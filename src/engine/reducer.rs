@@ -321,8 +321,10 @@ impl ReducerEngine {
         // Phase 2: Single batch call
         self.runtime.process_grouped(&mut batches)?;
 
-        // Phase 3: Collect results — restore states, save snapshots, enrich emits
-        let mut output_maps: Vec<RowMap> = Vec::new();
+        // Phase 3: Collect results — restore states, save snapshots, enrich emits.
+        // Emit in original row order (not grouped order) so first()/last() MVs
+        // produce the same results as the per-row path.
+        let mut indexed_emits: Vec<(usize, RowMap)> = Vec::new();
         let block_keys = self.block_groups.entry(block).or_default();
 
         for (i, batch) in batches.into_iter().enumerate() {
@@ -338,15 +340,34 @@ impl ReducerEngine {
             block_keys.insert(key.clone());
 
             let first_row = &rows[row_indices[0]];
-            for mut emit_row in batch.emits {
+            // Batched path assumes 1 emit per input row for correct ordering.
+            // Multi-emit per row would break the row_indices mapping.
+            debug_assert!(
+                batch.emits.len() <= row_indices.len(),
+                "batched path: got {} emits for {} rows in group — multi-emit not supported",
+                batch.emits.len(),
+                row_indices.len()
+            );
+            for (emit_idx, mut emit_row) in batch.emits.into_iter().enumerate() {
                 for col in &self.def.group_by {
                     if let Some(v) = first_row.get(col.as_str()) {
                         emit_row.entry(col.clone()).or_insert_with(|| v.clone());
                     }
                 }
-                output_maps.push(emit_row);
+                // Map back to original row index for ordering
+                let orig_idx = if emit_idx < row_indices.len() {
+                    row_indices[emit_idx]
+                } else {
+                    // Multi-emit: append after last row
+                    usize::MAX
+                };
+                indexed_emits.push((orig_idx, emit_row));
             }
         }
+
+        // Sort by original row index to preserve input order
+        indexed_emits.sort_by_key(|(idx, _)| *idx);
+        let output_maps: Vec<RowMap> = indexed_emits.into_iter().map(|(_, row)| row).collect();
 
         Ok(output_maps)
     }
@@ -564,7 +585,8 @@ fn parse_default(default_str: &str, column_type: &crate::types::ColumnType) -> V
             let json_val = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
             Value::JSON(json_val)
         }
-        _ => column_type.default_value(),
+        ColumnType::DateTime => Value::DateTime(default_str.parse::<i64>().unwrap_or(0)),
+        ColumnType::Uint256 | ColumnType::Bytes | ColumnType::Base58 => column_type.default_value(),
     }
 }
 
@@ -574,6 +596,7 @@ mod tests {
     use crate::schema::ast::*;
     use crate::storage::memory::MemoryBackend;
     use crate::types::ColumnRegistry;
+    use crate::types::ColumnType;
 
     fn pnl_reducer_def() -> ReducerDef {
         ReducerDef {
@@ -1095,5 +1118,89 @@ mod tests {
         ));
         assert!(!engine.needs_host_callback());
         assert!(engine.is_external()); // def.body unchanged
+    }
+
+    /// parse_default must handle DateTime explicitly (not fall through to wildcard).
+    #[test]
+    fn parse_default_datetime() {
+        let val = parse_default("1700000000", &ColumnType::DateTime);
+        assert_eq!(val, Value::DateTime(1700000000));
+    }
+
+    /// parse_default for Uint256 returns zero (no hex parsing, just type default).
+    #[test]
+    fn parse_default_uint256() {
+        let val = parse_default("0", &ColumnType::Uint256);
+        assert_eq!(val, Value::Uint256([0u8; 32]));
+    }
+
+    /// Batched path must preserve original input row order in emits.
+    #[test]
+    fn batched_path_preserves_emit_order() {
+        use crate::reducer_runtime::external::{ExternalRuntime, install_test_context};
+
+        let def = ReducerDef {
+            name: "counter".to_string(),
+            source: "events".to_string(),
+            group_by: vec!["user".to_string()],
+            state: vec![StateField {
+                name: "count".to_string(),
+                column_type: ColumnType::Float64,
+                default: "0".to_string(),
+            }],
+            requires: vec![],
+            body: ReducerBody::External {
+                id: "counter".to_string(),
+            },
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
+        let mut engine = ReducerEngine::new(def, storage, &reg, &[]);
+
+        // Install test context that increments count and emits it
+        let _guard = install_test_context(|groups| {
+            for group in groups.iter_mut() {
+                for row in &group.rows {
+                    let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let count = group
+                        .state
+                        .get("count")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let new_count = count + amount;
+                    group
+                        .state
+                        .insert("count".into(), Value::Float64(new_count));
+                    group
+                        .emits
+                        .push(HashMap::from([("count".into(), Value::Float64(new_count))]));
+                }
+            }
+        });
+
+        // Input: alice, bob, alice — interleaved
+        let rows = vec![
+            Row::from(HashMap::from([
+                ("user".into(), Value::String("alice".into())),
+                ("amount".into(), Value::Float64(1.0)),
+            ])),
+            Row::from(HashMap::from([
+                ("user".into(), Value::String("bob".into())),
+                ("amount".into(), Value::Float64(10.0)),
+            ])),
+            Row::from(HashMap::from([
+                ("user".into(), Value::String("alice".into())),
+                ("amount".into(), Value::Float64(2.0)),
+            ])),
+        ];
+
+        let output = engine.process_block(1000, &rows).unwrap();
+
+        // The key assertion: output follows original input order (alice, bob, alice)
+        // not grouped order (alice, alice, bob)
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0].get("user"), Some(&Value::String("alice".into())));
+        assert_eq!(output[1].get("user"), Some(&Value::String("bob".into())));
+        assert_eq!(output[2].get("user"), Some(&Value::String("alice".into())));
     }
 }
