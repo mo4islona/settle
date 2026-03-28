@@ -169,37 +169,45 @@ function buildPipeline() {
 }
 
 describe('Uniswap PnL pipeline', () => {
-  it('resolves ETH/USDC price and produces candles', () => {
+  it('resolves ETH/USDC price and produces candles', async () => {
     const db = buildPipeline().build()
 
     // amount0 > 0 = sender buys token0, amount1 < 0 = sender pays token1
-    db.processBatch('swaps', 1, [
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xalice',
-        amount0: 1,
-        amount1: -2000,
-        block_time: 60000,
+    const batch = await db.ingest({
+      data: {
+        swaps: [
+          {
+            block_number: 1,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xalice',
+            amount0: 1,
+            amount1: -2000,
+            block_time: 60000,
+          },
+          {
+            block_number: 1,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xbob',
+            amount0: 2,
+            amount1: -4100,
+            block_time: 120000,
+          },
+        ],
       },
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xbob',
-        amount0: 2,
-        amount1: -4100,
-        block_time: 120000,
-      },
-    ])
+      finalizedHead: { number: 1, hash: '0x1' },
+      rollbackChain: [{ number: 1, hash: '0x1' }],
+    })
 
-    const batch = db.flush()!
-    expect(batch.tables.swaps).toBeUndefined() // virtual
+    expect(batch).toBeTruthy()
+    expect(batch!.tables.swaps).toBeUndefined() // virtual
 
-    const candles = batch.tables.candles_5m
+    const candles = batch!.tables.candles_5m
     expect(candles).toHaveLength(1)
     // ratio = |amount1/amount0|, price = ratio (t1 is USDC)
     expect(candles[0].values.open).toBe(2000)
@@ -208,49 +216,55 @@ describe('Uniswap PnL pipeline', () => {
     expect(candles[0].values.tradeCount).toBe(2)
   })
 
-  it('computes wallet PnL with average cost method', () => {
+  it('computes wallet PnL with average cost method', async () => {
     const db = buildPipeline().build()
 
     // Block 1: alice buys 1 WETH @ 2000 (amount0>0 = buy token0)
-    db.processBatch('swaps', 1, [
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xalice',
-        amount0: 1,
-        amount1: -2000,
-        block_time: 60000,
-      },
-    ])
-
     // Block 2: alice buys 1 more WETH @ 2200, then sells 1 WETH @ 2400
-    db.processBatch('swaps', 2, [
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xalice',
-        amount0: 1,
-        amount1: -2200,
-        block_time: 120000,
+    const batch = await db.ingest({
+      data: {
+        swaps: [
+          {
+            block_number: 1,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xalice',
+            amount0: 1,
+            amount1: -2000,
+            block_time: 60000,
+          },
+          {
+            block_number: 2,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xalice',
+            amount0: 1,
+            amount1: -2200,
+            block_time: 120000,
+          },
+          {
+            block_number: 2,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xalice',
+            amount0: -1,
+            amount1: 2400,
+            block_time: 180000,
+          },
+        ],
       },
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xalice',
-        amount0: -1,
-        amount1: 2400,
-        block_time: 180000,
-      },
-    ])
+      finalizedHead: { number: 2, hash: '0x2' },
+      rollbackChain: [{ number: 2, hash: '0x2' }, { number: 1, hash: '0x1' }],
+    })
 
-    const batch = db.flush()!
-    const wallet = batch.tables.wallet_summary
+    expect(batch).toBeTruthy()
+    const wallet = batch!.tables.wallet_summary
     expect(wallet).toHaveLength(1)
     expect(wallet[0].values.tradeCount).toBe(3)
     expect(wallet[0].values.currentPosition).toBe(1) // bought 2, sold 1
@@ -259,114 +273,137 @@ describe('Uniswap PnL pipeline', () => {
     expect(wallet[0].values.totalPnl).toBeCloseTo(300, 0)
   })
 
-  it('handles cross-price via WETH', () => {
+  it('handles cross-price via WETH', async () => {
     const db = buildPipeline().build()
     const TOKEN_X = '0xtokenx'
 
     // Block 1: establish WETH price at 2000 USDC
-    db.processBatch('swaps', 1, [
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xalice',
-        amount0: 1,
-        amount1: -2000,
-        block_time: 60000,
-      },
-    ])
-
     // Block 2: swap TOKEN_X / WETH → price resolved via ETH cross
-    db.processBatch('swaps', 2, [
-      {
-        network: 'eth',
-        pool: 'TOKENX/WETH',
-        token0: TOKEN_X,
-        token1: WETH,
-        sender: '0xbob',
-        amount0: 100,
-        amount1: -1,
-        block_time: 120000,
+    const batch = await db.ingest({
+      data: {
+        swaps: [
+          {
+            block_number: 1,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xalice',
+            amount0: 1,
+            amount1: -2000,
+            block_time: 60000,
+          },
+          {
+            block_number: 2,
+            network: 'eth',
+            pool: 'TOKENX/WETH',
+            token0: TOKEN_X,
+            token1: WETH,
+            sender: '0xbob',
+            amount0: 100,
+            amount1: -1,
+            block_time: 120000,
+          },
+        ],
       },
-    ])
+      finalizedHead: { number: 2, hash: '0x2' },
+      rollbackChain: [{ number: 2, hash: '0x2' }, { number: 1, hash: '0x1' }],
+    })
 
-    const batch = db.flush()!
+    expect(batch).toBeTruthy()
 
     // TOKEN_X price = ratio * ethUsd = (1/100) * 2000 = 20
-    const candles = batch.tables.candles_5m
+    const candles = batch!.tables.candles_5m
     const tokenXCandle = candles.find((c: any) => c.key.pool === 'TOKENX/WETH')
     expect(tokenXCandle).toBeDefined()
     expect(tokenXCandle!.values.open).toBeCloseTo(20, 2)
   })
 
-  it('supports rollback across the full pipeline', () => {
+  it('supports rollback across the full pipeline', async () => {
     const db = buildPipeline().build()
 
-    db.processBatch('swaps', 1, [
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xalice',
-        amount0: 1,
-        amount1: -2000,
-        block_time: 60000,
+    // Ingest blocks 1 and 2
+    await db.ingest({
+      data: {
+        swaps: [
+          {
+            block_number: 1,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xalice',
+            amount0: 1,
+            amount1: -2000,
+            block_time: 60000,
+          },
+          {
+            block_number: 2,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xalice',
+            amount0: 1,
+            amount1: -2200,
+            block_time: 120000,
+          },
+        ],
       },
-    ])
-    db.processBatch('swaps', 2, [
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xalice',
-        amount0: 1,
-        amount1: -2200,
-        block_time: 120000,
-      },
-    ])
-    db.flush()
+      finalizedHead: { number: 1, hash: '0x1' },
+      rollbackChain: [{ number: 2, hash: '0x2' }, { number: 1, hash: '0x1' }],
+    })
 
-    // Rollback block 2
-    db.rollback(1)
-    const batch = db.flush()!
+    // Rollback block 2: ingest with rollbackChain that only includes block 1
+    const batch = await db.ingest({
+      data: {},
+      finalizedHead: { number: 1, hash: '0x1' },
+      rollbackChain: [{ number: 1, hash: '0x1' }],
+    })
 
-    const wallet = batch.tables.wallet_summary
+    expect(batch).toBeTruthy()
+    const wallet = batch!.tables.wallet_summary
     expect(wallet).toHaveLength(1)
     expect(wallet[0].values.tradeCount).toBe(1)
     expect(wallet[0].values.currentPosition).toBe(1) // only block 1's buy
   })
 
-  it('isolates wallet PnL per sender', () => {
+  it('isolates wallet PnL per sender', async () => {
     const db = buildPipeline().build()
 
-    db.processBatch('swaps', 1, [
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xalice',
-        amount0: 2,
-        amount1: -4000,
-        block_time: 60000,
+    const batch = await db.ingest({
+      data: {
+        swaps: [
+          {
+            block_number: 1,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xalice',
+            amount0: 2,
+            amount1: -4000,
+            block_time: 60000,
+          },
+          {
+            block_number: 1,
+            network: 'eth',
+            pool: 'WETH/USDC',
+            token0: WETH,
+            token1: USDC,
+            sender: '0xbob',
+            amount0: 1,
+            amount1: -2000,
+            block_time: 120000,
+          },
+        ],
       },
-      {
-        network: 'eth',
-        pool: 'WETH/USDC',
-        token0: WETH,
-        token1: USDC,
-        sender: '0xbob',
-        amount0: 1,
-        amount1: -2000,
-        block_time: 120000,
-      },
-    ])
+      finalizedHead: { number: 1, hash: '0x1' },
+      rollbackChain: [{ number: 1, hash: '0x1' }],
+    })
 
-    const batch = db.flush()!
-    const wallet = batch.tables.wallet_summary
+    expect(batch).toBeTruthy()
+    const wallet = batch!.tables.wallet_summary
     expect(wallet).toHaveLength(2)
 
     const alice = wallet.find((r: any) => r.key.sender === '0xalice')

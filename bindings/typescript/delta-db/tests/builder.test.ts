@@ -2,7 +2,7 @@ import {describe, expect, it} from 'vitest'
 import {datetime, float64, interval, Pipeline, string, uint64, type SlidingWindowOptions} from '../src'
 
 describe('Pipeline builder', () => {
-    it('builds a PnL pipeline and produces correct MV output', () => {
+    it('builds a PnL pipeline and produces correct MV output', async () => {
         const p = new Pipeline()
 
         const trades = p.table('trades', {
@@ -47,18 +47,26 @@ describe('Pipeline builder', () => {
         })
 
         const db = p.build()
-        db.processBatch('trades', 1000, [{user: 'alice', side: 'buy', amount: 10, price: 2000}])
-        db.processBatch('trades', 1001, [{user: 'alice', side: 'sell', amount: 5, price: 2200}])
+        const batch = await db.ingest({
+            data: {
+                trades: [
+                    {block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000},
+                    {block_number: 1001, user: 'alice', side: 'sell', amount: 5, price: 2200},
+                ],
+            },
+            finalizedHead: {number: 1001, hash: '0x1001'},
+            rollbackChain: [{number: 1001, hash: '0x1001'}, {number: 1000, hash: '0x1000'}],
+        })
 
-        const batch = db.flush()!
-        const mv = batch.tables.position_summary
+        expect(batch).toBeTruthy()
+        const mv = batch!.tables.position_summary
         expect(mv).toHaveLength(1)
         expect(mv[0].values.tradeCount).toBe(2)
         expect(mv[0].values.currentPosition).toBeCloseTo(5, 6)
         expect(mv[0].values.totalPnl).toBeCloseTo(1000, 2)
     })
 
-    it('handles multiple groups', () => {
+    it('handles multiple groups', async () => {
         const p = new Pipeline()
         const trades = p.table('trades', {
             block_number: uint64(),
@@ -88,14 +96,20 @@ describe('Pipeline builder', () => {
             })
 
         const db = p.build()
-        db.processBatch('trades', 1, [
-            {user: 'alice', side: 'buy', amount: 10, price: 100},
-            {user: 'bob', side: 'buy', amount: 5, price: 200},
-            {user: 'alice', side: 'sell', amount: 3, price: 110},
-        ])
+        const batch = await db.ingest({
+            data: {
+                trades: [
+                    {block_number: 1, user: 'alice', side: 'buy', amount: 10, price: 100},
+                    {block_number: 1, user: 'bob', side: 'buy', amount: 5, price: 200},
+                    {block_number: 1, user: 'alice', side: 'sell', amount: 3, price: 110},
+                ],
+            },
+            finalizedHead: {number: 1, hash: '0x1'},
+            rollbackChain: [{number: 1, hash: '0x1'}],
+        })
 
-        const batch = db.flush()!
-        const mv = batch.tables.summary
+        expect(batch).toBeTruthy()
+        const mv = batch!.tables.summary
         expect(mv).toHaveLength(2)
 
         const alice = mv.find((r) => r.key.user === 'alice')
@@ -106,7 +120,7 @@ describe('Pipeline builder', () => {
         expect(bob?.values.trades).toBe(1)
     })
 
-    it('supports rollback', () => {
+    it('supports rollback', async () => {
         const p = new Pipeline()
         const t = p.table('t', {block_number: uint64(), k: string(), v: float64()})
 
@@ -127,17 +141,32 @@ describe('Pipeline builder', () => {
         })
 
         const db = p.build()
-        db.processBatch('t', 1, [{k: 'a', v: 10}])
-        db.processBatch('t', 2, [{k: 'a', v: 20}])
-        db.flush()
 
-        db.rollback(1)
-        const batch = db.flush()!
-        const mv = batch.tables.mv
+        // Ingest blocks 1 and 2
+        await db.ingest({
+            data: {
+                t: [
+                    {block_number: 1, k: 'a', v: 10},
+                    {block_number: 2, k: 'a', v: 20},
+                ],
+            },
+            finalizedHead: {number: 1, hash: '0x1'},
+            rollbackChain: [{number: 2, hash: '0x2'}, {number: 1, hash: '0x1'}],
+        })
+
+        // Rollback block 2: ingest with rollbackChain that only includes block 1
+        const batch = await db.ingest({
+            data: {},
+            finalizedHead: {number: 1, hash: '0x1'},
+            rollbackChain: [{number: 1, hash: '0x1'}],
+        })
+
+        expect(batch).toBeTruthy()
+        const mv = batch!.tables.mv
         expect(mv[0].values.total).toBe(10)
     })
 
-    it('chains reducers (reducer → reducer → view)', () => {
+    it('chains reducers (reducer → reducer → view)', async () => {
         const p = new Pipeline()
         const events = p.table('events', {
             block_number: uint64(),
@@ -177,17 +206,25 @@ describe('Pipeline builder', () => {
         })
 
         const db = p.build()
-        db.processBatch('events', 1, [{user: 'alice', amount: 10}])
-        db.processBatch('events', 2, [{user: 'alice', amount: 15}])
+        const batch = await db.ingest({
+            data: {
+                events: [
+                    {block_number: 1, user: 'alice', amount: 10},
+                    {block_number: 2, user: 'alice', amount: 15},
+                ],
+            },
+            finalizedHead: {number: 2, hash: '0x2'},
+            rollbackChain: [{number: 2, hash: '0x2'}, {number: 1, hash: '0x1'}],
+        })
 
-        const batch = db.flush()!
-        const mv = batch.tables.spike_summary
+        expect(batch).toBeTruthy()
+        const mv = batch!.tables.spike_summary
         expect(mv).toHaveLength(1)
         expect(mv[0].values.spikes).toBe(1)
         expect(mv[0].values.lastSpike).toBe(25)
     })
 
-    it('creates a view with time-window grouping', () => {
+    it('creates a view with time-window grouping', async () => {
         const p = new Pipeline()
         const swaps = p.table('swaps', {
             block_number: uint64(),
@@ -221,16 +258,20 @@ describe('Pipeline builder', () => {
             })
 
         const db = p.build()
-        db.processBatch('swaps', 1, [
-            {pool: 'ETH/USDC', block_time: 60000, price: 2000, volume: 100},
-            {pool: 'ETH/USDC', block_time: 120000, price: 2100, volume: 200},
-        ])
-        db.processBatch('swaps', 2, [
-            {pool: 'ETH/USDC', block_time: 360000, price: 2050, volume: 150},
-        ])
+        const batch = await db.ingest({
+            data: {
+                swaps: [
+                    {block_number: 1, pool: 'ETH/USDC', block_time: 60000, price: 2000, volume: 100},
+                    {block_number: 1, pool: 'ETH/USDC', block_time: 120000, price: 2100, volume: 200},
+                    {block_number: 2, pool: 'ETH/USDC', block_time: 360000, price: 2050, volume: 150},
+                ],
+            },
+            finalizedHead: {number: 2, hash: '0x2'},
+            rollbackChain: [{number: 2, hash: '0x2'}, {number: 1, hash: '0x1'}],
+        })
 
-        const batch = db.flush()!
-        const candles = batch.tables.candles_5m
+        expect(batch).toBeTruthy()
+        const candles = batch!.tables.candles_5m
         expect(candles).toHaveLength(2)
         candles.sort((a, b) => a.values.windowStart - b.values.windowStart)
 
@@ -246,7 +287,7 @@ describe('Pipeline builder', () => {
         expect(candles[1].values.tradeCount).toBe(1)
     })
 
-    it('supports virtual tables (no deltas emitted for raw rows)', () => {
+    it('supports virtual tables (no deltas emitted for raw rows)', async () => {
         const p = new Pipeline()
         const orders = p.table(
             'orders',
@@ -273,15 +314,21 @@ describe('Pipeline builder', () => {
             })
 
         const db = p.build()
-        db.processBatch('orders', 1, [{trader: 'alice', amount: 100}])
+        const batch = await db.ingest({
+            data: {
+                orders: [{block_number: 1, trader: 'alice', amount: 100}],
+            },
+            finalizedHead: {number: 1, hash: '0x1'},
+            rollbackChain: [{number: 1, hash: '0x1'}],
+        })
 
-        const batch = db.flush()!
-        expect(batch.tables.orders).toBeUndefined()
-        expect(batch.tables.summary).toHaveLength(1)
-        expect(batch.tables.summary[0].values.total).toBe(100)
+        expect(batch).toBeTruthy()
+        expect(batch!.tables.orders).toBeUndefined()
+        expect(batch!.tables.summary).toHaveLength(1)
+        expect(batch!.tables.summary[0].values.total).toBe(100)
     })
 
-    it('creates a sliding window view with time-based expiry', () => {
+    it('creates a sliding window view with time-based expiry', async () => {
         const p = new Pipeline()
         const trades = p.table('trades', {
             block_number: uint64(),
@@ -305,35 +352,45 @@ describe('Pipeline builder', () => {
 
         const db = p.build()
 
-        // Block 1: ETH volume=100 at t=0
-        db.processBatch('trades', 1, [
-            {pair: 'ETH', volume: 100, block_time: 0},
-        ])
-        // Block 2: ETH volume=200 at t=30min
-        db.processBatch('trades', 2, [
-            {pair: 'ETH', volume: 200, block_time: 1_800_000},
-        ])
+        // Ingest blocks 1 and 2
+        const batch1 = await db.ingest({
+            data: {
+                trades: [
+                    {block_number: 1, pair: 'ETH', volume: 100, block_time: 0},
+                    {block_number: 2, pair: 'ETH', volume: 200, block_time: 1_800_000},
+                ],
+            },
+            finalizedHead: {number: 2, hash: '0x2'},
+            rollbackChain: [{number: 2, hash: '0x2'}, {number: 1, hash: '0x1'}],
+        })
 
-        const batch1 = db.flush()!
-        const vol1 = batch1.tables.volume_1h
+        expect(batch1).toBeTruthy()
+        const vol1 = batch1!.tables.volume_1h
         // Should have Insert + Update for ETH
         const latest1 = vol1[vol1.length - 1]
         expect(latest1.values.totalVolume).toBe(300)
         expect(latest1.values.tradeCount).toBe(2)
 
         // Block 3: ETH volume=50 at t=1hr+1s → block 1 expires
-        db.processBatch('trades', 3, [
-            {pair: 'ETH', volume: 50, block_time: 3_601_000},
-        ])
-        const batch2 = db.flush()!
-        const vol2 = batch2.tables.volume_1h
+        const batch2 = await db.ingest({
+            data: {
+                trades: [
+                    {block_number: 3, pair: 'ETH', volume: 50, block_time: 3_601_000},
+                ],
+            },
+            finalizedHead: {number: 3, hash: '0x3'},
+            rollbackChain: [{number: 3, hash: '0x3'}, {number: 2, hash: '0x2'}, {number: 1, hash: '0x1'}],
+        })
+
+        expect(batch2).toBeTruthy()
+        const vol2 = batch2!.tables.volume_1h
         expect(vol2).toHaveLength(1)
         // After expiry: 200 + 50 = 250
         expect(vol2[0].values.totalVolume).toBe(250)
         expect(vol2[0].values.tradeCount).toBe(2)
     })
 
-    it('sliding window emits Delete when group fully expires', () => {
+    it('sliding window emits Delete when group fully expires', async () => {
         const p = new Pipeline()
         const trades = p.table('trades', {
             block_number: uint64(),
@@ -357,13 +414,25 @@ describe('Pipeline builder', () => {
         const db = p.build()
 
         // DOGE at t=0
-        db.processBatch('trades', 1, [{pair: 'DOGE', volume: 1000, block_time: 0}])
-        db.flush()
+        await db.ingest({
+            data: {
+                trades: [{block_number: 1, pair: 'DOGE', volume: 1000, block_time: 0}],
+            },
+            finalizedHead: {number: 1, hash: '0x1'},
+            rollbackChain: [{number: 1, hash: '0x1'}],
+        })
 
         // ETH at t=1hr+1s → DOGE expires completely
-        db.processBatch('trades', 2, [{pair: 'ETH', volume: 100, block_time: 3_601_000}])
-        const batch = db.flush()!
-        const records = batch.tables.volume_1h
+        const batch = await db.ingest({
+            data: {
+                trades: [{block_number: 2, pair: 'ETH', volume: 100, block_time: 3_601_000}],
+            },
+            finalizedHead: {number: 2, hash: '0x2'},
+            rollbackChain: [{number: 2, hash: '0x2'}, {number: 1, hash: '0x1'}],
+        })
+
+        expect(batch).toBeTruthy()
+        const records = batch!.tables.volume_1h
 
         const dogeDelete = records.find((r: any) => r.key.pair === 'DOGE')
         expect(dogeDelete).toBeDefined()

@@ -10,7 +10,7 @@ const TABLE_SCHEMA = `
   CREATE TABLE trades (
     block_number UInt64,
     user         String,
-    side         String, 
+    side         String,
     amount       Float64,
     price        Float64
   );
@@ -101,29 +101,41 @@ function registerPnlReducer(db: DeltaDb) {
 }
 
 describe('External Reducer', () => {
-  it('produces same MV output as Lua for PnL workload', () => {
+  it('produces same MV output as Lua for PnL workload', async () => {
     // Lua version
     const luaDb = DeltaDb.open({ schema: TABLE_SCHEMA + LUA_REDUCER + MV_SCHEMA })
-    luaDb.processBatch('trades', 1000, [
-      { user: 'alice', side: 'buy', amount: 10, price: 2000 },
-      { user: 'alice', side: 'buy', amount: 5, price: 2100 },
-    ])
-    luaDb.processBatch('trades', 1001, [{ user: 'alice', side: 'sell', amount: 5, price: 2200 }])
-    const luaBatch = luaDb.flush()!
+    const luaBatch = await luaDb.ingest({
+      data: {
+        trades: [
+          { block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000 },
+          { block_number: 1000, user: 'alice', side: 'buy', amount: 5, price: 2100 },
+          { block_number: 1001, user: 'alice', side: 'sell', amount: 5, price: 2200 },
+        ],
+      },
+      finalizedHead: { number: 1001, hash: '0x1001' },
+      rollbackChain: [{ number: 1001, hash: '0x1001' }, { number: 1000, hash: '0x1000' }],
+    })
 
     // External version
     const extDb = DeltaDb.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
     registerPnlReducer(extDb)
-    extDb.processBatch('trades', 1000, [
-      { user: 'alice', side: 'buy', amount: 10, price: 2000 },
-      { user: 'alice', side: 'buy', amount: 5, price: 2100 },
-    ])
-    extDb.processBatch('trades', 1001, [{ user: 'alice', side: 'sell', amount: 5, price: 2200 }])
-    const extBatch = extDb.flush()!
+    const extBatch = await extDb.ingest({
+      data: {
+        trades: [
+          { block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000 },
+          { block_number: 1000, user: 'alice', side: 'buy', amount: 5, price: 2100 },
+          { block_number: 1001, user: 'alice', side: 'sell', amount: 5, price: 2200 },
+        ],
+      },
+      finalizedHead: { number: 1001, hash: '0x1001' },
+      rollbackChain: [{ number: 1001, hash: '0x1001' }, { number: 1000, hash: '0x1000' }],
+    })
 
     // Compare MV records
-    const luaMv = luaBatch.tables.position_summary
-    const extMv = extBatch.tables.position_summary
+    expect(luaBatch).toBeTruthy()
+    expect(extBatch).toBeTruthy()
+    const luaMv = luaBatch!.tables.position_summary
+    const extMv = extBatch!.tables.position_summary
 
     expect(extMv).toHaveLength(luaMv.length)
     expect(extMv[0].values.trade_count).toBe(luaMv[0].values.trade_count)
@@ -131,17 +143,23 @@ describe('External Reducer', () => {
     expect(extMv[0].values.total_pnl).toBeCloseTo(luaMv[0].values.total_pnl, 2)
   })
 
-  it('handles multiple groups correctly', () => {
+  it('handles multiple groups correctly', async () => {
     const db = DeltaDb.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
     registerPnlReducer(db)
 
-    db.processBatch('trades', 1000, [
-      { user: 'alice', side: 'buy', amount: 10, price: 2000 },
-      { user: 'bob', side: 'buy', amount: 5, price: 3000 },
-    ])
-    const batch = db.flush()!
+    const batch = await db.ingest({
+      data: {
+        trades: [
+          { block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000 },
+          { block_number: 1000, user: 'bob', side: 'buy', amount: 5, price: 3000 },
+        ],
+      },
+      finalizedHead: { number: 1000, hash: '0x1000' },
+      rollbackChain: [{ number: 1000, hash: '0x1000' }],
+    })
 
-    const mvRecords = batch.tables.position_summary
+    expect(batch).toBeTruthy()
+    const mvRecords = batch!.tables.position_summary
     expect(mvRecords).toHaveLength(2)
 
     const alice = mvRecords.find((r: any) => r.key.user === 'alice')
@@ -151,19 +169,31 @@ describe('External Reducer', () => {
     expect(bob?.values.current_position).toBe(5)
   })
 
-  it('supports rollback', () => {
+  it('supports rollback', async () => {
     const db = DeltaDb.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
     registerPnlReducer(db)
 
-    db.processBatch('trades', 1000, [{ user: 'alice', side: 'buy', amount: 10, price: 2000 }])
-    db.processBatch('trades', 1001, [{ user: 'alice', side: 'buy', amount: 5, price: 2100 }])
-    db.flush()
+    // Ingest blocks 1000 and 1001
+    await db.ingest({
+      data: {
+        trades: [
+          { block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000 },
+          { block_number: 1001, user: 'alice', side: 'buy', amount: 5, price: 2100 },
+        ],
+      },
+      finalizedHead: { number: 1000, hash: '0x1000' },
+      rollbackChain: [{ number: 1001, hash: '0x1001' }, { number: 1000, hash: '0x1000' }],
+    })
 
-    // Rollback block 1001
-    db.rollback(1000)
-    const batch = db.flush()!
+    // Rollback block 1001: ingest with rollbackChain that only includes block 1000
+    const batch = await db.ingest({
+      data: {},
+      finalizedHead: { number: 1000, hash: '0x1000' },
+      rollbackChain: [{ number: 1000, hash: '0x1000' }],
+    })
 
-    const mvRecords = batch.tables.position_summary
+    expect(batch).toBeTruthy()
+    const mvRecords = batch!.tables.position_summary
     expect(mvRecords).toHaveLength(1)
     expect(mvRecords[0].values.current_position).toBe(10) // back to 10, not 15
   })

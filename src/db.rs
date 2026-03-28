@@ -319,16 +319,51 @@ impl DeltaDb {
         // Single WriteBatch for all storage writes (raw rows + finalize + meta)
         let mut write_batch = StorageWriteBatch::new();
 
-        // Track the block before ingest started so we can rollback on error
-        let pre_ingest_block = self.engine.latest_block();
-
-        // 1. For each table, group rows by block_number and process in order
         // Collect deltas locally — only push to buffer on success to avoid
         // partial deltas leaking into downstream output on failure.
         let mut pending_deltas: Vec<(Vec<DeltaRecord>, Vec<PerfNode>)> = Vec::new();
 
+        // 0. Detect fork: compare new chain against stored block_hashes and rollback
+        //    if our latest block is no longer on the canonical chain.
+        //    rollback_chain must be in descending order (newest block first) so that
+        //    resolve_fork_cursor returns the highest common ancestor.
+        let recovery_block = {
+            let current_latest = self.engine.latest_block();
+            if current_latest > 0 {
+                let new_chain: Vec<(BlockNumber, &str)> = input
+                    .rollback_chain
+                    .iter()
+                    .map(|c| (c.number, c.hash.as_str()))
+                    .chain(std::iter::once((
+                        input.finalized_head.number,
+                        input.finalized_head.hash.as_str(),
+                    )))
+                    .collect();
+
+                let fork_point = match self.engine.resolve_fork_cursor(&new_chain) {
+                    Some(ref c) if c.number < current_latest => c.number,
+                    Some(_) => current_latest, // no divergence
+                    None => 0,                 // no common ancestor: full rollback
+                };
+
+                if fork_point < current_latest {
+                    let deltas = self.engine.rollback_to_batch(fork_point, &mut write_batch)?;
+                    pending_deltas.push((deltas, vec![]));
+                }
+                fork_point
+            } else {
+                0
+            }
+        };
+
+        // 1. For each table, group rows by block_number and process in order.
+        //    Tables are sorted by name for deterministic processing order across
+        //    multiple tables (HashMap iteration order is non-deterministic).
         let result = (|| -> Result<()> {
-            for (table, rows) in &input.data {
+            let mut tables: Vec<(&String, &Vec<RowMap>)> = input.data.iter().collect();
+            tables.sort_by_key(|(name, _)| name.as_str());
+
+            for (table, rows) in tables {
                 let mut by_block: BTreeMap<BlockNumber, Vec<RowMap>> = BTreeMap::new();
                 for row in rows {
                     let block = match row.get("block_number") {
@@ -362,11 +397,9 @@ impl DeltaDb {
         })();
 
         if let Err(e) = result {
-            // Rollback in-memory state to pre-ingest point.
+            // Rollback in-memory state to recovery_block (the fork point, or 0 for fresh DB).
             // pending_deltas is dropped — buffer stays clean.
-            if pre_ingest_block > 0 {
-                let _ = self.engine.rollback(pre_ingest_block);
-            }
+            let _ = self.engine.rollback(recovery_block);
             return Err(e);
         }
 

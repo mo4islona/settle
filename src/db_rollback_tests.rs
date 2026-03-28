@@ -485,3 +485,107 @@ fn resolve_fork_cursor_finds_common_ancestor() {
     let fork_cursor = db.resolve_fork_cursor(&previous_blocks).unwrap();
     assert_eq!(fork_cursor.number, 99);
 }
+
+#[test]
+fn ingest_auto_rollback_on_fork() {
+    // Verify that ingest() automatically rolls back when rollback_chain shrinks.
+    // This tests the fork detection path in ingest().
+    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+
+    // Ingest blocks 1 and 2. Block 2 is unfinalized (finalizedHead = 1).
+    db.ingest(IngestInput {
+        data: std::collections::HashMap::from([(
+            "swaps".to_string(),
+            vec![
+                {
+                    let mut r = make_swap("ETH", 100.0);
+                    r.insert("block_number".into(), Value::UInt64(1));
+                    r
+                },
+                {
+                    let mut r = make_swap("ETH", 200.0);
+                    r.insert("block_number".into(), Value::UInt64(2));
+                    r
+                },
+            ],
+        )]),
+        rollback_chain: vec![
+            BlockCursor { number: 2, hash: "0x2".into() },
+            BlockCursor { number: 1, hash: "0x1".into() },
+        ],
+        finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+    })
+    .unwrap();
+
+    assert_eq!(db.latest_block(), 2);
+
+    // Rollback: send ingest with rollback_chain that omits block 2.
+    // ingest() must detect the fork and roll back to block 1.
+    let batch = db
+        .ingest(IngestInput {
+            data: std::collections::HashMap::new(),
+            rollback_chain: vec![BlockCursor { number: 1, hash: "0x1".into() }],
+            finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+        })
+        .unwrap();
+
+    assert_eq!(db.latest_block(), 1, "latest_block must revert to fork point");
+
+    // The batch must contain compensating deltas for block 2's data
+    let batch = batch.expect("rollback ingest must return a batch with compensating deltas");
+    let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
+    assert_eq!(mv_records.len(), 1);
+    assert_eq!(mv_records[0].operation, DeltaOperation::Update);
+    // After rolling back block 2's 200.0, total should be back to 100.0
+    assert_eq!(
+        mv_records[0].values.get("total_volume"),
+        Some(&Value::Float64(100.0))
+    );
+}
+
+#[test]
+fn ingest_auto_rollback_full_when_no_common_ancestor() {
+    // When no common ancestor exists in the new chain, ingest() does a full
+    // rollback to block 0 and processes fresh data.
+    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+
+    db.ingest(IngestInput {
+        data: std::collections::HashMap::from([(
+            "swaps".to_string(),
+            vec![{
+                let mut r = make_swap("ETH", 100.0);
+                r.insert("block_number".into(), Value::UInt64(1));
+                r
+            }],
+        )]),
+        rollback_chain: vec![BlockCursor { number: 1, hash: "0xold1".into() }],
+        finalized_head: BlockCursor { number: 0, hash: "0x0".into() },
+    })
+    .unwrap();
+
+    assert_eq!(db.latest_block(), 1);
+
+    // New chain has completely different hashes — no common ancestor
+    let batch = db
+        .ingest(IngestInput {
+            data: std::collections::HashMap::from([(
+                "swaps".to_string(),
+                vec![{
+                    let mut r = make_swap("BTC", 500.0);
+                    r.insert("block_number".into(), Value::UInt64(1));
+                    r
+                }],
+            )]),
+            rollback_chain: vec![BlockCursor { number: 1, hash: "0xnew1".into() }],
+            finalized_head: BlockCursor { number: 0, hash: "0x0".into() },
+        })
+        .unwrap()
+        .expect("must return a batch");
+
+    assert_eq!(db.latest_block(), 1);
+
+    // Only BTC data should be present (ETH was rolled back)
+    let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
+    let btc = mv_records.iter().find(|r| r.key.get("pool") == Some(&Value::String("BTC".into())));
+    assert!(btc.is_some(), "BTC must appear after re-ingest");
+}
