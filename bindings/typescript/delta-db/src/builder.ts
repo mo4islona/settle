@@ -47,7 +47,7 @@ export function interval(column: string, duration: string): IntervalExpr {
     column,
     seconds,
     as(alias: string): IntervalExpr {
-      return { _type: 'interval', column, seconds, alias }
+      return { _type: 'interval', column, seconds, alias, as: (a: string) => interval(column, duration).as(a) }
     },
   }
 }
