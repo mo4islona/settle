@@ -589,3 +589,145 @@ fn ingest_auto_rollback_full_when_no_common_ancestor() {
     let btc = mv_records.iter().find(|r| r.key.get("pool") == Some(&Value::String("BTC".into())));
     assert!(btc.is_some(), "BTC must appear after re-ingest");
 }
+
+#[test]
+fn ingest_fork_detection_robust_against_asc_rollback_chain() {
+    // If the portal sends rollbackChain in ascending order (oldest first),
+    // ingest() must still detect fork correctly (no false rollback, no deep rollback).
+    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+
+    // Ingest blocks 1, 2, 3. Block 3 is unfinalized.
+    db.ingest(IngestInput {
+        data: std::collections::HashMap::from([(
+            "swaps".to_string(),
+            vec![
+                {
+                    let mut r = make_swap("ETH", 10.0);
+                    r.insert("block_number".into(), Value::UInt64(1));
+                    r
+                },
+                {
+                    let mut r = make_swap("ETH", 20.0);
+                    r.insert("block_number".into(), Value::UInt64(2));
+                    r
+                },
+                {
+                    let mut r = make_swap("ETH", 30.0);
+                    r.insert("block_number".into(), Value::UInt64(3));
+                    r
+                },
+            ],
+        )]),
+        rollback_chain: vec![
+            BlockCursor { number: 3, hash: "0x3".into() },
+            BlockCursor { number: 2, hash: "0x2".into() },
+            BlockCursor { number: 1, hash: "0x1".into() },
+        ],
+        finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+    })
+    .unwrap();
+
+    assert_eq!(db.latest_block(), 3);
+
+    // Second ingest: SAME chain but rollbackChain sent in ASCENDING order.
+    // No fork has occurred — ingest() must NOT roll back anything.
+    let batch = db
+        .ingest(IngestInput {
+            data: std::collections::HashMap::new(),
+            rollback_chain: vec![
+                // ASC order — oldest first (wrong but must be tolerated)
+                BlockCursor { number: 2, hash: "0x2".into() },
+                BlockCursor { number: 3, hash: "0x3".into() },
+            ],
+            finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+        })
+        .unwrap();
+
+    // No rollback should have happened — latest_block must remain at 3
+    assert_eq!(
+        db.latest_block(),
+        3,
+        "ASC rollbackChain must not trigger spurious rollback"
+    );
+    // Empty data + no rollback → None batch
+    assert!(batch.is_none(), "no delta with empty data and no fork");
+}
+
+#[test]
+fn ingest_no_spurious_rollback_on_multi_batch_advance() {
+    // ingest() must NOT roll back when called in multiple batches
+    // where each batch only contains NEW blocks (not yet in block_hashes).
+    // Previously, resolve_fork_cursor would find an old finalized anchor and
+    // trigger a rollback on every batch after the first.
+    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+
+    // Batch 1: blocks 1-3 (finalized=1, unfinalized=2,3)
+    db.ingest(IngestInput {
+        data: std::collections::HashMap::from([(
+            "swaps".to_string(),
+            vec![
+                {
+                    let mut r = make_swap("ETH", 10.0);
+                    r.insert("block_number".into(), Value::UInt64(1));
+                    r
+                },
+                {
+                    let mut r = make_swap("ETH", 20.0);
+                    r.insert("block_number".into(), Value::UInt64(2));
+                    r
+                },
+                {
+                    let mut r = make_swap("ETH", 30.0);
+                    r.insert("block_number".into(), Value::UInt64(3));
+                    r
+                },
+            ],
+        )]),
+        rollback_chain: vec![
+            BlockCursor { number: 3, hash: "0x3".into() },
+            BlockCursor { number: 2, hash: "0x2".into() },
+        ],
+        finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+    })
+    .unwrap();
+
+    assert_eq!(db.latest_block(), 3);
+
+    // Batch 2: only NEW blocks 4-5, rollbackChain contains only batch blocks.
+    // block_hashes already has {1,2,3} from batch 1.
+    // Without the "advancing" guard, resolve_fork_cursor would find block 1
+    // (finalized anchor) and falsely rollback to 1.
+    let batch = db
+        .ingest(IngestInput {
+            data: std::collections::HashMap::from([(
+                "swaps".to_string(),
+                vec![
+                    {
+                        let mut r = make_swap("ETH", 40.0);
+                        r.insert("block_number".into(), Value::UInt64(4));
+                        r
+                    },
+                    {
+                        let mut r = make_swap("ETH", 50.0);
+                        r.insert("block_number".into(), Value::UInt64(5));
+                        r
+                    },
+                ],
+            )]),
+            // Only current batch blocks (as pipes-sdk's extractRollbackChain would produce)
+            rollback_chain: vec![
+                BlockCursor { number: 5, hash: "0x5".into() },
+                BlockCursor { number: 4, hash: "0x4".into() },
+            ],
+            finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+        })
+        .unwrap()
+        .expect("must return a batch with new data");
+
+    // No rollback — latest must advance, not regress
+    assert_eq!(db.latest_block(), 5, "multi-batch advance must not rollback");
+
+    // Batch 2 data should be there (40 + 50 = 90, plus 10+20+30=60 from batch 1, total 150)
+    let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
+    assert!(!mv_records.is_empty(), "batch 2 must produce MV updates");
+}

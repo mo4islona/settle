@@ -325,32 +325,54 @@ impl DeltaDb {
 
         // 0. Detect fork: compare new chain against stored block_hashes and rollback
         //    if our latest block is no longer on the canonical chain.
-        //    rollback_chain must be in descending order (newest block first) so that
-        //    resolve_fork_cursor returns the highest common ancestor.
+        //    Sort rollback_chain DESC (newest first) so resolve_fork_cursor returns
+        //    the HIGHEST common ancestor — preventing catastrophic deep rollbacks
+        //    when the caller sends blocks in ascending order.
+        //
+        //    IMPORTANT: skip fork detection when the chain is advancing (rollbackChain
+        //    or finalizedHead contains blocks above current_latest). In that case, the
+        //    caller is providing new unseen blocks, not a rollback signal. External
+        //    fork handling (e.g. 409 in pipes-sdk) runs before ingest() is called.
         let recovery_block = {
             let current_latest = self.engine.latest_block();
             if current_latest > 0 {
-                let new_chain: Vec<(BlockNumber, &str)> = input
-                    .rollback_chain
-                    .iter()
-                    .map(|c| (c.number, c.hash.as_str()))
-                    .chain(std::iter::once((
-                        input.finalized_head.number,
-                        input.finalized_head.hash.as_str(),
-                    )))
-                    .collect();
+                let mut sorted_chain: Vec<_> = input.rollback_chain.iter().collect();
+                sorted_chain.sort_unstable_by_key(|c| std::cmp::Reverse(c.number));
 
-                let fork_point = match self.engine.resolve_fork_cursor(&new_chain) {
-                    Some(ref c) if c.number < current_latest => c.number,
-                    Some(_) => current_latest, // no divergence
-                    None => 0,                 // no common ancestor: full rollback
-                };
+                // If any block in rollbackChain or finalizedHead is ABOVE current_latest,
+                // the caller is advancing (normal progress). Resolve-fork-cursor would
+                // fall through to an old finalized anchor and trigger a spurious rollback.
+                let advancing = sorted_chain
+                    .first()
+                    .map(|c| c.number > current_latest)
+                    .unwrap_or(false)
+                    || input.finalized_head.number > current_latest;
 
-                if fork_point < current_latest {
-                    let deltas = self.engine.rollback_to_batch(fork_point, &mut write_batch)?;
-                    pending_deltas.push((deltas, vec![]));
+                if !advancing {
+                    let new_chain: Vec<(BlockNumber, &str)> = sorted_chain
+                        .iter()
+                        .map(|c| (c.number, c.hash.as_str()))
+                        .chain(std::iter::once((
+                            input.finalized_head.number,
+                            input.finalized_head.hash.as_str(),
+                        )))
+                        .collect();
+
+                    let fork_point = match self.engine.resolve_fork_cursor(&new_chain) {
+                        Some(ref c) if c.number < current_latest => c.number,
+                        Some(_) => current_latest, // no divergence
+                        None => 0,                 // no common ancestor: full rollback
+                    };
+
+                    if fork_point < current_latest {
+                        let deltas =
+                            self.engine.rollback_to_batch(fork_point, &mut write_batch)?;
+                        pending_deltas.push((deltas, vec![]));
+                    }
+                    fork_point
+                } else {
+                    current_latest // advancing — no fork detection needed
                 }
-                fork_point
             } else {
                 0
             }

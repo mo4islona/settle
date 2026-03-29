@@ -225,10 +225,13 @@ impl DeltaDb {
         &self,
         previous_blocks: Vec<DeltaDbCursor>,
     ) -> Option<DeltaDbCursor> {
-        let blocks: Vec<(u64, String)> = previous_blocks
+        // Sort DESC so resolve_fork_cursor returns the HIGHEST common ancestor
+        // regardless of the order the portal sends previousBlocks (typically ASC).
+        let mut blocks: Vec<(u64, String)> = previous_blocks
             .into_iter()
             .map(|c| (c.number as u64, c.hash))
             .collect();
+        blocks.sort_unstable_by_key(|(n, _)| std::cmp::Reverse(*n));
         let refs: Vec<(u64, &str)> = blocks.iter().map(|(n, h)| (*n, h.as_str())).collect();
         self.inner.resolve_fork_cursor(&refs).map(|c| c.into())
     }
