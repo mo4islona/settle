@@ -1,17 +1,32 @@
 {
   "name": "@sqd-pipes/delta-db",
-  "version": "0.0.1-alpha.11",
+  "version": "0.0.1-alpha.20",
   "description": "Embedded rollback-aware computation engine for blockchain data",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./web": {
+      "types": "./dist/web.d.ts",
+      "default": "./dist/web.js"
+    },
+    "./src/native/*": "./src/native/*",
+    "./src/wasm/*": "./src/wasm/*"
+  },
   "napi": {
     "name": "delta-db"
   },
   "scripts": {
     "build:native": "napi build --cargo-cwd ../../.. --features napi --release --platform --dts native.d.ts --js false src/native",
     "build:native:debug": "napi build --cargo-cwd ../../.. --features napi --platform --dts native.d.ts --js false src/native",
-    "build:ts": "tsc -p tsconfig.build.json && cp -r src/native dist/native",
+    "build:wasm": "wasm-pack build ../../.. --target web --no-default-features --features wasm && cp ../../../pkg/delta_db.js ../../../pkg/delta_db.d.ts ../../../pkg/delta_db_bg.wasm src/wasm/",
+    "build:ts": "tsc -p tsconfig.build.json",
     "build": "pnpm run build:native && pnpm run build:ts",
+    "build:all": "pnpm run build:native && pnpm run build:wasm && pnpm run build:ts",
+    "build:all:debug": "pnpm run build:native:debug && pnpm run build:wasm && pnpm run build:ts",
     "artifacts": "napi artifacts",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -20,6 +35,12 @@
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0"
+  },
+  "optionalDependencies": {
+    "@sqd-pipes/delta-db-darwin-arm64": "0.0.1-alpha.20",
+    "@sqd-pipes/delta-db-darwin-x64": "0.0.1-alpha.20",
+    "@sqd-pipes/delta-db-linux-x64-gnu": "0.0.1-alpha.20",
+    "@sqd-pipes/delta-db-linux-arm64-gnu": "0.0.1-alpha.20"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.7",
@@ -34,7 +55,7 @@
     "dist/**/*.js.map",
     "src/native/native.js",
     "src/native/native.d.ts",
-    "src/native/*.node"
+    "src/wasm/**/*"
   ],
   "license": "MIT"
 }

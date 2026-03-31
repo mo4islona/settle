@@ -281,6 +281,16 @@ pub fn encode_batch_to_msgpack(batch: &DeltaBatch) -> Vec<u8> {
     rmp_serde::to_vec(&BatchRef(batch)).expect("DeltaBatch serialization should never fail")
 }
 
+/// Encode a DeltaBatch into a `serde_json::Value` with plain (untagged) values.
+///
+/// Used by the WASM binding to produce a JS-friendly object (via
+/// `serde_wasm_bindgen::to_value`) with the same field names and value
+/// representation as the msgpack path.
+#[cfg(feature = "wasm")]
+pub fn encode_batch_to_json_value(batch: &DeltaBatch) -> serde_json::Value {
+    serde_json::to_value(BatchRef(batch)).expect("DeltaBatch serialization should never fail")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

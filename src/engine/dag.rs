@@ -1,7 +1,24 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+#[cfg(feature = "rayon")]
 use rayon::prelude::*;
+
+// wasm32 does not support std::time::Instant. Use a zero-cost stub instead.
+#[cfg(not(target_arch = "wasm32"))]
+fn start_timer() -> std::time::Instant {
+    std::time::Instant::now()
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn elapsed_ms(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
+#[cfg(target_arch = "wasm32")]
+fn start_timer() -> () {}
+#[cfg(target_arch = "wasm32")]
+fn elapsed_ms(_: ()) -> f64 {
+    0.0
+}
 
 use crate::error::{Error, Result};
 use crate::schema::ast::Schema;
@@ -323,9 +340,7 @@ impl DeltaEngine {
         row_maps: Vec<RowMap>,
         write_batch: Option<&mut StorageWriteBatch>,
     ) -> Result<(Vec<DeltaRecord>, PerfNode)> {
-        use std::time::Instant;
-
-        let pipeline_start = Instant::now();
+        let pipeline_start = start_timer();
         let mut perf_children: Vec<PerfNode> = Vec::new();
 
         if !self.raw_tables.contains_key(table) {
@@ -335,7 +350,7 @@ impl DeltaEngine {
         let mut all_deltas = Vec::new();
 
         // Phase 1: Raw table ingest
-        let raw_start = Instant::now();
+        let raw_start = start_timer();
         let raw_eng = self.raw_tables.get(table).unwrap();
         let is_virtual = self.virtual_tables.contains(table);
         if let Some(batch) = write_batch {
@@ -351,7 +366,7 @@ impl DeltaEngine {
         perf_children.push(PerfNode {
             kind: PerfNodeKind::RawTable,
             name: table.to_string(),
-            duration_ms: raw_start.elapsed().as_secs_f64() * 1000.0,
+            duration_ms: elapsed_ms(raw_start),
             children: vec![],
         });
 
@@ -362,159 +377,165 @@ impl DeltaEngine {
         // Check if parallel branch execution is possible:
         // - 2+ branches, all reducers source from raw tables (not from each other),
         //   and no external reducers (which require main-thread JS callbacks).
+        #[cfg(feature = "rayon")]
         let can_parallelize = self.branches.len() >= 2
             && self.branches.iter().all(|b| {
                 self.raw_tables.contains_key(b.reducer.source()) && !b.reducer.is_external()
             });
+        #[cfg(not(feature = "rayon"))]
+        let can_parallelize = false;
 
         if can_parallelize {
-            // Phase 2a: Process MVs that source directly from raw tables
-            for mv_name in &self.direct_mvs {
-                let mv_start = Instant::now();
-                let mv = self.mvs.get_mut(mv_name).unwrap();
-                let source = mv.source().to_string();
-                if let Some(source_rows) = output_rows.get(&source) {
-                    let deltas = mv.process_block(block, source_rows);
-                    all_deltas.extend(deltas);
+            #[cfg(feature = "rayon")]
+            {
+                // Phase 2a: Process MVs that source directly from raw tables
+                for mv_name in &self.direct_mvs {
+                    let mv_start = start_timer();
+                    let mv = self.mvs.get_mut(mv_name).unwrap();
+                    let source = mv.source().to_string();
+                    if let Some(source_rows) = output_rows.get(&source) {
+                        let deltas = mv.process_block(block, source_rows);
+                        all_deltas.extend(deltas);
+                    }
+                    perf_children.push(PerfNode {
+                        kind: PerfNodeKind::MV,
+                        name: mv_name.clone(),
+                        duration_ms: elapsed_ms(mv_start),
+                        children: vec![],
+                    });
                 }
-                perf_children.push(PerfNode {
-                    kind: PerfNodeKind::MV,
-                    name: mv_name.clone(),
-                    duration_ms: mv_start.elapsed().as_secs_f64() * 1000.0,
-                    children: vec![],
-                });
-            }
 
-            // Phase 2b: Process reducer branches in parallel.
-            let parallel_start = Instant::now();
-            if self.branches.len() == 2 {
-                let (first, second) = self.branches.split_at_mut(1);
-                let branch_0 = &mut first[0];
-                let branch_1 = &mut second[0];
+                // Phase 2b: Process reducer branches in parallel.
+                let parallel_start = start_timer();
+                if self.branches.len() == 2 {
+                    let (first, second) = self.branches.split_at_mut(1);
+                    let branch_0 = &mut first[0];
+                    let branch_1 = &mut second[0];
 
-                let (result_0, result_1) = rayon::join(
-                    || -> Result<(Vec<DeltaRecord>, PerfNode)> {
-                        let r_start = Instant::now();
-                        let source = branch_0.reducer.source();
-                        let mut deltas = Vec::new();
-                        let mut mv_nodes = Vec::new();
-                        if let Some(rows) = output_rows.get(source) {
-                            let enriched = branch_0.reducer.process_block_maps(block, rows)?;
-                            if !enriched.is_empty() {
-                                for (mv_name, mv) in branch_0.mv_entries.iter_mut() {
-                                    let mv_start = Instant::now();
-                                    deltas.extend(mv.process_block(block, &enriched));
-                                    mv_nodes.push(PerfNode {
-                                        kind: PerfNodeKind::MV,
-                                        name: mv_name.clone(),
-                                        duration_ms: mv_start.elapsed().as_secs_f64() * 1000.0,
-                                        children: vec![],
-                                    });
+                    let (result_0, result_1) = rayon::join(
+                        || -> Result<(Vec<DeltaRecord>, PerfNode)> {
+                            let r_start = start_timer();
+                            let source = branch_0.reducer.source();
+                            let mut deltas = Vec::new();
+                            let mut mv_nodes = Vec::new();
+                            if let Some(rows) = output_rows.get(source) {
+                                let enriched = branch_0.reducer.process_block_maps(block, rows)?;
+                                if !enriched.is_empty() {
+                                    for (mv_name, mv) in branch_0.mv_entries.iter_mut() {
+                                        let mv_start = start_timer();
+                                        deltas.extend(mv.process_block(block, &enriched));
+                                        mv_nodes.push(PerfNode {
+                                            kind: PerfNodeKind::MV,
+                                            name: mv_name.clone(),
+                                            duration_ms: elapsed_ms(mv_start),
+                                            children: vec![],
+                                        });
+                                    }
                                 }
                             }
-                        }
-                        Ok((
-                            deltas,
-                            PerfNode {
-                                kind: PerfNodeKind::Reducer,
-                                name: branch_0.reducer_name.clone(),
-                                duration_ms: r_start.elapsed().as_secs_f64() * 1000.0,
-                                children: mv_nodes,
-                            },
-                        ))
-                    },
-                    || -> Result<(Vec<DeltaRecord>, PerfNode)> {
-                        let r_start = Instant::now();
-                        let source = branch_1.reducer.source();
-                        let mut deltas = Vec::new();
-                        let mut mv_nodes = Vec::new();
-                        if let Some(rows) = output_rows.get(source) {
-                            let enriched = branch_1.reducer.process_block_maps(block, rows)?;
-                            if !enriched.is_empty() {
-                                for (mv_name, mv) in branch_1.mv_entries.iter_mut() {
-                                    let mv_start = Instant::now();
-                                    deltas.extend(mv.process_block(block, &enriched));
-                                    mv_nodes.push(PerfNode {
-                                        kind: PerfNodeKind::MV,
-                                        name: mv_name.clone(),
-                                        duration_ms: mv_start.elapsed().as_secs_f64() * 1000.0,
-                                        children: vec![],
-                                    });
+                            Ok((
+                                deltas,
+                                PerfNode {
+                                    kind: PerfNodeKind::Reducer,
+                                    name: branch_0.reducer_name.clone(),
+                                    duration_ms: elapsed_ms(r_start),
+                                    children: mv_nodes,
+                                },
+                            ))
+                        },
+                        || -> Result<(Vec<DeltaRecord>, PerfNode)> {
+                            let r_start = start_timer();
+                            let source = branch_1.reducer.source();
+                            let mut deltas = Vec::new();
+                            let mut mv_nodes = Vec::new();
+                            if let Some(rows) = output_rows.get(source) {
+                                let enriched = branch_1.reducer.process_block_maps(block, rows)?;
+                                if !enriched.is_empty() {
+                                    for (mv_name, mv) in branch_1.mv_entries.iter_mut() {
+                                        let mv_start = start_timer();
+                                        deltas.extend(mv.process_block(block, &enriched));
+                                        mv_nodes.push(PerfNode {
+                                            kind: PerfNodeKind::MV,
+                                            name: mv_name.clone(),
+                                            duration_ms: elapsed_ms(mv_start),
+                                            children: vec![],
+                                        });
+                                    }
                                 }
                             }
-                        }
-                        Ok((
-                            deltas,
-                            PerfNode {
-                                kind: PerfNodeKind::Reducer,
-                                name: branch_1.reducer_name.clone(),
-                                duration_ms: r_start.elapsed().as_secs_f64() * 1000.0,
-                                children: mv_nodes,
-                            },
-                        ))
-                    },
-                );
+                            Ok((
+                                deltas,
+                                PerfNode {
+                                    kind: PerfNodeKind::Reducer,
+                                    name: branch_1.reducer_name.clone(),
+                                    duration_ms: elapsed_ms(r_start),
+                                    children: mv_nodes,
+                                },
+                            ))
+                        },
+                    );
 
-                let (d0, p0) = result_0?;
-                let (d1, p1) = result_1?;
-                all_deltas.extend(d0);
-                all_deltas.extend(d1);
-                perf_children.push(PerfNode {
-                    kind: PerfNodeKind::Parallel,
-                    name: "parallel".to_string(),
-                    duration_ms: parallel_start.elapsed().as_secs_f64() * 1000.0,
-                    children: vec![p0, p1],
-                });
-            } else {
-                // General N-branch parallel using par_iter_mut
-                let results: Vec<Result<(Vec<DeltaRecord>, PerfNode)>> = self
-                    .branches
-                    .par_iter_mut()
-                    .map(|branch| {
-                        let r_start = Instant::now();
-                        let source = branch.reducer.source();
-                        let mut deltas = Vec::new();
-                        let mut mv_nodes = Vec::new();
-                        if let Some(rows) = output_rows.get(source) {
-                            let enriched = branch.reducer.process_block_maps(block, rows)?;
-                            if !enriched.is_empty() {
-                                for (mv_name, mv) in branch.mv_entries.iter_mut() {
-                                    let mv_start = Instant::now();
-                                    deltas.extend(mv.process_block(block, &enriched));
-                                    mv_nodes.push(PerfNode {
-                                        kind: PerfNodeKind::MV,
-                                        name: mv_name.clone(),
-                                        duration_ms: mv_start.elapsed().as_secs_f64() * 1000.0,
-                                        children: vec![],
-                                    });
+                    let (d0, p0) = result_0?;
+                    let (d1, p1) = result_1?;
+                    all_deltas.extend(d0);
+                    all_deltas.extend(d1);
+                    perf_children.push(PerfNode {
+                        kind: PerfNodeKind::Parallel,
+                        name: "parallel".to_string(),
+                        duration_ms: elapsed_ms(parallel_start),
+                        children: vec![p0, p1],
+                    });
+                } else {
+                    // General N-branch parallel using par_iter_mut
+                    let results: Vec<Result<(Vec<DeltaRecord>, PerfNode)>> = self
+                        .branches
+                        .par_iter_mut()
+                        .map(|branch| {
+                            let r_start = start_timer();
+                            let source = branch.reducer.source();
+                            let mut deltas = Vec::new();
+                            let mut mv_nodes = Vec::new();
+                            if let Some(rows) = output_rows.get(source) {
+                                let enriched = branch.reducer.process_block_maps(block, rows)?;
+                                if !enriched.is_empty() {
+                                    for (mv_name, mv) in branch.mv_entries.iter_mut() {
+                                        let mv_start = start_timer();
+                                        deltas.extend(mv.process_block(block, &enriched));
+                                        mv_nodes.push(PerfNode {
+                                            kind: PerfNodeKind::MV,
+                                            name: mv_name.clone(),
+                                            duration_ms: elapsed_ms(mv_start),
+                                            children: vec![],
+                                        });
+                                    }
                                 }
                             }
-                        }
-                        Ok((
-                            deltas,
-                            PerfNode {
-                                kind: PerfNodeKind::Reducer,
-                                name: branch.reducer_name.clone(),
-                                duration_ms: r_start.elapsed().as_secs_f64() * 1000.0,
-                                children: mv_nodes,
-                            },
-                        ))
-                    })
-                    .collect();
+                            Ok((
+                                deltas,
+                                PerfNode {
+                                    kind: PerfNodeKind::Reducer,
+                                    name: branch.reducer_name.clone(),
+                                    duration_ms: elapsed_ms(r_start),
+                                    children: mv_nodes,
+                                },
+                            ))
+                        })
+                        .collect();
 
-                let mut branch_nodes = Vec::new();
-                for result in results {
-                    let (d, p) = result?;
-                    all_deltas.extend(d);
-                    branch_nodes.push(p);
+                    let mut branch_nodes = Vec::new();
+                    for result in results {
+                        let (d, p) = result?;
+                        all_deltas.extend(d);
+                        branch_nodes.push(p);
+                    }
+                    perf_children.push(PerfNode {
+                        kind: PerfNodeKind::Parallel,
+                        name: "parallel".to_string(),
+                        duration_ms: elapsed_ms(parallel_start),
+                        children: branch_nodes,
+                    });
                 }
-                perf_children.push(PerfNode {
-                    kind: PerfNodeKind::Parallel,
-                    name: "parallel".to_string(),
-                    duration_ms: parallel_start.elapsed().as_secs_f64() * 1000.0,
-                    children: branch_nodes,
-                });
-            }
+            } // #[cfg(feature = "rayon")]
         } else {
             // Sequential execution: process branches + remaining engines.
             // Track reducer name → perf_children index for nesting MV nodes.
@@ -524,7 +545,7 @@ impl DeltaEngine {
                 match node {
                     PipelineNode::RawTable(_) => {} // Already processed in Phase 1
                     PipelineNode::Reducer(name) => {
-                        let r_start = Instant::now();
+                        let r_start = start_timer();
                         let enriched = if let Some(branch) =
                             self.branch_index.get(name).map(|&i| &mut self.branches[i])
                         {
@@ -548,7 +569,7 @@ impl DeltaEngine {
                         perf_children.push(PerfNode {
                             kind: PerfNodeKind::Reducer,
                             name: name.clone(),
-                            duration_ms: r_start.elapsed().as_secs_f64() * 1000.0,
+                            duration_ms: elapsed_ms(r_start),
                             children: vec![],
                         });
                         if !enriched.is_empty() {
@@ -556,7 +577,7 @@ impl DeltaEngine {
                         }
                     }
                     PipelineNode::MV(name) => {
-                        let mv_start = Instant::now();
+                        let mv_start = start_timer();
                         let mv_source;
                         if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
                             let mv = &mut self.branches[bi].mv_entries[mi].1;
@@ -576,7 +597,7 @@ impl DeltaEngine {
                         let mv_node = PerfNode {
                             kind: PerfNodeKind::MV,
                             name: name.clone(),
-                            duration_ms: mv_start.elapsed().as_secs_f64() * 1000.0,
+                            duration_ms: elapsed_ms(mv_start),
                             children: vec![],
                         };
                         // Nest under parent reducer if exists, otherwise add as sibling
@@ -597,7 +618,7 @@ impl DeltaEngine {
         let perf_node = PerfNode {
             kind: PerfNodeKind::Pipeline,
             name: table.to_string(),
-            duration_ms: pipeline_start.elapsed().as_secs_f64() * 1000.0,
+            duration_ms: elapsed_ms(pipeline_start),
             children: perf_children,
         };
 
@@ -1554,8 +1575,7 @@ mod tests {
                     body: ReducerBody::Lua {
                         script: r#"
                             state.total = state.total + row.amount
-                            emit.user = row.user
-                            emit.total = state.total
+                            emit({user = row.user, total = state.total})
                         "#
                         .to_string(),
                     },
@@ -1568,8 +1588,7 @@ mod tests {
                     requires: vec![],
                     body: ReducerBody::Lua {
                         script: r#"
-                            emit.user = row.user
-                            emit.doubled = row.total * 2
+                            emit({user = row.user, doubled = row.total * 2})
                         "#
                         .to_string(),
                     },

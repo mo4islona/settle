@@ -1,0 +1,9 @@
+{
+  "name": "@sqd-pipes/delta-db-linux-x64-gnu",
+  "version": "0.0.1-alpha.20",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "main": "delta-db.linux-x64-gnu.node",
+  "files": ["delta-db.linux-x64-gnu.node"],
+  "license": "MIT"
+}

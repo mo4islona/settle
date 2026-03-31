@@ -1,4 +1,5 @@
 pub mod memory;
+#[cfg(feature = "rocksdb")]
 pub mod rocks;
 
 use crate::error::{Error, Result};

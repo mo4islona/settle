@@ -300,3 +300,52 @@ fn ingest_persists_and_restores_state() {
         assert_eq!(cursor.hash, "0xabc");
     }
 }
+
+/// ingest() with multiple blocks must batch perf nodes into a flat array,
+/// not create nested per-push arrays.
+#[test]
+fn ingest_batches_perf_into_single_array() {
+    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+
+    let batch = db
+        .ingest(IngestInput {
+            data: HashMap::from([(
+                "swaps".to_string(),
+                vec![
+                    {
+                        let mut r = make_swap("ETH", 100.0);
+                        r.insert("block_number".to_string(), Value::UInt64(1000));
+                        r
+                    },
+                    {
+                        let mut r = make_swap("ETH", 200.0);
+                        r.insert("block_number".to_string(), Value::UInt64(1001));
+                        r
+                    },
+                    {
+                        let mut r = make_swap("ETH", 300.0);
+                        r.insert("block_number".to_string(), Value::UInt64(1002));
+                        r
+                    },
+                ],
+            )]),
+            rollback_chain: vec![
+                BlockCursor { number: 1002, hash: "0x2".into() },
+                BlockCursor { number: 1001, hash: "0x1".into() },
+                BlockCursor { number: 1000, hash: "0x0".into() },
+            ],
+            finalized_head: BlockCursor { number: 1000, hash: "0x0".into() },
+        })
+        .unwrap()
+        .expect("should produce batch");
+
+    // Single "ingest" root with aggregated children (not per-block)
+    assert_eq!(batch.perf.len(), 1, "expected 1 perf node, got {}", batch.perf.len());
+    let root = &batch.perf[0];
+    assert_eq!(root.name, "ingest");
+    assert!(root.duration_ms > 0.0);
+    // "swaps" table aggregated into one child (sum of 3 blocks)
+    let swaps = root.children.iter().find(|c| c.name == "swaps");
+    assert!(swaps.is_some(), "expected 'swaps' child node");
+    assert!(swaps.unwrap().duration_ms > 0.0);
+}

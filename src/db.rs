@@ -6,9 +6,10 @@ use crate::engine::dag::DeltaEngine;
 use crate::error::{Error, Result};
 use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
+#[cfg(feature = "rocksdb")]
 use crate::storage::rocks::RocksDbBackend;
 use crate::storage::{StorageBackend, StorageWriteBatch};
-use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, PerfNode, RowMap, Value};
+use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, PerfNode, PerfNodeKind, RowMap, Value};
 
 /// Configuration for opening a DeltaDb instance.
 pub struct Config {
@@ -66,6 +67,14 @@ pub struct IngestInput {
     pub finalized_head: BlockCursor,
 }
 
+/// Result of `handle_fork()`.
+pub struct ForkResult {
+    /// The block to resume ingestion from (highest common ancestor).
+    pub cursor: BlockCursor,
+    /// Compensating delta batch (rollback deltas), if any state was rolled back.
+    pub batch: Option<DeltaBatch>,
+}
+
 // Metadata keys for persistence
 const META_LATEST_BLOCK: &str = "latest_block";
 const META_FINALIZED_BLOCK: &str = "finalized_block";
@@ -89,8 +98,17 @@ impl DeltaDb {
 
         let storage: Arc<dyn StorageBackend> = if let Some(s) = config.storage {
             s
-        } else if let Some(ref dir) = config.data_dir {
-            Arc::new(RocksDbBackend::open(dir)?)
+        } else if let Some(ref _dir) = config.data_dir {
+            #[cfg(feature = "rocksdb")]
+            {
+                Arc::new(RocksDbBackend::open(_dir)?)
+            }
+            #[cfg(not(feature = "rocksdb"))]
+            {
+                return Err(Error::InvalidOperation(
+                    "RocksDB requires the 'rocksdb' feature".into(),
+                ));
+            }
         } else {
             Arc::new(MemoryBackend::new())
         };
@@ -311,6 +329,62 @@ impl DeltaDb {
         self.engine.resolve_fork_cursor(previous_blocks)
     }
 
+    /// Atomically handle a fork (409 from Portal).
+    ///
+    /// Finds the highest common ancestor in `rollback_chain`, rolls back all
+    /// state after that point, commits compensating deltas and updated metadata
+    /// atomically, and returns the cursor to resume from plus any delta batch.
+    ///
+    /// Uses the current internal finalized block — no need to pass it in.
+    ///
+    /// Returns `Err` if no common ancestor is found (fork too deep / unrecoverable).
+    pub fn handle_fork(&mut self, mut rollback_chain: Vec<BlockCursor>) -> Result<ForkResult> {
+        // Sort DESC to ensure we find the HIGHEST common ancestor first,
+        // matching the same contract as ingest()'s rollback_chain handling.
+        rollback_chain.sort_unstable_by_key(|c| std::cmp::Reverse(c.number));
+
+        let previous_blocks: Vec<(BlockNumber, &str)> = rollback_chain
+            .iter()
+            .map(|c| (c.number, c.hash.as_str()))
+            .collect();
+
+        let cursor = self
+            .engine
+            .resolve_fork_cursor(&previous_blocks)
+            .ok_or_else(|| {
+                Error::InvalidOperation(
+                    "Fork too deep: no common ancestor found in block hashes".into(),
+                )
+            })?;
+
+        let mut write_batch = StorageWriteBatch::new();
+        let deltas = self
+            .engine
+            .rollback_to_batch(cursor.number, &mut write_batch)?;
+
+        // Store the new rollback chain and persist atomically
+        let chain: Vec<(BlockNumber, String)> = rollback_chain
+            .iter()
+            .map(|c| (c.number, c.hash.clone()))
+            .collect();
+        self.engine.set_rollback_chain(&chain);
+
+        self.append_meta_to_batch(&mut write_batch)?;
+        self.storage.commit(&write_batch)?;
+
+        self.buffer.push(
+            deltas,
+            self.engine.finalized_cursor(),
+            self.engine.latest_cursor(),
+            vec![],
+        );
+        self.buffer
+            .set_heads(self.engine.finalized_cursor(), self.engine.latest_cursor());
+
+        let batch = self.buffer.flush();
+        Ok(ForkResult { cursor, batch })
+    }
+
     /// Atomic ingest: process all tables, store rollback chain, finalize, flush.
     ///
     /// Replaces separate `process_batch` + `set_rollback_chain` + `finalize` + `flush`.
@@ -365,8 +439,9 @@ impl DeltaDb {
                     };
 
                     if fork_point < current_latest {
-                        let deltas =
-                            self.engine.rollback_to_batch(fork_point, &mut write_batch)?;
+                        let deltas = self
+                            .engine
+                            .rollback_to_batch(fork_point, &mut write_batch)?;
                         pending_deltas.push((deltas, vec![]));
                     }
                     fork_point
@@ -425,15 +500,50 @@ impl DeltaDb {
             return Err(e);
         }
 
-        // Success — push all deltas to buffer
+        // Success — push all deltas with aggregated perf.
+        // Sum per-block durations into one "ingest" node. Children are
+        // accumulated in-place using the first block's structure as template.
+        let mut all_deltas = Vec::new();
+        let mut total_ms = 0.0f64;
+        let mut merged: Option<PerfNode> = None;
         for (deltas, perf) in pending_deltas {
-            self.buffer.push(
-                deltas,
-                self.engine.finalized_cursor(),
-                self.engine.latest_cursor(),
-                perf,
-            );
+            all_deltas.extend(deltas);
+            for node in perf {
+                total_ms += node.duration_ms;
+                match &mut merged {
+                    None => merged = Some(node),
+                    Some(m) => {
+                        m.duration_ms += node.duration_ms;
+                        // Sum children by index (same pipeline structure every block)
+                        for (i, child) in node.children.into_iter().enumerate() {
+                            if i < m.children.len() {
+                                m.children[i].duration_ms += child.duration_ms;
+                                for (j, gc) in child.children.into_iter().enumerate() {
+                                    if j < m.children[i].children.len() {
+                                        m.children[i].children[j].duration_ms += gc.duration_ms;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+        let batch_perf = match merged {
+            Some(m) => vec![PerfNode {
+                kind: PerfNodeKind::Pipeline,
+                name: "ingest".to_string(),
+                duration_ms: total_ms,
+                children: vec![m],
+            }],
+            None => vec![],
+        };
+        self.buffer.push(
+            all_deltas,
+            self.engine.finalized_cursor(),
+            self.engine.latest_cursor(),
+            batch_perf,
+        );
 
         // 2. Store rollback chain hashes (including finalized head)
         let mut chain: Vec<(BlockNumber, String)> = input

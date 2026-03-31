@@ -893,13 +893,17 @@ fn full_scenario_with_cross_pricing() {
 
     // Verify wallet summaries exist
     assert!(
-        batch1.records_for("wallet_summary").iter().any(|r|
-            r.key.get("sender") == Some(&Value::String("alice".into()))),
+        batch1
+            .records_for("wallet_summary")
+            .iter()
+            .any(|r| r.key.get("sender") == Some(&Value::String("alice".into()))),
         "missing alice summary"
     );
     assert!(
-        batch1.records_for("wallet_summary").iter().any(|r|
-            r.key.get("sender") == Some(&Value::String("bob".into()))),
+        batch1
+            .records_for("wallet_summary")
+            .iter()
+            .any(|r| r.key.get("sender") == Some(&Value::String("bob".into()))),
         "missing bob summary"
     );
 

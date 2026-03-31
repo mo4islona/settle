@@ -31,7 +31,7 @@ mod napi_bridge {
 
     /// Raw napi env + callback pointers. Stored in thread-local.
     /// We store raw pointers because napi::Ref<()> is not Clone.
-    struct ExternalContext {
+    pub(crate) struct ExternalContext {
         env: napi::Env,
         /// reducer_id → raw napi_ref (prevent GC)
         callbacks: HashMap<String, sys::napi_ref>,
@@ -259,6 +259,181 @@ mod napi_bridge {
 #[cfg(feature = "napi")]
 pub use napi_bridge::{ContextGuard, install_context};
 
+// ─── WASM callback context ─────────────────────────────────────────
+
+#[cfg(feature = "wasm")]
+mod wasm_bridge {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use js_sys::Function;
+    use wasm_bindgen::prelude::*;
+
+    use crate::json_conv::value_to_json;
+    use crate::types::{Row, Value};
+
+    use super::GroupBatch;
+
+    thread_local! {
+        pub(super) static WASM_CTX: RefCell<Option<HashMap<String, Function>>> = RefCell::new(None);
+    }
+
+    pub fn install_context(callbacks: HashMap<String, Function>) -> ContextGuard {
+        WASM_CTX.with(|cell| {
+            *cell.borrow_mut() = Some(callbacks);
+        });
+        ContextGuard
+    }
+
+    pub struct ContextGuard;
+
+    impl Drop for ContextGuard {
+        fn drop(&mut self) {
+            WASM_CTX.with(|cell| {
+                *cell.borrow_mut() = None;
+            });
+        }
+    }
+
+    pub fn call_js_batch(reducer_id: &str, groups: &mut [GroupBatch]) {
+        WASM_CTX.with(|cell| {
+            let ctx = cell.borrow();
+            let ctx = ctx
+                .as_ref()
+                .expect("ExternalRuntime called outside wasm context");
+
+            let func = ctx
+                .get(reducer_id)
+                .unwrap_or_else(|| panic!("no callback for reducer '{reducer_id}'"));
+
+            let js_input = groups_to_js(groups);
+
+            let result = func
+                .call1(&JsValue::NULL, &js_input)
+                .expect("external reducer callback threw an exception");
+
+            js_result_to_groups(result, groups);
+        });
+    }
+
+    fn groups_to_js(groups: &[GroupBatch]) -> JsValue {
+        let arr = js_sys::Array::new();
+        for group in groups {
+            let obj = js_sys::Object::new();
+
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("state"),
+                &value_map_to_js(&group.state),
+            )
+            .unwrap();
+
+            let rows_arr = js_sys::Array::new();
+            for row in &group.rows {
+                rows_arr.push(&row_to_js(row));
+            }
+            js_sys::Reflect::set(&obj, &JsValue::from_str("rows"), &rows_arr).unwrap();
+
+            arr.push(&obj);
+        }
+        arr.into()
+    }
+
+    fn value_map_to_js(map: &HashMap<String, Value>) -> JsValue {
+        let obj = js_sys::Object::new();
+        for (k, v) in map {
+            js_sys::Reflect::set(&obj, &JsValue::from_str(k), &value_to_js(v)).unwrap();
+        }
+        obj.into()
+    }
+
+    fn row_to_js(row: &Row) -> JsValue {
+        let obj = js_sys::Object::new();
+        for name in row.registry().names() {
+            if let Some(val) = row.get(name) {
+                js_sys::Reflect::set(&obj, &JsValue::from_str(name), &value_to_js(val)).unwrap();
+            }
+        }
+        obj.into()
+    }
+
+    fn value_to_js(val: &Value) -> JsValue {
+        match val {
+            Value::Float64(f) => JsValue::from_f64(*f),
+            Value::UInt64(n) => JsValue::from_f64(*n as f64),
+            Value::Int64(n) => JsValue::from_f64(*n as f64),
+            Value::String(s) => JsValue::from_str(s),
+            Value::Boolean(b) => JsValue::from_bool(*b),
+            Value::Null => JsValue::NULL,
+            Value::JSON(v) => serde_wasm_bindgen::to_value(v).unwrap_or(JsValue::NULL),
+            _ => {
+                let json = value_to_json(val);
+                serde_wasm_bindgen::to_value(&json).unwrap_or(JsValue::NULL)
+            }
+        }
+    }
+
+    fn js_result_to_groups(result: JsValue, groups: &mut [GroupBatch]) {
+        let arr: js_sys::Array = result
+            .dyn_into()
+            .expect("external reducer result must be an array");
+        for (i, group) in groups.iter_mut().enumerate() {
+            let item = arr.get(i as u32);
+            let item_obj: js_sys::Object = item.dyn_into().expect("result item must be an object");
+
+            let js_state = js_sys::Reflect::get(&item_obj, &JsValue::from_str("state")).unwrap();
+            group.state = js_to_value_map(js_state);
+
+            let js_emits = js_sys::Reflect::get(&item_obj, &JsValue::from_str("emits")).unwrap();
+            let emits_arr: js_sys::Array = js_emits.dyn_into().expect("emits must be an array");
+            for j in 0..emits_arr.length() {
+                group.emits.push(js_to_value_map(emits_arr.get(j)));
+            }
+        }
+    }
+
+    fn js_to_value_map(val: JsValue) -> HashMap<String, Value> {
+        let mut map = HashMap::new();
+        if val.is_null() || val.is_undefined() {
+            return map;
+        }
+        let obj: js_sys::Object = match val.dyn_into() {
+            Ok(o) => o,
+            Err(_) => return map,
+        };
+        let keys = js_sys::Object::keys(&obj);
+        for i in 0..keys.length() {
+            let key_js = keys.get(i);
+            let key_str = key_js.as_string().unwrap_or_default();
+            let v = js_sys::Reflect::get(&obj, &key_js).unwrap_or(JsValue::NULL);
+            map.insert(key_str, js_to_value(v));
+        }
+        map
+    }
+
+    fn js_to_value(val: JsValue) -> Value {
+        if val.is_null() || val.is_undefined() {
+            return Value::Null;
+        }
+        if let Some(b) = val.as_bool() {
+            return Value::Boolean(b);
+        }
+        if let Some(n) = val.as_f64() {
+            return Value::Float64(n);
+        }
+        if let Some(s) = val.as_string() {
+            return Value::String(s);
+        }
+        match serde_wasm_bindgen::from_value::<serde_json::Value>(val) {
+            Ok(json) => Value::JSON(json),
+            Err(_) => Value::Null,
+        }
+    }
+}
+
+#[cfg(feature = "wasm")]
+pub use wasm_bridge::{ContextGuard as WasmContextGuard, install_context as install_wasm_context};
+
 // ─── Test-only context (non-napi builds) ─────────────────────────
 
 /// A test-only callback context that lets unit tests drive `ExternalRuntime`
@@ -307,6 +482,10 @@ pub use test_bridge::{TestContextGuard, install_test_context};
 pub fn context_installed() -> bool {
     #[cfg(feature = "napi")]
     if napi_bridge::EXTERNAL_CTX.with(|cell| cell.borrow().is_some()) {
+        return true;
+    }
+    #[cfg(feature = "wasm")]
+    if wasm_bridge::WASM_CTX.with(|cell| cell.borrow().is_some()) {
         return true;
     }
     #[cfg(test)]
@@ -361,6 +540,11 @@ impl ReducerRuntime for ExternalRuntime {
             napi_bridge::call_js_batch(&self.reducer_id, groups);
             return Ok(());
         }
+        #[cfg(all(feature = "wasm", not(feature = "napi")))]
+        {
+            wasm_bridge::call_js_batch(&self.reducer_id, groups);
+            return Ok(());
+        }
         #[cfg(test)]
         {
             test_bridge::TEST_CTX.with(|cell| {
@@ -372,10 +556,10 @@ impl ReducerRuntime for ExternalRuntime {
             });
             return Ok(());
         }
-        #[cfg(not(feature = "napi"))]
+        #[cfg(not(any(feature = "napi", feature = "wasm")))]
         {
             let _ = groups;
-            panic!("ExternalRuntime requires the 'napi' feature");
+            panic!("ExternalRuntime requires the 'napi' or 'wasm' feature");
         }
         #[allow(unreachable_code)]
         Ok(())

@@ -70,13 +70,7 @@ PROCESS $$
     end
 
     if price_usd > 0 then
-        emit.pool = row.pool
-        emit.token = target
-        emit.block_time = row.block_time
-        emit.price_usd = price_usd
-        emit.volume_usd = vol_usd
-        emit.sender = row.sender
-        emit.base_delta = base_delta
+        emit({pool = row.pool, token = target, block_time = row.block_time, price_usd = price_usd, volume_usd = vol_usd, sender = row.sender, base_delta = base_delta})
     end
 $$;
 
@@ -125,10 +119,7 @@ PROCESS $$
 
     state.positions[pos_key] = pos
 
-    emit.sender = row.sender
-    emit.pool = row.pool
-    emit.realized_pnl = pnl
-    emit.position = pos.balance
+    emit({sender = row.sender, pool = row.pool, realized_pnl = pnl, position = pos.balance})
 $$;
 
 -- Aggregate PnL per wallet per pool

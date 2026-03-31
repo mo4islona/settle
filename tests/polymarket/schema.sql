@@ -36,10 +36,7 @@ PROCESS $$
     if state.first_seen == 0 then state.first_seen = row.timestamp end
     state.last_seen = row.timestamp
 
-    emit.asset_id = row.asset_id
-    emit.volume = vol
-    emit.price = price
-    emit.price_sq = price * price
+    emit({asset_id = row.asset_id, volume = vol, price = price, price_sq = price * price})
 $$;
 
 -- Aggregates market_stats emits into per-token totals.

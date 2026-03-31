@@ -39,7 +39,12 @@ pub fn parse_schema(input: &str) -> Result<Schema, Error> {
                 }
                 tables.push(def);
             }
-            sql::Statement::CreateView { name, query, materialized: true, .. } => {
+            sql::Statement::CreateView {
+                name,
+                query,
+                materialized: true,
+                ..
+            } => {
                 let mut mv = parse_create_mv(&name, &query)?;
                 if let Some(sw) = sliding_windows.get(&mv.name) {
                     mv.sliding_window = Some(sw.clone());
@@ -52,7 +57,12 @@ pub fn parse_schema(input: &str) -> Result<Schema, Error> {
         }
     }
 
-    let schema = Schema { tables, modules, reducers, materialized_views };
+    let schema = Schema {
+        tables,
+        modules,
+        reducers,
+        materialized_views,
+    };
     validate_schema(&schema)?;
     Ok(schema)
 }
@@ -67,7 +77,11 @@ fn parse_create_table(ct: &sql::CreateTable) -> Result<TableDef, Error> {
             column_type,
         });
     }
-    Ok(TableDef { name, columns, virtual_table: false })
+    Ok(TableDef {
+        name,
+        columns,
+        virtual_table: false,
+    })
 }
 
 /// Replace `CREATE VIRTUAL TABLE` with `CREATE TABLE` and return the set
@@ -82,7 +96,8 @@ fn extract_virtual_tables(input: &str) -> (String, Vec<String>) {
         if let Some(offset) = upper[pos..].find("CREATE VIRTUAL TABLE") {
             let abs = pos + offset;
             // Ensure word boundary (start of input or whitespace/semicolon before)
-            if abs > 0 && !input.as_bytes()[abs - 1].is_ascii_whitespace()
+            if abs > 0
+                && !input.as_bytes()[abs - 1].is_ascii_whitespace()
                 && input.as_bytes()[abs - 1] != b';'
             {
                 result.push_str(&input[pos..=abs]);
@@ -117,7 +132,9 @@ fn extract_virtual_tables(input: &str) -> (String, Vec<String>) {
 /// Strip `WINDOW SLIDING INTERVAL <N> <UNIT> BY <column>` clauses from MV
 /// definitions before sqlparser sees them. Returns cleaned SQL and a map of
 /// MV name → SlidingWindowDef.
-fn extract_sliding_windows(input: &str) -> Result<(String, HashMap<String, SlidingWindowDef>), Error> {
+fn extract_sliding_windows(
+    input: &str,
+) -> Result<(String, HashMap<String, SlidingWindowDef>), Error> {
     let mut result = String::with_capacity(input.len());
     let mut windows = HashMap::new();
     let upper = input.to_uppercase();
@@ -160,9 +177,9 @@ fn extract_sliding_windows(input: &str) -> Result<(String, HashMap<String, Slidi
                     "WINDOW SLIDING: expected numeric interval value".into(),
                 ));
             }
-            let n: u64 = after_interval_trimmed[..num_end].parse().map_err(|_| {
-                Error::Schema("WINDOW SLIDING: invalid interval value".into())
-            })?;
+            let n: u64 = after_interval_trimmed[..num_end]
+                .parse()
+                .map_err(|_| Error::Schema("WINDOW SLIDING: invalid interval value".into()))?;
 
             // Parse unit
             let after_num = after_interval_trimmed[num_end..].trim_start();
@@ -211,8 +228,7 @@ fn extract_sliding_windows(input: &str) -> Result<(String, HashMap<String, Slidi
             // Compute the absolute end position of the WINDOW SLIDING clause
             let clause_end_in_upper =
                 abs + "WINDOW SLIDING".len() + (rest.len() - after_by.len()) + col_end;
-            let time_column = input
-                [clause_end_in_upper - col_end..clause_end_in_upper]
+            let time_column = input[clause_end_in_upper - col_end..clause_end_in_upper]
                 .trim()
                 .to_string();
 
@@ -284,23 +300,21 @@ fn map_column_type(dt: &sql::DataType, col_name: &sql::Ident) -> Result<ColumnTy
         sql::DataType::Bytea | sql::DataType::Varbinary(_) | sql::DataType::Blob(_) => {
             Ok(ColumnType::Bytes)
         }
-        sql::DataType::Custom(name, _) => {
-            match name.to_string().to_lowercase().as_str() {
-                "uint64" => Ok(ColumnType::UInt64),
-                "int64" => Ok(ColumnType::Int64),
-                "float64" => Ok(ColumnType::Float64),
-                "uint256" => Ok(ColumnType::Uint256),
-                "string" => Ok(ColumnType::String),
-                "datetime" => Ok(ColumnType::DateTime),
-                "boolean" => Ok(ColumnType::Boolean),
-                "bytes" => Ok(ColumnType::Bytes),
-                "base58" => Ok(ColumnType::Base58),
-                "json" | "jsonb" => Ok(ColumnType::JSON),
-                other => Err(Error::Schema(format!(
-                    "unknown type '{other}' for column '{col_name}'"
-                ))),
-            }
-        }
+        sql::DataType::Custom(name, _) => match name.to_string().to_lowercase().as_str() {
+            "uint64" => Ok(ColumnType::UInt64),
+            "int64" => Ok(ColumnType::Int64),
+            "float64" => Ok(ColumnType::Float64),
+            "uint256" => Ok(ColumnType::Uint256),
+            "string" => Ok(ColumnType::String),
+            "datetime" => Ok(ColumnType::DateTime),
+            "boolean" => Ok(ColumnType::Boolean),
+            "bytes" => Ok(ColumnType::Bytes),
+            "base58" => Ok(ColumnType::Base58),
+            "json" | "jsonb" => Ok(ColumnType::JSON),
+            other => Err(Error::Schema(format!(
+                "unknown type '{other}' for column '{col_name}'"
+            ))),
+        },
         _ => Err(Error::Schema(format!(
             "unsupported SQL type '{dt}' for column '{col_name}'"
         ))),
@@ -312,18 +326,28 @@ fn parse_create_mv(name: &sql::ObjectName, query: &sql::Query) -> Result<MVDef, 
 
     let select = match query.body.as_ref() {
         sql::SetExpr::Select(s) => s,
-        _ => return Err(Error::Schema(format!("MV '{view_name}': only simple SELECT supported"))),
+        _ => {
+            return Err(Error::Schema(format!(
+                "MV '{view_name}': only simple SELECT supported"
+            )));
+        }
     };
 
     // Source table (FROM clause)
     let source = match select.from.first() {
-        Some(sql::TableWithJoins { relation, .. }) => {
-            match relation {
-                sql::TableFactor::Table { name, .. } => name.to_string(),
-                _ => return Err(Error::Schema(format!("MV '{view_name}': unsupported FROM clause"))),
+        Some(sql::TableWithJoins { relation, .. }) => match relation {
+            sql::TableFactor::Table { name, .. } => name.to_string(),
+            _ => {
+                return Err(Error::Schema(format!(
+                    "MV '{view_name}': unsupported FROM clause"
+                )));
             }
+        },
+        None => {
+            return Err(Error::Schema(format!(
+                "MV '{view_name}': missing FROM clause"
+            )));
         }
-        None => return Err(Error::Schema(format!("MV '{view_name}': missing FROM clause"))),
     };
 
     // SELECT items
@@ -334,23 +358,40 @@ fn parse_create_mv(name: &sql::ObjectName, query: &sql::Query) -> Result<MVDef, 
                 items.push(parse_select_expr(expr, None, &view_name)?);
             }
             sql::SelectItem::ExprWithAlias { expr, alias } => {
-                items.push(parse_select_expr(expr, Some(alias.value.clone()), &view_name)?);
+                items.push(parse_select_expr(
+                    expr,
+                    Some(alias.value.clone()),
+                    &view_name,
+                )?);
             }
-            _ => return Err(Error::Schema(format!("MV '{view_name}': unsupported select item"))),
+            _ => {
+                return Err(Error::Schema(format!(
+                    "MV '{view_name}': unsupported select item"
+                )));
+            }
         }
     }
 
     // GROUP BY
     let group_by = match &select.group_by {
-        sql::GroupByExpr::Expressions(exprs, _) => {
-            exprs.iter().map(|e| expr_to_column_name(e)).collect::<Result<Vec<_>, _>>()?
-        }
+        sql::GroupByExpr::Expressions(exprs, _) => exprs
+            .iter()
+            .map(|e| expr_to_column_name(e))
+            .collect::<Result<Vec<_>, _>>()?,
         sql::GroupByExpr::All(_) => {
-            return Err(Error::Schema(format!("MV '{view_name}': GROUP BY ALL not supported")));
+            return Err(Error::Schema(format!(
+                "MV '{view_name}': GROUP BY ALL not supported"
+            )));
         }
     };
 
-    Ok(MVDef { name: view_name, source, select: items, group_by, sliding_window: None })
+    Ok(MVDef {
+        name: view_name,
+        source,
+        select: items,
+        group_by,
+        sliding_window: None,
+    })
 }
 
 fn parse_select_expr(
@@ -359,9 +400,10 @@ fn parse_select_expr(
     view_name: &str,
 ) -> Result<SelectItem, Error> {
     match expr {
-        sql::Expr::Identifier(ident) => {
-            Ok(SelectItem { expr: SelectExpr::Column(ident.value.clone()), alias })
-        }
+        sql::Expr::Identifier(ident) => Ok(SelectItem {
+            expr: SelectExpr::Column(ident.value.clone()),
+            alias,
+        }),
         sql::Expr::Function(func) => {
             let func_name = func.name.to_string().to_lowercase();
 
@@ -402,9 +444,11 @@ fn parse_select_expr(
                             sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(
                                 sql::Expr::Identifier(ident),
                             )) => Some(ident.value.clone()),
-                            _ => return Err(Error::Schema(format!(
-                                "MV '{view_name}': unsupported argument to {func_name}()"
-                            ))),
+                            _ => {
+                                return Err(Error::Schema(format!(
+                                    "MV '{view_name}': unsupported argument to {func_name}()"
+                                )));
+                            }
                         }
                     } else {
                         return Err(Error::Schema(format!(
@@ -413,12 +457,17 @@ fn parse_select_expr(
                     }
                 }
                 sql::FunctionArguments::None => None,
-                _ => return Err(Error::Schema(format!(
-                    "MV '{view_name}': unsupported arguments to {func_name}()"
-                ))),
+                _ => {
+                    return Err(Error::Schema(format!(
+                        "MV '{view_name}': unsupported arguments to {func_name}()"
+                    )));
+                }
             };
 
-            Ok(SelectItem { expr: SelectExpr::Agg(agg, col), alias })
+            Ok(SelectItem {
+                expr: SelectExpr::Agg(agg, col),
+                alias,
+            })
         }
         _ => Err(Error::Schema(format!(
             "MV '{view_name}': unsupported expression '{expr}'"
@@ -433,9 +482,11 @@ fn parse_window_func(
 ) -> Result<SelectItem, Error> {
     let args = match &func.args {
         sql::FunctionArguments::List(list) => &list.args,
-        _ => return Err(Error::Schema(format!(
-            "MV '{view_name}': toStartOfInterval() requires arguments"
-        ))),
+        _ => {
+            return Err(Error::Schema(format!(
+                "MV '{view_name}': toStartOfInterval() requires arguments"
+            )));
+        }
     };
 
     if args.len() != 2 {
@@ -448,22 +499,29 @@ fn parse_window_func(
         sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Identifier(ident))) => {
             ident.value.clone()
         }
-        _ => return Err(Error::Schema(format!(
-            "MV '{view_name}': toStartOfInterval() first arg must be a column"
-        ))),
+        _ => {
+            return Err(Error::Schema(format!(
+                "MV '{view_name}': toStartOfInterval() first arg must be a column"
+            )));
+        }
     };
 
     let interval_seconds = match &args[1] {
         sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Interval(iv))) => {
             parse_interval(iv, view_name)?
         }
-        _ => return Err(Error::Schema(format!(
-            "MV '{view_name}': toStartOfInterval() second arg must be an INTERVAL"
-        ))),
+        _ => {
+            return Err(Error::Schema(format!(
+                "MV '{view_name}': toStartOfInterval() second arg must be an INTERVAL"
+            )));
+        }
     };
 
     Ok(SelectItem {
-        expr: SelectExpr::WindowFunc { column, interval_seconds },
+        expr: SelectExpr::WindowFunc {
+            column,
+            interval_seconds,
+        },
         alias,
     })
 }
@@ -471,21 +529,26 @@ fn parse_window_func(
 fn parse_interval(iv: &sql::Interval, view_name: &str) -> Result<u64, Error> {
     let value_str = iv.value.to_string();
     let n: u64 = value_str.trim().parse().map_err(|_| {
-        Error::Schema(format!("MV '{view_name}': invalid interval value '{value_str}'"))
+        Error::Schema(format!(
+            "MV '{view_name}': invalid interval value '{value_str}'"
+        ))
     })?;
 
-    let unit = iv.leading_field.as_ref().ok_or_else(|| {
-        Error::Schema(format!("MV '{view_name}': interval missing unit"))
-    })?;
+    let unit = iv
+        .leading_field
+        .as_ref()
+        .ok_or_else(|| Error::Schema(format!("MV '{view_name}': interval missing unit")))?;
 
     let seconds = match unit {
         sql::DateTimeField::Second => n,
         sql::DateTimeField::Minute => n * 60,
         sql::DateTimeField::Hour => n * 3600,
         sql::DateTimeField::Day => n * 86400,
-        _ => return Err(Error::Schema(format!(
-            "MV '{view_name}': unsupported interval unit '{unit}'"
-        ))),
+        _ => {
+            return Err(Error::Schema(format!(
+                "MV '{view_name}': unsupported interval unit '{unit}'"
+            )));
+        }
     };
 
     Ok(seconds)
@@ -498,7 +561,9 @@ fn expr_to_column_name(expr: &sql::Expr) -> Result<String, Error> {
         sql::Expr::Function(func) if matches!(&func.args, sql::FunctionArguments::None) => {
             Ok(func.name.to_string())
         }
-        _ => Err(Error::Schema(format!("GROUP BY expression must be a column name, got '{expr}'"))),
+        _ => Err(Error::Schema(format!(
+            "GROUP BY expression must be a column name, got '{expr}'"
+        ))),
     }
 }
 
@@ -606,7 +671,10 @@ fn find_create_reducer(input: &str) -> Option<usize> {
     while let Some(pos) = upper[search_from..].find("CREATE REDUCER") {
         let abs_pos = search_from + pos;
         // Make sure it's not inside a string or comment
-        if abs_pos == 0 || input.as_bytes()[abs_pos - 1].is_ascii_whitespace() || input.as_bytes()[abs_pos - 1] == b';' {
+        if abs_pos == 0
+            || input.as_bytes()[abs_pos - 1].is_ascii_whitespace()
+            || input.as_bytes()[abs_pos - 1] == b';'
+        {
             return Some(abs_pos);
         }
         search_from = abs_pos + 1;
@@ -682,7 +750,17 @@ fn parse_reducer_block(input: &str) -> Result<(ReducerDef, usize), Error> {
         pos += 1;
     }
 
-    Ok((ReducerDef { name, source, group_by, state, requires, body }, pos))
+    Ok((
+        ReducerDef {
+            name,
+            source,
+            group_by,
+            state,
+            requires,
+            body,
+        },
+        pos,
+    ))
 }
 
 fn parse_state_block(input: &str, start: usize) -> Result<(Vec<StateField>, usize), Error> {
@@ -720,7 +798,11 @@ fn parse_state_block(input: &str, start: usize) -> Result<(Vec<StateField>, usiz
         let (default, new_pos) = read_token(input, pos)?;
         pos = new_pos;
 
-        fields.push(StateField { name: field_name, column_type, default });
+        fields.push(StateField {
+            name: field_name,
+            column_type,
+            default,
+        });
     }
 
     Ok((fields, pos))
@@ -757,6 +839,7 @@ fn parse_external_body(input: &str, start: usize) -> Result<(ReducerBody, usize)
     Ok((ReducerBody::External { id: String::new() }, pos))
 }
 
+#[allow(unused_variables)]
 fn parse_lua_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Error> {
     let mut pos = start;
     pos = skip_keyword(input, pos, "LANGUAGE")?;
@@ -768,6 +851,12 @@ fn parse_lua_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Err
 
     // Read $$...$$ block
     let (script, new_pos) = read_dollar_quoted(input, pos)?;
+    #[cfg(not(feature = "lua"))]
+    return Err(Error::Schema(
+        "Lua reducers require the 'lua' feature. Use LANGUAGE EXTERNAL or event rules instead."
+            .into(),
+    ));
+    #[cfg(feature = "lua")]
     Ok((ReducerBody::Lua { script }, new_pos))
 }
 
@@ -795,10 +884,18 @@ fn parse_event_rules_body(input: &str, start: usize) -> Result<(ReducerBody, usi
     }
 
     if when_blocks.is_empty() {
-        return Err(Error::Schema("reducer must have at least one WHEN block".into()));
+        return Err(Error::Schema(
+            "reducer must have at least one WHEN block".into(),
+        ));
     }
 
-    Ok((ReducerBody::EventRules { when_blocks, always_emit }, pos))
+    Ok((
+        ReducerBody::EventRules {
+            when_blocks,
+            always_emit,
+        },
+        pos,
+    ))
 }
 
 fn parse_when_block(input: &str, start: usize) -> Result<(WhenBlock, usize), Error> {
@@ -838,7 +935,15 @@ fn parse_when_block(input: &str, start: usize) -> Result<(WhenBlock, usize), Err
         }
     }
 
-    Ok((WhenBlock { condition, lets, sets, emits }, pos))
+    Ok((
+        WhenBlock {
+            condition,
+            lets,
+            sets,
+            emits,
+        },
+        pos,
+    ))
 }
 
 fn parse_always_emit(input: &str, start: usize) -> Result<(AlwaysEmit, usize), Error> {
@@ -899,7 +1004,10 @@ fn parse_set_clause(input: &str, start: usize) -> Result<(Vec<(String, Expr)>, u
         pos = new_pos;
 
         // Strip "state." prefix
-        let field_name = field_ref.strip_prefix("state.").unwrap_or(&field_ref).to_string();
+        let field_name = field_ref
+            .strip_prefix("state.")
+            .unwrap_or(&field_ref)
+            .to_string();
         assignments.push((field_name, expr));
 
         pos = skip_ws(input, pos);
@@ -1050,7 +1158,10 @@ fn parse_comparison_expr(input: &str) -> Result<Expr, Error> {
 
 fn parse_if_expr(input: &str) -> Result<Expr, Error> {
     // IF(cond, then, else)
-    let inner_start = input.find('(').ok_or_else(|| Error::Schema("IF missing '('".into()))? + 1;
+    let inner_start = input
+        .find('(')
+        .ok_or_else(|| Error::Schema("IF missing '('".into()))?
+        + 1;
     let inner_end = rfind_matching_paren(input, inner_start - 1)?;
     let inner = &input[inner_start..inner_end];
 
@@ -1101,7 +1212,11 @@ fn parse_additive_expr(input: &str) -> Result<Expr, Error> {
     if let Some(pos) = last_op_pos {
         let left = &input[..pos];
         let right = &input[pos + 1..];
-        let op = if bytes[pos] == b'+' { BinaryOp::Add } else { BinaryOp::Sub };
+        let op = if bytes[pos] == b'+' {
+            BinaryOp::Add
+        } else {
+            BinaryOp::Sub
+        };
         return Ok(Expr::BinaryOp {
             left: Box::new(parse_additive_expr(left.trim())?),
             op,
@@ -1133,7 +1248,11 @@ fn parse_multiplicative_expr(input: &str) -> Result<Expr, Error> {
     if let Some(pos) = last_op_pos {
         let left = &input[..pos];
         let right = &input[pos + 1..];
-        let op = if bytes[pos] == b'*' { BinaryOp::Mul } else { BinaryOp::Div };
+        let op = if bytes[pos] == b'*' {
+            BinaryOp::Mul
+        } else {
+            BinaryOp::Div
+        };
         return Ok(Expr::BinaryOp {
             left: Box::new(parse_multiplicative_expr(left.trim())?),
             op,
@@ -1252,7 +1371,9 @@ fn read_dotted_name(input: &str, pos: usize) -> Result<(String, usize), Error> {
     let bytes = input.as_bytes();
     let start = pos;
     let mut p = pos;
-    while p < bytes.len() && (bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_' || bytes[p] == b'.') {
+    while p < bytes.len()
+        && (bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_' || bytes[p] == b'.')
+    {
         p += 1;
     }
     if p == start {
@@ -1322,7 +1443,9 @@ fn read_token(input: &str, pos: usize) -> Result<(String, usize), Error> {
 
 fn read_dollar_quoted(input: &str, pos: usize) -> Result<(String, usize), Error> {
     if !input[pos..].starts_with("$$") {
-        return Err(Error::Schema("expected '$$' to start dollar-quoted block".into()));
+        return Err(Error::Schema(
+            "expected '$$' to start dollar-quoted block".into(),
+        ));
     }
     let start = pos + 2;
     let end = input[start..]
@@ -1342,8 +1465,7 @@ fn read_until_keyword(input: &str, pos: usize, keyword: &str) -> Result<(String,
     while search_from < upper.len() {
         if let Some(idx) = upper[search_from..].find(&kw_upper) {
             let abs_idx = search_from + idx;
-            let before_ok = abs_idx == 0
-                || remaining.as_bytes()[abs_idx - 1].is_ascii_whitespace();
+            let before_ok = abs_idx == 0 || remaining.as_bytes()[abs_idx - 1].is_ascii_whitespace();
             let after_pos = abs_idx + kw_upper.len();
             let after_ok = after_pos >= remaining.len()
                 || remaining.as_bytes()[after_pos].is_ascii_whitespace();
@@ -1407,7 +1529,11 @@ fn read_expr_until_comma_or_clause(input: &str, pos: usize) -> Result<(String, u
     Ok((result, p))
 }
 
-fn read_expr_until_any(input: &str, pos: usize, keywords: &[&str]) -> Result<(String, usize), Error> {
+fn read_expr_until_any(
+    input: &str,
+    pos: usize,
+    keywords: &[&str],
+) -> Result<(String, usize), Error> {
     let bytes = input.as_bytes();
     let mut p = pos;
     let mut depth = 0i32;
@@ -1416,7 +1542,9 @@ fn read_expr_until_any(input: &str, pos: usize, keywords: &[&str]) -> Result<(St
         match bytes[p] {
             b'(' => depth += 1,
             b')' => {
-                if depth == 0 { break; }
+                if depth == 0 {
+                    break;
+                }
                 depth -= 1;
             }
             b';' if depth == 0 => break,
@@ -1424,7 +1552,9 @@ fn read_expr_until_any(input: &str, pos: usize, keywords: &[&str]) -> Result<(St
                 let remaining_upper = input[p..].to_uppercase();
                 for kw in keywords {
                     let kw_space = format!("{kw} ");
-                    if remaining_upper.starts_with(&kw_space) || remaining_upper.starts_with(&format!("{kw}\n")) {
+                    if remaining_upper.starts_with(&kw_space)
+                        || remaining_upper.starts_with(&format!("{kw}\n"))
+                    {
                         return Ok((input[pos..p].trim().to_string(), p));
                     }
                 }
@@ -1462,8 +1592,14 @@ fn split_binary_op<'a>(input: &'a str, ops: &[&str]) -> Vec<&'a str> {
 
     while i < bytes.len() {
         match bytes[i] {
-            b'(' => { depth += 1; i += 1; }
-            b')' => { depth -= 1; i += 1; }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
             // Skip quoted strings to avoid matching operators inside them
             q @ (b'\'' | b'"') => {
                 i += 1;
@@ -1500,7 +1636,9 @@ fn split_binary_op<'a>(input: &'a str, ops: &[&str]) -> Vec<&'a str> {
                     i += 1;
                 }
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
     parts.push(&input[last..]);
@@ -1638,7 +1776,11 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
         // Validate GROUP BY columns against source table (only when source is a table;
         // for chained reducers, output columns are dynamic and validated at runtime)
         if source_is_table {
-            let source_table = schema.tables.iter().find(|t| t.name == reducer.source).unwrap();
+            let source_table = schema
+                .tables
+                .iter()
+                .find(|t| t.name == reducer.source)
+                .unwrap();
             for col in &reducer.group_by {
                 if !source_table.columns.iter().any(|c| c.name == *col) {
                     return Err(Error::Schema(format!(
@@ -1688,9 +1830,11 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
         // Validate sliding window time_column exists in source table with a numeric type
         if let Some(ref sw) = mv.sliding_window {
             if source_is_table {
-                let source_table =
-                    schema.tables.iter().find(|t| t.name == mv.source).unwrap();
-                let col = source_table.columns.iter().find(|c| c.name == sw.time_column);
+                let source_table = schema.tables.iter().find(|t| t.name == mv.source).unwrap();
+                let col = source_table
+                    .columns
+                    .iter()
+                    .find(|c| c.name == sw.time_column);
                 match col {
                     None => {
                         return Err(Error::Schema(format!(
@@ -1780,7 +1924,10 @@ mod tests {
 
         // Check window function
         match &mv.select[1].expr {
-            SelectExpr::WindowFunc { column, interval_seconds } => {
+            SelectExpr::WindowFunc {
+                column,
+                interval_seconds,
+            } => {
                 assert_eq!(column, "block_time");
                 assert_eq!(*interval_seconds, 300); // 5 minutes
             }
@@ -1854,7 +2001,10 @@ mod tests {
         assert_eq!(r.state[1].name, "cost_basis");
 
         match &r.body {
-            ReducerBody::EventRules { when_blocks, always_emit } => {
+            ReducerBody::EventRules {
+                when_blocks,
+                always_emit,
+            } => {
                 assert_eq!(when_blocks.len(), 2);
 
                 // Buy block
@@ -2063,7 +2213,11 @@ mod tests {
     fn parse_expr_arithmetic() {
         let expr = parse_expr("state.quantity + row.amount").unwrap();
         match expr {
-            Expr::BinaryOp { left, op: BinaryOp::Add, right } => {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Add,
+                right,
+            } => {
                 assert!(matches!(*left, Expr::StateRef(ref s) if s == "quantity"));
                 assert!(matches!(*right, Expr::RowRef(ref s) if s == "amount"));
             }
@@ -2075,18 +2229,37 @@ mod tests {
     fn parse_expr_multiply_and_subtract() {
         let expr = parse_expr("row.amount * (row.price - avg_cost)").unwrap();
         match expr {
-            Expr::BinaryOp { op: BinaryOp::Mul, .. } => {}
+            Expr::BinaryOp {
+                op: BinaryOp::Mul, ..
+            } => {}
             _ => panic!("expected Mul at top level, got {expr:?}"),
         }
     }
 
     #[test]
     fn parse_expr_if_function() {
-        let expr = parse_expr("IF(state.quantity > 0, state.cost_basis / state.quantity, 0)").unwrap();
+        let expr =
+            parse_expr("IF(state.quantity > 0, state.cost_basis / state.quantity, 0)").unwrap();
         match expr {
-            Expr::If { condition, then_expr, else_expr } => {
-                assert!(matches!(*condition, Expr::BinaryOp { op: BinaryOp::Gt, .. }));
-                assert!(matches!(*then_expr, Expr::BinaryOp { op: BinaryOp::Div, .. }));
+            Expr::If {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                assert!(matches!(
+                    *condition,
+                    Expr::BinaryOp {
+                        op: BinaryOp::Gt,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    *then_expr,
+                    Expr::BinaryOp {
+                        op: BinaryOp::Div,
+                        ..
+                    }
+                ));
                 assert!(matches!(*else_expr, Expr::Int(0)));
             }
             _ => panic!("expected If, got {expr:?}"),
@@ -2097,7 +2270,11 @@ mod tests {
     fn parse_expr_string_comparison() {
         let expr = parse_expr("row.side = 'buy'").unwrap();
         match expr {
-            Expr::BinaryOp { left, op: BinaryOp::Eq, right } => {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            } => {
                 assert!(matches!(*left, Expr::RowRef(ref s) if s == "side"));
                 assert!(matches!(*right, Expr::Literal(ref s) if s == "buy"));
             }
@@ -2110,13 +2287,21 @@ mod tests {
     fn parse_expr_or_condition() {
         let expr = parse_expr("row.side = 'buy' OR row.side = 'sell'").unwrap();
         match expr {
-            Expr::BinaryOp { op: BinaryOp::Or, left, right } => {
+            Expr::BinaryOp {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
                 match *left {
-                    Expr::BinaryOp { op: BinaryOp::Eq, .. } => {}
+                    Expr::BinaryOp {
+                        op: BinaryOp::Eq, ..
+                    } => {}
                     other => panic!("expected Eq on left, got {other:?}"),
                 }
                 match *right {
-                    Expr::BinaryOp { op: BinaryOp::Eq, .. } => {}
+                    Expr::BinaryOp {
+                        op: BinaryOp::Eq, ..
+                    } => {}
                     other => panic!("expected Eq on right, got {other:?}"),
                 }
             }
@@ -2130,12 +2315,16 @@ mod tests {
         // "a = 1 OR b = 2 AND c = 3" should parse as "a = 1 OR (b = 2 AND c = 3)"
         let expr = parse_expr("row.a = '1' OR row.b = '2' AND row.c = '3'").unwrap();
         match expr {
-            Expr::BinaryOp { op: BinaryOp::Or, right, .. } => {
-                match *right {
-                    Expr::BinaryOp { op: BinaryOp::And, .. } => {}
-                    other => panic!("expected And on right side of Or, got {other:?}"),
-                }
-            }
+            Expr::BinaryOp {
+                op: BinaryOp::Or,
+                right,
+                ..
+            } => match *right {
+                Expr::BinaryOp {
+                    op: BinaryOp::And, ..
+                } => {}
+                other => panic!("expected And on right side of Or, got {other:?}"),
+            },
             other => panic!("expected Or at top level, got {other:?}"),
         }
     }
@@ -2145,7 +2334,9 @@ mod tests {
     fn parse_expr_multibyte_utf8_in_condition() {
         let expr = parse_expr("row.msg = 'café' OR row.msg = 'naïve'").unwrap();
         match expr {
-            Expr::BinaryOp { op: BinaryOp::Or, .. } => {}
+            Expr::BinaryOp {
+                op: BinaryOp::Or, ..
+            } => {}
             other => panic!("expected Or, got {other:?}"),
         }
     }
@@ -2158,7 +2349,9 @@ mod tests {
         // Use a more extreme case: column named with non-ASCII that changes length.
         let expr = parse_expr("row.x = 'straße' AND row.y = '1'").unwrap();
         match expr {
-            Expr::BinaryOp { op: BinaryOp::And, .. } => {}
+            Expr::BinaryOp {
+                op: BinaryOp::And, ..
+            } => {}
             other => panic!("expected And, got {other:?}"),
         }
     }
@@ -2414,7 +2607,10 @@ mod tests {
         assert_eq!(mv.name, "volume_1h");
         assert_eq!(mv.group_by, vec!["pair"]);
 
-        let sw = mv.sliding_window.as_ref().expect("should have sliding window");
+        let sw = mv
+            .sliding_window
+            .as_ref()
+            .expect("should have sliding window");
         assert_eq!(sw.interval_seconds, 3600);
         assert_eq!(sw.time_column, "block_time");
     }

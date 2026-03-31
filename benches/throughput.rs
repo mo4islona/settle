@@ -156,8 +156,14 @@ fn pnl_fn_runtime() -> FnReducerRuntime {
         let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let price = row.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-        let qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let cost = state.get("cost_basis").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let qty = state
+            .get("quantity")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let cost = state
+            .get("cost_basis")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
 
         let mut emit = HashMap::new();
 
@@ -167,12 +173,21 @@ fn pnl_fn_runtime() -> FnReducerRuntime {
             emit.insert("trade_pnl".into(), Value::Float64(0.0));
         } else {
             let avg_cost = if qty > 0.0 { cost / qty } else { 0.0 };
-            emit.insert("trade_pnl".into(), Value::Float64(amount * (price - avg_cost)));
+            emit.insert(
+                "trade_pnl".into(),
+                Value::Float64(amount * (price - avg_cost)),
+            );
             state.insert("quantity".into(), Value::Float64(qty - amount));
-            state.insert("cost_basis".into(), Value::Float64(cost - amount * avg_cost));
+            state.insert(
+                "cost_basis".into(),
+                Value::Float64(cost - amount * avg_cost),
+            );
         }
 
-        let new_qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let new_qty = state
+            .get("quantity")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         emit.insert("position_size".into(), Value::Float64(new_qty));
 
         vec![emit]

@@ -510,10 +510,19 @@ fn ingest_auto_rollback_on_fork() {
             ],
         )]),
         rollback_chain: vec![
-            BlockCursor { number: 2, hash: "0x2".into() },
-            BlockCursor { number: 1, hash: "0x1".into() },
+            BlockCursor {
+                number: 2,
+                hash: "0x2".into(),
+            },
+            BlockCursor {
+                number: 1,
+                hash: "0x1".into(),
+            },
         ],
-        finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+        finalized_head: BlockCursor {
+            number: 1,
+            hash: "0x1".into(),
+        },
     })
     .unwrap();
 
@@ -524,12 +533,22 @@ fn ingest_auto_rollback_on_fork() {
     let batch = db
         .ingest(IngestInput {
             data: std::collections::HashMap::new(),
-            rollback_chain: vec![BlockCursor { number: 1, hash: "0x1".into() }],
-            finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+            rollback_chain: vec![BlockCursor {
+                number: 1,
+                hash: "0x1".into(),
+            }],
+            finalized_head: BlockCursor {
+                number: 1,
+                hash: "0x1".into(),
+            },
         })
         .unwrap();
 
-    assert_eq!(db.latest_block(), 1, "latest_block must revert to fork point");
+    assert_eq!(
+        db.latest_block(),
+        1,
+        "latest_block must revert to fork point"
+    );
 
     // The batch must contain compensating deltas for block 2's data
     let batch = batch.expect("rollback ingest must return a batch with compensating deltas");
@@ -558,8 +577,14 @@ fn ingest_auto_rollback_full_when_no_common_ancestor() {
                 r
             }],
         )]),
-        rollback_chain: vec![BlockCursor { number: 1, hash: "0xold1".into() }],
-        finalized_head: BlockCursor { number: 0, hash: "0x0".into() },
+        rollback_chain: vec![BlockCursor {
+            number: 1,
+            hash: "0xold1".into(),
+        }],
+        finalized_head: BlockCursor {
+            number: 0,
+            hash: "0x0".into(),
+        },
     })
     .unwrap();
 
@@ -576,8 +601,14 @@ fn ingest_auto_rollback_full_when_no_common_ancestor() {
                     r
                 }],
             )]),
-            rollback_chain: vec![BlockCursor { number: 1, hash: "0xnew1".into() }],
-            finalized_head: BlockCursor { number: 0, hash: "0x0".into() },
+            rollback_chain: vec![BlockCursor {
+                number: 1,
+                hash: "0xnew1".into(),
+            }],
+            finalized_head: BlockCursor {
+                number: 0,
+                hash: "0x0".into(),
+            },
         })
         .unwrap()
         .expect("must return a batch");
@@ -586,7 +617,9 @@ fn ingest_auto_rollback_full_when_no_common_ancestor() {
 
     // Only BTC data should be present (ETH was rolled back)
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
-    let btc = mv_records.iter().find(|r| r.key.get("pool") == Some(&Value::String("BTC".into())));
+    let btc = mv_records
+        .iter()
+        .find(|r| r.key.get("pool") == Some(&Value::String("BTC".into())));
     assert!(btc.is_some(), "BTC must appear after re-ingest");
 }
 
@@ -619,11 +652,23 @@ fn ingest_fork_detection_robust_against_asc_rollback_chain() {
             ],
         )]),
         rollback_chain: vec![
-            BlockCursor { number: 3, hash: "0x3".into() },
-            BlockCursor { number: 2, hash: "0x2".into() },
-            BlockCursor { number: 1, hash: "0x1".into() },
+            BlockCursor {
+                number: 3,
+                hash: "0x3".into(),
+            },
+            BlockCursor {
+                number: 2,
+                hash: "0x2".into(),
+            },
+            BlockCursor {
+                number: 1,
+                hash: "0x1".into(),
+            },
         ],
-        finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+        finalized_head: BlockCursor {
+            number: 1,
+            hash: "0x1".into(),
+        },
     })
     .unwrap();
 
@@ -636,10 +681,19 @@ fn ingest_fork_detection_robust_against_asc_rollback_chain() {
             data: std::collections::HashMap::new(),
             rollback_chain: vec![
                 // ASC order — oldest first (wrong but must be tolerated)
-                BlockCursor { number: 2, hash: "0x2".into() },
-                BlockCursor { number: 3, hash: "0x3".into() },
+                BlockCursor {
+                    number: 2,
+                    hash: "0x2".into(),
+                },
+                BlockCursor {
+                    number: 3,
+                    hash: "0x3".into(),
+                },
             ],
-            finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+            finalized_head: BlockCursor {
+                number: 1,
+                hash: "0x1".into(),
+            },
         })
         .unwrap();
 
@@ -684,10 +738,19 @@ fn ingest_no_spurious_rollback_on_multi_batch_advance() {
             ],
         )]),
         rollback_chain: vec![
-            BlockCursor { number: 3, hash: "0x3".into() },
-            BlockCursor { number: 2, hash: "0x2".into() },
+            BlockCursor {
+                number: 3,
+                hash: "0x3".into(),
+            },
+            BlockCursor {
+                number: 2,
+                hash: "0x2".into(),
+            },
         ],
-        finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+        finalized_head: BlockCursor {
+            number: 1,
+            hash: "0x1".into(),
+        },
     })
     .unwrap();
 
@@ -716,16 +779,29 @@ fn ingest_no_spurious_rollback_on_multi_batch_advance() {
             )]),
             // Only current batch blocks (as pipes-sdk's extractRollbackChain would produce)
             rollback_chain: vec![
-                BlockCursor { number: 5, hash: "0x5".into() },
-                BlockCursor { number: 4, hash: "0x4".into() },
+                BlockCursor {
+                    number: 5,
+                    hash: "0x5".into(),
+                },
+                BlockCursor {
+                    number: 4,
+                    hash: "0x4".into(),
+                },
             ],
-            finalized_head: BlockCursor { number: 1, hash: "0x1".into() },
+            finalized_head: BlockCursor {
+                number: 1,
+                hash: "0x1".into(),
+            },
         })
         .unwrap()
         .expect("must return a batch with new data");
 
     // No rollback — latest must advance, not regress
-    assert_eq!(db.latest_block(), 5, "multi-batch advance must not rollback");
+    assert_eq!(
+        db.latest_block(),
+        5,
+        "multi-batch advance must not rollback"
+    );
 
     // Batch 2 data should be there (40 + 50 = 90, plus 10+20+30=60 from batch 1, total 150)
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();

@@ -40,14 +40,14 @@ const LUA_REDUCER = `
     if row.side == "buy" then
       state.quantity = state.quantity + row.amount
       state.cost_basis = state.cost_basis + row.amount * row.price
-      emit.trade_pnl = 0
+      emit({trade_pnl = 0, position_size = state.quantity})
     else
       local avg_cost = state.cost_basis / state.quantity
-      emit.trade_pnl = row.amount * (row.price - avg_cost)
+      local pnl = row.amount * (row.price - avg_cost)
       state.quantity = state.quantity - row.amount
       state.cost_basis = state.cost_basis - row.amount * avg_cost
+      emit({trade_pnl = pnl, position_size = state.quantity})
     end
-    emit.position_size = state.quantity
   $$;
 `
 

@@ -56,14 +56,16 @@ fn main() {
 
     // Warm up
     for (block, chunk) in rows[..5000].chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+        db.process_batch("orders", block as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
 
     // Profiled section
     let start_block = 10;
     for (i, chunk) in rows[5000..].chunks(batch_size).enumerate() {
-        db.process_batch("orders", (start_block + i) as u64, chunk.to_vec()).unwrap();
+        db.process_batch("orders", (start_block + i) as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
 

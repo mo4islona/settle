@@ -79,8 +79,14 @@ mod tests {
 
     #[test]
     fn json_bool_to_value() {
-        assert_eq!(json_to_value(&serde_json::json!(true)), Value::Boolean(true));
-        assert_eq!(json_to_value(&serde_json::json!(false)), Value::Boolean(false));
+        assert_eq!(
+            json_to_value(&serde_json::json!(true)),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            json_to_value(&serde_json::json!(false)),
+            Value::Boolean(false)
+        );
     }
 
     #[test]
@@ -107,7 +113,10 @@ mod tests {
 
     #[test]
     fn json_float_to_value() {
-        assert_eq!(json_to_value(&serde_json::json!(3.14)), Value::Float64(3.14));
+        assert_eq!(
+            json_to_value(&serde_json::json!(3.14)),
+            Value::Float64(3.14)
+        );
     }
 
     #[test]

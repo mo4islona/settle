@@ -10,3 +10,5 @@ pub mod reducer_runtime;
 pub mod schema;
 pub mod storage;
 pub mod types;
+#[cfg(feature = "wasm")]
+mod wasm;

@@ -1,6 +1,7 @@
 pub mod event_rules;
 pub mod external;
 pub mod fn_reducer;
+#[cfg(feature = "lua")]
 pub mod lua;
 
 use std::collections::HashMap;

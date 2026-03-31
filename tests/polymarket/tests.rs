@@ -54,10 +54,7 @@ fn market_stats_tracks_volume_and_price_stats() {
 
     let batch = db.flush().unwrap();
 
-    let mv_records: Vec<_> = batch
-        .records_for("token_summary")
-        .iter()
-        .collect();
+    let mv_records: Vec<_> = batch.records_for("token_summary").iter().collect();
 
     assert_eq!(mv_records.len(), 1);
     assert_eq!(mv_records[0].operation, DeltaOperation::Insert);
@@ -111,10 +108,7 @@ fn market_stats_different_prices() {
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let mv = batch
-        .records_for("token_summary")
-        .first()
-        .unwrap();
+    let mv = batch.records_for("token_summary").first().unwrap();
 
     let last_price = mv.values.get("last_price").unwrap().as_f64().unwrap();
     assert!((last_price - 0.6).abs() < 0.001);
@@ -168,10 +162,7 @@ fn insider_classifier_ignores_sell_side() {
 
     let batch = db.flush().unwrap();
 
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     assert!(insider_records.is_empty());
 }
@@ -197,10 +188,7 @@ fn insider_classifier_ignores_high_price() {
 
     let batch = db.flush().unwrap();
 
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     assert!(insider_records.is_empty());
 }
@@ -227,10 +215,7 @@ fn insider_detected_with_full_fields() {
 
     let batch = db.flush().unwrap();
 
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     assert_eq!(insider_records.len(), 1);
     let rec = &insider_records[0];
@@ -245,20 +230,11 @@ fn insider_detected_with_full_fields() {
     assert!((sum_price_sq - 0.25).abs() < 0.001);
 
     // first_seen = last_seen = 1000
-    assert_eq!(
-        rec.values.get("first_seen"),
-        Some(&Value::Int64(1000))
-    );
-    assert_eq!(
-        rec.values.get("last_seen"),
-        Some(&Value::Int64(1000))
-    );
+    assert_eq!(rec.values.get("first_seen"), Some(&Value::Int64(1000)));
+    assert_eq!(rec.values.get("last_seen"), Some(&Value::Int64(1000)));
 
     // detected_at = 1000
-    assert_eq!(
-        rec.values.get("detected_at"),
-        Some(&Value::Int64(1000))
-    );
+    assert_eq!(rec.values.get("detected_at"), Some(&Value::Int64(1000)));
 }
 
 #[test]
@@ -280,10 +256,7 @@ fn insider_accumulates_across_orders_in_window() {
 
     let batch = db.flush().unwrap();
 
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // Multi-emit: should emit positions for both token_a and token_b
     assert_eq!(insider_records.len(), 2);
@@ -338,10 +311,7 @@ fn insider_subsequent_orders_emit_with_timestamps() {
 
     let batch = db.flush().unwrap();
 
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     assert!(!insider_records.is_empty());
 
@@ -411,10 +381,7 @@ fn window_expiration_marks_clean() {
 
     let batch = db.flush().unwrap();
 
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // Clean trader → no insider positions emitted
     assert!(insider_records.is_empty());
@@ -436,10 +403,7 @@ fn window_expiration_marks_clean() {
 
     let batch = db.flush().unwrap();
 
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     assert!(insider_records.is_empty());
 }
@@ -480,9 +444,7 @@ fn rollback_undoes_insider_classification() {
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let insider_count = batch
-        .records_for("insider_positions")
-        .len();
+    let insider_count = batch.records_for("insider_positions").len();
     assert!(insider_count > 0, "insider should be detected");
 
     // Rollback block 1001 — classification should be undone
@@ -556,10 +518,7 @@ fn market_stats_rollback() {
 
     let batch = db.flush().unwrap();
 
-    let mv_records: Vec<_> = batch
-        .records_for("token_summary")
-        .iter()
-        .collect();
+    let mv_records: Vec<_> = batch.records_for("token_summary").iter().collect();
 
     assert_eq!(mv_records.len(), 1);
     assert_eq!(mv_records[0].operation, DeltaOperation::Update);
@@ -588,7 +547,14 @@ fn full_pipeline_both_reducers() {
         1000,
         vec![
             // Insider: $5000 BUY at price=0.5
-            make_order("insider_1", "token_a", 5_000_000_000, 10_000_000_000, 0, 1000),
+            make_order(
+                "insider_1",
+                "token_a",
+                5_000_000_000,
+                10_000_000_000,
+                0,
+                1000,
+            ),
             // Normal: $100 BUY at price=0.5
             make_order("normal_1", "token_a", 100_000_000, 200_000_000, 0, 1000),
             // SELL: goes to market_stats but not insider_classifier
@@ -600,10 +566,7 @@ fn full_pipeline_both_reducers() {
     let batch = db.flush().unwrap();
 
     // token_summary should have 3 trades for token_a
-    let token_records: Vec<_> = batch
-        .records_for("token_summary")
-        .iter()
-        .collect();
+    let token_records: Vec<_> = batch.records_for("token_summary").iter().collect();
     assert_eq!(token_records.len(), 1);
     assert_eq!(
         token_records[0].values.get("trade_count"),
@@ -619,10 +582,7 @@ fn full_pipeline_both_reducers() {
     assert!((sum_price - 1.5).abs() < 0.001);
 
     // insider_positions should have 1 entry (only insider_1 exceeded threshold)
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
     assert_eq!(insider_records.len(), 1);
     // Verify it has all required fields
     assert!(insider_records[0].values.contains_key("sum_price"));
@@ -675,10 +635,7 @@ fn post_window_trades_do_not_trigger_insider() {
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // Window expired → clean → no insider emission
     assert!(
@@ -723,10 +680,7 @@ fn price_filter_high_vs_low_in_same_batch() {
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // Only low_price_trader should appear
     assert_eq!(insider_records.len(), 1);
@@ -764,10 +718,7 @@ fn market_stats_both_sides_multiple_tokens_with_derivation() {
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let mv_records: Vec<_> = batch
-        .records_for("token_summary")
-        .iter()
-        .collect();
+    let mv_records: Vec<_> = batch.records_for("token_summary").iter().collect();
 
     // Two tokens → two MV records
     assert_eq!(mv_records.len(), 2);
@@ -855,20 +806,14 @@ fn virtual_table_suppresses_order_deltas() {
     let batch = db.flush().unwrap();
 
     // No raw "orders" records should appear in deltas
-    let order_records: Vec<_> = batch
-        .records_for("orders")
-        .iter()
-        .collect();
+    let order_records: Vec<_> = batch.records_for("orders").iter().collect();
     assert!(
         order_records.is_empty(),
         "virtual table should not emit delta records"
     );
 
     // But market_stats → token_summary should still work
-    let mv_records: Vec<_> = batch
-        .records_for("token_summary")
-        .iter()
-        .collect();
+    let mv_records: Vec<_> = batch.records_for("token_summary").iter().collect();
     assert_eq!(mv_records.len(), 1);
 }
 
@@ -882,41 +827,17 @@ fn multiple_insiders_same_block() {
         1000,
         vec![
             // Insider 1: $5000
-            make_order(
-                "whale_a",
-                "token_a",
-                5_000_000_000,
-                10_000_000_000,
-                0,
-                1000,
-            ),
+            make_order("whale_a", "token_a", 5_000_000_000, 10_000_000_000, 0, 1000),
             // Insider 2: $6000
-            make_order(
-                "whale_b",
-                "token_b",
-                6_000_000_000,
-                12_000_000_000,
-                0,
-                1000,
-            ),
+            make_order("whale_b", "token_b", 6_000_000_000, 12_000_000_000, 0, 1000),
             // Normal trader: $100 (below threshold)
-            make_order(
-                "minnow",
-                "token_a",
-                100_000_000,
-                200_000_000,
-                0,
-                1000,
-            ),
+            make_order("minnow", "token_a", 100_000_000, 200_000_000, 0, 1000),
         ],
     )
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // Two insiders detected
     assert_eq!(insider_records.len(), 2);
@@ -950,10 +871,7 @@ fn exact_threshold_triggers_insider() {
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     assert_eq!(
         insider_records.len(),
@@ -983,10 +901,7 @@ fn just_below_threshold_no_insider() {
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     assert!(
         insider_records.is_empty(),
@@ -1017,10 +932,7 @@ fn exact_price_boundary_filtered() {
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     assert!(
         insider_records.is_empty(),
@@ -1038,7 +950,14 @@ fn multi_block_rollback() {
     db.process_batch(
         "orders",
         1000,
-        vec![make_order("alice", "token_a", 100_000_000, 200_000_000, 0, 1000)],
+        vec![make_order(
+            "alice",
+            "token_a",
+            100_000_000,
+            200_000_000,
+            0,
+            1000,
+        )],
     )
     .unwrap();
     db.flush();
@@ -1046,7 +965,14 @@ fn multi_block_rollback() {
     db.process_batch(
         "orders",
         1001,
-        vec![make_order("bob", "token_a", 200_000_000, 400_000_000, 0, 1001)],
+        vec![make_order(
+            "bob",
+            "token_a",
+            200_000_000,
+            400_000_000,
+            0,
+            1001,
+        )],
     )
     .unwrap();
     db.flush();
@@ -1054,7 +980,14 @@ fn multi_block_rollback() {
     db.process_batch(
         "orders",
         1002,
-        vec![make_order("charlie", "token_a", 300_000_000, 600_000_000, 0, 1002)],
+        vec![make_order(
+            "charlie",
+            "token_a",
+            300_000_000,
+            600_000_000,
+            0,
+            1002,
+        )],
     )
     .unwrap();
     db.flush();
@@ -1129,10 +1062,7 @@ fn insider_multi_block_subsequent_orders() {
     .unwrap();
 
     let batch = db.flush().unwrap();
-    let insider_records: Vec<_> = batch
-        .records_for("insider_positions")
-        .iter()
-        .collect();
+    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // token_a should get an Update (trade_count goes from 1 to 2)
     let token_a = insider_records

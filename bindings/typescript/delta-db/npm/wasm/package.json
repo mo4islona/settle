@@ -1,0 +1,8 @@
+{
+  "name": "@sqd-pipes/delta-db-wasm",
+  "version": "0.0.1-alpha.20",
+  "main": "delta-db.js",
+  "types": "delta-db.d.ts",
+  "files": ["delta-db.js", "delta-db.d.ts", "delta-db_bg.wasm"],
+  "license": "MIT"
+}

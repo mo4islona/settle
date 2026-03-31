@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use mlua::{Lua, MultiValue, RegistryKey, Result as LuaResult, Value as LuaValue};
 
@@ -19,7 +21,7 @@ use super::ReducerRuntime;
 /// - Pre-computed column IDs enable direct Vec indexing into Row.values()
 pub struct LuaRuntime {
     lua: Lua,
-    /// Pre-compiled wrapper: clears emit + _emits, calls user function, returns results
+    /// Pre-compiled wrapper: calls user function, returns state fields
     call_key: RegistryKey,
     /// Registry handle to the persistent `state` global table
     state_key: RegistryKey,
@@ -33,6 +35,9 @@ pub struct LuaRuntime {
     /// Used to filter row.iter() — only matching fields are marshalled to Lua.
     /// Empty = no filtering (all non-null fields are set).
     accessed_fields: HashSet<String>,
+    /// Rust-side emit buffer. Each `emit({...})` call from Lua is serialized
+    /// immediately into this Vec, avoiding any Lua-side table accumulation.
+    emits: Rc<RefCell<Vec<RowMap>>>,
 }
 
 // Safety: Each LuaRuntime is owned by exactly one ReducerEngine.
@@ -98,44 +103,38 @@ impl LuaRuntime {
             .create_registry_value(row_table)
             .expect("failed to store row in registry");
 
-        // Set up emit metatable ONCE (persists across all calls)
-        lua.load(
-            r#"
-            _emits = {}
-            emit = setmetatable({}, {
-                __call = function(self, tbl)
-                    local copy = {}
-                    for k, v in pairs(tbl) do copy[k] = v end
-                    _emits[#_emits + 1] = copy
-                end
+        // Register `emit` as a Rust callback. Each emit({...}) call is serialized
+        // immediately into the Rust-side buffer — no Lua table accumulation.
+        let emits: Rc<RefCell<Vec<RowMap>>> = Rc::new(RefCell::new(Vec::new()));
+        let emits_for_lua = emits.clone();
+        let emit_fn = lua
+            .create_function(move |_lua, tbl: mlua::Table| {
+                let map = lua_table_to_value_map(&tbl)?;
+                if !map.is_empty() {
+                    emits_for_lua.borrow_mut().push(map);
+                }
+                Ok(())
             })
-            "#,
-        )
-        .exec()
-        .expect("failed to set up emit metatable");
+            .expect("failed to create emit function");
+        lua.globals()
+            .set("emit", emit_fn)
+            .expect("failed to set emit global");
 
-        // Pre-compile wrapper: user function + emit reset.
+        // Pre-compile wrapper: calls user function and returns state fields.
         // Using string concat (not format!) to avoid issues with {} in Lua scripts.
         let call_src = if state_fields.is_empty() {
-            // Generic path: no state field optimization
+            // Generic path: no state field optimization.
             [
                 "local _user = function()\n",
                 script,
                 "\nend\n",
                 "return function()\n",
-                "    for i = #_emits, 1, -1 do _emits[i] = nil end\n",
-                "    for k in pairs(emit) do emit[k] = nil end\n",
                 "    _user()\n",
-                "    return #_emits, _emits, emit\n",
                 "end\n",
             ]
             .concat()
         } else {
             // Specialized path: state passed as positional args, returned as extra values.
-            // Generates: function(s0, s1, ..., sN)
-            //   state.field0 = s0; state.field1 = s1; ...
-            //   <clear emits> <run user>
-            //   return #_emits, _emits, emit, state.field0, state.field1, ...
             let n = state_fields.len();
             let params: Vec<String> = (0..n).map(|i| format!("_s{i}")).collect();
             let param_list = params.join(", ");
@@ -157,10 +156,8 @@ impl LuaRuntime {
             parts.push("\nend\n".to_string());
             parts.push(format!("return function({param_list})\n"));
             parts.push(set_lines);
-            parts.push("    for i = #_emits, 1, -1 do _emits[i] = nil end\n".to_string());
-            parts.push("    for k in pairs(emit) do emit[k] = nil end\n".to_string());
             parts.push("    _user()\n".to_string());
-            parts.push(format!("    return #_emits, _emits, emit, {return_list}\n"));
+            parts.push(format!("    return {return_list}\n"));
             parts.push("end\n".to_string());
             parts.concat()
         };
@@ -185,6 +182,7 @@ impl LuaRuntime {
             state_fields: state_fields.to_vec(),
             state_types: state_types.iter().cloned().collect(),
             accessed_fields,
+            emits,
         }
     }
 }
@@ -197,125 +195,131 @@ impl ReducerRuntime for LuaRuntime {
     ) -> crate::error::Result<Vec<RowMap>> {
         let lua_err = |e: mlua::Error| crate::error::Error::Reducer(e.to_string());
 
-        // Update persistent row table in-place (no table allocation).
-        // Only fields the script actually references are marshalled.
         let row_table: mlua::Table = self.lua.registry_value(&self.row_key).map_err(lua_err)?;
-        // Clear all existing row fields to prevent stale values leaking across rows.
-        // Use Lua's next()-based iteration to cover both string and integer keys,
-        // including the array part of the table.
-        row_table.clear().map_err(lua_err)?;
-        if self.accessed_fields.is_empty() {
-            for (k, v) in row.iter() {
-                row_table
-                    .raw_set(k, value_to_lua(&self.lua, v).map_err(lua_err)?)
-                    .map_err(lua_err)?;
-            }
-        } else {
-            for (k, v) in row.iter() {
-                if self.accessed_fields.contains(k) {
-                    row_table
-                        .raw_set(k, value_to_lua(&self.lua, v).map_err(lua_err)?)
-                        .map_err(lua_err)?;
-                }
-            }
-        }
+        marshal_row_to_lua(&self.lua, &row_table, row, &self.accessed_fields)
+            .map_err(lua_err)?;
 
         let call: mlua::Function = self.lua.registry_value(&self.call_key).map_err(lua_err)?;
 
+        // Clear the emit buffer before calling user script
+        self.emits.borrow_mut().clear();
+
         if self.state_fields.is_empty() {
-            // Generic path: set/get state via table fields
             let state_table: mlua::Table =
                 self.lua.registry_value(&self.state_key).map_err(lua_err)?;
-            for (k, v) in state.iter() {
-                state_table
-                    .raw_set(k.as_str(), value_to_lua(&self.lua, v).map_err(lua_err)?)
-                    .map_err(lua_err)?;
-            }
+            serialize_state_generic(&self.lua, &state_table, state).map_err(lua_err)?;
 
-            let (multi_count, emits_array, emit_table): (i64, mlua::Table, mlua::Table) =
-                call.call(()).map_err(lua_err)?;
+            lua_call_generic(&call).map_err(lua_err)?;
 
-            for (k, v) in state.iter_mut() {
-                let lua_val: LuaValue = state_table.raw_get(k.as_str()).map_err(lua_err)?;
-                *v = lua_to_value_typed(&lua_val, self.state_types.get(k));
-            }
-
-            collect_emits(multi_count, &emits_array, &emit_table)
+            deserialize_state_generic(&state_table, state, &self.state_types)
+                .map_err(lua_err)?;
         } else {
-            // Specialized path: state passed as positional args, returned as extra values.
-            // Build args: state values in field order
-            let mut args = MultiValue::new();
-            for field in &self.state_fields {
-                let v = state.get(field).unwrap_or(&Value::Null);
-                args.push_back(value_to_lua(&self.lua, v).map_err(lua_err)?);
-            }
+            let args =
+                serialize_state_hoisted(&self.lua, &self.state_fields, state).map_err(lua_err)?;
 
-            let result: MultiValue = call.call(args).map_err(lua_err)?;
+            let result =
+                lua_call_hoisted(&call, args).map_err(lua_err)?;
 
-            // Unpack: first 3 values are (multi_count, emits, emit), rest are state values
-            let mut iter = result.into_vec().into_iter();
-            let multi_count = match iter.next() {
-                Some(LuaValue::Integer(n)) => n as i64,
-                Some(LuaValue::Number(n)) => n as i64,
-                _ => 0,
-            };
-            let emits_array = match iter.next() {
-                Some(LuaValue::Table(t)) => t,
-                _ => {
-                    return Err(crate::error::Error::Reducer(
-                        "expected _emits table from Lua wrapper".into(),
-                    ));
-                }
-            };
-            let emit_table = match iter.next() {
-                Some(LuaValue::Table(t)) => t,
-                _ => {
-                    return Err(crate::error::Error::Reducer(
-                        "expected emit table from Lua wrapper".into(),
-                    ));
-                }
-            };
-
-            // Read back state values from remaining return values
-            for field in &self.state_fields {
-                if let Some(lua_val) = iter.next() {
-                    if let Some(v) = state.get_mut(field) {
-                        *v = lua_to_value_typed(&lua_val, self.state_types.get(field));
-                    }
-                }
-            }
-
-            collect_emits(multi_count, &emits_array, &emit_table)
+            deserialize_state_hoisted(result, &self.state_fields, state, &self.state_types);
         }
+
+        Ok(std::mem::take(&mut *self.emits.borrow_mut()))
     }
 }
 
-/// Extract emit results from Lua tables.
-fn collect_emits(
-    multi_count: i64,
-    emits_array: &mlua::Table,
-    emit_table: &mlua::Table,
-) -> crate::error::Result<Vec<RowMap>> {
-    if multi_count > 0 {
-        let mut results = Vec::with_capacity(multi_count as usize);
-        for i in 1..=multi_count {
-            if let Ok(tbl) = emits_array.get::<mlua::Table>(i) {
-                let map = lua_table_to_value_map(&tbl).map_err(|e| {
-                    crate::error::Error::Reducer(format!("failed to convert emit: {e}"))
-                })?;
-                if !map.is_empty() {
-                    results.push(map);
-                }
+// --- Perf-visible phases: each #[inline(never)] fn is a distinct frame in perf/flamegraph ---
+
+/// Phase 1: Marshal Row (Rust) → Lua row table
+#[inline(never)]
+fn marshal_row_to_lua(
+    lua: &Lua,
+    row_table: &mlua::Table,
+    row: &Row,
+    accessed_fields: &HashSet<String>,
+) -> LuaResult<()> {
+    row_table.clear()?;
+    if accessed_fields.is_empty() {
+        for (k, v) in row.iter() {
+            row_table.raw_set(k, value_to_lua(lua, v)?)?;
+        }
+    } else {
+        for (k, v) in row.iter() {
+            if accessed_fields.contains(k) {
+                row_table.raw_set(k, value_to_lua(lua, v)?)?;
             }
         }
-        Ok(results)
-    } else {
-        let emit_map = lua_table_to_value_map(emit_table)
-            .map_err(|e| crate::error::Error::Reducer(format!("failed to convert emit: {e}")))?;
-        if emit_map.is_empty() {
-            Ok(vec![])
-        } else {
-            Ok(vec![emit_map])
+    }
+    Ok(())
+}
+
+/// Phase 2a: Serialize state → Lua table (generic path)
+#[inline(never)]
+fn serialize_state_generic(
+    lua: &Lua,
+    state_table: &mlua::Table,
+    state: &HashMap<String, Value>,
+) -> LuaResult<()> {
+    for (k, v) in state.iter() {
+        state_table.raw_set(k.as_str(), value_to_lua(lua, v)?)?;
+    }
+    Ok(())
+}
+
+/// Phase 2b: Serialize state → MultiValue args (hoisted path)
+#[inline(never)]
+fn serialize_state_hoisted(
+    lua: &Lua,
+    state_fields: &[String],
+    state: &HashMap<String, Value>,
+) -> LuaResult<MultiValue> {
+    let mut args = MultiValue::new();
+    for field in state_fields {
+        let v = state.get(field).unwrap_or(&Value::Null);
+        args.push_back(value_to_lua(lua, v)?);
+    }
+    Ok(args)
+}
+
+/// Phase 3a: Call Lua function (generic path — no args)
+#[inline(never)]
+fn lua_call_generic(call: &mlua::Function) -> LuaResult<()> {
+    call.call::<()>(())
+}
+
+/// Phase 3b: Call Lua function (hoisted path — state as args, returns state)
+#[inline(never)]
+fn lua_call_hoisted(call: &mlua::Function, args: MultiValue) -> LuaResult<MultiValue> {
+    call.call(args)
+}
+
+/// Phase 4a: Deserialize state ← Lua table (generic path)
+#[inline(never)]
+fn deserialize_state_generic(
+    state_table: &mlua::Table,
+    state: &mut HashMap<String, Value>,
+    state_types: &HashMap<String, ColumnType>,
+) -> LuaResult<()> {
+    for (k, v) in state.iter_mut() {
+        let lua_val: LuaValue = state_table.raw_get(k.as_str())?;
+        *v = lua_to_value_typed(&lua_val, state_types.get(k));
+    }
+    Ok(())
+}
+
+/// Phase 4b: Deserialize state ← MultiValue returns (hoisted path)
+#[inline(never)]
+fn deserialize_state_hoisted(
+    result: MultiValue,
+    state_fields: &[String],
+    state: &mut HashMap<String, Value>,
+    state_types: &HashMap<String, ColumnType>,
+) {
+    let mut iter = result.into_vec().into_iter();
+    for field in state_fields {
+        if let Some(lua_val) = iter.next() {
+            if let Some(v) = state.get_mut(field) {
+                *v = lua_to_value_typed(&lua_val, state_types.get(field));
+            }
         }
     }
 }
@@ -415,10 +419,10 @@ fn register_json_module(lua: &Lua) -> LuaResult<()> {
 
 fn lua_table_to_value_map(table: &mlua::Table) -> LuaResult<HashMap<String, Value>> {
     let mut map = HashMap::new();
-    for pair in table.pairs::<String, LuaValue>() {
-        let (k, v) = pair?;
+    table.for_each(|k: String, v: LuaValue| {
         map.insert(k, lua_to_value(&v));
-    }
+        Ok(())
+    })?;
     Ok(map)
 }
 
@@ -474,20 +478,18 @@ fn lua_to_value_typed(val: &LuaValue, col_type: Option<&ColumnType>) -> Value {
 /// Convert a Lua table to serde_json::Value (recursive).
 fn lua_table_to_json(table: &mlua::Table) -> serde_json::Value {
     if is_lua_array(table) {
-        let arr: Vec<serde_json::Value> = table
-            .clone()
-            .sequence_values::<LuaValue>()
-            .filter_map(|r| r.ok())
-            .map(|v| lua_value_to_json(&v))
-            .collect();
+        let mut arr = Vec::new();
+        let _ = table.for_each_value::<LuaValue>(|v| {
+            arr.push(lua_value_to_json(&v));
+            Ok(())
+        });
         serde_json::Value::Array(arr)
     } else {
         let mut map = serde_json::Map::new();
-        for pair in table.clone().pairs::<String, LuaValue>() {
-            if let Ok((k, v)) = pair {
-                map.insert(k, lua_value_to_json(&v));
-            }
-        }
+        let _ = table.for_each(|k: String, v: LuaValue| {
+            map.insert(k, lua_value_to_json(&v));
+            Ok(())
+        });
         serde_json::Value::Object(map)
     }
 }
@@ -522,23 +524,21 @@ fn lua_value_to_json_string(_lua: &Lua, val: &LuaValue) -> String {
             // Check if it's an array or object
             if is_lua_array(t) {
                 let mut arr = Vec::new();
-                for pair in t.clone().sequence_values::<LuaValue>() {
-                    if let Ok(v) = pair {
-                        arr.push(lua_value_to_json_string(_lua, &v));
-                    }
-                }
+                let _ = t.for_each_value::<LuaValue>(|v| {
+                    arr.push(lua_value_to_json_string(_lua, &v));
+                    Ok(())
+                });
                 format!("[{}]", arr.join(","))
             } else {
                 let mut obj = Vec::new();
-                for pair in t.clone().pairs::<String, LuaValue>() {
-                    if let Ok((k, v)) = pair {
-                        obj.push(format!(
-                            "{}:{}",
-                            serde_json::to_string(&k).unwrap(),
-                            lua_value_to_json_string(_lua, &v)
-                        ));
-                    }
-                }
+                let _ = t.for_each(|k: String, v: LuaValue| {
+                    obj.push(format!(
+                        "{}:{}",
+                        serde_json::to_string(&k).unwrap(),
+                        lua_value_to_json_string(_lua, &v)
+                    ));
+                    Ok(())
+                });
                 format!("{{{}}}", obj.join(","))
             }
         }
@@ -581,14 +581,13 @@ fn json_value_to_lua(lua: &Lua, val: &serde_json::Value) -> LuaResult<LuaValue> 
 fn is_lua_array(table: &mlua::Table) -> bool {
     let mut has_int_keys = false;
     let mut has_str_keys = false;
-    for pair in table.clone().pairs::<LuaValue, LuaValue>() {
-        if let Ok((k, _)) = pair {
-            match k {
-                LuaValue::Integer(_) | LuaValue::Number(_) => has_int_keys = true,
-                _ => has_str_keys = true,
-            }
+    let _ = table.for_each(|k: LuaValue, _: LuaValue| {
+        match k {
+            LuaValue::Integer(_) | LuaValue::Number(_) => has_int_keys = true,
+            _ => has_str_keys = true,
         }
-    }
+        Ok(())
+    });
     has_int_keys && !has_str_keys
 }
 
@@ -609,7 +608,7 @@ mod tests {
         let runtime = LuaRuntime::new(
             r#"
             state.count = state.count + 1
-            emit.total = state.count
+            emit({total = state.count})
             "#,
         );
 
@@ -637,7 +636,7 @@ mod tests {
     fn lua_reads_row_values() {
         let runtime = LuaRuntime::new(
             r#"
-            emit.doubled = row.amount * 2
+            emit({doubled = row.amount * 2})
             "#,
         );
 
@@ -661,14 +660,14 @@ mod tests {
             if row.side == "buy" then
                 state.quantity = state.quantity + row.amount
                 state.cost_basis = state.cost_basis + row.amount * row.price
-                emit.trade_pnl = 0
+                emit({trade_pnl = 0, position_size = state.quantity})
             else
                 local avg_cost = state.cost_basis / state.quantity
-                emit.trade_pnl = row.amount * (row.price - avg_cost)
+                local pnl = row.amount * (row.price - avg_cost)
                 state.quantity = state.quantity - row.amount
                 state.cost_basis = state.cost_basis - row.amount * avg_cost
+                emit({trade_pnl = pnl, position_size = state.quantity})
             end
-            emit.position_size = state.quantity
             "#,
         );
 
@@ -715,12 +714,11 @@ mod tests {
         let runtime = LuaRuntime::new(
             r#"
             local lots = json.decode(state.lots)
+            local pnl = 0
             if row.side == "buy" then
                 table.insert(lots, { qty = row.amount, price = row.price })
-                emit.trade_pnl = 0
             else
                 local remaining = row.amount
-                local pnl = 0
                 while remaining > 0 and #lots > 0 do
                     local lot = lots[1]
                     local used = math.min(remaining, lot.qty)
@@ -729,7 +727,6 @@ mod tests {
                     remaining = remaining - used
                     if lot.qty <= 0 then table.remove(lots, 1) end
                 end
-                emit.trade_pnl = pnl
             end
             state.lots = json.encode(lots)
 
@@ -737,7 +734,7 @@ mod tests {
             for _, lot in ipairs(lots) do
                 total_qty = total_qty + lot.qty
             end
-            emit.position_size = total_qty
+            emit({trade_pnl = pnl, position_size = total_qty})
             "#,
         );
 
@@ -789,7 +786,7 @@ mod tests {
         let runtime = LuaRuntime::new(
             r#"
             if os == nil then
-                emit.sandboxed = 1
+                emit({sandboxed = 1})
             end
             "#,
         );
@@ -810,7 +807,7 @@ mod tests {
         let runtime = LuaRuntime::new(
             r#"
             if require == nil and package == nil then
-                emit.sandboxed = 1
+                emit({sandboxed = 1})
             end
             "#,
         );
@@ -830,9 +827,9 @@ mod tests {
         let runtime = LuaRuntime::new(
             r#"
             if row.side == "buy" then
-                emit.matched = 1
+                emit({matched = 1})
             else
-                emit.matched = 0
+                emit({matched = 0})
             end
             "#,
         );
@@ -934,9 +931,7 @@ mod tests {
             pos.trades = pos.trades + 1
             state.count = state.count + 1
 
-            emit.token = token
-            emit.total_volume = pos.volume
-            emit.total_trades = pos.trades
+            emit({token = token, total_volume = pos.volume, total_trades = pos.trades})
             "#,
             &state_fields,
             &state_types,
@@ -1008,7 +1003,7 @@ mod tests {
             -- lots is already a native Lua table (array)
             if row.side == "buy" then
                 state.lots[#state.lots + 1] = { qty = row.amount, price = row.price }
-                emit.pnl = 0
+                emit({pnl = 0})
             else
                 local remaining = row.amount
                 local pnl = 0
@@ -1020,7 +1015,7 @@ mod tests {
                     remaining = remaining - used
                     if lot.qty <= 0 then table.remove(state.lots, 1) end
                 end
-                emit.pnl = pnl
+                emit({pnl = pnl})
             end
             "#,
             &state_fields,
@@ -1125,7 +1120,7 @@ mod tests {
             r#"
             local doubled = utils.double(row.value)
             state.total = utils.add(state.total, doubled)
-            emit.result = state.total
+            emit({result = state.total})
             "#,
             &["total".to_string()],
             &[("total".to_string(), ColumnType::Float64)],
@@ -1150,7 +1145,7 @@ mod tests {
     fn lua_int64_precision() {
         let runtime = LuaRuntime::new(
             r#"
-            emit.result = row.big
+            emit({result = row.big})
             "#,
         );
         let mut state = HashMap::new();
@@ -1176,9 +1171,9 @@ mod tests {
         let runtime = LuaRuntime::new(
             r#"
             if row.optional ~= nil then
-                emit.saw = row.optional
+                emit({saw = row.optional})
             else
-                emit.saw = "nil"
+                emit({saw = "nil"})
             end
             "#,
         );
@@ -1222,9 +1217,9 @@ mod tests {
                 row[1] = "injected"
             end
             if row[1] ~= nil then
-                emit.saw = row[1]
+                emit({saw = row[1]})
             else
-                emit.saw = "nil"
+                emit({saw = "nil"})
             end
             "#,
         );
@@ -1246,6 +1241,295 @@ mod tests {
             Some(&Value::String("nil".into())),
             "Numeric key row[1] should be cleared between rows"
         );
+    }
+
+    /// Reproduce insider_classifier-style: JSON state grows with many unique keys,
+    /// flush loop calls emit() many times, then continues processing.
+    #[test]
+    fn lua_json_state_many_rows_no_overflow() {
+        let state_fields = vec![
+            "status".to_string(),
+            "window_vol".to_string(),
+            "positions".to_string(),
+        ];
+        let state_types = vec![("positions".to_string(), ColumnType::JSON)];
+        let source_cols = vec![
+            "shares".to_string(),
+            "side".to_string(),
+            "usdc".to_string(),
+            "trader".to_string(),
+            "asset_id".to_string(),
+        ];
+        let runtime = LuaRuntime::with_state_fields(
+            r#"
+            if row.shares == 0 then return end
+            if row.side ~= 0 then return end
+            if state.status ~= "unknown" then
+                if state.status == "insider" then
+                    local price = row.usdc / row.shares
+                    emit({ trader = row.trader, asset_id = row.asset_id, vol = row.usdc / 1000000, price = price })
+                end
+                return
+            end
+            state.window_vol = state.window_vol + row.usdc
+            local token = row.asset_id
+            local price = row.usdc / row.shares
+            local pos = state.positions[token]
+            if not pos then
+                pos = { volume = 0, trades = 0 }
+            end
+            pos.volume = pos.volume + row.usdc / 1000000
+            pos.trades = pos.trades + 1
+            state.positions[token] = pos
+            if state.window_vol >= 4000000000 then
+                state.status = "insider"
+                for tid, p in pairs(state.positions) do
+                    emit({ trader = row.trader, asset_id = tid, volume = p.volume })
+                end
+            end
+            "#,
+            &state_fields,
+            &state_types,
+            &source_cols,
+            &[],
+        );
+
+        let mut state: HashMap<String, Value> = HashMap::from([
+            ("status".to_string(), Value::String("unknown".into())),
+            ("window_vol".to_string(), Value::UInt64(0)),
+            ("positions".to_string(), Value::JSON(serde_json::json!({}))),
+        ]);
+
+        // 5000 rows across 100 unique asset_ids; window_vol crosses threshold ~row 4
+        for i in 0u64..5000 {
+            let asset = format!("asset_{}", i % 100);
+            let row = Row::from(HashMap::from([
+                ("shares".to_string(), Value::UInt64(1000)),
+                ("side".to_string(), Value::UInt64(0)),
+                ("usdc".to_string(), Value::UInt64(1_000_000_000)), // $1000
+                ("trader".to_string(), Value::String("trader1".into())),
+                ("asset_id".to_string(), Value::String(asset)),
+            ]));
+            runtime.process(&mut state, &row).unwrap();
+        }
+        assert_eq!(
+            state.get("status"),
+            Some(&Value::String("insider".into())),
+            "Trader should be classified as insider"
+        );
+    }
+
+    /// Emit buffer must be cleared between process() calls — no bleed from one row to the next.
+    #[test]
+    fn emit_buffer_cleared_between_rows() {
+        let runtime = LuaRuntime::new(
+            r#"
+            for i = 1, row.n do
+                emit({ i = i })
+            end
+            "#,
+        );
+        let mut state = HashMap::new();
+
+        // Row 1 emits 5
+        let row1 = Row::from(HashMap::from([("n".to_string(), Value::Int64(5))]));
+        let out1 = runtime.process(&mut state, &row1).unwrap();
+        assert_eq!(out1.len(), 5);
+
+        // Row 2 emits 1 — must NOT include the 5 from row 1
+        let row2 = Row::from(HashMap::from([("n".to_string(), Value::Int64(1))]));
+        let out2 = runtime.process(&mut state, &row2).unwrap();
+        assert_eq!(out2.len(), 1, "emit buffer must be cleared between rows");
+        assert_eq!(out2[0].get("i"), Some(&Value::Int64(1)));
+
+        // Row 3 emits 0
+        let row3 = Row::from(HashMap::from([("n".to_string(), Value::Int64(0))]));
+        let out3 = runtime.process(&mut state, &row3).unwrap();
+        assert!(out3.is_empty(), "emit buffer must be empty when no emit is called");
+    }
+
+    /// A single row that emits 1000 rows must return all 1000 with correct values.
+    /// Tests the Rust-side buffer under load (replacing the old _emits Lua table).
+    #[test]
+    fn emit_large_flush_preserves_all_values() {
+        let runtime = LuaRuntime::new(
+            r#"
+            for i = 1, row.n do
+                emit({ idx = i, double = i * 2 })
+            end
+            "#,
+        );
+        let mut state = HashMap::new();
+        let n = 1000i64;
+        let row = Row::from(HashMap::from([("n".to_string(), Value::Int64(n))]));
+
+        let results = runtime.process(&mut state, &row).unwrap();
+        assert_eq!(results.len(), n as usize);
+        for (i, r) in results.iter().enumerate() {
+            let expected_idx = (i + 1) as i64;
+            assert_eq!(
+                r.get("idx"),
+                Some(&Value::Int64(expected_idx)),
+                "row {i}: wrong idx"
+            );
+            assert_eq!(
+                r.get("double"),
+                Some(&Value::Int64(expected_idx * 2)),
+                "row {i}: wrong double"
+            );
+        }
+    }
+
+    /// After a large flush, subsequent process() calls must still emit correctly.
+    #[test]
+    fn emit_after_large_flush_continues_correctly() {
+        let runtime = LuaRuntime::new(
+            r#"
+            for i = 1, row.n do
+                emit({ val = i })
+            end
+            "#,
+        );
+        let mut state = HashMap::new();
+
+        // Large flush
+        let row_many = Row::from(HashMap::from([("n".to_string(), Value::Int64(500))]));
+        let out_many = runtime.process(&mut state, &row_many).unwrap();
+        assert_eq!(out_many.len(), 500);
+
+        // Single emit after flush
+        let row_one = Row::from(HashMap::from([("n".to_string(), Value::Int64(1))]));
+        let out_one = runtime.process(&mut state, &row_one).unwrap();
+        assert_eq!(out_one.len(), 1);
+        assert_eq!(out_one[0].get("val"), Some(&Value::Int64(1)));
+
+        // Zero emits after flush
+        let row_zero = Row::from(HashMap::from([("n".to_string(), Value::Int64(0))]));
+        let out_zero = runtime.process(&mut state, &row_zero).unwrap();
+        assert!(out_zero.is_empty());
+    }
+
+    /// emit() called inside pairs() loop with a large JSON table.
+    /// Pre-populate 500 keys, then emit once per key inside pairs().
+    /// This caused Lua stack overflow when emit was a Rust callback.
+    #[test]
+    fn emit_inside_pairs_no_stack_overflow() {
+        let state_fields = vec!["positions".to_string()];
+        let state_types = vec![("positions".to_string(), ColumnType::JSON)];
+        let source_cols = vec!["x".to_string()];
+        let runtime = LuaRuntime::with_state_fields(
+            r#"
+            for k, v in pairs(state.positions) do
+                emit({ key = k, val = v })
+            end
+            "#,
+            &state_fields,
+            &state_types,
+            &source_cols,
+            &[],
+        );
+
+        // Pre-populate 500 keys
+        let mut positions = serde_json::Map::new();
+        for i in 0..500 {
+            positions.insert(format!("asset_{i}"), serde_json::json!(i));
+        }
+        let mut state: HashMap<String, Value> = HashMap::from([(
+            "positions".to_string(),
+            Value::JSON(serde_json::Value::Object(positions)),
+        )]);
+
+        // Single row triggers 500 emits inside pairs()
+        let row = Row::from(HashMap::from([("x".to_string(), Value::UInt64(1))]));
+        let out = runtime.process(&mut state, &row).unwrap();
+        assert_eq!(out.len(), 500);
+    }
+
+    /// Multi-emit in the specialized path (with state_fields / positional args).
+    #[test]
+    fn emit_specialized_path_multi_emit() {
+        let state_fields = vec!["count".to_string(), "positions".to_string()];
+        let state_types = vec![
+            ("count".to_string(), ColumnType::Float64),
+            ("positions".to_string(), ColumnType::JSON),
+        ];
+        let runtime = LuaRuntime::with_state_fields(
+            r#"
+            state.count = state.count + 1
+            local token = row.token
+            if not state.positions[token] then
+                state.positions[token] = 0
+            end
+            state.positions[token] = state.positions[token] + row.vol
+
+            -- flush: emit one row per position tracked so far
+            if state.count % 3 == 0 then
+                for k, v in pairs(state.positions) do
+                    emit({ token = k, total_vol = v, flush_at = state.count })
+                end
+            end
+            "#,
+            &state_fields,
+            &state_types,
+            &["token".to_string(), "vol".to_string()],
+            &[],
+        );
+
+        let mut state = HashMap::from([
+            ("count".to_string(), Value::Float64(0.0)),
+            ("positions".to_string(), Value::JSON(serde_json::json!({}))),
+        ]);
+
+        let make_row = |token: &str, vol: f64| {
+            Row::from(HashMap::from([
+                ("token".to_string(), Value::String(token.into())),
+                ("vol".to_string(), Value::Float64(vol)),
+            ]))
+        };
+
+        // Rows 1 & 2: no flush yet
+        assert!(runtime.process(&mut state, &make_row("A", 10.0)).unwrap().is_empty());
+        assert!(runtime.process(&mut state, &make_row("B", 20.0)).unwrap().is_empty());
+
+        // Row 3: count == 3, triggers flush (2 tokens: A and B)
+        let out3 = runtime.process(&mut state, &make_row("A", 5.0)).unwrap();
+        assert_eq!(out3.len(), 2, "flush should emit one row per tracked token");
+        let mut totals: HashMap<String, f64> = HashMap::new();
+        for r in &out3 {
+            if let (Some(Value::String(k)), Some(v)) = (r.get("token"), r.get("total_vol")) {
+                totals.insert(k.clone(), v.as_f64().unwrap());
+            }
+        }
+        assert_eq!(totals["A"], 15.0); // 10 + 5
+        assert_eq!(totals["B"], 20.0);
+
+        // State must still be updated correctly
+        assert_eq!(state.get("count"), Some(&Value::Float64(3.0)));
+
+        // Rows 4 & 5: no flush
+        assert!(runtime.process(&mut state, &make_row("C", 30.0)).unwrap().is_empty());
+        assert!(runtime.process(&mut state, &make_row("C", 10.0)).unwrap().is_empty());
+
+        // Row 6: flush again (3 tokens: A, B, C)
+        let out6 = runtime.process(&mut state, &make_row("B", 5.0)).unwrap();
+        assert_eq!(out6.len(), 3, "second flush should emit 3 tokens");
+    }
+
+    /// Emitting an empty table must be silently dropped.
+    #[test]
+    fn emit_empty_table_is_skipped() {
+        let runtime = LuaRuntime::new(
+            r#"
+            emit({})
+            emit({ x = 1 })
+            emit({})
+            "#,
+        );
+        let mut state = HashMap::new();
+        let row = Row::from(RowMap::new());
+        let results = runtime.process(&mut state, &row).unwrap();
+        assert_eq!(results.len(), 1, "empty table emits must be skipped");
+        assert_eq!(results[0].get("x"), Some(&Value::Int64(1)));
     }
 
     /// Lua script runtime errors must return Err, not panic.

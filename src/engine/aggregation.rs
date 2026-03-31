@@ -41,7 +41,7 @@ enum NumAccum {
 
 mod u256_serde {
     use ethnum::U256;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &U256, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_bytes(&v.to_be_bytes())

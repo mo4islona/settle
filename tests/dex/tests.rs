@@ -159,7 +159,10 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     for user in &users {
         let user_val = Value::String(user.to_string());
         let rec = find_record_by_key(&rb, "position_summary", "user", &user_val);
-        assert!(rec.is_some(), "missing rollback position_summary for {user}");
+        assert!(
+            rec.is_some(),
+            "missing rollback position_summary for {user}"
+        );
         let rec = rec.unwrap();
         assert_eq!(
             rec.values.get("trade_count"),
@@ -226,10 +229,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     for user in &users {
         let user_val = Value::String(user.to_string());
         let rec = find_record_by_key(&final_batch, "position_summary", "user", &user_val);
-        assert!(
-            rec.is_some(),
-            "missing final position_summary for {user}"
-        );
+        assert!(rec.is_some(), "missing final position_summary for {user}");
         let rec = rec.unwrap();
         assert_eq!(
             rec.values.get("trade_count"),
@@ -300,10 +300,7 @@ fn rollback_to_finalized_boundary() {
     let batch = db.flush().unwrap();
     let pos = find_records(&batch, "position_summary");
     assert_eq!(pos.len(), 1);
-    assert_eq!(
-        pos[0].values.get("trade_count"),
-        Some(&Value::UInt64(30))
-    );
+    assert_eq!(pos[0].values.get("trade_count"), Some(&Value::UInt64(30)));
 }
 
 #[test]
@@ -334,18 +331,12 @@ fn multi_user_pnl_correctness() {
     .unwrap();
 
     let alice_pnl = alice_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
-    assert!(
-        (alice_pnl - 2500.0).abs() < 0.01,
-        "alice PnL: {alice_pnl}"
-    );
+    assert!((alice_pnl - 2500.0).abs() < 0.01, "alice PnL: {alice_pnl}");
     assert_eq!(
         alice_rec.values.get("current_position"),
         Some(&Value::Float64(5.0))
     );
-    assert_eq!(
-        alice_rec.values.get("trade_count"),
-        Some(&Value::UInt64(2))
-    );
+    assert_eq!(alice_rec.values.get("trade_count"), Some(&Value::UInt64(2)));
 
     let bob_rec = find_record_by_key(
         &batch,
@@ -356,10 +347,7 @@ fn multi_user_pnl_correctness() {
     .unwrap();
 
     let bob_pnl = bob_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
-    assert!(
-        (bob_pnl - (-600.0)).abs() < 0.01,
-        "bob PnL: {bob_pnl}"
-    );
+    assert!((bob_pnl - (-600.0)).abs() < 0.01, "bob PnL: {bob_pnl}");
     assert_eq!(
         bob_rec.values.get("current_position"),
         Some(&Value::Float64(2.0))

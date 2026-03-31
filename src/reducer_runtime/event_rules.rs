@@ -27,7 +27,11 @@ impl EventRulesRuntime {
 }
 
 impl ReducerRuntime for EventRulesRuntime {
-    fn process(&self, state: &mut HashMap<String, Value>, row: &Row) -> crate::error::Result<Vec<RowMap>> {
+    fn process(
+        &self,
+        state: &mut HashMap<String, Value>,
+        row: &Row,
+    ) -> crate::error::Result<Vec<RowMap>> {
         let mut output = HashMap::new();
         let mut matched = false;
 
@@ -353,7 +357,8 @@ mod tests {
         // Trade 1: BUY 10 ETH @ $2000
         let row1 = make_trade("buy", 10.0, 2000.0);
         let out1 = runtime
-            .process(&mut state, &row1).unwrap()
+            .process(&mut state, &row1)
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -366,7 +371,8 @@ mod tests {
         // Trade 2: BUY 5 ETH @ $2100
         let row2 = make_trade("buy", 5.0, 2100.0);
         let out2 = runtime
-            .process(&mut state, &row2).unwrap()
+            .process(&mut state, &row2)
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -380,7 +386,8 @@ mod tests {
         // Trade 3: SELL 8 ETH @ $2200
         let row3 = make_trade("sell", 8.0, 2200.0);
         let out3 = runtime
-            .process(&mut state, &row3).unwrap()
+            .process(&mut state, &row3)
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -425,7 +432,8 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(HashMap::from([("x".to_string(), Value::Float64(1.0))]));
         let out = runtime
-            .process(&mut state, &row).unwrap()
+            .process(&mut state, &row)
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -474,7 +482,8 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(HashMap::from([("x".to_string(), Value::Float64(1.0))]));
         let out = runtime
-            .process(&mut state, &row).unwrap()
+            .process(&mut state, &row)
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();

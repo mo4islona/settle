@@ -1,6 +1,7 @@
 import { decode, Encoder } from '@msgpack/msgpack'
 import type { ReducerCtx } from './ddl'
-import { DeltaDb as NativeDeltaDb } from './native/native.js'
+// Import from src/native/ directly — not copied to dist/ to avoid stale binaries
+import { DeltaDb as NativeDeltaDb } from '../src/native/native.js'
 
 const encoder = new Encoder({ useBigInt64: true })
 
@@ -81,21 +82,48 @@ export class DeltaDb {
   }
 
   async ingest(input: IngestInput): Promise<DeltaBatch | null> {
+    const t0 = performance.now()
+    const encoded = Buffer.from(encoder.encode(input.data))
+    const encodeMs = performance.now() - t0
+
     const buf = this.#native.ingest({
-      data: Buffer.from(encoder.encode(input.data)),
+      data: encoded,
       rollbackChain: input.rollbackChain,
       finalizedHead: input.finalizedHead,
     })
+
+    const t1 = performance.now()
     const batch = buf ? (decode(buf) as DeltaBatch) : null
+    const decodeMs = performance.now() - t1
+
+    if (batch) {
+      // Inject encode/decode timing into perf tree (encode first, decode last)
+      batch.perf.unshift(
+        { kind: 'pipeline', name: 'msgpack_encode', durationMs: encodeMs, children: [] },
+      )
+      batch.perf.push(
+        { kind: 'pipeline', name: 'msgpack_decode', durationMs: decodeMs, children: [] },
+      )
+    }
+
     if (batch && input.onDelta) {
-      await input.onDelta(batch)
-      this.#native.ack(batch.sequence)
+      try {
+        await input.onDelta(batch)
+      } finally {
+        this.#native.ack(batch.sequence)
+      }
     }
     return batch
   }
 
   resolveForkCursor(previousBlocks: DeltaDbCursor[]): DeltaDbCursor | null {
     return this.#native.resolveForkCursor(previousBlocks)
+  }
+
+  handleFork(previousBlocks: DeltaDbCursor[]): { cursor: DeltaDbCursor; batch: DeltaBatch | null } {
+    const result = this.#native.handleFork(previousBlocks)
+    const batch = result.batch ? (decode(result.batch) as DeltaBatch) : null
+    return { cursor: result.cursor, batch }
   }
 
   flush(): DeltaBatch | null {

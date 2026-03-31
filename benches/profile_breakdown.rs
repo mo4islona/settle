@@ -48,16 +48,26 @@ FROM market_stats GROUP BY asset_id;
 fn make_order(i: usize, num_traders: usize) -> RowMap {
     let top_traders = num_traders / 10;
     let remaining = num_traders - top_traders;
-    let trader_idx = if i % 5 < 4 { i % top_traders } else { top_traders + (i % remaining) };
+    let trader_idx = if i % 5 < 4 {
+        i % top_traders
+    } else {
+        top_traders + (i % remaining)
+    };
     let trader = format!("0xtrader{trader_idx:06x}");
     let asset_id = format!("token_{:04}", i % 10_000);
     let side: u64 = if i % 5 < 3 { 0 } else { 1 };
     let (usdc, shares) = if i % 10 < 7 {
         let price_bps = 9600 + (i % 400);
-        (1_000_000_000u64 * price_bps as u64 / 10_000, 1_000_000_000u64)
+        (
+            1_000_000_000u64 * price_bps as u64 / 10_000,
+            1_000_000_000u64,
+        )
     } else {
         let price_bps = 3000 + (i % 6000);
-        (1_000_000_000u64 * price_bps as u64 / 10_000, 1_000_000_000u64)
+        (
+            1_000_000_000u64 * price_bps as u64 / 10_000,
+            1_000_000_000u64,
+        )
     };
     let timestamp = 1_000_000 + (i as u64 / 500);
     HashMap::from([
@@ -76,14 +86,21 @@ fn main() {
     let traders = 100_000;
     let rows: Vec<RowMap> = (0..n).map(|i| make_order(i, traders)).collect();
 
-    println!("=== Pipeline Breakdown ({}K rows, batch={}) ===\n", n / 1000, batch);
+    println!(
+        "=== Pipeline Breakdown ({}K rows, batch={}) ===\n",
+        n / 1000,
+        batch
+    );
 
     // 1. Measure RowMap creation overhead (already done above, but for reference)
     let start = Instant::now();
     let _rows2: Vec<RowMap> = (0..n).map(|i| make_order(i, traders)).collect();
     let data_gen = start.elapsed();
-    println!("  Data generation:     {:>7.1}ms  ({:.1}us/row)",
-        data_gen.as_secs_f64() * 1000.0, data_gen.as_secs_f64() * 1_000_000.0 / n as f64);
+    println!(
+        "  Data generation:     {:>7.1}ms  ({:.1}us/row)",
+        data_gen.as_secs_f64() * 1000.0,
+        data_gen.as_secs_f64() * 1_000_000.0 / n as f64
+    );
 
     // 2. Isolated reducer: market_stats only (no raw table, no MV)
     {
@@ -91,13 +108,18 @@ fn main() {
         let storage = Arc::new(MemoryBackend::new());
         let reducer_def = schema.reducers[0].clone();
         let source_registry = ColumnRegistry::new(
-            schema.tables[0].columns.iter().map(|c| c.name.clone()).collect()
+            schema.tables[0]
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
         );
         let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]);
 
         // Convert RowMaps to Rows for reducer input
         let registry = Arc::new(source_registry);
-        let typed_rows: Vec<Row> = rows.iter()
+        let typed_rows: Vec<Row> = rows
+            .iter()
             .map(|m| Row::from_map(registry.clone(), m))
             .collect();
 
@@ -106,10 +128,12 @@ fn main() {
             engine.process_block(block as u64, chunk).unwrap();
         }
         let elapsed = start.elapsed();
-        println!("  Reducer only (market_stats): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
+        println!(
+            "  Reducer only (market_stats): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
             elapsed.as_secs_f64() * 1000.0,
             elapsed.as_secs_f64() * 1_000_000.0 / n as f64,
-            n as f64 / elapsed.as_secs_f64() / 1000.0);
+            n as f64 / elapsed.as_secs_f64() / 1000.0
+        );
     }
 
     // 3. Full pipeline: market_stats only (raw + reducer + MV)
@@ -119,14 +143,17 @@ fn main() {
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+            db.process_batch("orders", block as u64, chunk.to_vec())
+                .unwrap();
         }
         db.flush();
         let elapsed = start.elapsed();
-        println!("  Pipeline (market_stats+MV): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
+        println!(
+            "  Pipeline (market_stats+MV): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
             elapsed.as_secs_f64() * 1000.0,
             elapsed.as_secs_f64() * 1_000_000.0 / n as f64,
-            n as f64 / elapsed.as_secs_f64() / 1000.0);
+            n as f64 / elapsed.as_secs_f64() / 1000.0
+        );
     }
 
     // 4. Full pipeline: both reducers + both MVs
@@ -136,14 +163,17 @@ fn main() {
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+            db.process_batch("orders", block as u64, chunk.to_vec())
+                .unwrap();
         }
         db.flush();
         let elapsed = start.elapsed();
-        println!("  Pipeline (full):     {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
+        println!(
+            "  Pipeline (full):     {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
             elapsed.as_secs_f64() * 1000.0,
             elapsed.as_secs_f64() * 1_000_000.0 / n as f64,
-            n as f64 / elapsed.as_secs_f64() / 1000.0);
+            n as f64 / elapsed.as_secs_f64() / 1000.0
+        );
     }
 
     // 5. Measure process_batch overhead: Vec clone + Row conversion
@@ -157,9 +187,11 @@ fn main() {
             let _ = chunk.to_vec();
         }
         let elapsed = start.elapsed();
-        println!("\n  Vec<RowMap> clone:    {:>7.1}ms  ({:.1}us/row)",
+        println!(
+            "\n  Vec<RowMap> clone:    {:>7.1}ms  ({:.1}us/row)",
             elapsed.as_secs_f64() * 1000.0,
-            elapsed.as_secs_f64() * 1_000_000.0 / n as f64);
+            elapsed.as_secs_f64() * 1_000_000.0 / n as f64
+        );
 
         // Measure the full process_batch with a raw-only schema (no reducers, no MVs)
         let raw_schema = r#"
@@ -173,14 +205,17 @@ fn main() {
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+            db.process_batch("orders", block as u64, chunk.to_vec())
+                .unwrap();
         }
         db.flush();
         let elapsed = start.elapsed();
-        println!("  Raw table only (virtual): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
+        println!(
+            "  Raw table only (virtual): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
             elapsed.as_secs_f64() * 1000.0,
             elapsed.as_secs_f64() * 1_000_000.0 / n as f64,
-            n as f64 / elapsed.as_secs_f64() / 1000.0);
+            n as f64 / elapsed.as_secs_f64() / 1000.0
+        );
 
         // Non-virtual raw table
         let raw_schema2 = r#"
@@ -194,14 +229,17 @@ fn main() {
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+            db.process_batch("orders", block as u64, chunk.to_vec())
+                .unwrap();
         }
         db.flush();
         let elapsed = start.elapsed();
-        println!("  Raw table only (stored):  {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
+        println!(
+            "  Raw table only (stored):  {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
             elapsed.as_secs_f64() * 1000.0,
             elapsed.as_secs_f64() * 1_000_000.0 / n as f64,
-            n as f64 / elapsed.as_secs_f64() / 1000.0);
+            n as f64 / elapsed.as_secs_f64() / 1000.0
+        );
     }
 
     // 6. String formatting overhead (trader/asset_id generation dominates data creation)
@@ -212,9 +250,11 @@ fn main() {
             let _ = format!("token_{:04}", i % 10_000);
         }
         let elapsed = start.elapsed();
-        println!("\n  String formatting:   {:>7.1}ms  ({:.1}us/row)",
+        println!(
+            "\n  String formatting:   {:>7.1}ms  ({:.1}us/row)",
             elapsed.as_secs_f64() * 1000.0,
-            elapsed.as_secs_f64() * 1_000_000.0 / n as f64);
+            elapsed.as_secs_f64() * 1_000_000.0 / n as f64
+        );
     }
 
     println!("\n=== Done ===");
