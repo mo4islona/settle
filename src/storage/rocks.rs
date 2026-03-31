@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use rocksdb::{
-    ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Direction,
+    IteratorMode, Options, ReadOptions, WriteBatch,
 };
 
 use crate::error::{Error, Result};
@@ -105,6 +106,18 @@ fn upper_bound(prefix: &[u8]) -> Vec<u8> {
 // Backend
 // ---------------------------------------------------------------------------
 
+/// RocksDB tuning options exposed via Config.
+#[derive(Debug, Default)]
+pub struct RocksDbConfig {
+    /// Compression: "none", "snappy" (default), "zstd", "lz4".
+    pub compression: Option<String>,
+    /// Disable automatic background compactions.
+    pub disable_compaction: bool,
+    /// Block cache size in bytes. None = RocksDB default (~8MB per CF).
+    /// 0 = disable block cache entirely.
+    pub cache_size: Option<usize>,
+}
+
 /// RocksDB-backed persistent storage for Delta DB.
 pub struct RocksDbBackend {
     db: DB,
@@ -112,17 +125,56 @@ pub struct RocksDbBackend {
 
 impl RocksDbBackend {
     /// Open (or create) a RocksDB database at the given path.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
+    pub fn open(path: impl AsRef<Path>, config: &RocksDbConfig) -> Result<Self> {
+        let comp_type = match config.compression.as_deref() {
+            Some("none") => DBCompressionType::None,
+            Some("zstd") => DBCompressionType::Zstd,
+            Some("lz4") => DBCompressionType::Lz4,
+            Some("snappy") => DBCompressionType::Snappy,
+            _ => DBCompressionType::Snappy,
+        };
+
+        // Shared block cache across all column families
+        let shared_cache = config.cache_size.map(|size| {
+            if size > 0 {
+                Some(Cache::new_lru_cache(size))
+            } else {
+                None
+            }
+        });
+
+        let make_opts = || {
+            let mut opts = Options::default();
+            opts.set_compression_type(comp_type);
+            if config.disable_compaction {
+                opts.set_disable_auto_compactions(true);
+            }
+            match &shared_cache {
+                Some(Some(cache)) => {
+                    let mut block_opts = BlockBasedOptions::default();
+                    block_opts.set_block_cache(cache);
+                    opts.set_block_based_table_factory(&block_opts);
+                }
+                Some(None) => {
+                    let mut block_opts = BlockBasedOptions::default();
+                    block_opts.disable_cache();
+                    opts.set_block_based_table_factory(&block_opts);
+                }
+                None => {}
+            }
+            opts
+        };
+
+        let mut db_opts = make_opts();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
 
         let cfs = [CF_RAW, CF_REDUCER_SNAP, CF_REDUCER_FIN, CF_MV, CF_META]
             .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
+            .map(|name| ColumnFamilyDescriptor::new(name, make_opts()))
             .collect::<Vec<_>>();
 
-        let db = DB::open_cf_descriptors(&opts, path, cfs).map_err(to_err)?;
+        let db = DB::open_cf_descriptors(&db_opts, path, cfs).map_err(to_err)?;
         Ok(Self { db })
     }
 
@@ -575,7 +627,7 @@ mod tests {
 
     fn test_backend() -> (RocksDbBackend, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let backend = RocksDbBackend::open(dir.path()).unwrap();
+        let backend = RocksDbBackend::open(dir.path(), &RocksDbConfig::default()).unwrap();
         (backend, dir)
     }
 
@@ -842,14 +894,14 @@ mod tests {
 
         // Write data
         {
-            let b = RocksDbBackend::open(path).unwrap();
+            let b = RocksDbBackend::open(path, &RocksDbConfig::default()).unwrap();
             b.put_raw_rows("t", 100, b"test_row_data").unwrap();
             b.put_meta("cursor", b"100").unwrap();
         }
 
         // Reopen and verify
         {
-            let b = RocksDbBackend::open(path).unwrap();
+            let b = RocksDbBackend::open(path, &RocksDbConfig::default()).unwrap();
             let rows = b.get_raw_rows("t", 100, 100).unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].1, b"test_row_data");

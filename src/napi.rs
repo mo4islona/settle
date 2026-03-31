@@ -21,6 +21,12 @@ pub struct DeltaDbConfig {
     pub data_dir: Option<String>,
     /// Maximum buffer size before backpressure (default: 10000).
     pub max_buffer_size: Option<u32>,
+    /// Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4".
+    pub compression: Option<String>,
+    /// Disable RocksDB automatic background compactions.
+    pub disable_compaction: Option<bool>,
+    /// Block cache size in bytes. Omit for RocksDB default (~8MB per CF), 0 to disable.
+    pub cache_size: Option<u32>,
 }
 
 /// Block cursor: number + hash.
@@ -102,6 +108,9 @@ impl DeltaDb {
         if let Some(max) = config.max_buffer_size {
             cfg = cfg.max_buffer_size(max as usize);
         }
+        cfg.compression = config.compression;
+        cfg.disable_compaction = config.disable_compaction.unwrap_or(false);
+        cfg.cache_size = config.cache_size.map(|s| s as usize);
 
         let inner = DeltaDbInner::open(cfg)
             .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;

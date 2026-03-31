@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
 #[cfg(feature = "rocksdb")]
-use crate::storage::rocks::RocksDbBackend;
+use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
 use crate::storage::{StorageBackend, StorageWriteBatch};
 use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, PerfNode, PerfNodeKind, RowMap, Value};
 
@@ -22,6 +22,12 @@ pub struct Config {
     pub data_dir: Option<String>,
     /// Explicit storage backend override. Takes precedence over data_dir.
     pub storage: Option<Arc<dyn StorageBackend>>,
+    /// Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4".
+    pub compression: Option<String>,
+    /// Disable RocksDB automatic background compactions.
+    pub disable_compaction: bool,
+    /// Block cache size in bytes. None = RocksDB default, 0 = disable.
+    pub cache_size: Option<usize>,
 }
 
 impl Config {
@@ -33,6 +39,9 @@ impl Config {
             max_buffer_size: 10_000,
             data_dir: None,
             storage: None,
+            compression: None,
+            disable_compaction: false,
+            cache_size: None,
         }
     }
 
@@ -43,6 +52,9 @@ impl Config {
             max_buffer_size: 10_000,
             data_dir: Some(data_dir.into()),
             storage: None,
+            compression: None,
+            disable_compaction: false,
+            cache_size: None,
         }
     }
 
@@ -101,7 +113,12 @@ impl DeltaDb {
         } else if let Some(ref _dir) = config.data_dir {
             #[cfg(feature = "rocksdb")]
             {
-                Arc::new(RocksDbBackend::open(_dir)?)
+                let rocks_config = RocksDbConfig {
+                    compression: config.compression.clone(),
+                    disable_compaction: config.disable_compaction,
+                    cache_size: config.cache_size,
+                };
+                Arc::new(RocksDbBackend::open(_dir, &rocks_config)?)
             }
             #[cfg(not(feature = "rocksdb"))]
             {

@@ -14,6 +14,12 @@ export interface DeltaDbConfig {
   dataDir?: string
   /** Maximum buffer size before backpressure (default: 10000). */
   maxBufferSize?: number
+  /** Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4". */
+  compression?: string
+  /** Disable RocksDB automatic background compactions. */
+  disableCompaction?: boolean
+  /** Block cache size in bytes. Omit for RocksDB default (~8MB per CF), 0 to disable. */
+  cacheSize?: number
 }
 /** Block cursor: number + hash. */
 export interface DeltaDbCursor {
