@@ -130,8 +130,12 @@ impl RocksDbBackend {
             Some("none") => DBCompressionType::None,
             Some("zstd") => DBCompressionType::Zstd,
             Some("lz4") => DBCompressionType::Lz4,
-            Some("snappy") => DBCompressionType::Snappy,
-            _ => DBCompressionType::Snappy,
+            Some("snappy") | None => DBCompressionType::Snappy,
+            Some(other) => {
+                return Err(Error::Storage(format!(
+                    "invalid RocksDB compression '{other}' (allowed: none, snappy, zstd, lz4)"
+                )));
+            }
         };
 
         // Shared block cache across all column families
@@ -907,5 +911,66 @@ mod tests {
             assert_eq!(rows[0].1, b"test_row_data");
             assert_eq!(b.get_meta("cursor").unwrap().unwrap(), b"100");
         }
+    }
+
+    // --- Config options ---
+
+    #[test]
+    fn open_with_compression_options() {
+        for compression in &["none", "snappy", "zstd", "lz4"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = RocksDbConfig {
+                compression: Some(compression.to_string()),
+                ..Default::default()
+            };
+            let b = RocksDbBackend::open(dir.path(), &config).unwrap();
+            b.put_raw_rows("t", 1, b"data").unwrap();
+            assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn open_with_invalid_compression_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RocksDbConfig {
+            compression: Some("brotli".to_string()),
+            ..Default::default()
+        };
+        assert!(RocksDbBackend::open(dir.path(), &config).is_err());
+    }
+
+    #[test]
+    fn open_with_cache_options() {
+        // Explicit cache size
+        let dir = tempfile::tempdir().unwrap();
+        let config = RocksDbConfig {
+            cache_size: Some(4 * 1024 * 1024),
+            ..Default::default()
+        };
+        let b = RocksDbBackend::open(dir.path(), &config).unwrap();
+        b.put_raw_rows("t", 1, b"data").unwrap();
+        assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
+
+        // Cache disabled
+        let dir2 = tempfile::tempdir().unwrap();
+        let config2 = RocksDbConfig {
+            cache_size: Some(0),
+            ..Default::default()
+        };
+        let b2 = RocksDbBackend::open(dir2.path(), &config2).unwrap();
+        b2.put_raw_rows("t", 1, b"data").unwrap();
+        assert_eq!(b2.get_raw_rows("t", 1, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_with_compaction_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RocksDbConfig {
+            disable_compaction: true,
+            ..Default::default()
+        };
+        let b = RocksDbBackend::open(dir.path(), &config).unwrap();
+        b.put_raw_rows("t", 1, b"data").unwrap();
+        assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
     }
 }
