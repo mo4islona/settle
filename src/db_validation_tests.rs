@@ -9,7 +9,7 @@ fn ingest_rejects_negative_block_number() {
     let schema = r#"
         CREATE TABLE t (block_number UInt64, x Float64);
     "#;
-    let mut db = DeltaDb::open(Config::new(schema)).unwrap();
+    let mut db = Settle::open(Config::new(schema)).unwrap();
     let result = db.ingest(IngestInput {
         data: HashMap::from([(
             "t".to_string(),
@@ -38,7 +38,7 @@ fn ingest_rejects_float_block_number() {
     let schema = r#"
         CREATE TABLE t (block_number UInt64, x Float64);
     "#;
-    let mut db = DeltaDb::open(Config::new(schema)).unwrap();
+    let mut db = Settle::open(Config::new(schema)).unwrap();
     let result = db.ingest(IngestInput {
         data: HashMap::from([(
             "t".to_string(),
@@ -66,7 +66,7 @@ fn ingest_rejects_float_block_number() {
 /// double-count previously processed blocks.
 #[test]
 fn partial_ingest_failure_rolls_back() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     // Successful ingest — block 1000
     db.ingest(IngestInput {
@@ -147,16 +147,16 @@ fn partial_ingest_failure_rolls_back() {
     );
 }
 
-/// Failed ingest must not leak partial deltas into the buffer.
-/// On retry, only the retry's deltas should appear in the output.
+/// Failed ingest must not leak partial changes into the buffer.
+/// On retry, only the retry's changes should appear in the output.
 #[test]
-fn failed_ingest_does_not_leak_deltas_to_buffer() {
+fn failed_ingest_does_not_leak_changes_to_buffer() {
     let schema = r#"
         CREATE TABLE t (block_number UInt64, x Float64);
         CREATE MATERIALIZED VIEW mv AS
           SELECT SUM(x) AS total FROM t GROUP BY x;
     "#;
-    let mut db = DeltaDb::open(Config::new(schema)).unwrap();
+    let mut db = Settle::open(Config::new(schema)).unwrap();
 
     // First ingest succeeds — consumed by flush inside ingest()
     let batch1 = db
@@ -218,14 +218,14 @@ fn failed_ingest_does_not_leak_deltas_to_buffer() {
         })
         .unwrap();
 
-    // batch3 should contain ONLY deltas from ingest 3, not leaked from ingest 2
+    // batch3 should contain ONLY changes from ingest 3, not leaked from ingest 2
     let batch3 = batch3.expect("third ingest should produce batch");
     let raw_records = batch3.records_for("t");
     // Should have 1 raw insert (block 1001), not 2
     assert_eq!(
         raw_records.len(),
         1,
-        "failed ingest should not leak deltas: got {} raw records",
+        "failed ingest should not leak changes: got {} raw records",
         raw_records.len()
     );
 }

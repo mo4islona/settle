@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::types::{RowMap, Value};
+use settle::db::{Config, Settle};
+use settle::types::{RowMap, Value};
 
 const SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
 
@@ -48,7 +48,7 @@ fn main() {
     let num_traders = 100_000;
 
     let cfg = Config::new(SCHEMA);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = Settle::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| make_polymarket_order(i, num_traders))

@@ -43,8 +43,8 @@ fn pnl_fn_runtime() -> crate::reducer_runtime::fn_reducer::FnReducerRuntime {
     })
 }
 
-fn open_with_fn_reducer() -> DeltaDb {
-    let mut db = DeltaDb::open(Config::new(EXTERNAL_PNL_SCHEMA)).unwrap();
+fn open_with_fn_reducer() -> Settle {
+    let mut db = Settle::open(Config::new(EXTERNAL_PNL_SCHEMA)).unwrap();
     db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
         .unwrap();
     db
@@ -121,7 +121,7 @@ fn external_reducer_rollback() {
 #[test]
 fn external_reducer_matches_event_rules() {
     // Run same workload through EventRules and FnReducer, compare MV output
-    let mut er_db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+    let mut er_db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
     let mut fn_db = open_with_fn_reducer();
 
     let trades = vec![
@@ -241,7 +241,7 @@ fn external_reducer_crash_recovery() {
     {
         let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
         config.storage = Some(storage.clone());
-        let mut db = DeltaDb::open(config).unwrap();
+        let mut db = Settle::open(config).unwrap();
         db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
             .unwrap();
 
@@ -293,7 +293,7 @@ fn external_reducer_crash_recovery() {
     {
         let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
         config.storage = Some(storage.clone());
-        let mut db = DeltaDb::open(config).unwrap();
+        let mut db = Settle::open(config).unwrap();
 
         // Install callback — triggers replay of unfinalized blocks
         db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
@@ -327,7 +327,7 @@ fn external_reducer_crash_recovery() {
             })
             .unwrap();
 
-        let batch = batch.expect("should produce a delta batch");
+        let batch = batch.expect("should produce a change batch");
 
         // MV should have data for alice (from blocks 1000, 1001, 1002)
         let mv_records: Vec<_> = batch.records_for("position_summary").to_vec();
@@ -367,7 +367,7 @@ fn replay_reducer_catches_up_existing_external() {
     {
         let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
         config.storage = Some(storage.clone());
-        let mut db = DeltaDb::open(config).unwrap();
+        let mut db = Settle::open(config).unwrap();
         db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
             .unwrap();
 
@@ -422,7 +422,7 @@ fn replay_reducer_catches_up_existing_external() {
     {
         let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
         config.storage = Some(storage.clone());
-        let mut db = DeltaDb::open(config).unwrap();
+        let mut db = Settle::open(config).unwrap();
 
         // This is what napi.rs does for existing reducers:
         // 1. Store callback (simulated by set_reducer_runtime)
@@ -549,7 +549,7 @@ fn external_runtime_replay_uses_real_external_runtime() {
     {
         let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
         config.storage = Some(storage.clone());
-        let mut db = DeltaDb::open(config).unwrap();
+        let mut db = Settle::open(config).unwrap();
         // DO NOT call set_reducer_runtime — ExternalRuntime stays as the runtime
 
         let _ctx = install_test_context(pnl_batch_cb());
@@ -601,7 +601,7 @@ fn external_runtime_replay_uses_real_external_runtime() {
     {
         let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
         config.storage = Some(storage.clone());
-        let mut db = DeltaDb::open(config).unwrap();
+        let mut db = Settle::open(config).unwrap();
 
         // Install test context (simulates JS callback registration in NAPI)
         let _ctx = install_test_context(pnl_batch_cb());
@@ -636,7 +636,7 @@ fn external_runtime_replay_uses_real_external_runtime() {
                 },
             })
             .unwrap()
-            .expect("should produce a delta batch");
+            .expect("should produce a change batch");
 
         let mv_records: Vec<_> = batch.records_for("position_summary").to_vec();
         let alice = mv_records

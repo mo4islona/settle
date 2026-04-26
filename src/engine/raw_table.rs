@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::error::Result;
 use crate::schema::ast::TableDef;
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
-use crate::types::{BlockNumber, ColumnRegistry, DeltaOperation, DeltaRecord, Row, RowMap, Value};
+use crate::types::{BlockNumber, ColumnRegistry, ChangeOp, ChangeRecord, Row, RowMap, Value};
 
 /// Manages ingestion, storage, and rollback for a single raw table.
 pub struct RawTableEngine {
@@ -38,8 +38,8 @@ impl RawTableEngine {
 
     /// Ingest a batch of rows for a given block number.
     /// Encodes directly from RowMaps using the column registry (no intermediate Row objects).
-    /// Returns delta records (one Insert per row).
-    pub fn ingest(&self, block: BlockNumber, row_maps: &[RowMap]) -> Result<Vec<DeltaRecord>> {
+    /// Returns change records (one Insert per row).
+    pub fn ingest(&self, block: BlockNumber, row_maps: &[RowMap]) -> Result<Vec<ChangeRecord>> {
         if row_maps.is_empty() {
             return Ok(Vec::new());
         }
@@ -48,7 +48,7 @@ impl RawTableEngine {
         let encoded = storage::encode_rows_from_maps(row_maps, &self.registry);
         self.storage.put_raw_rows(&self.def.name, block, &encoded)?;
 
-        let deltas = row_maps
+        let changes = row_maps
             .iter()
             .enumerate()
             .map(|(idx, values)| {
@@ -56,9 +56,9 @@ impl RawTableEngine {
                 key.insert("block_number".to_string(), Value::UInt64(block));
                 key.insert("_row_index".to_string(), Value::UInt64(idx as u64));
 
-                DeltaRecord {
+                ChangeRecord {
                     table: self.def.name.clone(),
-                    operation: DeltaOperation::Insert,
+                    operation: ChangeOp::Insert,
                     key,
                     values: values.clone(),
                     prev_values: None,
@@ -66,12 +66,12 @@ impl RawTableEngine {
             })
             .collect();
 
-        Ok(deltas)
+        Ok(changes)
     }
 
-    /// Ingest rows without creating delta records (for virtual tables).
-    /// Stores the rows for replay but skips the expensive delta record allocation.
-    pub fn ingest_no_deltas(&self, block: BlockNumber, row_maps: &[RowMap]) -> Result<()> {
+    /// Ingest rows without creating change records (for virtual tables).
+    /// Stores the rows for replay but skips the expensive change record allocation.
+    pub fn ingest_no_changes(&self, block: BlockNumber, row_maps: &[RowMap]) -> Result<()> {
         if row_maps.is_empty() {
             return Ok(());
         }
@@ -81,14 +81,14 @@ impl RawTableEngine {
     }
 
     /// Ingest rows, deferring the storage write to a WriteBatch.
-    /// Returns delta records (one Insert per row) or none for virtual tables.
+    /// Returns change records (one Insert per row) or none for virtual tables.
     pub fn ingest_to_batch(
         &self,
         block: BlockNumber,
         row_maps: &[RowMap],
         batch: &mut StorageWriteBatch,
         virtual_table: bool,
-    ) -> Result<Vec<DeltaRecord>> {
+    ) -> Result<Vec<ChangeRecord>> {
         if row_maps.is_empty() {
             return Ok(Vec::new());
         }
@@ -100,7 +100,7 @@ impl RawTableEngine {
             return Ok(Vec::new());
         }
 
-        let deltas = row_maps
+        let changes = row_maps
             .iter()
             .enumerate()
             .map(|(idx, values)| {
@@ -108,9 +108,9 @@ impl RawTableEngine {
                 key.insert("block_number".to_string(), Value::UInt64(block));
                 key.insert("_row_index".to_string(), Value::UInt64(idx as u64));
 
-                DeltaRecord {
+                ChangeRecord {
                     table: self.def.name.clone(),
-                    operation: DeltaOperation::Insert,
+                    operation: ChangeOp::Insert,
                     key,
                     values: values.clone(),
                     prev_values: None,
@@ -118,27 +118,27 @@ impl RawTableEngine {
             })
             .collect();
 
-        Ok(deltas)
+        Ok(changes)
     }
 
     /// Roll back all rows where block_number > fork_point.
-    /// Returns compensating Delete delta records for the rolled-back rows.
+    /// Returns compensating Delete change records for the rolled-back rows.
     /// Uses `rollback_to_batch` internally and commits atomically.
-    pub fn rollback(&self, fork_point: BlockNumber) -> Result<Vec<DeltaRecord>> {
+    pub fn rollback(&self, fork_point: BlockNumber) -> Result<Vec<ChangeRecord>> {
         let mut batch = StorageWriteBatch::new();
-        let deltas = self.rollback_to_batch(fork_point, &mut batch)?;
+        let changes = self.rollback_to_batch(fork_point, &mut batch)?;
         self.storage.commit(&batch)?;
-        Ok(deltas)
+        Ok(changes)
     }
 
     /// Roll back all rows where block_number > fork_point, deferring the
     /// storage deletion to the provided write batch for atomic commit.
-    /// Returns compensating Delete delta records for the rolled-back rows.
+    /// Returns compensating Delete change records for the rolled-back rows.
     pub fn rollback_to_batch(
         &self,
         fork_point: BlockNumber,
         batch: &mut StorageWriteBatch,
-    ) -> Result<Vec<DeltaRecord>> {
+    ) -> Result<Vec<ChangeRecord>> {
         if fork_point == BlockNumber::MAX {
             return Ok(Vec::new());
         }
@@ -151,7 +151,7 @@ impl RawTableEngine {
         // Defer the deletion to the write batch
         batch.delete_raw_rows_after(&self.def.name, fork_point);
 
-        let mut deltas = Vec::new();
+        let mut changes = Vec::new();
         for (block, data) in rolled_back {
             let rows = storage::decode_rows(&data, &self.registry)?;
             for (idx, row) in rows.into_iter().enumerate() {
@@ -159,9 +159,9 @@ impl RawTableEngine {
                 key.insert("block_number".to_string(), Value::UInt64(block));
                 key.insert("_row_index".to_string(), Value::UInt64(idx as u64));
 
-                deltas.push(DeltaRecord {
+                changes.push(ChangeRecord {
                     table: self.def.name.clone(),
-                    operation: DeltaOperation::Delete,
+                    operation: ChangeOp::Delete,
                     key,
                     values: row.to_map(),
                     prev_values: None,
@@ -169,7 +169,7 @@ impl RawTableEngine {
             }
         }
 
-        Ok(deltas)
+        Ok(changes)
     }
 
     /// Get all rows for a block range (inclusive). Used for reducer replay.
@@ -226,29 +226,29 @@ mod tests {
     }
 
     #[test]
-    fn ingest_produces_insert_deltas() {
+    fn ingest_produces_insert_changes() {
         let storage = Arc::new(MemoryBackend::new());
         let engine = RawTableEngine::new(test_table_def(), storage);
 
         let rows = vec![make_row_map("alice", 10.0), make_row_map("bob", 20.0)];
-        let deltas = engine.ingest(1000, &rows).unwrap();
+        let changes = engine.ingest(1000, &rows).unwrap();
 
-        assert_eq!(deltas.len(), 2);
-        assert_eq!(deltas[0].operation, DeltaOperation::Insert);
-        assert_eq!(deltas[0].table, "trades");
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].operation, ChangeOp::Insert);
+        assert_eq!(changes[0].table, "trades");
         assert_eq!(
-            deltas[0].key.get("block_number"),
+            changes[0].key.get("block_number"),
             Some(&Value::UInt64(1000))
         );
-        assert_eq!(deltas[0].key.get("_row_index"), Some(&Value::UInt64(0)));
+        assert_eq!(changes[0].key.get("_row_index"), Some(&Value::UInt64(0)));
         assert_eq!(
-            deltas[0].values.get("user"),
+            changes[0].values.get("user"),
             Some(&Value::String("alice".into()))
         );
 
-        assert_eq!(deltas[1].key.get("_row_index"), Some(&Value::UInt64(1)));
+        assert_eq!(changes[1].key.get("_row_index"), Some(&Value::UInt64(1)));
         assert_eq!(
-            deltas[1].values.get("user"),
+            changes[1].values.get("user"),
             Some(&Value::String("bob".into()))
         );
     }
@@ -258,8 +258,8 @@ mod tests {
         let storage = Arc::new(MemoryBackend::new());
         let engine = RawTableEngine::new(test_table_def(), storage);
 
-        let deltas = engine.ingest(1000, &[]).unwrap();
-        assert!(deltas.is_empty());
+        let changes = engine.ingest(1000, &[]).unwrap();
+        assert!(changes.is_empty());
     }
 
     #[test]
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_deletes_rows_and_emits_deltas() {
+    fn rollback_deletes_rows_and_emits_changes() {
         let storage = Arc::new(MemoryBackend::new());
         let engine = RawTableEngine::new(test_table_def(), storage);
 
@@ -291,18 +291,18 @@ mod tests {
             .unwrap();
 
         // Rollback to block 1000 (delete 1001 and 1002)
-        let deltas = engine.rollback(1000).unwrap();
+        let changes = engine.rollback(1000).unwrap();
 
-        // Should get 3 Delete deltas (1 from block 1001 + 2 from block 1002)
-        assert_eq!(deltas.len(), 3);
-        for d in &deltas {
-            assert_eq!(d.operation, DeltaOperation::Delete);
+        // Should get 3 Delete changes (1 from block 1001 + 2 from block 1002)
+        assert_eq!(changes.len(), 3);
+        for d in &changes {
+            assert_eq!(d.operation, ChangeOp::Delete);
             assert_eq!(d.table, "trades");
         }
 
-        // Verify bob's row is in the deltas
+        // Verify bob's row is in the changes
         assert!(
-            deltas
+            changes
                 .iter()
                 .any(|d| d.values.get("user") == Some(&Value::String("bob".into())))
         );
@@ -320,8 +320,8 @@ mod tests {
 
         engine.ingest(1000, &[make_row_map("alice", 10.0)]).unwrap();
 
-        let deltas = engine.rollback(1000).unwrap();
-        assert!(deltas.is_empty());
+        let changes = engine.rollback(1000).unwrap();
+        assert!(changes.is_empty());
 
         let remaining = engine.get_rows(1000, 1000).unwrap();
         assert_eq!(remaining.len(), 1);
@@ -338,18 +338,18 @@ mod tests {
         engine.ingest(1002, &[make_row_map("carol", 30.0)]).unwrap();
 
         // Rollback block 1002
-        let rollback_deltas = engine.rollback(1001).unwrap();
-        assert_eq!(rollback_deltas.len(), 1);
+        let rollback_changes = engine.rollback(1001).unwrap();
+        assert_eq!(rollback_changes.len(), 1);
         assert_eq!(
-            rollback_deltas[0].values.get("user"),
+            rollback_changes[0].values.get("user"),
             Some(&Value::String("carol".into()))
         );
 
         // Re-ingest block 1002 with different data (reorg)
-        let new_deltas = engine.ingest(1002, &[make_row_map("eve", 50.0)]).unwrap();
-        assert_eq!(new_deltas.len(), 1);
+        let new_changes = engine.ingest(1002, &[make_row_map("eve", 50.0)]).unwrap();
+        assert_eq!(new_changes.len(), 1);
         assert_eq!(
-            new_deltas[0].values.get("user"),
+            new_changes[0].values.get("user"),
             Some(&Value::String("eve".into()))
         );
 

@@ -1,0 +1,9 @@
+{
+  "name": "@settle/stream-darwin-x64",
+  "version": "0.0.1-alpha.20",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "main": "settle.darwin-x64.node",
+  "files": ["settle.darwin-x64.node"],
+  "license": "MIT"
+}

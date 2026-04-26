@@ -1,4 +1,4 @@
-//! Uniswap V2/V3 Swap Analytics — Complex Delta DB Example
+//! Uniswap V2/V3 Swap Analytics — Complex Settle Example
 //!
 //! Demonstrates a full pipeline for on-chain DEX analytics with cross-price
 //! calculation via stablecoins (USDT/USDC) and ETH intermediary:
@@ -13,8 +13,8 @@
 
 use std::collections::HashMap;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::types::{DeltaBatch, DeltaRecord, RowMap, Value};
+use settle::db::{Config, Settle};
+use settle::types::{ChangeBatch, ChangeRecord, RowMap, Value};
 
 // --- Token Addresses ---
 
@@ -78,22 +78,22 @@ fn link_weth(t: i64, tx: &str, sender: &str, link: f64, weth: f64) -> RowMap {
     make_swap(t, tx, POOL_LINK_WETH, LINK, WETH, sender, link, weth)
 }
 
-fn find_records<'a>(batch: &'a DeltaBatch, table: &str) -> Vec<&'a DeltaRecord> {
+fn find_records<'a>(batch: &'a ChangeBatch, table: &str) -> Vec<&'a ChangeRecord> {
     batch.records_for(table).iter().collect()
 }
 
 fn find_by_key<'a>(
-    batch: &'a DeltaBatch,
+    batch: &'a ChangeBatch,
     table: &str,
     key_checks: &[(&str, &Value)],
-) -> Option<&'a DeltaRecord> {
+) -> Option<&'a ChangeRecord> {
     batch
         .records_for(table)
         .iter()
         .find(|r| key_checks.iter().all(|(k, v)| r.key.get(*k) == Some(*v)))
 }
 
-fn get_val<'a>(record: &'a DeltaRecord, col: &str) -> &'a Value {
+fn get_val<'a>(record: &'a ChangeRecord, col: &str) -> &'a Value {
     record
         .values
         .get(col)
@@ -117,13 +117,13 @@ fn assert_approx(actual: f64, expected: f64, label: &str) {
 
 #[test]
 fn schema_parses_successfully() {
-    DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
 }
 
 /// Direct stablecoin pricing: WETH/USDC swap produces correct USD price.
 #[test]
 fn direct_stablecoin_pricing() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // Buy 1.5 WETH at $2000 (pay 3000 USDC)
@@ -154,7 +154,7 @@ fn direct_stablecoin_pricing() {
 /// Cross-price via ETH: UNI/WETH swap priced through ETH/USD reference.
 #[test]
 fn cross_price_via_eth() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // Block 1: Establish ETH/USD = $2000 via WETH/USDC swap
@@ -208,7 +208,7 @@ fn cross_price_via_eth() {
 /// where LINK is token1 (tests the t0==WETH branch).
 #[test]
 fn cross_price_both_directions() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // Establish ETH/USD = $2000
@@ -265,7 +265,7 @@ fn cross_price_both_directions() {
 /// ETH price updates propagate to subsequent cross-priced swaps.
 #[test]
 fn eth_price_update_propagation() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // Block 1: ETH = $2000
@@ -322,7 +322,7 @@ fn eth_price_update_propagation() {
 /// OHLC candles across multiple 5-minute windows with cross-priced tokens.
 #[test]
 fn ohlc_multiple_windows_cross_priced() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
     let five_min = 300_000i64;
 
@@ -397,7 +397,7 @@ fn ohlc_multiple_windows_cross_priced() {
 /// PnL tracking with cross-priced tokens: buy UNI via WETH, sell at different ETH price.
 #[test]
 fn wallet_pnl_cross_priced() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // Block 1: ETH = $2000
@@ -458,7 +458,7 @@ fn wallet_pnl_cross_priced() {
 /// Direct stablecoin PnL: buy and sell WETH against USDC.
 #[test]
 fn wallet_pnl_direct_stablecoin() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // Alice buys 10 WETH at $2000
@@ -514,7 +514,7 @@ fn wallet_pnl_direct_stablecoin() {
 /// Multiple wallets trading both direct and cross-priced pools.
 #[test]
 fn multi_wallet_multi_pool() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // ETH = $2000
@@ -593,7 +593,7 @@ fn multi_wallet_multi_pool() {
 /// WETH/USDT pricing works identically to WETH/USDC.
 #[test]
 fn usdt_pricing() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // WETH/USDT swap: sell 1 WETH for 2100 USDT
@@ -632,7 +632,7 @@ fn usdt_pricing() {
 /// Rollback restores cross-price state correctly.
 #[test]
 fn rollback_restores_cross_prices() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // Block 1: ETH = $2000
@@ -710,7 +710,7 @@ fn rollback_restores_cross_prices() {
 /// PnL rollback: rolling back a sell restores cost basis correctly.
 #[test]
 fn pnl_rollback() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // Block 1: ETH = $2000
@@ -783,7 +783,7 @@ fn pnl_rollback() {
 /// Full scenario: mixed pools, cross-pricing, finalization, rollback, re-ingest.
 #[test]
 fn full_scenario_with_cross_pricing() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
     let block_time = 12_000i64;
 
@@ -914,7 +914,7 @@ fn full_scenario_with_cross_pricing() {
     let rollback_batch = db.flush().unwrap();
     assert!(
         rollback_batch.record_count() > 0,
-        "rollback should produce deltas"
+        "rollback should produce changes"
     );
 
     // Phase 4: Re-ingest blocks 16-25 with different ETH price
@@ -977,7 +977,7 @@ fn full_scenario_with_cross_pricing() {
 /// Verify that swap_prices emits include block_time (timestamp of the swap).
 #[test]
 fn swap_prices_includes_timestamp() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     db.process_batch(
@@ -1006,7 +1006,7 @@ fn swap_prices_includes_timestamp() {
 /// No ETH reference price yet -> cross-priced swap should not emit (price_usd = 0).
 #[test]
 fn cross_price_without_eth_reference() {
-    let mut db = DeltaDb::open(Config::new(UNISWAP_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
     // UNI/WETH trade WITHOUT any prior WETH/USDC or WETH/USDT swap

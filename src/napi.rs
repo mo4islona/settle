@@ -5,15 +5,15 @@ use napi::bindgen_prelude::*;
 use napi::sys;
 use napi_derive::napi;
 
-use crate::db::{Config, DeltaDb as DeltaDbInner, IngestInput as IngestInputInner};
+use crate::db::{Config, Settle as Inner, IngestInput as IngestInputInner};
 use crate::msgpack_conv::{decode_data_from_msgpack, encode_batch_to_msgpack};
 use crate::reducer_runtime::external::install_context;
 use crate::schema::ast::{ReducerBody, ReducerDef, StateField};
 use crate::types::{BlockCursor, ColumnType};
 
-/// Configuration for opening a DeltaDb instance.
+/// Configuration for opening a Settle instance.
 #[napi(object)]
-pub struct DeltaDbConfig {
+pub struct SettleConfig {
     /// SQL schema definition string.
     pub schema: String,
     /// Path to RocksDB data directory for persistence.
@@ -35,14 +35,14 @@ pub struct DeltaDbConfig {
 
 /// Block cursor: number + hash.
 #[napi(object)]
-pub struct DeltaDbCursor {
+pub struct SettleCursor {
     pub number: u32,
     pub hash: String,
 }
 
-impl From<BlockCursor> for DeltaDbCursor {
+impl From<BlockCursor> for SettleCursor {
     fn from(c: BlockCursor) -> Self {
-        DeltaDbCursor {
+        SettleCursor {
             number: c.number as u32,
             hash: c.hash,
         }
@@ -53,8 +53,8 @@ impl From<BlockCursor> for DeltaDbCursor {
 #[napi(object)]
 pub struct ForkResultJs {
     /// The block to resume ingestion from (highest common ancestor).
-    pub cursor: DeltaDbCursor,
-    /// Compensating delta batch (msgpack-encoded), or null if nothing was rolled back.
+    pub cursor: SettleCursor,
+    /// Compensating change batch (msgpack-encoded), or null if nothing was rolled back.
     pub batch: Option<Buffer>,
 }
 
@@ -64,9 +64,9 @@ pub struct IngestInput {
     /// Table name → rows, msgpack-encoded as `{tableName: [{col: val}, ...], ...}`.
     pub data: Buffer,
     /// Unfinalized blocks with hashes for fork resolution.
-    pub rollback_chain: Option<Vec<DeltaDbCursor>>,
+    pub rollback_chain: Option<Vec<SettleCursor>>,
     /// Finalized head cursor — both number and hash stored.
-    pub finalized_head: DeltaDbCursor,
+    pub finalized_head: SettleCursor,
 }
 
 /// State field definition for external reducers.
@@ -88,10 +88,10 @@ pub struct ExternalReducerConfig {
     pub state: Vec<ExternalStateField>,
 }
 
-/// Delta DB N-API wrapper.
+/// Settle N-API wrapper.
 #[napi]
-pub struct DeltaDb {
-    inner: DeltaDbInner,
+pub struct Settle {
+    inner: Inner,
     /// Stored raw napi_ref handles for external reducer callbacks (prevent GC).
     external_callbacks: HashMap<String, sys::napi_ref>,
     /// Raw napi_env for cleanup on drop.
@@ -100,10 +100,10 @@ pub struct DeltaDb {
 }
 
 #[napi]
-impl DeltaDb {
-    /// Open a new DeltaDb instance.
+impl Settle {
+    /// Open a new Settle instance.
     #[napi(factory)]
-    pub fn open(env: Env, config: DeltaDbConfig) -> Result<Self> {
+    pub fn open(env: Env, config: SettleConfig) -> Result<Self> {
         let mut cfg = if let Some(dir) = config.data_dir {
             Config::with_data_dir(config.schema, dir)
         } else {
@@ -134,7 +134,7 @@ impl DeltaDb {
             None => None,
         };
 
-        let inner = DeltaDbInner::open(cfg)
+        let inner = Inner::open(cfg)
             .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
 
         Ok(Self {
@@ -218,7 +218,7 @@ impl DeltaDb {
     // not crash-safe individually. Use ingest() which handles all three atomically.
 
     /// Atomic ingest: process all tables, store rollback chain, finalize, flush.
-    /// Returns a msgpack-encoded DeltaBatch buffer, or null if no records produced.
+    /// Returns a msgpack-encoded ChangeBatch buffer, or null if no records produced.
     #[napi]
     pub fn ingest(&mut self, env: Env, input: IngestInput) -> Result<Option<Buffer>> {
         let data =
@@ -263,8 +263,8 @@ impl DeltaDb {
     #[napi]
     pub fn resolve_fork_cursor(
         &self,
-        previous_blocks: Vec<DeltaDbCursor>,
-    ) -> Option<DeltaDbCursor> {
+        previous_blocks: Vec<SettleCursor>,
+    ) -> Option<SettleCursor> {
         // Sort DESC so resolve_fork_cursor returns the HIGHEST common ancestor
         // regardless of the order the portal sends previousBlocks (typically ASC).
         let mut blocks: Vec<(u64, String)> = previous_blocks
@@ -280,7 +280,7 @@ impl DeltaDb {
     ///
     /// Finds the common ancestor in `previousBlocks`, rolls back all state after
     /// that point, and returns the cursor to resume from plus any compensating
-    /// delta batch (msgpack-encoded). Uses the internal finalized block — no need
+    /// change batch (msgpack-encoded). Uses the internal finalized block — no need
     /// to pass it in.
     ///
     /// Throws if no common ancestor is found (fork too deep / unrecoverable).
@@ -288,7 +288,7 @@ impl DeltaDb {
     pub fn handle_fork(
         &mut self,
         _env: Env,
-        previous_blocks: Vec<DeltaDbCursor>,
+        previous_blocks: Vec<SettleCursor>,
     ) -> napi::Result<ForkResultJs> {
         let chain: Vec<crate::types::BlockCursor> = previous_blocks
             .into_iter()
@@ -313,7 +313,7 @@ impl DeltaDb {
         })
     }
 
-    /// Flush buffered deltas into a msgpack-encoded batch.
+    /// Flush buffered changes into a msgpack-encoded batch.
     /// Returns null if no pending records.
     #[napi]
     pub fn flush(&mut self) -> Option<Buffer> {
@@ -328,7 +328,7 @@ impl DeltaDb {
         self.inner.ack(sequence as u64);
     }
 
-    /// Number of pending (unflushed) delta records.
+    /// Number of pending (unflushed) change records.
     #[napi(getter)]
     pub fn pending_count(&self) -> u32 {
         self.inner.pending_count() as u32
@@ -342,7 +342,7 @@ impl DeltaDb {
 
     /// Current cursor: latest processed block + hash. Null if no blocks processed.
     #[napi(getter)]
-    pub fn cursor(&self) -> Option<DeltaDbCursor> {
+    pub fn cursor(&self) -> Option<SettleCursor> {
         self.inner.latest_cursor().map(|c| c.into())
     }
 }

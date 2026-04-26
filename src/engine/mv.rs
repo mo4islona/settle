@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::ast::{AggFunc, MVDef, SelectExpr, SelectItem, SlidingWindowDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
-use crate::types::{BlockNumber, ColumnType, DeltaOperation, DeltaRecord, GroupKey, RowMap, Value};
+use crate::types::{BlockNumber, ColumnType, ChangeOp, ChangeRecord, GroupKey, RowMap, Value};
 
 use super::aggregation::{AggregationFunc, create_agg, restore_agg, to_start_of_interval};
 
@@ -44,7 +44,7 @@ enum GroupKeyExtractor {
     Window(String, u64),
 }
 
-/// Manages a single materialized view: GROUP BY routing, aggregation, rollback, deltas.
+/// Manages a single materialized view: GROUP BY routing, aggregation, rollback, changes.
 pub struct MVEngine {
     def: MVDef,
     /// The output column descriptors (in SELECT order).
@@ -62,7 +62,7 @@ pub struct MVEngine {
     /// Tracks which blocks have been ingested (for rollback).
     /// block -> set of group keys touched. BTreeMap for O(log N) range queries.
     block_groups: BTreeMap<BlockNumber, FxHashSet<GroupKey>>,
-    /// Snapshot of previous output values per group key, for delta computation.
+    /// Snapshot of previous output values per group key, for change computation.
     prev_output: FxHashMap<GroupKey, HashMap<String, Value>>,
     /// Storage backend for persisting finalized MV state.
     storage: Arc<dyn StorageBackend>,
@@ -239,8 +239,8 @@ impl MVEngine {
     }
 
     /// Process a batch of rows from a single block.
-    /// Returns delta records for new/updated groups.
-    pub fn process_block(&mut self, block: BlockNumber, rows: &[RowMap]) -> Vec<DeltaRecord> {
+    /// Returns change records for new/updated groups.
+    pub fn process_block(&mut self, block: BlockNumber, rows: &[RowMap]) -> Vec<ChangeRecord> {
         // Sliding window replay protection: skip blocks already in restored state
         if self.sliding_window.is_some() && self.block_times.contains_key(&block) {
             return Vec::new();
@@ -304,13 +304,13 @@ impl MVEngine {
             touched_keys.extend(expired_keys);
         }
 
-        // Emit deltas for all touched groups
-        self.emit_deltas(&touched_keys)
+        // Emit changes for all touched groups
+        self.emit_changes(&touched_keys)
     }
 
     /// Roll back all blocks after fork_point.
-    /// Returns compensating delta records.
-    pub fn rollback(&mut self, fork_point: BlockNumber) -> Vec<DeltaRecord> {
+    /// Returns compensating change records.
+    pub fn rollback(&mut self, fork_point: BlockNumber) -> Vec<ChangeRecord> {
         // Guard: fork_point + 1 would overflow u64::MAX to 0, causing split_off(&0)
         // to remove the entire map. MAX is a valid no-op: nothing exists after it.
         if fork_point == BlockNumber::MAX {
@@ -354,8 +354,8 @@ impl MVEngine {
             }
         }
 
-        // Emit deltas (updates or deletes)
-        self.emit_deltas(&touched_keys)
+        // Emit changes (updates or deletes)
+        self.emit_changes(&touched_keys)
     }
 
     /// Finalize all blocks up to and including the given block.
@@ -502,8 +502,8 @@ impl MVEngine {
         Some(output)
     }
 
-    fn emit_deltas(&mut self, touched_keys: &FxHashSet<GroupKey>) -> Vec<DeltaRecord> {
-        let mut deltas = Vec::new();
+    fn emit_changes(&mut self, touched_keys: &FxHashSet<GroupKey>) -> Vec<ChangeRecord> {
+        let mut changes = Vec::new();
 
         for key in touched_keys {
             let prev = self.prev_output.remove(key);
@@ -516,16 +516,16 @@ impl MVEngine {
                 .map(|aggs| aggs.iter().all(|a| !a.has_data()))
                 .unwrap_or(true);
 
-            let delta_key = self.build_delta_key(key);
+            let change_key = self.build_change_key(key);
 
             match (prev, is_empty) {
                 (None, false) => {
                     // New group -> Insert
                     if let Some(values) = current {
-                        deltas.push(DeltaRecord {
+                        changes.push(ChangeRecord {
                             table: self.def.name.clone(),
-                            operation: DeltaOperation::Insert,
-                            key: delta_key,
+                            operation: ChangeOp::Insert,
+                            key: change_key,
                             values,
                             prev_values: None,
                         });
@@ -535,10 +535,10 @@ impl MVEngine {
                     // Existing group updated -> Update
                     if let Some(values) = current {
                         if values != prev_vals {
-                            deltas.push(DeltaRecord {
+                            changes.push(ChangeRecord {
                                 table: self.def.name.clone(),
-                                operation: DeltaOperation::Update,
-                                key: delta_key,
+                                operation: ChangeOp::Update,
+                                key: change_key,
                                 values,
                                 prev_values: Some(prev_vals),
                             });
@@ -547,10 +547,10 @@ impl MVEngine {
                 }
                 (Some(prev_vals), true) => {
                     // Group became empty after rollback/expiry -> Delete
-                    deltas.push(DeltaRecord {
+                    changes.push(ChangeRecord {
                         table: self.def.name.clone(),
-                        operation: DeltaOperation::Delete,
-                        key: delta_key,
+                        operation: ChangeOp::Delete,
+                        key: change_key,
                         values: prev_vals.clone(),
                         prev_values: Some(prev_vals),
                     });
@@ -559,28 +559,28 @@ impl MVEngine {
                     self.removed_groups.push(key.clone());
                 }
                 (None, true) => {
-                    // Was never emitted and is empty — no delta needed
+                    // Was never emitted and is empty — no change needed
                 }
             }
         }
 
-        deltas
+        changes
     }
 
-    fn build_delta_key(&self, group_key: &GroupKey) -> HashMap<String, Value> {
-        let mut delta_key = HashMap::new();
+    fn build_change_key(&self, group_key: &GroupKey) -> HashMap<String, Value> {
+        let mut change_key = HashMap::new();
         let mut key_idx = 0;
         for col in &self.output_columns {
             match col {
                 OutputColumn::GroupBy { output_name, .. }
                 | OutputColumn::Window { output_name, .. } => {
-                    delta_key.insert(output_name.clone(), group_key[key_idx].clone());
+                    change_key.insert(output_name.clone(), group_key[key_idx].clone());
                     key_idx += 1;
                 }
                 OutputColumn::Agg { .. } => {}
             }
         }
-        delta_key
+        change_key
     }
 
     fn create_agg_vec(&self) -> Vec<Box<dyn AggregationFunc>> {

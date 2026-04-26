@@ -1,0 +1,61 @@
+{
+  "name": "@settle/stream",
+  "version": "0.0.1-alpha.20",
+  "description": "Embedded rollback-aware computation engine for blockchain data",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./web": {
+      "types": "./dist/web.d.ts",
+      "default": "./dist/web.js"
+    },
+    "./src/native/*": "./src/native/*",
+    "./src/wasm/*": "./src/wasm/*"
+  },
+  "napi": {
+    "name": "settle"
+  },
+  "scripts": {
+    "build:native": "napi build --cargo-cwd ../../.. --features napi --release --platform --dts native.d.ts --js false src/native",
+    "build:native:debug": "napi build --cargo-cwd ../../.. --features napi --platform --dts native.d.ts --js false src/native",
+    "build:wasm": "wasm-pack build ../../.. --target web --no-default-features --features wasm && cp ../../../pkg/settle.js ../../../pkg/settle.d.ts ../../../pkg/settle_bg.wasm src/wasm/",
+    "build:ts": "tsc -p tsconfig.build.json",
+    "build": "pnpm run build:native && pnpm run build:ts",
+    "build:all": "pnpm run build:native && pnpm run build:wasm && pnpm run build:ts",
+    "build:all:debug": "pnpm run build:native:debug && pnpm run build:wasm && pnpm run build:ts",
+    "artifacts": "napi artifacts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check",
+    "lint:fix": "biome check --fix"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0"
+  },
+  "optionalDependencies": {
+    "@settle/stream-darwin-arm64": "0.0.1-alpha.20",
+    "@settle/stream-darwin-x64": "0.0.1-alpha.20",
+    "@settle/stream-linux-x64-gnu": "0.0.1-alpha.20",
+    "@settle/stream-linux-arm64-gnu": "0.0.1-alpha.20"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.7",
+    "@napi-rs/cli": "^2.18.0",
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.0.0"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/**/*.js.map",
+    "src/native/native.js",
+    "src/native/native.d.ts",
+    "src/wasm/**/*"
+  ],
+  "license": "MIT"
+}

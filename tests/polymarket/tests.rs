@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::types::{DeltaOperation, RowMap, Value};
+use settle::db::{Config, Settle};
+use settle::types::{ChangeOp, RowMap, Value};
 
 const SCHEMA: &str = include_str!("schema.sql");
 
@@ -32,12 +32,12 @@ fn make_order(
 
 #[test]
 fn schema_parses() {
-    DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    Settle::open(Config::new(SCHEMA)).unwrap();
 }
 
 #[test]
 fn market_stats_tracks_volume_and_price_stats() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Two trades on the same token, both price = 0.5
     db.process_batch(
@@ -57,7 +57,7 @@ fn market_stats_tracks_volume_and_price_stats() {
     let mv_records: Vec<_> = batch.records_for("token_summary").iter().collect();
 
     assert_eq!(mv_records.len(), 1);
-    assert_eq!(mv_records[0].operation, DeltaOperation::Insert);
+    assert_eq!(mv_records[0].operation, ChangeOp::Insert);
     assert_eq!(
         mv_records[0].values.get("trade_count"),
         Some(&Value::UInt64(2))
@@ -93,7 +93,7 @@ fn market_stats_tracks_volume_and_price_stats() {
 
 #[test]
 fn market_stats_different_prices() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     db.process_batch(
         "orders",
@@ -125,7 +125,7 @@ fn market_stats_different_prices() {
 
 #[test]
 fn market_stats_skips_zero_shares() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     db.process_batch(
         "orders",
@@ -136,14 +136,14 @@ fn market_stats_skips_zero_shares() {
     )
     .unwrap();
 
-    // Virtual table produces no raw deltas, and zero-shares means no reducer
+    // Virtual table produces no raw changes, and zero-shares means no reducer
     // output either, so flush returns None (empty buffer).
     assert!(db.flush().is_none());
 }
 
 #[test]
 fn insider_classifier_ignores_sell_side() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // side=1 (SELL) — should be ignored by insider_classifier
     db.process_batch(
@@ -169,7 +169,7 @@ fn insider_classifier_ignores_sell_side() {
 
 #[test]
 fn insider_classifier_ignores_high_price() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Price = usdc/shares = 0.96 (above 0.95 threshold)
     db.process_batch(
@@ -195,7 +195,7 @@ fn insider_classifier_ignores_high_price() {
 
 #[test]
 fn insider_detected_with_full_fields() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Trader buys $5000 in a single order (above $4000 threshold)
     // price = 0.5 (well below 0.95), BUY side
@@ -239,7 +239,7 @@ fn insider_detected_with_full_fields() {
 
 #[test]
 fn insider_accumulates_across_orders_in_window() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Two orders from same trader within 15 min, total > $4000
     db.process_batch(
@@ -276,7 +276,7 @@ fn insider_accumulates_across_orders_in_window() {
 
 #[test]
 fn insider_subsequent_orders_emit_with_timestamps() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // First order: triggers insider classification ($5000 > $4000) at t=1000
     db.process_batch(
@@ -346,7 +346,7 @@ fn insider_subsequent_orders_emit_with_timestamps() {
 
 #[test]
 fn window_expiration_marks_clean() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // First order: $2000 (below threshold), starts window
     db.process_batch(
@@ -410,7 +410,7 @@ fn window_expiration_marks_clean() {
 
 #[test]
 fn rollback_undoes_insider_classification() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Block 1000: small order (below threshold)
     db.process_batch(
@@ -472,7 +472,7 @@ fn rollback_undoes_insider_classification() {
     let insider_records: Vec<_> = batch
         .records_for("insider_positions")
         .iter()
-        .filter(|r| r.operation == DeltaOperation::Insert)
+        .filter(|r| r.operation == ChangeOp::Insert)
         .collect();
     assert!(
         insider_records.is_empty(),
@@ -482,7 +482,7 @@ fn rollback_undoes_insider_classification() {
 
 #[test]
 fn market_stats_rollback() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     db.process_batch(
         "orders",
@@ -521,7 +521,7 @@ fn market_stats_rollback() {
     let mv_records: Vec<_> = batch.records_for("token_summary").iter().collect();
 
     assert_eq!(mv_records.len(), 1);
-    assert_eq!(mv_records[0].operation, DeltaOperation::Update);
+    assert_eq!(mv_records[0].operation, ChangeOp::Update);
     // Only 1 trade left
     assert_eq!(
         mv_records[0].values.get("trade_count"),
@@ -539,7 +539,7 @@ fn market_stats_rollback() {
 
 #[test]
 fn full_pipeline_both_reducers() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Multiple orders in one block from different traders
     db.process_batch(
@@ -601,7 +601,7 @@ fn full_pipeline_both_reducers() {
 /// Total exceeds $4k but the window expired → classified as clean, not insider.
 #[test]
 fn post_window_trades_do_not_trigger_insider() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Batch 1: $3000 at t=1000 (starts window)
     db.process_batch(
@@ -651,7 +651,7 @@ fn post_window_trades_do_not_trigger_insider() {
 /// Only the low-price trader should be classified as insider.
 #[test]
 fn price_filter_high_vs_low_in_same_batch() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     db.process_batch(
         "orders",
@@ -694,10 +694,10 @@ fn price_filter_high_vs_low_in_same_batch() {
 /// outcomes with multiple matched fills per side"
 ///
 /// SELL-side fills must contribute to market stats. Both yes/no tokens get
-/// independent stats. Verifies mean and stddev can be derived from deltas.
+/// independent stats. Verifies mean and stddev can be derived from changes.
 #[test]
 fn market_stats_both_sides_multiple_tokens_with_derivation() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     db.process_batch(
         "orders",
@@ -784,10 +784,10 @@ fn market_stats_both_sides_multiple_tokens_with_derivation() {
     );
 }
 
-/// Virtual table test: orders should NOT appear in delta output.
+/// Virtual table test: orders should NOT appear in change output.
 #[test]
-fn virtual_table_suppresses_order_deltas() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+fn virtual_table_suppresses_order_changes() {
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     db.process_batch(
         "orders",
@@ -805,11 +805,11 @@ fn virtual_table_suppresses_order_deltas() {
 
     let batch = db.flush().unwrap();
 
-    // No raw "orders" records should appear in deltas
+    // No raw "orders" records should appear in changes
     let order_records: Vec<_> = batch.records_for("orders").iter().collect();
     assert!(
         order_records.is_empty(),
-        "virtual table should not emit delta records"
+        "virtual table should not emit change records"
     );
 
     // But market_stats → token_summary should still work
@@ -820,7 +820,7 @@ fn virtual_table_suppresses_order_deltas() {
 /// Multiple insiders detected in the same block.
 #[test]
 fn multiple_insiders_same_block() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     db.process_batch(
         "orders",
@@ -853,7 +853,7 @@ fn multiple_insiders_same_block() {
 /// Exact threshold boundary: $4000 exactly should trigger insider.
 #[test]
 fn exact_threshold_triggers_insider() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Exactly $4000 (4_000_000_000 raw USDC with 6 decimals)
     db.process_batch(
@@ -883,7 +883,7 @@ fn exact_threshold_triggers_insider() {
 /// Just below threshold: $3999.99 should NOT trigger.
 #[test]
 fn just_below_threshold_no_insider() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // $3999.99 = 3_999_990_000 raw USDC
     db.process_batch(
@@ -914,7 +914,7 @@ fn just_below_threshold_no_insider() {
 /// At price=0.95: usdc/shares = 0.95, so usdc*10000 = shares*9500 → filtered
 #[test]
 fn exact_price_boundary_filtered() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // price = 9500/10000 = 0.95 exactly
     db.process_batch(
@@ -945,7 +945,7 @@ fn exact_price_boundary_filtered() {
 /// Rollback to 1000 → only trade A remains.
 #[test]
 fn multi_block_rollback() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     db.process_batch(
         "orders",
@@ -1012,7 +1012,7 @@ fn multi_block_rollback() {
 /// Known insider's subsequent orders across multiple blocks emit correctly.
 #[test]
 fn insider_multi_block_subsequent_orders() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Block 1000: triggers insider ($5000)
     db.process_batch(

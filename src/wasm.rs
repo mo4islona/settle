@@ -4,7 +4,7 @@ use js_sys::Function;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
-use crate::db::{Config, DeltaDb as DeltaDbInner, IngestInput as IngestInputInner};
+use crate::db::{Config, Settle as Inner, IngestInput as IngestInputInner};
 use crate::json_conv::json_object_to_row;
 use crate::msgpack_conv::encode_batch_to_json_value;
 use crate::reducer_runtime::external::{WasmContextGuard, install_wasm_context};
@@ -17,22 +17,22 @@ fn to_js<T: Serialize>(v: &T) -> Result<JsValue, serde_wasm_bindgen::Error> {
     v.serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
 }
 
-/// WASM binding for DeltaDb.
+/// WASM binding for Settle.
 #[wasm_bindgen]
-pub struct DeltaDb {
-    inner: DeltaDbInner,
+pub struct Settle {
+    inner: Inner,
     /// JS callbacks for external reducers, keyed by reducer name.
     external_callbacks: HashMap<String, Function>,
 }
 
 #[wasm_bindgen]
-impl DeltaDb {
-    /// Create a new DeltaDb with in-memory storage.
+impl Settle {
+    /// Create a new Settle with in-memory storage.
     #[wasm_bindgen(constructor)]
-    pub fn new(schema: &str) -> Result<DeltaDb, JsError> {
+    pub fn new(schema: &str) -> Result<Settle, JsError> {
         let config = Config::new(schema);
-        let inner = DeltaDbInner::open(config).map_err(to_js_err)?;
-        Ok(DeltaDb {
+        let inner = Inner::open(config).map_err(to_js_err)?;
+        Ok(Settle {
             inner,
             external_callbacks: HashMap::new(),
         })
@@ -88,7 +88,7 @@ impl DeltaDb {
         Ok(())
     }
 
-    /// Atomic ingest: process all tables, finalize, and return delta batch.
+    /// Atomic ingest: process all tables, finalize, and return change batch.
     /// Input and output are plain JS objects — no msgpack encoding needed.
     pub fn ingest(&mut self, input: JsValue) -> Result<JsValue, JsError> {
         let input: WasmIngestInput = serde_wasm_bindgen::from_value(input).map_err(to_js_err)?;
@@ -139,7 +139,7 @@ impl DeltaDb {
         }
     }
 
-    /// Flush buffered deltas. Returns a delta batch object, or null if empty.
+    /// Flush buffered changes. Returns a change batch object, or null if empty.
     pub fn flush(&mut self) -> Result<JsValue, JsError> {
         let _guard = self.install_context();
         match self.inner.flush() {
@@ -153,7 +153,7 @@ impl DeltaDb {
         self.inner.ack(sequence as u64);
     }
 
-    /// Number of pending (unflushed) delta records.
+    /// Number of pending (unflushed) change records.
     #[wasm_bindgen(getter, js_name = pendingCount)]
     pub fn pending_count(&self) -> u32 {
         self.inner.pending_count() as u32
@@ -244,7 +244,7 @@ impl DeltaDb {
     }
 }
 
-impl DeltaDb {
+impl Settle {
     /// Install external callbacks as a thread-local context guard.
     fn install_context(&self) -> Option<WasmContextGuard> {
         if self.external_callbacks.is_empty() {

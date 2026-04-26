@@ -1,12 +1,12 @@
 //! Integration tests for sliding window materialized views.
 //!
-//! Tests the full pipeline through DeltaDb: schema parsing, raw table ingest,
-//! sliding window MV processing with expiry, rollback, and delta emission.
+//! Tests the full pipeline through Settle: schema parsing, raw table ingest,
+//! sliding window MV processing with expiry, rollback, and change emission.
 
 use std::collections::HashMap;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::types::{DeltaBatch, DeltaOperation, DeltaRecord, RowMap, Value};
+use settle::db::{Config, Settle};
+use settle::types::{ChangeBatch, ChangeOp, ChangeRecord, RowMap, Value};
 
 const SCHEMA: &str = include_str!("schema.sql");
 
@@ -19,7 +19,7 @@ fn make_trade(pair: &str, volume: f64, price: f64, block_time_ms: i64) -> RowMap
     ])
 }
 
-fn records_for_table<'a>(batch: &'a DeltaBatch, table: &str) -> Vec<&'a DeltaRecord> {
+fn records_for_table<'a>(batch: &'a ChangeBatch, table: &str) -> Vec<&'a ChangeRecord> {
     batch
         .tables
         .get(table)
@@ -29,12 +29,12 @@ fn records_for_table<'a>(batch: &'a DeltaBatch, table: &str) -> Vec<&'a DeltaRec
 
 #[test]
 fn schema_parses() {
-    DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    Settle::open(Config::new(SCHEMA)).unwrap();
 }
 
 #[test]
 fn sliding_window_basic_volume_tracking() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Block 1: ETH trade at t=0
     db.process_batch("trades", 1, vec![make_trade("ETH", 100.0, 2000.0, 0)])
@@ -45,7 +45,7 @@ fn sliding_window_basic_volume_tracking() {
     let eth_insert = vol_recs
         .iter()
         .find(|r| {
-            r.operation == DeltaOperation::Insert
+            r.operation == ChangeOp::Insert
                 && r.key.get("pair") == Some(&Value::String("ETH".into()))
         })
         .expect("should have ETH insert in volume_1h");
@@ -61,7 +61,7 @@ fn sliding_window_basic_volume_tracking() {
 
 #[test]
 fn sliding_window_expiry_reduces_volume() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Block 1: ETH trade at t=0, volume=100
     db.process_batch("trades", 1, vec![make_trade("ETH", 100.0, 2000.0, 0)])
@@ -93,8 +93,8 @@ fn sliding_window_expiry_reduces_volume() {
     let eth_update = vol_recs
         .iter()
         .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
-        .expect("should have ETH delta in volume_1h");
-    assert_eq!(eth_update.operation, DeltaOperation::Update);
+        .expect("should have ETH change in volume_1h");
+    assert_eq!(eth_update.operation, ChangeOp::Update);
     assert_eq!(
         eth_update.values.get("total_volume"),
         Some(&Value::Float64(250.0))
@@ -109,7 +109,7 @@ fn sliding_window_expiry_reduces_volume() {
     let eth_total = total_recs
         .iter()
         .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
-        .expect("should have ETH delta in totals");
+        .expect("should have ETH change in totals");
     assert_eq!(
         eth_total.values.get("total_volume"),
         Some(&Value::Float64(350.0))
@@ -118,7 +118,7 @@ fn sliding_window_expiry_reduces_volume() {
 
 #[test]
 fn sliding_window_rollback_and_reprocess() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Block 1-3: normal processing
     db.process_batch("trades", 1, vec![make_trade("ETH", 100.0, 2000.0, 0)])
@@ -145,8 +145,8 @@ fn sliding_window_rollback_and_reprocess() {
     let eth_rb = vol_recs
         .iter()
         .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
-        .expect("should have ETH rollback delta");
-    assert_eq!(eth_rb.operation, DeltaOperation::Update);
+        .expect("should have ETH rollback change");
+    assert_eq!(eth_rb.operation, ChangeOp::Update);
     assert_eq!(
         eth_rb.values.get("total_volume"),
         Some(&Value::Float64(100.0))
@@ -174,7 +174,7 @@ fn sliding_window_rollback_and_reprocess() {
 
 #[test]
 fn sliding_window_multiple_groups_and_windows() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Block 1: trades for ETH and BTC at t=0
     db.process_batch(
@@ -253,7 +253,7 @@ fn sliding_window_multiple_groups_and_windows() {
 
 #[test]
 fn sliding_window_complete_expiry_deletes_group() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Block 1: single trade for DOGE at t=0
     db.process_batch("trades", 1, vec![make_trade("DOGE", 1000.0, 0.1, 0)])
@@ -277,7 +277,7 @@ fn sliding_window_complete_expiry_deletes_group() {
         .find(|r| r.key.get("pair") == Some(&Value::String("DOGE".into())));
     assert!(
         doge_delete
-            .map(|d| d.operation == DeltaOperation::Delete)
+            .map(|d| d.operation == ChangeOp::Delete)
             .unwrap_or(false),
         "DOGE should be deleted from volume_1h"
     );
@@ -287,12 +287,12 @@ fn sliding_window_complete_expiry_deletes_group() {
         .iter()
         .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())));
     assert!(eth_insert.is_some());
-    assert_eq!(eth_insert.unwrap().operation, DeltaOperation::Insert);
+    assert_eq!(eth_insert.unwrap().operation, ChangeOp::Insert);
 }
 
 #[test]
 fn sliding_window_with_finalization() {
-    let mut db = DeltaDb::open(Config::new(SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Process several blocks
     for i in 0..5u64 {
@@ -327,8 +327,8 @@ fn sliding_window_with_finalization() {
     let eth = vol_recs
         .iter()
         .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
-        .expect("ETH should have delta");
-    assert_eq!(eth.operation, DeltaOperation::Update);
+        .expect("ETH should have change");
+    assert_eq!(eth.operation, ChangeOp::Update);
 
     // Block 1 (ts=0) should be expired. Volume = blocks 2-6.
     // Block 2: vol=20 (ts=600k), Block 3: vol=30 (ts=1200k), Block 4: vol=40 (ts=1800k),

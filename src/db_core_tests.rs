@@ -1,23 +1,23 @@
 use super::test_helpers::*;
 use super::*;
-use crate::types::{BlockCursor, DeltaOperation, Value};
+use crate::types::{BlockCursor, ChangeOp, Value};
 use std::collections::HashMap;
 
 #[test]
 fn open_with_valid_schema() {
-    let db = DeltaDb::open(Config::new(SIMPLE_SCHEMA));
+    let db = Settle::open(Config::new(SIMPLE_SCHEMA));
     assert!(db.is_ok());
 }
 
 #[test]
 fn open_with_invalid_schema() {
-    let db = DeltaDb::open(Config::new("INVALID SQL GARBAGE"));
+    let db = Settle::open(Config::new("INVALID SQL GARBAGE"));
     assert!(db.is_err());
 }
 
 #[test]
 fn simple_ingest_and_flush() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     db.process_batch(
         "swaps",
@@ -35,7 +35,7 @@ fn simple_ingest_and_flush() {
 
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
     assert_eq!(mv_records.len(), 1);
-    assert_eq!(mv_records[0].operation, DeltaOperation::Insert);
+    assert_eq!(mv_records[0].operation, ChangeOp::Insert);
     assert_eq!(
         mv_records[0].values.get("total_volume"),
         Some(&Value::Float64(300.0))
@@ -44,7 +44,7 @@ fn simple_ingest_and_flush() {
 
 #[test]
 fn multiple_blocks_merge_in_buffer() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
         .unwrap();
@@ -56,7 +56,7 @@ fn multiple_blocks_merge_in_buffer() {
     // MV records should be merged: Insert + Update -> Insert with latest values
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
     assert_eq!(mv_records.len(), 1);
-    assert_eq!(mv_records[0].operation, DeltaOperation::Insert);
+    assert_eq!(mv_records[0].operation, ChangeOp::Insert);
     assert_eq!(
         mv_records[0].values.get("total_volume"),
         Some(&Value::Float64(300.0))
@@ -65,7 +65,7 @@ fn multiple_blocks_merge_in_buffer() {
 
 #[test]
 fn full_pipeline_with_reducer() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
 
     // Block 1000: alice buys 10 @ 2000
     db.process_batch(
@@ -111,7 +111,7 @@ fn full_pipeline_with_reducer() {
 
 #[test]
 fn backpressure_signal() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA).max_buffer_size(3)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).max_buffer_size(3)).unwrap();
 
     // First batch: 2 raw + 1 MV = 3 records → buffer full
     let full = db
@@ -132,20 +132,20 @@ fn backpressure_signal() {
 
 #[test]
 fn unknown_table_returns_error() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
     let result = db.process_batch("nonexistent", 1000, vec![]);
     assert!(result.is_err());
 }
 
 #[test]
 fn empty_flush_returns_none() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
     assert!(db.flush().is_none());
 }
 
 #[test]
 fn sequence_numbers_increment() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
         .unwrap();
@@ -161,7 +161,7 @@ fn sequence_numbers_increment() {
 
 #[test]
 fn ingest_groups_rows_by_block_number() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     let batch = db
         .ingest(IngestInput {
@@ -205,7 +205,7 @@ fn ingest_groups_rows_by_block_number() {
 
 #[test]
 fn ingest_stores_block_hashes_and_cursor() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     db.ingest(IngestInput {
         data: std::collections::HashMap::from([(
@@ -235,7 +235,7 @@ fn ingest_stores_block_hashes_and_cursor() {
 
 #[test]
 fn ingest_errors_on_missing_block_number() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     let result = db.ingest(IngestInput {
         data: std::collections::HashMap::from([(
@@ -264,7 +264,7 @@ fn ingest_persists_and_restores_state() {
     // Ingest some data
     {
         let mut db =
-            DeltaDb::open(Config::with_data_dir(schema, dir.path().to_str().unwrap())).unwrap();
+            Settle::open(Config::with_data_dir(schema, dir.path().to_str().unwrap())).unwrap();
 
         db.ingest(IngestInput {
             data: std::collections::HashMap::from([(
@@ -290,7 +290,7 @@ fn ingest_persists_and_restores_state() {
     // Reopen and verify state was restored
     {
         let db =
-            DeltaDb::open(Config::with_data_dir(schema, dir.path().to_str().unwrap())).unwrap();
+            Settle::open(Config::with_data_dir(schema, dir.path().to_str().unwrap())).unwrap();
 
         assert_eq!(db.latest_block(), 1000);
         assert_eq!(db.finalized_block(), 999);
@@ -305,7 +305,7 @@ fn ingest_persists_and_restores_state() {
 /// not create nested per-push arrays.
 #[test]
 fn ingest_batches_perf_into_single_array() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     let batch = db
         .ingest(IngestInput {

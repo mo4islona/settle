@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::engine::reducer::ReducerEngine;
-use delta_db::schema::parser::parse_schema;
-use delta_db::storage::memory::MemoryBackend;
-use delta_db::types::{ColumnRegistry, Row, RowMap, Value};
+use settle::db::{Config, Settle};
+use settle::engine::reducer::ReducerEngine;
+use settle::schema::parser::parse_schema;
+use settle::storage::memory::MemoryBackend;
+use settle::types::{ColumnRegistry, Row, RowMap, Value};
 
 const FULL_SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
 
@@ -139,7 +139,7 @@ fn main() {
     // 3. Full pipeline: market_stats only (raw + reducer + MV)
     {
         let cfg = Config::new(MARKET_STATS_ONLY);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
@@ -159,7 +159,7 @@ fn main() {
     // 4. Full pipeline: both reducers + both MVs
     {
         let cfg = Config::new(FULL_SCHEMA);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
@@ -179,7 +179,7 @@ fn main() {
     // 5. Measure process_batch overhead: Vec clone + Row conversion
     {
         let cfg = Config::new(FULL_SCHEMA);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         // Measure just the chunk.to_vec() overhead
         let start = Instant::now();
@@ -201,7 +201,7 @@ fn main() {
             );
         "#;
         let cfg = Config::new(raw_schema);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
@@ -225,7 +225,7 @@ fn main() {
             );
         "#;
         let cfg = Config::new(raw_schema2);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {

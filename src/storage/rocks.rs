@@ -118,7 +118,7 @@ pub struct RocksDbConfig {
     pub cache_size: Option<usize>,
 }
 
-/// RocksDB-backed persistent storage for Delta DB.
+/// RocksDB-backed persistent storage for Settle.
 pub struct RocksDbBackend {
     db: DB,
 }

@@ -342,7 +342,7 @@ pub fn decode_rows(bytes: &[u8], registry: &Arc<ColumnRegistry>) -> Result<Vec<R
     Ok(rows)
 }
 
-/// Storage backend trait for Delta DB persistence.
+/// Storage backend trait for Settle persistence.
 ///
 /// All methods use `&self` with interior mutability (the implementation
 /// is expected to use internal locking).
