@@ -5,11 +5,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::engine::reducer::ReducerEngine;
-use delta_db::schema::parser::parse_schema;
-use delta_db::storage::memory::MemoryBackend;
-use delta_db::types::{ColumnRegistry, Row, RowMap, Value};
+use settle::db::{Config, Settle};
+use settle::engine::reducer::ReducerEngine;
+use settle::schema::parser::parse_schema;
+use settle::storage::memory::MemoryBackend;
+use settle::test_helpers::ingest_one;
+use settle::types::{ColumnRegistry, Row, RowMap, Value};
 
 const FULL_SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
 
@@ -139,14 +140,12 @@ fn main() {
     // 3. Full pipeline: market_stats only (raw + reducer + MV)
     {
         let cfg = Config::new(MARKET_STATS_ONLY);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec())
-                .unwrap();
+            ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
         }
-        db.flush();
         let elapsed = start.elapsed();
         println!(
             "  Pipeline (market_stats+MV): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
@@ -159,14 +158,12 @@ fn main() {
     // 4. Full pipeline: both reducers + both MVs
     {
         let cfg = Config::new(FULL_SCHEMA);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec())
-                .unwrap();
+            ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
         }
-        db.flush();
         let elapsed = start.elapsed();
         println!(
             "  Pipeline (full):     {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
@@ -179,7 +176,7 @@ fn main() {
     // 5. Measure process_batch overhead: Vec clone + Row conversion
     {
         let cfg = Config::new(FULL_SCHEMA);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         // Measure just the chunk.to_vec() overhead
         let start = Instant::now();
@@ -201,14 +198,12 @@ fn main() {
             );
         "#;
         let cfg = Config::new(raw_schema);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec())
-                .unwrap();
+            ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
         }
-        db.flush();
         let elapsed = start.elapsed();
         println!(
             "  Raw table only (virtual): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
@@ -225,14 +220,12 @@ fn main() {
             );
         "#;
         let cfg = Config::new(raw_schema2);
-        let mut db = DeltaDb::open(cfg).unwrap();
+        let mut db = Settle::open(cfg).unwrap();
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec())
-                .unwrap();
+            ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
         }
-        db.flush();
         let elapsed = start.elapsed();
         println!(
             "  Raw table only (stored):  {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",

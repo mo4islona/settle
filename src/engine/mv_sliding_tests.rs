@@ -131,7 +131,7 @@ fn sliding_window_no_expiry_within_window() {
         )],
     );
     assert_eq!(d1.len(), 1);
-    assert_eq!(d1[0].operation, DeltaOperation::Insert);
+    assert_eq!(d1[0].operation, ChangeOp::Insert);
     assert_eq!(
         d1[0].values.get("total_volume"),
         Some(&Value::Float64(100.0))
@@ -148,7 +148,7 @@ fn sliding_window_no_expiry_within_window() {
         )],
     );
     assert_eq!(d2.len(), 1);
-    assert_eq!(d2[0].operation, DeltaOperation::Update);
+    assert_eq!(d2[0].operation, ChangeOp::Update);
     assert_eq!(
         d2[0].values.get("total_volume"),
         Some(&Value::Float64(300.0))
@@ -217,7 +217,7 @@ fn sliding_window_basic_expiry() {
         )],
     );
     assert_eq!(d3.len(), 1);
-    assert_eq!(d3[0].operation, DeltaOperation::Update);
+    assert_eq!(d3[0].operation, ChangeOp::Update);
     // After expiry: 200 + 300 = 500 (block 1's 100 expired)
     assert_eq!(
         d3[0].values.get("total_volume"),
@@ -262,11 +262,11 @@ fn sliding_window_full_expiry_delete() {
     assert_eq!(d2.len(), 2);
     let insert = d2
         .iter()
-        .find(|d| d.operation == DeltaOperation::Insert)
+        .find(|d| d.operation == ChangeOp::Insert)
         .unwrap();
     let delete = d2
         .iter()
-        .find(|d| d.operation == DeltaOperation::Delete)
+        .find(|d| d.operation == ChangeOp::Delete)
         .unwrap();
     assert_eq!(insert.key.get("pair"), Some(&Value::String("B".into())));
     assert_eq!(delete.key.get("pair"), Some(&Value::String("A".into())));
@@ -293,8 +293,8 @@ fn sliding_window_sum_correctness_across_expiry() {
     // At block 5: ts=12_000, window=10_000, cutoff=2_000
     // Block 1 (ts=0) expired. Blocks 2-5 remain.
     // Sum = 20 + 30 + 40 + 50 = 140, count = 4
-    // (Note: we need to check current state, which is reflected in the last delta)
-    // Actually, let me trace: after block 5, the last emit_deltas for "X" captures all changes
+    // (Note: we need to check current state, which is reflected in the last change)
+    // Actually, let me trace: after block 5, the last emit_changes for "X" captures all changes
     // including expiry. Let me just check the accumulated state.
     // Re-check: block 5 ts=12000, cutoff = 12000-10000 = 2000
     // Block 1 ts=0 < 2000 → expired. Blocks 2(ts=3000),3(ts=6000),4(ts=9000),5(ts=12000) remain
@@ -415,11 +415,11 @@ fn sliding_window_rollback() {
     );
 
     // Rollback to block 1
-    let rollback_deltas = mv.rollback(1);
-    assert_eq!(rollback_deltas.len(), 1);
-    assert_eq!(rollback_deltas[0].operation, DeltaOperation::Update);
+    let rollback_changes = mv.rollback(1);
+    assert_eq!(rollback_changes.len(), 1);
+    assert_eq!(rollback_changes[0].operation, ChangeOp::Update);
     assert_eq!(
-        rollback_deltas[0].values.get("total_volume"),
+        rollback_changes[0].values.get("total_volume"),
         Some(&Value::Float64(100.0))
     );
 
@@ -592,16 +592,16 @@ fn sliding_window_multiple_groups_independent_expiry() {
 
     // Group A: block 1 expired, block 3 added → volume=50
     // Group B: block 2 (ts=3000s) still within window (cutoff=3_601_000-3_600_000=1_000)
-    let a_delta = d3
+    let a_change = d3
         .iter()
         .find(|d| d.key.get("pair") == Some(&Value::String("A".into())))
         .unwrap();
     assert_eq!(
-        a_delta.values.get("total_volume"),
+        a_change.values.get("total_volume"),
         Some(&Value::Float64(50.0))
     );
 
-    // Group B should NOT appear in deltas (not touched and not expired)
+    // Group B should NOT appear in changes (not touched and not expired)
     assert!(
         d3.iter()
             .all(|d| d.key.get("pair") != Some(&Value::String("B".into())))
@@ -843,7 +843,7 @@ fn sliding_window_empty_group_cleanup_on_finalize() {
         )],
     );
 
-    // Group X should be gone from self.groups (Delete delta cleans it up)
+    // Group X should be gone from self.groups (Delete change cleans it up)
     assert!(
         !mv.groups
             .keys()

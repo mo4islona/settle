@@ -3,8 +3,9 @@
 
 use std::collections::HashMap;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::types::{RowMap, Value};
+use settle::db::{Config, Settle};
+use settle::test_helpers::ingest_one;
+use settle::types::{RowMap, Value};
 
 const SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
 
@@ -48,26 +49,24 @@ fn main() {
     let num_traders = 100_000;
 
     let cfg = Config::new(SCHEMA);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = Settle::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| make_polymarket_order(i, num_traders))
         .collect();
 
-    // Warm up
+    // Warm up. Start blocks at 1 (block 0 is reserved for "no blocks yet"
+    // by the helpers' deterministic block hashes).
+    let warmup_chunks = rows[..5000].chunks(batch_size).count() as u64;
     for (block, chunk) in rows[..5000].chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
 
-    // Profiled section
-    let start_block = 10;
+    // Profiled section continues from where warm-up left off.
+    let start_block = warmup_chunks + 1;
     for (i, chunk) in rows[5000..].chunks(batch_size).enumerate() {
-        db.process_batch("orders", (start_block + i) as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "orders", start_block + i as u64, chunk.to_vec()).unwrap();
     }
-    db.flush();
 
     eprintln!("Done: {} rows processed", total_rows);
 }

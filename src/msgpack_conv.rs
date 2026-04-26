@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
-use crate::types::{DeltaBatch, DeltaOperation, DeltaRecord, RowMap, Value};
+use crate::types::{ChangeBatch, ChangeOp, ChangeRecord, RowMap, Value};
 
 /// Wrapper for Value that deserializes from plain (untagged) msgpack values.
 ///
@@ -186,7 +186,7 @@ impl Serialize for PlainMapRef<'_> {
     }
 }
 
-struct BatchRef<'a>(&'a DeltaBatch);
+struct BatchRef<'a>(&'a ChangeBatch);
 
 impl Serialize for BatchRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -230,8 +230,8 @@ impl Serialize for PerfNodeRef<'_> {
     }
 }
 
-/// Wrapper for serializing HashMap<String, Vec<DeltaRecord>> as a map of table_name → records array.
-struct TablesRef<'a>(&'a HashMap<String, Vec<DeltaRecord>>);
+/// Wrapper for serializing HashMap<String, Vec<ChangeRecord>> as a map of table_name → records array.
+struct TablesRef<'a>(&'a HashMap<String, Vec<ChangeRecord>>);
 
 impl Serialize for TablesRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -255,7 +255,7 @@ impl Serialize for CursorRef<'_> {
     }
 }
 
-struct RecordRef<'a>(&'a DeltaRecord);
+struct RecordRef<'a>(&'a ChangeRecord);
 
 impl Serialize for RecordRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -264,9 +264,9 @@ impl Serialize for RecordRef<'_> {
         map.serialize_entry(
             "operation",
             match self.0.operation {
-                DeltaOperation::Insert => "insert",
-                DeltaOperation::Update => "update",
-                DeltaOperation::Delete => "delete",
+                ChangeOp::Insert => "insert",
+                ChangeOp::Update => "update",
+                ChangeOp::Delete => "delete",
             },
         )?;
         map.serialize_entry("key", &PlainMapRef(&self.0.key))?;
@@ -276,19 +276,19 @@ impl Serialize for RecordRef<'_> {
     }
 }
 
-/// Encode a DeltaBatch into a msgpack buffer with plain (untagged) values.
-pub fn encode_batch_to_msgpack(batch: &DeltaBatch) -> Vec<u8> {
-    rmp_serde::to_vec(&BatchRef(batch)).expect("DeltaBatch serialization should never fail")
+/// Encode a ChangeBatch into a msgpack buffer with plain (untagged) values.
+pub fn encode_batch_to_msgpack(batch: &ChangeBatch) -> Vec<u8> {
+    rmp_serde::to_vec(&BatchRef(batch)).expect("ChangeBatch serialization should never fail")
 }
 
-/// Encode a DeltaBatch into a `serde_json::Value` with plain (untagged) values.
+/// Encode a ChangeBatch into a `serde_json::Value` with plain (untagged) values.
 ///
 /// Used by the WASM binding to produce a JS-friendly object (via
 /// `serde_wasm_bindgen::to_value`) with the same field names and value
 /// representation as the msgpack path.
 #[cfg(feature = "wasm")]
-pub fn encode_batch_to_json_value(batch: &DeltaBatch) -> serde_json::Value {
-    serde_json::to_value(BatchRef(batch)).expect("DeltaBatch serialization should never fail")
+pub fn encode_batch_to_json_value(batch: &ChangeBatch) -> serde_json::Value {
+    serde_json::to_value(BatchRef(batch)).expect("ChangeBatch serialization should never fail")
 }
 
 #[cfg(test)]
@@ -417,9 +417,9 @@ mod tests {
 
     #[test]
     fn encode_batch_roundtrip() {
-        use crate::types::{BlockCursor, DeltaOperation};
+        use crate::types::{BlockCursor, ChangeOp};
 
-        let batch = DeltaBatch {
+        let batch = ChangeBatch {
             sequence: 1,
             finalized_head: Some(BlockCursor {
                 number: 900,
@@ -431,9 +431,9 @@ mod tests {
             }),
             tables: HashMap::from([(
                 "swaps".into(),
-                vec![DeltaRecord {
+                vec![ChangeRecord {
                     table: "swaps".into(),
-                    operation: DeltaOperation::Insert,
+                    operation: ChangeOp::Insert,
                     key: HashMap::from([("block_number".into(), Value::UInt64(1000))]),
                     values: HashMap::from([
                         ("pool".into(), Value::String("ETH/USDC".into())),
@@ -464,17 +464,17 @@ mod tests {
 
     #[test]
     fn encode_batch_with_prev_values() {
-        use crate::types::DeltaOperation;
+        use crate::types::ChangeOp;
 
-        let batch = DeltaBatch {
+        let batch = ChangeBatch {
             sequence: 2,
             finalized_head: None,
             latest_head: None,
             tables: HashMap::from([(
                 "volume".into(),
-                vec![DeltaRecord {
+                vec![ChangeRecord {
                     table: "volume".into(),
-                    operation: DeltaOperation::Update,
+                    operation: ChangeOp::Update,
                     key: HashMap::from([("pool".into(), Value::String("ETH".into()))]),
                     values: HashMap::from([("total".into(), Value::Float64(300.0))]),
                     prev_values: Some(HashMap::from([("total".into(), Value::Float64(200.0))])),
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn encode_empty_batch() {
-        let batch = DeltaBatch {
+        let batch = ChangeBatch {
             sequence: 0,
             finalized_head: None,
             latest_head: None,

@@ -98,7 +98,7 @@ impl Row {
         }
     }
 
-    /// Convert to a HashMap (for DeltaRecord construction). Skips Null values.
+    /// Convert to a HashMap (for ChangeRecord construction). Skips Null values.
     pub fn to_map(&self) -> HashMap<String, Value> {
         self.registry
             .names
@@ -172,7 +172,7 @@ impl From<RowMap> for Row {
     }
 }
 
-/// A HashMap-based row representation used for DeltaRecord fields,
+/// A HashMap-based row representation used for ChangeRecord fields,
 /// reducer state, and API boundaries where column names are dynamic.
 pub type RowMap = HashMap<String, Value>;
 
@@ -474,16 +474,16 @@ pub type GroupKey = SmallVec<[Value; 2]>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DeltaOperation {
+pub enum ChangeOp {
     Insert,
     Update,
     Delete,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeltaRecord {
+pub struct ChangeRecord {
     pub table: String,
-    pub operation: DeltaOperation,
+    pub operation: ChangeOp,
     pub key: HashMap<String, Value>,
     pub values: HashMap<String, Value>,
     pub prev_values: Option<HashMap<String, Value>>,
@@ -509,23 +509,23 @@ pub struct PerfNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeltaBatch {
+pub struct ChangeBatch {
     pub sequence: u64,
     pub finalized_head: Option<BlockCursor>,
     pub latest_head: Option<BlockCursor>,
-    pub tables: HashMap<String, Vec<DeltaRecord>>,
+    pub tables: HashMap<String, Vec<ChangeRecord>>,
     #[serde(default)]
     pub perf: Vec<PerfNode>,
 }
 
-impl DeltaBatch {
+impl ChangeBatch {
     /// Iterate all records across all tables.
-    pub fn all_records(&self) -> impl Iterator<Item = &DeltaRecord> {
+    pub fn all_records(&self) -> impl Iterator<Item = &ChangeRecord> {
         self.tables.values().flat_map(|v| v.iter())
     }
 
     /// Get records for a specific table.
-    pub fn records_for(&self, table: &str) -> &[DeltaRecord] {
+    pub fn records_for(&self, table: &str) -> &[ChangeRecord] {
         self.tables.get(table).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
@@ -681,9 +681,9 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let record = DeltaRecord {
+        let record = ChangeRecord {
             table: "swaps".into(),
-            operation: DeltaOperation::Insert,
+            operation: ChangeOp::Insert,
             key: HashMap::from([("block_number".into(), Value::UInt64(1000))]),
             values: HashMap::from([
                 ("user".into(), Value::String("alice".into())),
@@ -693,9 +693,9 @@ mod tests {
         };
 
         let bytes = rmp_serde::to_vec(&record).unwrap();
-        let decoded: DeltaRecord = rmp_serde::from_slice(&bytes).unwrap();
+        let decoded: ChangeRecord = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.table, "swaps");
-        assert_eq!(decoded.operation, DeltaOperation::Insert);
+        assert_eq!(decoded.operation, ChangeOp::Insert);
         assert_eq!(
             decoded.values.get("user"),
             Some(&Value::String("alice".into()))
@@ -703,8 +703,8 @@ mod tests {
     }
 
     #[test]
-    fn delta_batch_serde_roundtrip() {
-        let batch = DeltaBatch {
+    fn change_batch_serde_roundtrip() {
+        let batch = ChangeBatch {
             sequence: 1,
             finalized_head: Some(BlockCursor {
                 number: 900,
@@ -719,7 +719,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&batch).unwrap();
-        let decoded: DeltaBatch = serde_json::from_str(&json).unwrap();
+        let decoded: ChangeBatch = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.sequence, 1);
         assert_eq!(decoded.finalized_head.as_ref().unwrap().number, 900);
         assert_eq!(decoded.finalized_head.as_ref().unwrap().hash, "0xabc");

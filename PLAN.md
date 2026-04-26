@@ -1,6 +1,6 @@
-# Delta DB — Implementation Plan
+# Settle — Implementation Plan
 
-Based on [RFC_DELTA_DB.md](./RFC_DELTA_DB.md). Targets **Phase 1 (PoC)** scope.
+Targets **Phase 1 (PoC)** scope.
 
 ---
 
@@ -9,14 +9,14 @@ Based on [RFC_DELTA_DB.md](./RFC_DELTA_DB.md). Targets **Phase 1 (PoC)** scope.
 ### Step 0: Project Scaffolding — DONE
 
 - [x] Rust project with `Cargo.toml` (serde, serde_json, thiserror, sqlparser, rmp-serde, mlua, napi)
-- [x] Module structure: `types`, `schema/{parser,ast}`, `storage/{mod,memory}`, `engine/{dag,raw_table,reducer,mv,aggregation}`, `reducer_runtime/{event_rules,lua}`, `delta`, `db`, `napi`, `json_conv`, `error`
+- [x] Module structure: `types`, `schema/{parser,ast}`, `storage/{mod,memory}`, `engine/{dag,raw_table,reducer,mv,aggregation}`, `reducer_runtime/{event_rules,lua}`, `change`, `db`, `napi`, `json_conv`, `error`
 
 ### Step 1: Core Types — DONE
 
 - [x] `Value` enum: UInt64, Int64, Float64, Uint256, String, DateTime, Boolean, Bytes, Base58
 - [x] `ColumnType` enum, `Row = HashMap<String, Value>`, `BlockNumber = u64`
-- [x] `DeltaRecord { table, operation, key, values, prev_values }`
-- [x] `DeltaBatch { sequence, finalized_block, latest_block, records }`
+- [x] `ChangeRecord { table, operation, key, values, prev_values }`
+- [x] `ChangeBatch { sequence, finalized_block, latest_block, records }`
 
 ### Step 2: Schema Parser — DONE
 
@@ -34,7 +34,7 @@ Based on [RFC_DELTA_DB.md](./RFC_DELTA_DB.md). Targets **Phase 1 (PoC)** scope.
 
 ### Step 4: Raw Table Engine — DONE
 
-- [x] `RawTableEngine`: ingest rows, store via storage, rollback, emit Insert/Delete deltas
+- [x] `RawTableEngine`: ingest rows, store via storage, rollback, emit Insert/Delete changes
 - [x] Optimized rollback via `take_raw_rows_after` (single BTreeMap pass)
 
 ### Step 5: Aggregation Functions — DONE
@@ -45,7 +45,7 @@ Based on [RFC_DELTA_DB.md](./RFC_DELTA_DB.md). Targets **Phase 1 (PoC)** scope.
 
 ### Step 6: Materialized View Engine — DONE
 
-- [x] `MVEngine`: group key tracking, aggregation routing, delta emission (Insert/Update/Delete)
+- [x] `MVEngine`: group key tracking, aggregation routing, change emission (Insert/Update/Delete)
 - [x] `block_groups: BTreeMap<BlockNumber, HashSet<GroupKey>>` for O(log N) rollback (Step 18)
 - [x] toStartOfInterval time windowing
 
@@ -69,17 +69,17 @@ Based on [RFC_DELTA_DB.md](./RFC_DELTA_DB.md). Targets **Phase 1 (PoC)** scope.
 
 ### Step 10: DAG Wiring — DONE
 
-- [x] `DeltaEngine`: topological sort, pipeline processing (raw → reducer → MV)
+- [x] `SettleEngine`: topological sort, pipeline processing (raw → reducer → MV)
 - [x] `process_batch`, `rollback`, `finalize` orchestration
 
-### Step 11: Delta Buffer — DONE
+### Step 11: Change Buffer — DONE
 
-- [x] `DeltaBuffer`: accumulation, merging (Insert+Update→Insert, etc.), sequence numbers
+- [x] `ChangeBuffer`: accumulation, merging (Insert+Update→Insert, etc.), sequence numbers
 - [x] Backpressure via configurable max buffer size
 
 ### Step 12: Public API — DONE
 
-- [x] `DeltaDb` struct: open, process_batch, rollback, finalize, flush, ack
+- [x] `Settle` struct: open, process_batch, rollback, finalize, flush, ack
 - [x] `Config`: schema string, max_buffer_size, optional storage backend
 
 ### Step 13: ClickHouse Adapter — DONE (example only)
@@ -89,9 +89,9 @@ Based on [RFC_DELTA_DB.md](./RFC_DELTA_DB.md). Targets **Phase 1 (PoC)** scope.
 
 ### Step 14: Pipes SDK Integration — DONE (initial, needs rework)
 
-- [x] napi-rs bindings: `JsDeltaDb` class with open, processBatch, rollback, finalize, flush, ack
+- [x] napi-rs bindings: `JsSettle` class with open, processBatch, rollback, finalize, flush, ack
 - [x] TypeScript type definitions (index.d.ts, pipes.d.ts)
-- [x] `deltaDbTarget` Pipes SDK target (pipes.js): write loop, fork handler, finalization
+- [x] `settleTarget` Pipes SDK target (pipes.js): write loop, fork handler, finalization
 - [x] E2E tests (e2e.test.ts): raw tables, reducers, MVs, forks, multiple tables
 - [ ] Needs rework — see [PIPES_SDK_PLAN.md](./PIPES_SDK_PLAN.md)
 
@@ -120,7 +120,7 @@ Run: `cargo bench --bench throughput`
 
 #### Memory vs RocksDB
 
-| Benchmark | Memory | RocksDB | Delta |
+| Benchmark | Memory | RocksDB | Change |
 |-----------|-------:|--------:|------:|
 | Raw ingestion (200K rows) | 825K rows/s | 814K rows/s | -1% |
 | Raw + MV (200K rows) | 280K rows/s | 286K rows/s | +2% |
@@ -145,7 +145,7 @@ Run: `cargo bench --bench throughput`
 #### Observations
 
 - **Memory vs RocksDB gap is small (1-5%)** — the bottleneck is computation, not storage I/O. RocksDB writes are buffered in memtables, so the cost is mostly serialization.
-- **MV overhead is 2.9x** — going from 825K (raw only) to 280K (raw + MV). Group key hashing, aggregation state management, and delta emission are significant.
+- **MV overhead is 2.9x** — going from 825K (raw only) to 280K (raw + MV). Group key hashing, aggregation state management, and change emission are significant.
 - **Reducer adds another 2.3x** — going from 280K to 124K. Expression evaluation, state snapshotting, and group-key lookup dominate.
 - **Rollback passes** — ~7ms for 10K rows.
 - **Row type only for storage** — Step 20 showed that using `Row` (Vec<Value>) in the pipeline added conversion overhead. Keeping `RowMap` (HashMap) throughout the pipeline and only using `Row` for storage serialization gave the best results.
@@ -169,8 +169,8 @@ Added `Row` struct (`Arc<ColumnRegistry>` + `Vec<Value>`) for compact storage se
 
 - [x] **Intern column names** — `ColumnRegistry` maps column names ↔ `u16` indices for storage encoding.
 - [x] **Storage format** — raw rows stored as `Vec<Vec<Value>>` (values only, no keys). Encoding/decoding uses the table's `ColumnRegistry`. Only `RawTableEngine::ingest` and `rollback` create `Row` objects.
-- [x] **Pipeline uses RowMaps** — `ReducerRuntime`, `ReducerEngine`, `MVEngine`, and `DeltaEngine` all operate on `RowMap` (HashMap). No RowMap↔Row conversions in the hot path.
-- [x] **Public API** — `DeltaDb::process_batch` accepts `Vec<RowMap>`. RowMaps flow through the pipeline unchanged.
+- [x] **Pipeline uses RowMaps** — `ReducerRuntime`, `ReducerEngine`, `MVEngine`, and `SettleEngine` all operate on `RowMap` (HashMap). No RowMap↔Row conversions in the hot path.
+- [x] **Public API** — `Settle::process_batch` accepts `Vec<RowMap>`. RowMaps flow through the pipeline unchanged.
 - [ ] **Arena allocation for String values** — deferred to a future step.
 
 Benchmark: Raw ingestion +15% (557K→638K), reducer-only +19% (993K→1180K). Full pipeline benchmarks unchanged (no regression). The key insight: Row is only beneficial for storage serialization (compact Vec<Value> encoding). Using it for pipeline processing added conversion overhead that negated the benefit.
@@ -185,13 +185,13 @@ Replaced `rmp_serde` (MessagePack + serde) for raw row encoding with a custom bi
 
 Benchmark: Raw ingestion +17% (638K→744K), rollback +15% (8.8ms→7.5ms), full pipeline +4-6% across all benchmarks. MessagePack+serde still used for reducer state and group keys (not on hot path).
 
-### Step 22: Delta Buffer Merge Optimization — DONE
+### Step 22: Change Buffer Merge Optimization — DONE
 
-Made `DeltaBuffer::push()` append-only and deferred merge to `flush()` time. Also replaced the `hash_delta_key` sort-based hash with a commutative wrapping_add hash (no allocation).
+Made `ChangeBuffer::push()` append-only and deferred merge to `flush()` time. Also replaced the `hash_change_key` sort-based hash with a commutative wrapping_add hash (no allocation).
 
 - [x] **Append-only push** — `push()` just extends the pending Vec. No hashing, no index lookup, no merge per record. O(1) amortized per record.
 - [x] **Deferred merge at flush time** — `flush()` builds the merge index in a single pass over all pending records. Same merge semantics, but the HashMap is built once (not grown incrementally across thousands of push calls).
-- [x] **Commutative hash** — `hash_delta_key` uses `wrapping_add` of per-field hashes instead of sorting key fields into a Vec. Eliminates one allocation per record.
+- [x] **Commutative hash** — `hash_change_key` uses `wrapping_add` of per-field hashes instead of sorting key fields into a Vec. Eliminates one allocation per record.
 
 Benchmark: Raw ingestion +11% (744K→825K), 100K unique group keys +13% (262K→296K). Full pipeline benchmarks unchanged (buffer overhead is negligible vs reducer/MV computation).
 
@@ -203,9 +203,9 @@ Made finalization atomic: all reducer finalized state + engine metadata (latest_
 - [x] **MemoryBackend** — `commit()` acquires lock once, applies all ops atomically.
 - [x] **RocksDbBackend** — `commit()` builds a `rocksdb::WriteBatch`, calls `db.write(batch)` — atomic via RocksDB WAL.
 - [x] **ReducerEngine::finalize()** — now takes `&mut StorageWriteBatch`, collects writes instead of writing directly to storage.
-- [x] **DeltaEngine::finalize()** — passes batch through to each reducer.
-- [x] **DeltaDb::finalize() and ingest()** — create batch, collect reducer state + metadata, call `storage.commit(&batch)` once.
-- [x] **Bug fix** — `DeltaDb::finalize()` previously did not persist metadata (only `ingest()` did). Now both paths commit metadata atomically.
+- [x] **SettleEngine::finalize()** — passes batch through to each reducer.
+- [x] **Settle::finalize() and ingest()** — create batch, collect reducer state + metadata, call `storage.commit(&batch)` once.
+- [x] **Bug fix** — `Settle::finalize()` previously did not persist metadata (only `ingest()` did). Now both paths commit metadata atomically.
 
 Crash safety model: raw rows are written eagerly per-block (single `put_raw_rows` = atomic via RocksDB WAL). Unfinalized state is replayed from raw rows on recovery (cheap, small window). Finalized state is now atomic — no partial writes possible.
 

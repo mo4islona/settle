@@ -1,23 +1,23 @@
-# delta-db
+# settle
 
 Embedded rollback-aware computation engine for blockchain data. Processes raw rows through a DAG pipeline of reducers
-and materialized views, emitting delta batches (insert/update/delete) grouped by table.
+and materialized views, emitting change batches (insert/update/delete) grouped by table.
 
 ## Architecture
 
 ```
-Raw Tables ──► Reducers (Lua / Event Rules) ──► Materialized Views ──► Delta Batches
+Raw Tables ──► Reducers (Lua / Event Rules) ──► Materialized Views ──► Change Batches
                     │                                  │
                     └──── state snapshots ─────────────┘
                           (rollback-safe)
 ```
 
-- **Raw Tables** — Append-only storage for incoming blockchain data. Supports `VIRTUAL` tables that skip delta emission.
+- **Raw Tables** — Append-only storage for incoming blockchain data. Supports `VIRTUAL` tables that skip change emission.
 - **Reducers** — Stateful processors with `GROUP BY` routing. Lua scripts or declarative event rules. State is
   snapshotted per-block for rollback.
 - **Materialized Views** — SQL-like aggregations (`sum`, `count`, `avg`, `min`, `max`, `first`, `last`, `ohlcv`) with
   automatic rollback support.
-- **Delta Batches** — Output grouped by table: `{ tables: { "table_name": [DeltaRecord, ...] } }`. Each record carries
+- **Change Batches** — Output grouped by table: `{ tables: { "table_name": [ChangeRecord, ...] } }`. Each record carries
   `operation` (insert/update/delete), `key`, `values`, and `prevValues`.
 
 ## Schema Definition
@@ -60,9 +60,9 @@ GROUP BY asset_id;
 ## Usage (Rust)
 
 ```rust
-use delta_db::db::{Config, DeltaDb};
+use settle::db::{Config, Settle};
 
-let db = DeltaDb::open(Config {
+let db = Settle::open(Config {
 schema: schema_string,
 data_dir: Some("/tmp/my-db".into()),
 max_buffer_size: 10_000,
@@ -74,7 +74,7 @@ db.process_batch("orders", block_number, rows) ?;
 // Finalize older blocks
 db.finalize(block_number - 10);
 
-// Get deltas
+// Get changes
 if let Some(batch) = db.flush() {
 for (table, records) in & batch.tables {
 for record in records {
@@ -91,13 +91,13 @@ db.rollback(fork_point);
 ## Usage (TypeScript)
 
 ```bash
-npm install @sqd-pipes/delta-db
+npm install @settle/stream
 ```
 
 ```typescript
-import {DeltaDb} from '@sqd-pipes/delta-db'
+import {Settle} from '@settle/stream'
 
-const db = DeltaDb.open({schema: SCHEMA})
+const db = Settle.open({schema: SCHEMA})
 
 db.processBatch('orders', blockNumber, rows)
 db.finalize(blockNumber - 10)
@@ -128,7 +128,7 @@ Benchmarked on Apple M-series (`cargo bench`). Independent reducer branches exec
 | Full pipeline — Lua         | 50K rows, 1K blocks × 50 rows, Lua reducer + MV, 100 groups          | ~171K/s | ~165K/s |
 | Full pipeline — Event Rules | 100K rows, 2K blocks × 50 rows, declarative reducer + MV, 100 groups | ~137K/s | ~129K/s |
 | Reducer only — Event Rules  | 200K rows, 2K blocks × 100 rows, no MV or storage                    | ~923K/s | —       |
-| Rollback                    | 75 blocks × 134 rows, undo all and emit compensating deltas          | ~1.5M/s | ~1.4M/s |
+| Rollback                    | 75 blocks × 134 rows, undo all and emit compensating changes          | ~1.5M/s | ~1.4M/s |
 | Ingest (atomic)             | 100K rows, 20 blocks × 5K rows, Raw + MV + finalize + flush          | ~756K/s | ~692K/s |
 | Polymarket: market_stats    | 200K rows, 400 blocks × 500 rows, Lua reducer + MV, 10K tokens       | ~170K/s | ~170K/s |
 | Polymarket: full pipeline   | 200K rows, 400 blocks × 500 rows, 2 reducers + 2 MVs, parallel       | ~148K/s | ~152K/s |
@@ -143,7 +143,7 @@ cargo test
 cargo bench
 
 # TypeScript bindings
-cd bindings/typescript/delta-db
+cd bindings/typescript/settle
 pnpm install
 pnpm run build
 ```

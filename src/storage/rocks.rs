@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use rocksdb::{
-    ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Direction,
+    IteratorMode, Options, ReadOptions, WriteBatch,
 };
 
 use crate::error::{Error, Result};
@@ -105,24 +106,84 @@ fn upper_bound(prefix: &[u8]) -> Vec<u8> {
 // Backend
 // ---------------------------------------------------------------------------
 
-/// RocksDB-backed persistent storage for Delta DB.
+/// RocksDB tuning options exposed via Config.
+#[derive(Debug, Default)]
+pub struct RocksDbConfig {
+    /// Compression: "none", "snappy" (default), "zstd", "lz4".
+    pub compression: Option<String>,
+    /// Disable automatic background compactions.
+    pub disable_compaction: bool,
+    /// Block cache size in bytes. None = RocksDB default (~8MB per CF).
+    /// 0 = disable block cache entirely.
+    pub cache_size: Option<usize>,
+}
+
+/// RocksDB-backed persistent storage for Settle.
 pub struct RocksDbBackend {
     db: DB,
 }
 
 impl RocksDbBackend {
-    /// Open (or create) a RocksDB database at the given path.
+    /// Open (or create) a RocksDB database at the given path with default tuning.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
+        Self::open_with_config(path, &RocksDbConfig::default())
+    }
+
+    /// Open (or create) a RocksDB database at the given path with custom tuning options.
+    pub fn open_with_config(path: impl AsRef<Path>, config: &RocksDbConfig) -> Result<Self> {
+        let comp_type = match config.compression.as_deref() {
+            Some("none") => DBCompressionType::None,
+            Some("zstd") => DBCompressionType::Zstd,
+            Some("lz4") => DBCompressionType::Lz4,
+            Some("snappy") | None => DBCompressionType::Snappy,
+            Some(other) => {
+                return Err(Error::Storage(format!(
+                    "invalid RocksDB compression '{other}' (allowed: none, snappy, zstd, lz4)"
+                )));
+            }
+        };
+
+        // Shared block cache across all column families
+        let shared_cache = config.cache_size.map(|size| {
+            if size > 0 {
+                Some(Cache::new_lru_cache(size))
+            } else {
+                None
+            }
+        });
+
+        let make_opts = || {
+            let mut opts = Options::default();
+            opts.set_compression_type(comp_type);
+            if config.disable_compaction {
+                opts.set_disable_auto_compactions(true);
+            }
+            match &shared_cache {
+                Some(Some(cache)) => {
+                    let mut block_opts = BlockBasedOptions::default();
+                    block_opts.set_block_cache(cache);
+                    opts.set_block_based_table_factory(&block_opts);
+                }
+                Some(None) => {
+                    let mut block_opts = BlockBasedOptions::default();
+                    block_opts.disable_cache();
+                    opts.set_block_based_table_factory(&block_opts);
+                }
+                None => {}
+            }
+            opts
+        };
+
+        let mut db_opts = make_opts();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
 
         let cfs = [CF_RAW, CF_REDUCER_SNAP, CF_REDUCER_FIN, CF_MV, CF_META]
             .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
+            .map(|name| ColumnFamilyDescriptor::new(name, make_opts()))
             .collect::<Vec<_>>();
 
-        let db = DB::open_cf_descriptors(&opts, path, cfs).map_err(to_err)?;
+        let db = DB::open_cf_descriptors(&db_opts, path, cfs).map_err(to_err)?;
         Ok(Self { db })
     }
 
@@ -855,5 +916,66 @@ mod tests {
             assert_eq!(rows[0].1, b"test_row_data");
             assert_eq!(b.get_meta("cursor").unwrap().unwrap(), b"100");
         }
+    }
+
+    // --- Config options ---
+
+    #[test]
+    fn open_with_compression_options() {
+        for compression in &["none", "snappy", "zstd", "lz4"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = RocksDbConfig {
+                compression: Some(compression.to_string()),
+                ..Default::default()
+            };
+            let b = RocksDbBackend::open_with_config(dir.path(), &config).unwrap();
+            b.put_raw_rows("t", 1, b"data").unwrap();
+            assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn open_with_invalid_compression_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RocksDbConfig {
+            compression: Some("brotli".to_string()),
+            ..Default::default()
+        };
+        assert!(RocksDbBackend::open_with_config(dir.path(), &config).is_err());
+    }
+
+    #[test]
+    fn open_with_cache_options() {
+        // Explicit cache size
+        let dir = tempfile::tempdir().unwrap();
+        let config = RocksDbConfig {
+            cache_size: Some(4 * 1024 * 1024),
+            ..Default::default()
+        };
+        let b = RocksDbBackend::open_with_config(dir.path(), &config).unwrap();
+        b.put_raw_rows("t", 1, b"data").unwrap();
+        assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
+
+        // Cache disabled
+        let dir2 = tempfile::tempdir().unwrap();
+        let config2 = RocksDbConfig {
+            cache_size: Some(0),
+            ..Default::default()
+        };
+        let b2 = RocksDbBackend::open_with_config(dir2.path(), &config2).unwrap();
+        b2.put_raw_rows("t", 1, b"data").unwrap();
+        assert_eq!(b2.get_raw_rows("t", 1, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_with_compaction_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RocksDbConfig {
+            disable_compaction: true,
+            ..Default::default()
+        };
+        let b = RocksDbBackend::open_with_config(dir.path(), &config).unwrap();
+        b.put_raw_rows("t", 1, b"data").unwrap();
+        assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
     }
 }
