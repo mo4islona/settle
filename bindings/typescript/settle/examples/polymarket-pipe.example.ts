@@ -295,35 +295,40 @@ function generateOrders(blockNumber: number, timestamp: number, count: number): 
 
 // ── Main ───────────────────────────────────────────────────────────
 
-function main() {
+async function main() {
   // Open settle with in-memory storage (no dataDir = no persistence)
   const db = Settle.open({ schema: SCHEMA })
 
   console.log('=== Polymarket Settle Example ===\n')
 
-  // Process 10 blocks, 20 orders each
+  // Process 10 blocks, 20 orders each. Keep the last 3 blocks unfinalized so
+  // the rollback demo below has something to roll back through.
   const numBlocks = 10
   const ordersPerBlock = 20
   const allBatches: ChangeBatch[] = []
 
+  // Helper: deterministic block hash that matches what handleFork() expects later.
+  const cursorOf = (n: number) => ({
+    number: n,
+    hash: `0x${n.toString(16).padStart(16, '0')}`,
+  })
+
+  // Build one big payload spanning blocks 1000..1009 with finalizedHead = 1006
+  // (so blocks 1007..1009 stay unfinalized).
+  const allRows: Record<string, unknown>[] = []
   for (let i = 0; i < numBlocks; i++) {
     const blockNumber = 1000 + i
     const timestamp = 1_700_000_000 + i * 12 // ~12s per block
-
     const orders = generateOrders(blockNumber, timestamp, ordersPerBlock)
-    const rows = transformOrders(orders)
-
-    // Feed rows into settle
-    db.processBatch('orders', blockNumber, rows)
-
-    // Finalize older blocks (keep last 3 unfinalized for rollback)
-    if (blockNumber > 1002) {
-      db.finalize(blockNumber - 3)
-    }
+    allRows.push(...transformOrders(orders))
   }
 
-  // Flush all pending changes
-  const batch = db.flush()
+  const finalizedTip = 1006
+  const batch = await db.ingest({
+    data: { orders: allRows },
+    rollbackChain: [1007, 1008, 1009].map(cursorOf),
+    finalizedHead: cursorOf(finalizedTip),
+  })
   if (batch) {
     allBatches.push(batch)
     db.ack(batch.sequence)
@@ -377,23 +382,25 @@ function main() {
     }
   }
 
-  // Demonstrate rollback
+  // Demonstrate rollback via handleFork
   console.log('\n=== Rollback Demo ===\n')
 
-  // Process one more block
+  // Process one more block (1010)
   const extraOrders = generateOrders(1010, 1_700_000_120, 10)
-  db.processBatch('orders', 1010, transformOrders(extraOrders))
-
-  const beforeRollback = db.flush()
+  const beforeRollback = await db.ingest({
+    data: { orders: transformOrders(extraOrders) },
+    rollbackChain: [1007, 1008, 1009, 1010].map(cursorOf),
+    finalizedHead: cursorOf(finalizedTip),
+  })
   if (beforeRollback) {
     const count = Object.values(beforeRollback.tables).reduce((s, r) => s + r.length, 0)
     console.log(`Before rollback: ${count} new records`)
     db.ack(beforeRollback.sequence)
   }
 
-  // Rollback to block 1008 (undoes blocks 1009 and 1010)
-  db.rollback(1008)
-  const rollbackBatch = db.flush()
+  // Rollback to block 1008 — provide just enough chain that 1008 is the
+  // highest common ancestor (handleFork drops every block above it).
+  const { batch: rollbackBatch } = db.handleFork([1007, 1008].map(cursorOf))
   if (rollbackBatch) {
     const allRecords = Object.values(rollbackBatch.tables).flat()
     const deletes = allRecords.filter((r) => r.operation === 'delete')
@@ -418,9 +425,11 @@ function main() {
 
   // Re-ingest corrected data after rollback
   const correctedOrders = generateOrders(1009, 1_700_000_108, 5)
-  db.processBatch('orders', 1009, transformOrders(correctedOrders))
-
-  const afterFix = db.flush()
+  const afterFix = await db.ingest({
+    data: { orders: transformOrders(correctedOrders) },
+    rollbackChain: [1007, 1008, 1009].map(cursorOf),
+    finalizedHead: cursorOf(finalizedTip),
+  })
   if (afterFix) {
     const decoded = decodeBatch(afterFix)
     console.log(

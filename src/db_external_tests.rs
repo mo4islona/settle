@@ -54,20 +54,23 @@ fn open_with_fn_reducer() -> Settle {
 fn external_reducer_full_pipeline() {
     let mut db = open_with_fn_reducer();
 
-    db.process_batch(
-        "trades",
-        1000,
-        vec![make_trade("alice", "buy", 10.0, 2000.0)],
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            (
+                "trades".into(),
+                1000,
+                vec![make_trade("alice", "buy", 10.0, 2000.0)],
+            ),
+            (
+                "trades".into(),
+                1001,
+                vec![make_trade("alice", "sell", 5.0, 2200.0)],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-    db.process_batch(
-        "trades",
-        1001,
-        vec![make_trade("alice", "sell", 5.0, 2200.0)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
     let mv = batch.records_for("position_summary");
     assert_eq!(mv.len(), 1);
     assert_eq!(mv[0].values.get("trade_count"), Some(&Value::UInt64(2)));
@@ -84,31 +87,34 @@ fn external_reducer_full_pipeline() {
 fn external_reducer_rollback() {
     let mut db = open_with_fn_reducer();
 
-    db.process_batch(
-        "trades",
-        1000,
-        vec![make_trade("alice", "buy", 10.0, 2000.0)],
+    ingest_blocks(
+        &mut db,
+        vec![
+            (
+                "trades".into(),
+                1000,
+                vec![make_trade("alice", "buy", 10.0, 2000.0)],
+            ),
+            (
+                "trades".into(),
+                1001,
+                vec![make_trade("alice", "buy", 5.0, 2100.0)],
+            ),
+        ],
     )
     .unwrap();
-    db.process_batch(
-        "trades",
-        1001,
-        vec![make_trade("alice", "buy", 5.0, 2100.0)],
-    )
-    .unwrap();
-    db.flush();
 
-    db.rollback(1000).unwrap();
+    rollback_to(&mut db, 1000).unwrap();
 
     // Re-ingest different trade
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "trades",
         1001,
         vec![make_trade("alice", "sell", 3.0, 2200.0)],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let mv = batch.records_for("position_summary");
     assert_eq!(mv.len(), 1);
     assert_eq!(mv[0].values.get("trade_count"), Some(&Value::UInt64(2)));
@@ -134,15 +140,25 @@ fn external_reducer_matches_event_rules() {
         make_trade("bob", "sell", 10.0, 1600.0),
     ];
 
-    er_db.process_batch("trades", 1000, trades.clone()).unwrap();
-    er_db
-        .process_batch("trades", 1001, trades2.clone())
-        .unwrap();
-    let er_batch = er_db.flush().unwrap();
+    let er_batch = ingest_blocks(
+        &mut er_db,
+        vec![
+            ("trades".into(), 1000, trades.clone()),
+            ("trades".into(), 1001, trades2.clone()),
+        ],
+    )
+    .unwrap()
+    .unwrap();
 
-    fn_db.process_batch("trades", 1000, trades).unwrap();
-    fn_db.process_batch("trades", 1001, trades2).unwrap();
-    let fn_batch = fn_db.flush().unwrap();
+    let fn_batch = ingest_blocks(
+        &mut fn_db,
+        vec![
+            ("trades".into(), 1000, trades),
+            ("trades".into(), 1001, trades2),
+        ],
+    )
+    .unwrap()
+    .unwrap();
 
     let er_mv = er_batch.records_for("position_summary");
     let fn_mv = fn_batch.records_for("position_summary");
@@ -179,29 +195,31 @@ fn external_reducer_matches_event_rules() {
 fn external_reducer_multi_group_rollback() {
     let mut db = open_with_fn_reducer();
 
-    db.process_batch(
-        "trades",
-        1000,
+    ingest_blocks(
+        &mut db,
         vec![
-            make_trade("alice", "buy", 10.0, 2000.0),
-            make_trade("bob", "buy", 5.0, 3000.0),
+            (
+                "trades".into(),
+                1000,
+                vec![
+                    make_trade("alice", "buy", 10.0, 2000.0),
+                    make_trade("bob", "buy", 5.0, 3000.0),
+                ],
+            ),
+            (
+                "trades".into(),
+                1001,
+                vec![
+                    make_trade("alice", "sell", 5.0, 2200.0),
+                    make_trade("bob", "sell", 3.0, 3100.0),
+                ],
+            ),
         ],
     )
     .unwrap();
-    db.process_batch(
-        "trades",
-        1001,
-        vec![
-            make_trade("alice", "sell", 5.0, 2200.0),
-            make_trade("bob", "sell", 3.0, 3100.0),
-        ],
-    )
-    .unwrap();
-    db.flush();
 
     // Rollback block 1001
-    db.rollback(1000).unwrap();
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 1000).unwrap().batch.unwrap();
 
     let mv = batch.records_for("position_summary");
     assert_eq!(mv.len(), 2);

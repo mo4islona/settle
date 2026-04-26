@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use settle::db::{Config, Settle};
+use settle::test_helpers::{ingest_blocks, ingest_one, ingest_with_finalized, rollback_to};
 use settle::types::{ChangeBatch, ChangeRecord, RowMap, Value};
 
 // --- Token Addresses ---
@@ -127,14 +128,14 @@ fn direct_stablecoin_pricing() {
     let t0 = 1_700_000_000_000i64;
 
     // Buy 1.5 WETH at $2000 (pay 3000 USDC)
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "swaps",
         1,
         vec![weth_usdc(t0, "0xaaa", "alice", 1.5, -3000.0)],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // Candle should show WETH price = $2000
     let candles = find_records(&batch, "candles_5m");
@@ -157,25 +158,26 @@ fn cross_price_via_eth() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // Block 1: Establish ETH/USD = $2000 via WETH/USDC swap
-    db.process_batch(
-        "swaps",
-        1,
-        vec![weth_usdc(t0, "0x1", "market_maker", 1.0, -2000.0)],
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // Block 1: Establish ETH/USD = $2000 via WETH/USDC swap
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdc(t0, "0x1", "market_maker", 1.0, -2000.0)],
+            ),
+            // Block 2: UNI/WETH swap — buy 100 UNI, pay 0.5 WETH
+            // ratio = |(-0.5) / 100| = 0.005 WETH per UNI; UNI price = 0.005 * $2000 = $10
+            (
+                "swaps".into(),
+                2,
+                vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-
-    // Block 2: UNI/WETH swap — buy 100 UNI, pay 0.5 WETH
-    // ratio = |(-0.5) / 100| = 0.005 WETH per UNI
-    // UNI price = 0.005 * $2000 = $10
-    db.process_batch(
-        "swaps",
-        2,
-        vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // Find the UNI pool candle
     let pool_val = Value::String(POOL_UNI_WETH.to_string());
@@ -211,30 +213,32 @@ fn cross_price_both_directions() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // Establish ETH/USD = $2000
-    db.process_batch("swaps", 1, vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)])
-        .unwrap();
-
-    // UNI/WETH: buy 100 UNI for 0.5 WETH
-    // ratio = 0.005 -> UNI = $10
-    db.process_batch(
-        "swaps",
-        2,
-        vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // Establish ETH/USD = $2000
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)],
+            ),
+            // UNI/WETH: buy 100 UNI for 0.5 WETH (ratio 0.005 → UNI = $10)
+            (
+                "swaps".into(),
+                2,
+                vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+            ),
+            // LINK/WETH: buy 50 LINK for 0.75 WETH
+            // ratio = |(-0.75) / 50| = 0.015 WETH per LINK; LINK = 0.015 * $2000 = $30
+            (
+                "swaps".into(),
+                3,
+                vec![link_weth(t0 + 2_000, "0x3", "bob", 50.0, -0.75)],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-
-    // LINK/WETH: buy 50 LINK for 0.75 WETH
-    // ratio = |(-0.75) / 50| = 0.015 WETH per LINK
-    // LINK = 0.015 * $2000 = $30
-    db.process_batch(
-        "swaps",
-        3,
-        vec![link_weth(t0 + 2_000, "0x3", "bob", 50.0, -0.75)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let uni_pool = Value::String(POOL_UNI_WETH.to_string());
     let link_pool = Value::String(POOL_LINK_WETH.to_string());
@@ -268,35 +272,37 @@ fn eth_price_update_propagation() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // Block 1: ETH = $2000
-    db.process_batch("swaps", 1, vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)])
-        .unwrap();
-
-    // Block 2: UNI/WETH at 0.005 WETH/UNI -> UNI = $10
-    db.process_batch(
-        "swaps",
-        2,
-        vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // Block 1: ETH = $2000
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)],
+            ),
+            // Block 2: UNI/WETH at 0.005 WETH/UNI -> UNI = $10
+            (
+                "swaps".into(),
+                2,
+                vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+            ),
+            // Block 3: ETH price rises to $2200
+            (
+                "swaps".into(),
+                3,
+                vec![weth_usdc(t0 + 2_000, "0x3", "mm", 1.0, -2200.0)],
+            ),
+            // Block 4: Same UNI/WETH ratio (0.005) -> UNI = 0.005 * $2200 = $11
+            (
+                "swaps".into(),
+                4,
+                vec![uni_weth(t0 + 3_000, "0x4", "bob", 200.0, -1.0)],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-
-    // Block 3: ETH price rises to $2200
-    db.process_batch(
-        "swaps",
-        3,
-        vec![weth_usdc(t0 + 2_000, "0x3", "mm", 1.0, -2200.0)],
-    )
-    .unwrap();
-
-    // Block 4: Same UNI/WETH ratio (0.005) -> UNI = 0.005 * $2200 = $11
-    db.process_batch(
-        "swaps",
-        4,
-        vec![uni_weth(t0 + 3_000, "0x4", "bob", 200.0, -1.0)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // The UNI candle should have:
     // open = $10 (first trade), close = $11 (last trade, after ETH price update)
@@ -326,39 +332,42 @@ fn ohlc_multiple_windows_cross_priced() {
     let t0 = 1_700_000_000_000i64;
     let five_min = 300_000i64;
 
-    // Block 1: Establish ETH = $2000
-    db.process_batch("swaps", 1, vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)])
-        .unwrap();
-
-    // Window 1: UNI trade at $10
-    db.process_batch(
-        "swaps",
-        2,
-        vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // Block 1: Establish ETH = $2000
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)],
+            ),
+            // Window 1: UNI trade at $10
+            (
+                "swaps".into(),
+                2,
+                vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+            ),
+            // Window 2: UNI trades at $12 and $8
+            (
+                "swaps".into(),
+                3,
+                vec![uni_weth(t0 + five_min + 1_000, "0x3", "bob", 100.0, -0.6)],
+            ),
+            (
+                "swaps".into(),
+                4,
+                vec![uni_weth(
+                    t0 + five_min + 10_000,
+                    "0x4",
+                    "alice",
+                    100.0,
+                    -0.4,
+                )],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-
-    // Window 2: UNI trades at $12 and $8
-    db.process_batch(
-        "swaps",
-        3,
-        vec![uni_weth(t0 + five_min + 1_000, "0x3", "bob", 100.0, -0.6)],
-    )
-    .unwrap();
-    db.process_batch(
-        "swaps",
-        4,
-        vec![uni_weth(
-            t0 + five_min + 10_000,
-            "0x4",
-            "alice",
-            100.0,
-            -0.4,
-        )],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
     let uni_pool = Value::String(POOL_UNI_WETH.to_string());
     let uni_candles: Vec<_> = batch
         .records_for("candles_5m")
@@ -400,37 +409,37 @@ fn wallet_pnl_cross_priced() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // Block 1: ETH = $2000
-    db.process_batch("swaps", 1, vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)])
-        .unwrap();
-
-    // Block 2: Alice buys 100 UNI at 0.005 WETH/UNI = $10/UNI
-    // Cost = 100 * $10 = $1000
-    db.process_batch(
-        "swaps",
-        2,
-        vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // Block 1: ETH = $2000
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)],
+            ),
+            // Block 2: Alice buys 100 UNI at 0.005 WETH/UNI = $10/UNI; Cost = $1000
+            (
+                "swaps".into(),
+                2,
+                vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+            ),
+            // Block 3: ETH rises to $2200
+            (
+                "swaps".into(),
+                3,
+                vec![weth_usdc(t0 + 2_000, "0x3", "mm", 1.0, -2200.0)],
+            ),
+            // Block 4: Alice sells 50 UNI at $11/UNI; Realized PnL = $50
+            (
+                "swaps".into(),
+                4,
+                vec![uni_weth(t0 + 3_000, "0x4", "alice", -50.0, 0.25)],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-
-    // Block 3: ETH rises to $2200
-    db.process_batch(
-        "swaps",
-        3,
-        vec![weth_usdc(t0 + 2_000, "0x3", "mm", 1.0, -2200.0)],
-    )
-    .unwrap();
-
-    // Block 4: Alice sells 50 UNI at 0.005 WETH/UNI = $11/UNI (due to ETH price rise)
-    // Realized PnL = 50 * ($11 - $10) = $50
-    db.process_batch(
-        "swaps",
-        4,
-        vec![uni_weth(t0 + 3_000, "0x4", "alice", -50.0, 0.25)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let alice_uni = find_by_key(
         &batch,
@@ -461,33 +470,32 @@ fn wallet_pnl_direct_stablecoin() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // Alice buys 10 WETH at $2000
-    db.process_batch(
-        "swaps",
-        1,
-        vec![weth_usdc(t0, "0x1", "alice", 10.0, -20_000.0)],
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // Alice buys 10 WETH at $2000
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdc(t0, "0x1", "alice", 10.0, -20_000.0)],
+            ),
+            // Alice buys 5 WETH at $2100
+            (
+                "swaps".into(),
+                2,
+                vec![weth_usdc(t0 + 1_000, "0x2", "alice", 5.0, -10_500.0)],
+            ),
+            // avg cost = (20000 + 10500) / 15 = $2033.33; sell 5 WETH at $2200
+            // PnL = 5 * (2200 - 2033.33) = $833.33
+            (
+                "swaps".into(),
+                3,
+                vec![weth_usdc(t0 + 2_000, "0x3", "alice", -5.0, 11_000.0)],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-
-    // Alice buys 5 WETH at $2100
-    db.process_batch(
-        "swaps",
-        2,
-        vec![weth_usdc(t0 + 1_000, "0x2", "alice", 5.0, -10_500.0)],
-    )
-    .unwrap();
-
-    // Alice's avg cost = (20000 + 10500) / (10 + 5) = $2033.33
-    // Alice sells 5 WETH at $2200
-    // PnL = 5 * (2200 - 2033.33) = $833.33
-    db.process_batch(
-        "swaps",
-        3,
-        vec![weth_usdc(t0 + 2_000, "0x3", "alice", -5.0, 11_000.0)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let alice = find_by_key(
         &batch,
@@ -517,39 +525,40 @@ fn multi_wallet_multi_pool() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // ETH = $2000
-    db.process_batch("swaps", 1, vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)])
-        .unwrap();
-
-    // Alice buys WETH directly, Bob buys UNI via WETH
-    db.process_batch(
-        "swaps",
-        2,
+    let batch = ingest_blocks(
+        &mut db,
         vec![
-            weth_usdc(t0 + 1_000, "0x2", "alice", 10.0, -20_000.0),
-            uni_weth(t0 + 2_000, "0x3", "bob", 1000.0, -5.0),
+            // ETH = $2000
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)],
+            ),
+            // Alice buys WETH directly, Bob buys UNI via WETH
+            (
+                "swaps".into(),
+                2,
+                vec![
+                    weth_usdc(t0 + 1_000, "0x2", "alice", 10.0, -20_000.0),
+                    uni_weth(t0 + 2_000, "0x3", "bob", 1000.0, -5.0),
+                ],
+            ),
+            // Block 3: Bob sells UNI while ETH is still $2000 -> PnL = 0
+            (
+                "swaps".into(),
+                3,
+                vec![uni_weth(t0 + 3_000, "0x4", "bob", -500.0, 2.5)],
+            ),
+            // Block 4: Alice sells WETH at $2500; PnL = 5 * (2500 - 2000) = 2500
+            (
+                "swaps".into(),
+                4,
+                vec![weth_usdc(t0 + 4_000, "0x5", "alice", -5.0, 12_500.0)],
+            ),
         ],
     )
+    .unwrap()
     .unwrap();
-
-    // Block 3: Bob sells UNI while ETH is still $2000 -> PnL = 0
-    db.process_batch(
-        "swaps",
-        3,
-        vec![uni_weth(t0 + 3_000, "0x4", "bob", -500.0, 2.5)],
-    )
-    .unwrap();
-
-    // Block 4: Alice sells WETH at $2500
-    // Alice PnL: 5 * (2500 - 2000) = 2500
-    db.process_batch(
-        "swaps",
-        4,
-        vec![weth_usdc(t0 + 4_000, "0x5", "alice", -5.0, 12_500.0)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // Alice: WETH position
     let alice = find_by_key(
@@ -596,24 +605,26 @@ fn usdt_pricing() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // WETH/USDT swap: sell 1 WETH for 2100 USDT
-    db.process_batch(
-        "swaps",
-        1,
-        vec![weth_usdt(t0, "0x1", "alice", -1.0, 2100.0)],
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // WETH/USDT swap: sell 1 WETH for 2100 USDT
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdt(t0, "0x1", "alice", -1.0, 2100.0)],
+            ),
+            // UNI/WETH uses ETH price from USDT pool = $2100
+            // Buy 100 UNI for 0.5 WETH -> UNI = 0.005 * 2100 = $10.5
+            (
+                "swaps".into(),
+                2,
+                vec![uni_weth(t0 + 1_000, "0x2", "bob", 100.0, -0.5)],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-
-    // UNI/WETH: uses ETH price from USDT pool = $2100
-    // Buy 100 UNI for 0.5 WETH -> UNI = 0.005 * 2100 = $10.5
-    db.process_batch(
-        "swaps",
-        2,
-        vec![uni_weth(t0 + 1_000, "0x2", "bob", 100.0, -0.5)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let uni_pool = Value::String(POOL_UNI_WETH.to_string());
     let uni_candle = batch
@@ -635,56 +646,60 @@ fn rollback_restores_cross_prices() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // Block 1: ETH = $2000
-    db.process_batch("swaps", 1, vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)])
-        .unwrap();
-
-    // Block 2: UNI trade at $10
-    db.process_batch(
-        "swaps",
-        2,
-        vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+    ingest_blocks(
+        &mut db,
+        vec![
+            // Block 1: ETH = $2000
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)],
+            ),
+            // Block 2: UNI trade at $10
+            (
+                "swaps".into(),
+                2,
+                vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+            ),
+            // Block 3: Bad ETH price spike to $10000 (will be rolled back)
+            (
+                "swaps".into(),
+                3,
+                vec![weth_usdc(t0 + 2_000, "0x3", "mm", 1.0, -10_000.0)],
+            ),
+            // Block 4: UNI trade with wrong ETH price -> UNI = $50 (wrong)
+            (
+                "swaps".into(),
+                4,
+                vec![uni_weth(t0 + 3_000, "0x4", "bob", 100.0, -0.5)],
+            ),
+        ],
     )
     .unwrap();
-
-    // Block 3: Bad ETH price spike to $10000 (will be rolled back)
-    db.process_batch(
-        "swaps",
-        3,
-        vec![weth_usdc(t0 + 2_000, "0x3", "mm", 1.0, -10_000.0)],
-    )
-    .unwrap();
-
-    // Block 4: UNI trade with wrong ETH price -> UNI = $50 (wrong)
-    db.process_batch(
-        "swaps",
-        4,
-        vec![uni_weth(t0 + 3_000, "0x4", "bob", 100.0, -0.5)],
-    )
-    .unwrap();
-
-    db.flush();
 
     // Rollback blocks 3 and 4
-    db.rollback(2).unwrap();
+    rollback_to(&mut db, 2).unwrap();
 
-    // Re-ingest block 3: correct ETH = $2200
-    db.process_batch(
-        "swaps",
-        3,
-        vec![weth_usdc(t0 + 2_000, "0x3b", "mm", 1.0, -2200.0)],
+    // Re-ingest blocks 3 and 4 with correct prices
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // Block 3: correct ETH = $2200
+            (
+                "swaps".into(),
+                3,
+                vec![weth_usdc(t0 + 2_000, "0x3b", "mm", 1.0, -2200.0)],
+            ),
+            // Block 4: UNI trade -> UNI = 0.005 * $2200 = $11
+            (
+                "swaps".into(),
+                4,
+                vec![uni_weth(t0 + 3_000, "0x4b", "bob", 100.0, -0.5)],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-
-    // Re-ingest block 4: UNI trade -> UNI = 0.005 * $2200 = $11
-    db.process_batch(
-        "swaps",
-        4,
-        vec![uni_weth(t0 + 3_000, "0x4b", "bob", 100.0, -0.5)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let uni_pool = Value::String(POOL_UNI_WETH.to_string());
     let uni_candle = batch
@@ -713,50 +728,53 @@ fn pnl_rollback() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    // Block 1: ETH = $2000
-    db.process_batch("swaps", 1, vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)])
-        .unwrap();
-
-    // Block 2: Alice buys 100 UNI at $10
-    db.process_batch(
-        "swaps",
-        2,
-        vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+    ingest_blocks(
+        &mut db,
+        vec![
+            // Block 1: ETH = $2000
+            (
+                "swaps".into(),
+                1,
+                vec![weth_usdc(t0, "0x1", "mm", 1.0, -2000.0)],
+            ),
+            // Block 2: Alice buys 100 UNI at $10
+            (
+                "swaps".into(),
+                2,
+                vec![uni_weth(t0 + 1_000, "0x2", "alice", 100.0, -0.5)],
+            ),
+            // Block 3: Alice sells 50 UNI at $10 -> PnL = 0
+            (
+                "swaps".into(),
+                3,
+                vec![uni_weth(t0 + 2_000, "0x3", "alice", -50.0, 0.25)],
+            ),
+        ],
     )
     .unwrap();
-
-    // Block 3: Alice sells 50 UNI at $10 -> PnL = 0
-    db.process_batch(
-        "swaps",
-        3,
-        vec![uni_weth(t0 + 2_000, "0x3", "alice", -50.0, 0.25)],
-    )
-    .unwrap();
-
-    db.flush();
 
     // Rollback the sell
-    db.rollback(2).unwrap();
-    db.flush();
+    rollback_to(&mut db, 2).unwrap();
 
-    // Re-ingest block 3: ETH jumps to $3000
-    db.process_batch(
-        "swaps",
-        3,
-        vec![weth_usdc(t0 + 2_000, "0x3b", "mm", 1.0, -3000.0)],
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // Block 3: ETH jumps to $3000
+            (
+                "swaps".into(),
+                3,
+                vec![weth_usdc(t0 + 2_000, "0x3b", "mm", 1.0, -3000.0)],
+            ),
+            // Block 4: Alice sells 50 UNI at 0.005 WETH = $15/UNI; PnL = $250
+            (
+                "swaps".into(),
+                4,
+                vec![uni_weth(t0 + 3_000, "0x4", "alice", -50.0, 0.25)],
+            ),
+        ],
     )
+    .unwrap()
     .unwrap();
-
-    // Block 4: Alice sells 50 UNI at 0.005 WETH = $15/UNI
-    // PnL = 50 * ($15 - $10) = $250
-    db.process_batch(
-        "swaps",
-        4,
-        vec![uni_weth(t0 + 3_000, "0x4", "alice", -50.0, 0.25)],
-    )
-    .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let alice = find_by_key(
         &batch,
@@ -787,16 +805,15 @@ fn full_scenario_with_cross_pricing() {
     let t0 = 1_700_000_000_000i64;
     let block_time = 12_000i64;
 
-    // Phase 1: Establish reference prices
-    // Block 1: ETH = $2000 via WETH/USDC
-    db.process_batch(
-        "swaps",
+    // Phase 1+2: Establish reference price + trading on multiple pools (blocks 1-20).
+    // All ingested in one go with finalized_head = 10 (so blocks 11-20 stay
+    // unfinalized and can be rolled back further down).
+    let mut items: Vec<(String, u64, Vec<RowMap>)> = vec![(
+        "swaps".into(),
         1,
         vec![weth_usdc(t0, "0x01", "mm", 10.0, -20_000.0)],
-    )
-    .unwrap();
+    )];
 
-    // Phase 2: Trading on multiple pools (blocks 2-20)
     for block in 2..=20u64 {
         let bt = t0 + block as i64 * block_time;
         let mut swaps = Vec::new();
@@ -862,14 +879,11 @@ fn full_scenario_with_cross_pricing() {
         }
 
         if !swaps.is_empty() {
-            db.process_batch("swaps", block, swaps).unwrap();
+            items.push(("swaps".into(), block, swaps));
         }
     }
 
-    // Finalize up to block 10
-    db.finalize(10).unwrap();
-
-    let batch1 = db.flush().unwrap();
+    let batch1 = ingest_with_finalized(&mut db, items, 10).unwrap().unwrap();
     assert!(batch1.record_count() > 0);
 
     // Verify candles exist for cross-priced pools
@@ -908,16 +922,15 @@ fn full_scenario_with_cross_pricing() {
     );
 
     // Phase 3: Rollback to block 15
-    db.rollback(15).unwrap();
+    let rollback_batch = rollback_to(&mut db, 15).unwrap().batch.unwrap();
     assert_eq!(db.latest_block(), 15);
-
-    let rollback_batch = db.flush().unwrap();
     assert!(
         rollback_batch.record_count() > 0,
         "rollback should produce changes"
     );
 
     // Phase 4: Re-ingest blocks 16-25 with different ETH price
+    let mut items: Vec<(String, u64, Vec<RowMap>)> = Vec::new();
     for block in 16..=24u64 {
         let bt = t0 + block as i64 * block_time;
         let mut swaps = Vec::new();
@@ -948,13 +961,12 @@ fn full_scenario_with_cross_pricing() {
         }
 
         if !swaps.is_empty() {
-            db.process_batch("swaps", block, swaps).unwrap();
+            items.push(("swaps".into(), block, swaps));
         }
     }
 
+    let final_batch = ingest_with_finalized(&mut db, items, 10).unwrap().unwrap();
     assert_eq!(db.latest_block(), 24);
-
-    let final_batch = db.flush().unwrap();
     assert!(final_batch.record_count() > 0);
 
     // Verify final state has both pools
@@ -980,14 +992,14 @@ fn swap_prices_includes_timestamp() {
     let mut db = Settle::open(Config::new(UNISWAP_SCHEMA)).unwrap();
     let t0 = 1_700_000_000_000i64;
 
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "swaps",
         1,
         vec![weth_usdc(t0 + 42_000, "0x1", "alice", 1.0, -2000.0)],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // The swap_prices reducer emits block_time -> candles_5m uses it for windowing.
     // If block_time wasn't emitted, toStartOfInterval would get 0 -> all in epoch window.
@@ -1010,10 +1022,8 @@ fn cross_price_without_eth_reference() {
     let t0 = 1_700_000_000_000i64;
 
     // UNI/WETH trade WITHOUT any prior WETH/USDC or WETH/USDT swap
-    db.process_batch("swaps", 1, vec![uni_weth(t0, "0x1", "alice", 100.0, -0.5)])
-        .unwrap();
-
-    let batch = db.flush();
+    let batch =
+        ingest_one(&mut db, "swaps", 1, vec![uni_weth(t0, "0x1", "alice", 100.0, -0.5)]).unwrap();
 
     // No ETH reference -> price_usd = 0 -> reducer doesn't emit -> no candle
     if let Some(batch) = batch {

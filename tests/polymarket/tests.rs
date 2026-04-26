@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use settle::db::{Config, Settle};
+use settle::test_helpers::{ingest_blocks, ingest_one, rollback_to};
 use settle::types::{ChangeOp, RowMap, Value};
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -40,7 +41,8 @@ fn market_stats_tracks_volume_and_price_stats() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Two trades on the same token, both price = 0.5
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![
@@ -50,9 +52,8 @@ fn market_stats_tracks_volume_and_price_stats() {
             make_order("bob", "token_a", 50_000_000, 100_000_000, 1, 1001),
         ],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let mv_records: Vec<_> = batch.records_for("token_summary").iter().collect();
 
@@ -95,7 +96,8 @@ fn market_stats_tracks_volume_and_price_stats() {
 fn market_stats_different_prices() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![
@@ -105,9 +107,8 @@ fn market_stats_different_prices() {
             make_order("bob", "token_a", 600_000_000, 1_000_000_000, 1, 1001),
         ],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let mv = batch.records_for("token_summary").first().unwrap();
 
     let last_price = mv.values.get("last_price").unwrap().as_f64().unwrap();
@@ -127,7 +128,10 @@ fn market_stats_different_prices() {
 fn market_stats_skips_zero_shares() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
-    db.process_batch(
+    // Virtual table produces no raw changes, and zero-shares means no reducer
+    // output either, so ingest returns None (empty buffer).
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![
@@ -135,10 +139,7 @@ fn market_stats_skips_zero_shares() {
         ],
     )
     .unwrap();
-
-    // Virtual table produces no raw changes, and zero-shares means no reducer
-    // output either, so flush returns None (empty buffer).
-    assert!(db.flush().is_none());
+    assert!(batch.is_none());
 }
 
 #[test]
@@ -146,7 +147,8 @@ fn insider_classifier_ignores_sell_side() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // side=1 (SELL) — should be ignored by insider_classifier
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -158,9 +160,8 @@ fn insider_classifier_ignores_sell_side() {
             1000,
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
@@ -172,7 +173,8 @@ fn insider_classifier_ignores_high_price() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Price = usdc/shares = 0.96 (above 0.95 threshold)
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -184,9 +186,8 @@ fn insider_classifier_ignores_high_price() {
             1000,
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
@@ -199,7 +200,8 @@ fn insider_detected_with_full_fields() {
 
     // Trader buys $5000 in a single order (above $4000 threshold)
     // price = 0.5 (well below 0.95), BUY side
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -211,9 +213,8 @@ fn insider_detected_with_full_fields() {
             1000, // timestamp
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
@@ -242,7 +243,8 @@ fn insider_accumulates_across_orders_in_window() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Two orders from same trader within 15 min, total > $4000
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![
@@ -252,9 +254,8 @@ fn insider_accumulates_across_orders_in_window() {
             make_order("trader_x", "token_b", 2_000_000_000, 5_000_000_000, 0, 1100),
         ],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
@@ -279,7 +280,8 @@ fn insider_subsequent_orders_emit_with_timestamps() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // First order: triggers insider classification ($5000 > $4000) at t=1000
-    db.process_batch(
+    ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -292,10 +294,10 @@ fn insider_subsequent_orders_emit_with_timestamps() {
         )],
     )
     .unwrap();
-    db.flush();
 
     // Second order: known insider buys on a different token at t=2000
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1001,
         vec![make_order(
@@ -307,9 +309,8 @@ fn insider_subsequent_orders_emit_with_timestamps() {
             2000,
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
@@ -349,7 +350,8 @@ fn window_expiration_marks_clean() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // First order: $2000 (below threshold), starts window
-    db.process_batch(
+    ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -362,10 +364,10 @@ fn window_expiration_marks_clean() {
         )],
     )
     .unwrap();
-    db.flush();
 
     // Second order: 20 minutes later (> 15 min window) → should classify as clean
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1001,
         vec![make_order(
@@ -379,15 +381,16 @@ fn window_expiration_marks_clean() {
     )
     .unwrap();
 
-    let batch = db.flush().unwrap();
-
-    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
-
     // Clean trader → no insider positions emitted
-    assert!(insider_records.is_empty());
+    let empty_insiders = batch
+        .as_ref()
+        .map(|b| b.records_for("insider_positions").is_empty())
+        .unwrap_or(true);
+    assert!(empty_insiders);
 
     // Third order: even more volume — should still be clean (no re-classification)
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1002,
         vec![make_order(
@@ -401,11 +404,11 @@ fn window_expiration_marks_clean() {
     )
     .unwrap();
 
-    let batch = db.flush().unwrap();
-
-    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
-
-    assert!(insider_records.is_empty());
+    let empty_insiders = batch
+        .as_ref()
+        .map(|b| b.records_for("insider_positions").is_empty())
+        .unwrap_or(true);
+    assert!(empty_insiders);
 }
 
 #[test]
@@ -413,7 +416,8 @@ fn rollback_undoes_insider_classification() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Block 1000: small order (below threshold)
-    db.process_batch(
+    ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -426,10 +430,10 @@ fn rollback_undoes_insider_classification() {
         )],
     )
     .unwrap();
-    db.flush();
 
     // Block 1001: big order pushes over threshold → insider detected
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1001,
         vec![make_order(
@@ -441,18 +445,17 @@ fn rollback_undoes_insider_classification() {
             1100,
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let insider_count = batch.records_for("insider_positions").len();
     assert!(insider_count > 0, "insider should be detected");
 
     // Rollback block 1001 — classification should be undone
-    db.rollback(1000).unwrap();
-    db.flush();
+    rollback_to(&mut db, 1000).unwrap();
 
     // Re-process block 1001 with a small order (stays below threshold)
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1001,
         vec![make_order(
@@ -464,9 +467,8 @@ fn rollback_undoes_insider_classification() {
             1100,
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // No insider classification with the smaller order
     let insider_records: Vec<_> = batch
@@ -484,39 +486,39 @@ fn rollback_undoes_insider_classification() {
 fn market_stats_rollback() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
-    db.process_batch(
-        "orders",
-        1000,
-        vec![make_order(
-            "alice",
-            "token_a",
-            100_000_000,
-            200_000_000,
-            0,
-            1000,
-        )],
+    ingest_blocks(
+        &mut db,
+        vec![
+            (
+                "orders".into(),
+                1000,
+                vec![make_order(
+                    "alice",
+                    "token_a",
+                    100_000_000,
+                    200_000_000,
+                    0,
+                    1000,
+                )],
+            ),
+            (
+                "orders".into(),
+                1001,
+                vec![make_order(
+                    "bob",
+                    "token_a",
+                    200_000_000,
+                    400_000_000,
+                    0,
+                    1001,
+                )],
+            ),
+        ],
     )
     .unwrap();
-
-    db.process_batch(
-        "orders",
-        1001,
-        vec![make_order(
-            "bob",
-            "token_a",
-            200_000_000,
-            400_000_000,
-            0,
-            1001,
-        )],
-    )
-    .unwrap();
-    db.flush();
 
     // Rollback block 1001
-    db.rollback(1000).unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 1000).unwrap().batch.unwrap();
 
     let mv_records: Vec<_> = batch.records_for("token_summary").iter().collect();
 
@@ -542,7 +544,8 @@ fn full_pipeline_both_reducers() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Multiple orders in one block from different traders
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![
@@ -561,9 +564,8 @@ fn full_pipeline_both_reducers() {
             make_order("seller_1", "token_a", 300_000_000, 600_000_000, 1, 1000),
         ],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // token_summary should have 3 trades for token_a
     let token_records: Vec<_> = batch.records_for("token_summary").iter().collect();
@@ -604,7 +606,8 @@ fn post_window_trades_do_not_trigger_insider() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Batch 1: $3000 at t=1000 (starts window)
-    db.process_batch(
+    ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -617,10 +620,10 @@ fn post_window_trades_do_not_trigger_insider() {
         )],
     )
     .unwrap();
-    db.flush();
 
     // Batch 2: $2000 at t=2000 (1000s > 900s window) → window expired
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1001,
         vec![make_order(
@@ -632,9 +635,8 @@ fn post_window_trades_do_not_trigger_insider() {
             2000,          // 1000s later
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // Window expired → clean → no insider emission
@@ -653,7 +655,8 @@ fn post_window_trades_do_not_trigger_insider() {
 fn price_filter_high_vs_low_in_same_batch() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![
@@ -677,9 +680,8 @@ fn price_filter_high_vs_low_in_same_batch() {
             ),
         ],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // Only low_price_trader should appear
@@ -699,7 +701,8 @@ fn price_filter_high_vs_low_in_same_batch() {
 fn market_stats_both_sides_multiple_tokens_with_derivation() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![
@@ -715,9 +718,8 @@ fn market_stats_both_sides_multiple_tokens_with_derivation() {
             make_order("buyer_2", "no_token", 910_000, 1_000_000, 0, 1003),
         ],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let mv_records: Vec<_> = batch.records_for("token_summary").iter().collect();
 
     // Two tokens → two MV records
@@ -789,7 +791,8 @@ fn market_stats_both_sides_multiple_tokens_with_derivation() {
 fn virtual_table_suppresses_order_changes() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -801,9 +804,8 @@ fn virtual_table_suppresses_order_changes() {
             1000,
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // No raw "orders" records should appear in changes
     let order_records: Vec<_> = batch.records_for("orders").iter().collect();
@@ -822,7 +824,8 @@ fn virtual_table_suppresses_order_changes() {
 fn multiple_insiders_same_block() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![
@@ -834,9 +837,8 @@ fn multiple_insiders_same_block() {
             make_order("minnow", "token_a", 100_000_000, 200_000_000, 0, 1000),
         ],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // Two insiders detected
@@ -856,7 +858,8 @@ fn exact_threshold_triggers_insider() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Exactly $4000 (4_000_000_000 raw USDC with 6 decimals)
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -868,9 +871,8 @@ fn exact_threshold_triggers_insider() {
             1000,
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     assert_eq!(
@@ -886,7 +888,8 @@ fn just_below_threshold_no_insider() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // $3999.99 = 3_999_990_000 raw USDC
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -900,13 +903,11 @@ fn just_below_threshold_no_insider() {
     )
     .unwrap();
 
-    let batch = db.flush().unwrap();
-    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
-
-    assert!(
-        insider_records.is_empty(),
-        "$3999.99 should not trigger insider"
-    );
+    let empty = batch
+        .as_ref()
+        .map(|b| b.records_for("insider_positions").is_empty())
+        .unwrap_or(true);
+    assert!(empty, "$3999.99 should not trigger insider");
 }
 
 /// Exact price boundary: price = 0.95 should be filtered out.
@@ -917,7 +918,8 @@ fn exact_price_boundary_filtered() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // price = 9500/10000 = 0.95 exactly
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -931,11 +933,12 @@ fn exact_price_boundary_filtered() {
     )
     .unwrap();
 
-    let batch = db.flush().unwrap();
-    let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
-
+    let empty = batch
+        .as_ref()
+        .map(|b| b.records_for("insider_positions").is_empty())
+        .unwrap_or(true);
     assert!(
-        insider_records.is_empty(),
+        empty,
         "price=0.95 exactly should be filtered out of insider detection"
     );
 }
@@ -947,54 +950,51 @@ fn exact_price_boundary_filtered() {
 fn multi_block_rollback() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
-    db.process_batch(
-        "orders",
-        1000,
-        vec![make_order(
-            "alice",
-            "token_a",
-            100_000_000,
-            200_000_000,
-            0,
-            1000,
-        )],
+    ingest_blocks(
+        &mut db,
+        vec![
+            (
+                "orders".into(),
+                1000,
+                vec![make_order(
+                    "alice",
+                    "token_a",
+                    100_000_000,
+                    200_000_000,
+                    0,
+                    1000,
+                )],
+            ),
+            (
+                "orders".into(),
+                1001,
+                vec![make_order(
+                    "bob",
+                    "token_a",
+                    200_000_000,
+                    400_000_000,
+                    0,
+                    1001,
+                )],
+            ),
+            (
+                "orders".into(),
+                1002,
+                vec![make_order(
+                    "charlie",
+                    "token_a",
+                    300_000_000,
+                    600_000_000,
+                    0,
+                    1002,
+                )],
+            ),
+        ],
     )
     .unwrap();
-    db.flush();
-
-    db.process_batch(
-        "orders",
-        1001,
-        vec![make_order(
-            "bob",
-            "token_a",
-            200_000_000,
-            400_000_000,
-            0,
-            1001,
-        )],
-    )
-    .unwrap();
-    db.flush();
-
-    db.process_batch(
-        "orders",
-        1002,
-        vec![make_order(
-            "charlie",
-            "token_a",
-            300_000_000,
-            600_000_000,
-            0,
-            1002,
-        )],
-    )
-    .unwrap();
-    db.flush();
 
     // Rollback blocks 1001 and 1002
-    db.rollback(1000).unwrap();
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 1000).unwrap().batch.unwrap();
 
     let mv = batch
         .records_for("token_summary")
@@ -1015,7 +1015,8 @@ fn insider_multi_block_subsequent_orders() {
     let mut db = Settle::open(Config::new(SCHEMA)).unwrap();
 
     // Block 1000: triggers insider ($5000)
-    db.process_batch(
+    ingest_one(
+        &mut db,
         "orders",
         1000,
         vec![make_order(
@@ -1028,10 +1029,10 @@ fn insider_multi_block_subsequent_orders() {
         )],
     )
     .unwrap();
-    db.flush();
 
     // Block 1001: subsequent order on token_b
-    db.process_batch(
+    ingest_one(
+        &mut db,
         "orders",
         1001,
         vec![make_order(
@@ -1044,10 +1045,10 @@ fn insider_multi_block_subsequent_orders() {
         )],
     )
     .unwrap();
-    db.flush();
 
     // Block 1002: another order on token_a
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "orders",
         1002,
         vec![make_order(
@@ -1059,9 +1060,8 @@ fn insider_multi_block_subsequent_orders() {
             3000,
         )],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
 
     // token_a should get an Update (trade_count goes from 1 to 2)

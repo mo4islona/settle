@@ -1,3 +1,9 @@
+// The ingest/rollback helpers live in `crate::test_helpers` so they're also
+// reachable from integration tests under `tests/` and benches under `benches/`.
+// Re-export them here so the unit tests under `db::` keep their existing
+// `use super::test_helpers::*;` import without further plumbing.
+pub use crate::test_helpers::{ingest_blocks, ingest_one, ingest_with_finalized, rollback_to};
+
 use crate::types::{RowMap, Value};
 use std::collections::HashMap;
 

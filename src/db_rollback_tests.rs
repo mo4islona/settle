@@ -7,18 +7,17 @@ use std::collections::HashMap;
 fn rollback_produces_compensating_changes() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
-        .unwrap();
-    db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)])
-        .unwrap();
-
-    // Flush and clear buffer
-    db.flush();
+    ingest_blocks(
+        &mut db,
+        vec![
+            ("swaps".into(), 1000, vec![make_swap("ETH/USDC", 100.0)]),
+            ("swaps".into(), 1001, vec![make_swap("ETH/USDC", 200.0)]),
+        ],
+    )
+    .unwrap();
 
     // Rollback block 1001
-    db.rollback(1000).unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 1000).unwrap().batch.unwrap();
 
     // Should have MV update (back to 100) and raw delete
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
@@ -36,22 +35,20 @@ fn rollback_produces_compensating_changes() {
 fn finalize_and_rollback() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
-        .unwrap();
-    db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)])
-        .unwrap();
-    db.process_batch("swaps", 1002, vec![make_swap("ETH/USDC", 300.0)])
-        .unwrap();
-    db.flush();
-
-    // Finalize up to 1001
-    db.finalize(1001).unwrap();
+    ingest_with_finalized(
+        &mut db,
+        vec![
+            ("swaps".into(), 1000, vec![make_swap("ETH/USDC", 100.0)]),
+            ("swaps".into(), 1001, vec![make_swap("ETH/USDC", 200.0)]),
+            ("swaps".into(), 1002, vec![make_swap("ETH/USDC", 300.0)]),
+        ],
+        1001,
+    )
+    .unwrap();
     assert_eq!(db.finalized_block(), 1001);
 
     // Rollback block 1002
-    db.rollback(1001).unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 1001).unwrap().batch.unwrap();
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
     assert_eq!(mv_records.len(), 1);
     // total should be 100 + 200 = 300
@@ -65,39 +62,42 @@ fn finalize_and_rollback() {
 fn full_pipeline_rollback_and_reingest() {
     let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
 
-    db.process_batch(
-        "trades",
-        1000,
-        vec![make_trade("alice", "buy", 10.0, 2000.0)],
+    // Keep all blocks unfinalized so rollback to 1001 is allowed.
+    ingest_with_finalized(
+        &mut db,
+        vec![
+            (
+                "trades".into(),
+                1000,
+                vec![make_trade("alice", "buy", 10.0, 2000.0)],
+            ),
+            (
+                "trades".into(),
+                1001,
+                vec![make_trade("alice", "buy", 5.0, 2100.0)],
+            ),
+            (
+                "trades".into(),
+                1002,
+                vec![make_trade("alice", "sell", 8.0, 2200.0)],
+            ),
+        ],
+        999,
     )
     .unwrap();
-    db.process_batch(
-        "trades",
-        1001,
-        vec![make_trade("alice", "buy", 5.0, 2100.0)],
-    )
-    .unwrap();
-    db.process_batch(
-        "trades",
-        1002,
-        vec![make_trade("alice", "sell", 8.0, 2200.0)],
-    )
-    .unwrap();
-    db.flush();
 
     // Rollback block 1002 (the sell)
-    db.rollback(1001).unwrap();
-    db.flush();
+    rollback_to(&mut db, 1001).unwrap();
 
     // Re-ingest with different sell
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "trades",
         1002,
         vec![make_trade("alice", "sell", 3.0, 2300.0)],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let mv_records: Vec<_> = batch.records_for("position_summary").iter().collect();
     assert_eq!(mv_records.len(), 1);
     assert_eq!(
@@ -133,8 +133,21 @@ fn full_rollback_emits_delete_for_mv_group() {
 
     let mut db = Settle::open(Config::new(schema)).unwrap();
 
+    // Marker block 999 (no alice data) so the rollback target has a stored hash.
+    ingest_one(
+        &mut db,
+        "transfers",
+        999,
+        vec![HashMap::from([
+            ("wallet".to_string(), Value::String("setup".to_string())),
+            ("amount".to_string(), Value::Float64(0.0)),
+        ])],
+    )
+    .unwrap();
+
     // Block 1000: alice appears for the first time
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "transfers",
         1000,
         vec![HashMap::from([
@@ -142,9 +155,8 @@ fn full_rollback_emits_delete_for_mv_group() {
             ("amount".to_string(), Value::Float64(500.0)),
         ])],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // Verify Insert was emitted for alice's MV group
     let mv_inserts: Vec<_> = batch
@@ -159,9 +171,7 @@ fn full_rollback_emits_delete_for_mv_group() {
     );
 
     // Rollback block 1000 — alice's only block
-    db.rollback(999).unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 999).unwrap().batch.unwrap();
 
     // The MV group for alice should be deleted since she has no data left
     let mv_deletes: Vec<_> = batch
@@ -201,30 +211,31 @@ fn partial_rollback_emits_update_not_delete() {
 
     let mut db = Settle::open(Config::new(schema)).unwrap();
 
-    db.process_batch(
-        "transfers",
-        1000,
-        vec![HashMap::from([
-            ("wallet".to_string(), Value::String("alice".to_string())),
-            ("amount".to_string(), Value::Float64(100.0)),
-        ])],
+    ingest_blocks(
+        &mut db,
+        vec![
+            (
+                "transfers".into(),
+                1000,
+                vec![HashMap::from([
+                    ("wallet".to_string(), Value::String("alice".to_string())),
+                    ("amount".to_string(), Value::Float64(100.0)),
+                ])],
+            ),
+            (
+                "transfers".into(),
+                1001,
+                vec![HashMap::from([
+                    ("wallet".to_string(), Value::String("alice".to_string())),
+                    ("amount".to_string(), Value::Float64(200.0)),
+                ])],
+            ),
+        ],
     )
     .unwrap();
-    db.process_batch(
-        "transfers",
-        1001,
-        vec![HashMap::from([
-            ("wallet".to_string(), Value::String("alice".to_string())),
-            ("amount".to_string(), Value::Float64(200.0)),
-        ])],
-    )
-    .unwrap();
-    db.flush();
 
     // Rollback only block 1001
-    db.rollback(1000).unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 1000).unwrap().batch.unwrap();
 
     let mv_records: Vec<_> = batch.records_for("wallet_volume").iter().collect();
     assert_eq!(mv_records.len(), 1);
@@ -246,17 +257,20 @@ fn rollback_persists_metadata_atomically() {
     let storage = Arc::new(MemoryBackend::new());
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
 
-    // Process blocks 1-3
-    db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)])
-        .unwrap();
-    db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)])
-        .unwrap();
-    db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)])
-        .unwrap();
-    db.finalize(1).unwrap();
+    // Process blocks 1-3 with finalized head at 1.
+    ingest_with_finalized(
+        &mut db,
+        vec![
+            ("swaps".into(), 1, vec![make_swap("ETH", 10.0)]),
+            ("swaps".into(), 2, vec![make_swap("ETH", 20.0)]),
+            ("swaps".into(), 3, vec![make_swap("ETH", 30.0)]),
+        ],
+        1,
+    )
+    .unwrap();
 
     // Rollback to block 1
-    db.rollback(1).unwrap();
+    rollback_to(&mut db, 1).unwrap();
 
     // Verify metadata was persisted — latest_block should be 1
     let latest_bytes = storage.get_meta("latest_block").unwrap().unwrap();
@@ -286,17 +300,19 @@ fn rollback_survives_simulated_restart() {
     // Phase 1: process and finalize
     {
         let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
-        db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)])
-            .unwrap();
-        db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)])
-            .unwrap();
-        db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)])
-            .unwrap();
-        db.finalize(1).unwrap();
+        ingest_with_finalized(
+            &mut db,
+            vec![
+                ("swaps".into(), 1, vec![make_swap("ETH", 10.0)]),
+                ("swaps".into(), 2, vec![make_swap("ETH", 20.0)]),
+                ("swaps".into(), 3, vec![make_swap("ETH", 30.0)]),
+            ],
+            1,
+        )
+        .unwrap();
 
         // Rollback to block 1
-        db.rollback(1).unwrap();
-        db.flush();
+        rollback_to(&mut db, 1).unwrap();
     }
 
     // Phase 2: "restart" — open from same storage
@@ -307,9 +323,9 @@ fn rollback_survives_simulated_restart() {
         assert_eq!(db.latest_block(), 1);
 
         // Process block 2 with new data — should work correctly
-        db.process_batch("swaps", 2, vec![make_swap("BTC", 50.0)])
+        let batch = ingest_one(&mut db, "swaps", 2, vec![make_swap("BTC", 50.0)])
+            .unwrap()
             .unwrap();
-        let batch = db.flush().unwrap();
 
         // Should have MV update with the new data
         let pool_vol = batch.tables.get("pool_volume").unwrap();
@@ -398,14 +414,14 @@ fn crash_recovery_replays_unfinalized_blocks() {
         //   qty = 10 + 5 + 3 = 18, cost = 20000 + 10500 + 6600 = 37100
         //   avg_cost = 37100/18 ≈ 2061.11
         //   pnl = 5 * (2300 - 2061.11) = 1194.44
-        db.process_batch(
+        let batch = ingest_one(
+            &mut db,
             "trades",
             1003,
             vec![make_trade("alice", "sell", 5.0, 2300.0)],
         )
+        .unwrap()
         .unwrap();
-
-        let batch = db.flush().unwrap();
 
         let mv_records: Vec<_> = batch.records_for("position_summary").iter().collect();
         assert_eq!(mv_records.len(), 1);

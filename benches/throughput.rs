@@ -11,6 +11,7 @@ use settle::engine::reducer::ReducerEngine;
 use settle::reducer_runtime::fn_reducer::FnReducerRuntime;
 use settle::schema::parser::parse_schema;
 use settle::storage::memory::MemoryBackend;
+use settle::test_helpers::{ingest_one, rollback_to};
 use settle::types::{ColumnRegistry, RowMap, Value};
 
 const RAW_ONLY_SCHEMA: &str = r#"
@@ -298,10 +299,8 @@ fn bench_raw_ingestion(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("events", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "events", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
     let elapsed = start.elapsed();
 
     let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
@@ -326,10 +325,8 @@ fn bench_raw_with_mv(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("events", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "events", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
     let elapsed = start.elapsed();
 
     let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
@@ -372,10 +369,8 @@ fn bench_full_pipeline_event_rules(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("trades", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "trades", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
     let elapsed = start.elapsed();
 
     let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
@@ -418,10 +413,8 @@ fn bench_full_pipeline_lua(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("trades", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "trades", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
     let elapsed = start.elapsed();
 
     let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
@@ -467,10 +460,8 @@ fn bench_full_pipeline_fn_reducer(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("trades", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "trades", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
     let elapsed = start.elapsed();
 
     let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
@@ -668,13 +659,11 @@ fn bench_rollback(backend: Backend) -> BenchResult {
                 make_trade(&user, "buy", 1.0, 2000.0)
             })
             .collect();
-        db.process_batch("trades", block, rows).unwrap();
+        ingest_one(&mut db, "trades", block, rows).unwrap();
     }
-    db.flush();
 
     let start = Instant::now();
-    db.rollback(0).unwrap();
-    let _batch = db.flush();
+    let _ = rollback_to(&mut db, 0).unwrap();
     let elapsed = start.elapsed();
 
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
@@ -761,7 +750,7 @@ fn bench_many_group_keys(backend: Backend) -> BenchResult {
                 make_trade(&user, "buy", 1.0, 2000.0)
             })
             .collect();
-        db.process_batch("trades", batch_idx as u64, rows).unwrap();
+        ingest_one(&mut db, "trades", batch_idx as u64 + 1, rows).unwrap();
     }
     let elapsed = start.elapsed();
 
@@ -999,10 +988,8 @@ fn bench_polymarket_market_stats(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
     let elapsed = start.elapsed();
 
     let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
@@ -1031,10 +1018,8 @@ fn bench_polymarket_insider_detect(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
     let elapsed = start.elapsed();
 
     let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
@@ -1063,10 +1048,8 @@ fn bench_polymarket_full_pipeline(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
     let elapsed = start.elapsed();
 
     let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
@@ -1095,10 +1078,8 @@ fn bench_polymarket_high_cardinality(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec())
-            .unwrap();
+        ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
     }
-    db.flush();
     let elapsed = start.elapsed();
 
     let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();

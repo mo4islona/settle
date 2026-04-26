@@ -73,14 +73,10 @@ export function settleTarget<TInput = Record<string, any[]>>({
     fork: async (previousBlocks) => {
       if (!previousBlocks.length) return null
 
-      const forkCursor = db.resolveForkCursor(previousBlocks)
-      if (forkCursor == null) {
-        throw new Error('Fork too deep: no common ancestor found in block hashes')
-      }
+      // handleFork() resolves the highest common ancestor, atomically rolls
+      // back state above it, and returns the compensating change batch.
+      const { cursor: forkCursor, batch } = db.handleFork(previousBlocks)
 
-      db.rollback(forkCursor.number)
-
-      const batch = db.flush()
       if (batch) {
         await onChange({ batch, ctx: null })
         db.ack(batch.sequence)

@@ -9,6 +9,7 @@ use settle::db::{Config, Settle};
 use settle::engine::reducer::ReducerEngine;
 use settle::schema::parser::parse_schema;
 use settle::storage::memory::MemoryBackend;
+use settle::test_helpers::ingest_one;
 use settle::types::{ColumnRegistry, Row, RowMap, Value};
 
 const FULL_SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
@@ -143,10 +144,8 @@ fn main() {
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec())
-                .unwrap();
+            ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
         }
-        db.flush();
         let elapsed = start.elapsed();
         println!(
             "  Pipeline (market_stats+MV): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
@@ -163,10 +162,8 @@ fn main() {
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec())
-                .unwrap();
+            ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
         }
-        db.flush();
         let elapsed = start.elapsed();
         println!(
             "  Pipeline (full):     {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
@@ -205,10 +202,8 @@ fn main() {
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec())
-                .unwrap();
+            ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
         }
-        db.flush();
         let elapsed = start.elapsed();
         println!(
             "  Raw table only (virtual): {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",
@@ -229,10 +224,8 @@ fn main() {
 
         let start = Instant::now();
         for (block, chunk) in rows.chunks(batch).enumerate() {
-            db.process_batch("orders", block as u64, chunk.to_vec())
-                .unwrap();
+            ingest_one(&mut db, "orders", block as u64 + 1, chunk.to_vec()).unwrap();
         }
-        db.flush();
         let elapsed = start.elapsed();
         println!(
             "  Raw table only (stored):  {:>7.1}ms  ({:.1}us/row, {:.0}K/s)",

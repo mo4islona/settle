@@ -232,67 +232,6 @@ impl Settle {
         self.engine.has_reducer(name)
     }
 
-    /// Process a batch of rows for a raw table at the given block number.
-    /// Change records are buffered internally.
-    /// Returns true if backpressure should be applied (buffer is full).
-    ///
-    /// **Warning:** This method writes raw rows to storage immediately but does
-    /// not persist `latest_block` metadata until the next `finalize()`. A crash
-    /// between these two operations leaves orphaned raw rows in storage that are
-    /// never replayed into reducer/MV state on recovery. For crash-safe ingestion,
-    /// use `ingest()` which commits all writes atomically.
-    /// **Deprecated**: Not crash-safe. Use `ingest()` instead.
-    /// Kept public for benchmarks and tests only.
-    #[doc(hidden)]
-    pub fn process_batch(
-        &mut self,
-        table: &str,
-        block: BlockNumber,
-        rows: Vec<RowMap>,
-    ) -> Result<bool> {
-        let (changes, perf_node) = self.engine.process_batch(table, block, rows)?;
-
-        self.buffer.push(
-            changes,
-            self.engine.finalized_cursor(),
-            self.engine.latest_cursor(),
-            vec![perf_node],
-        );
-
-        Ok(self.buffer.is_full())
-    }
-
-    /// Roll back all state after fork_point.
-    /// Compensating change records are buffered.
-    /// Raw-row deletions + metadata updates are committed atomically.
-    pub fn rollback(&mut self, fork_point: BlockNumber) -> Result<()> {
-        let mut batch = StorageWriteBatch::new();
-        let changes = self.engine.rollback_to_batch(fork_point, &mut batch)?;
-
-        // Persist updated latest_block + block_hashes atomically with raw-row deletions
-        self.append_meta_to_batch(&mut batch)?;
-        self.storage.commit(&batch)?;
-
-        self.buffer.push(
-            changes,
-            self.engine.finalized_cursor(),
-            self.engine.latest_cursor(),
-            vec![],
-        );
-
-        Ok(())
-    }
-
-    /// Finalize all state up to and including the given block.
-    /// Finalized data cannot be rolled back.
-    /// All finalized state + metadata is committed atomically.
-    pub fn finalize(&mut self, block: BlockNumber) -> Result<()> {
-        let mut batch = StorageWriteBatch::new();
-        self.engine.finalize(block, &mut batch);
-        self.append_meta_to_batch(&mut batch)?;
-        self.storage.commit(&batch)
-    }
-
     /// Flush all buffered change records into a ChangeBatch.
     /// Returns None if there are no pending records.
     pub fn flush(&mut self) -> Option<ChangeBatch> {
@@ -332,11 +271,6 @@ impl Settle {
     /// Current finalized block as a cursor (number + hash).
     pub fn finalized_cursor(&self) -> Option<BlockCursor> {
         self.engine.finalized_cursor()
-    }
-
-    /// Store block hashes from the rollback chain and finalized head.
-    pub fn set_rollback_chain(&mut self, chain: &[(BlockNumber, String)]) {
-        self.engine.set_rollback_chain(chain);
     }
 
     /// Find the common ancestor between our state and the Portal's chain.
