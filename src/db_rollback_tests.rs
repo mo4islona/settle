@@ -1,29 +1,28 @@
 use super::test_helpers::*;
 use super::*;
-use crate::types::{BlockCursor, DeltaOperation, Value};
+use crate::types::{BlockCursor, ChangeOp, Value};
 use std::collections::HashMap;
 
 #[test]
-fn rollback_produces_compensating_deltas() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+fn rollback_produces_compensating_changes() {
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
-        .unwrap();
-    db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)])
-        .unwrap();
-
-    // Flush and clear buffer
-    db.flush();
+    ingest_blocks(
+        &mut db,
+        vec![
+            ("swaps".into(), 1000, vec![make_swap("ETH/USDC", 100.0)]),
+            ("swaps".into(), 1001, vec![make_swap("ETH/USDC", 200.0)]),
+        ],
+    )
+    .unwrap();
 
     // Rollback block 1001
-    db.rollback(1000).unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 1000).unwrap().batch.unwrap();
 
     // Should have MV update (back to 100) and raw delete
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
     assert_eq!(mv_records.len(), 1);
-    assert_eq!(mv_records[0].operation, DeltaOperation::Update);
+    assert_eq!(mv_records[0].operation, ChangeOp::Update);
     assert_eq!(
         mv_records[0].values.get("total_volume"),
         Some(&Value::Float64(100.0))
@@ -34,24 +33,22 @@ fn rollback_produces_compensating_deltas() {
 
 #[test]
 fn finalize_and_rollback() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
-        .unwrap();
-    db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)])
-        .unwrap();
-    db.process_batch("swaps", 1002, vec![make_swap("ETH/USDC", 300.0)])
-        .unwrap();
-    db.flush();
-
-    // Finalize up to 1001
-    db.finalize(1001).unwrap();
+    ingest_with_finalized(
+        &mut db,
+        vec![
+            ("swaps".into(), 1000, vec![make_swap("ETH/USDC", 100.0)]),
+            ("swaps".into(), 1001, vec![make_swap("ETH/USDC", 200.0)]),
+            ("swaps".into(), 1002, vec![make_swap("ETH/USDC", 300.0)]),
+        ],
+        1001,
+    )
+    .unwrap();
     assert_eq!(db.finalized_block(), 1001);
 
     // Rollback block 1002
-    db.rollback(1001).unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 1001).unwrap().batch.unwrap();
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
     assert_eq!(mv_records.len(), 1);
     // total should be 100 + 200 = 300
@@ -63,41 +60,44 @@ fn finalize_and_rollback() {
 
 #[test]
 fn full_pipeline_rollback_and_reingest() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
 
-    db.process_batch(
-        "trades",
-        1000,
-        vec![make_trade("alice", "buy", 10.0, 2000.0)],
+    // Keep all blocks unfinalized so rollback to 1001 is allowed.
+    ingest_with_finalized(
+        &mut db,
+        vec![
+            (
+                "trades".into(),
+                1000,
+                vec![make_trade("alice", "buy", 10.0, 2000.0)],
+            ),
+            (
+                "trades".into(),
+                1001,
+                vec![make_trade("alice", "buy", 5.0, 2100.0)],
+            ),
+            (
+                "trades".into(),
+                1002,
+                vec![make_trade("alice", "sell", 8.0, 2200.0)],
+            ),
+        ],
+        999,
     )
     .unwrap();
-    db.process_batch(
-        "trades",
-        1001,
-        vec![make_trade("alice", "buy", 5.0, 2100.0)],
-    )
-    .unwrap();
-    db.process_batch(
-        "trades",
-        1002,
-        vec![make_trade("alice", "sell", 8.0, 2200.0)],
-    )
-    .unwrap();
-    db.flush();
 
     // Rollback block 1002 (the sell)
-    db.rollback(1001).unwrap();
-    db.flush();
+    rollback_to(&mut db, 1001).unwrap();
 
     // Re-ingest with different sell
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "trades",
         1002,
         vec![make_trade("alice", "sell", 3.0, 2300.0)],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
     let mv_records: Vec<_> = batch.records_for("position_summary").iter().collect();
     assert_eq!(mv_records.len(), 1);
     assert_eq!(
@@ -115,7 +115,7 @@ fn full_pipeline_rollback_and_reingest() {
 #[test]
 fn full_rollback_emits_delete_for_mv_group() {
     // Schema: aggregate volume per wallet. A wallet that only appeared in
-    // rolled-back blocks should produce a Delete delta for its MV group.
+    // rolled-back blocks should produce a Delete change for its MV group.
     let schema = r#"
         CREATE TABLE transfers (
             wallet String,
@@ -131,10 +131,23 @@ fn full_rollback_emits_delete_for_mv_group() {
         GROUP BY wallet;
     "#;
 
-    let mut db = DeltaDb::open(Config::new(schema)).unwrap();
+    let mut db = Settle::open(Config::new(schema)).unwrap();
+
+    // Marker block 999 (no alice data) so the rollback target has a stored hash.
+    ingest_one(
+        &mut db,
+        "transfers",
+        999,
+        vec![HashMap::from([
+            ("wallet".to_string(), Value::String("setup".to_string())),
+            ("amount".to_string(), Value::Float64(0.0)),
+        ])],
+    )
+    .unwrap();
 
     // Block 1000: alice appears for the first time
-    db.process_batch(
+    let batch = ingest_one(
+        &mut db,
         "transfers",
         1000,
         vec![HashMap::from([
@@ -142,15 +155,14 @@ fn full_rollback_emits_delete_for_mv_group() {
             ("amount".to_string(), Value::Float64(500.0)),
         ])],
     )
+    .unwrap()
     .unwrap();
-
-    let batch = db.flush().unwrap();
 
     // Verify Insert was emitted for alice's MV group
     let mv_inserts: Vec<_> = batch
         .records_for("wallet_volume")
         .iter()
-        .filter(|r| r.operation == DeltaOperation::Insert)
+        .filter(|r| r.operation == ChangeOp::Insert)
         .collect();
     assert_eq!(mv_inserts.len(), 1);
     assert_eq!(
@@ -159,20 +171,18 @@ fn full_rollback_emits_delete_for_mv_group() {
     );
 
     // Rollback block 1000 — alice's only block
-    db.rollback(999).unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 999).unwrap().batch.unwrap();
 
     // The MV group for alice should be deleted since she has no data left
     let mv_deletes: Vec<_> = batch
         .records_for("wallet_volume")
         .iter()
-        .filter(|r| r.operation == DeltaOperation::Delete)
+        .filter(|r| r.operation == ChangeOp::Delete)
         .collect();
     assert_eq!(
         mv_deletes.len(),
         1,
-        "expected Delete delta for fully rolled-back MV group"
+        "expected Delete change for fully rolled-back MV group"
     );
     assert_eq!(
         mv_deletes[0].key.get("wallet"),
@@ -199,36 +209,37 @@ fn partial_rollback_emits_update_not_delete() {
         GROUP BY wallet;
     "#;
 
-    let mut db = DeltaDb::open(Config::new(schema)).unwrap();
+    let mut db = Settle::open(Config::new(schema)).unwrap();
 
-    db.process_batch(
-        "transfers",
-        1000,
-        vec![HashMap::from([
-            ("wallet".to_string(), Value::String("alice".to_string())),
-            ("amount".to_string(), Value::Float64(100.0)),
-        ])],
+    ingest_blocks(
+        &mut db,
+        vec![
+            (
+                "transfers".into(),
+                1000,
+                vec![HashMap::from([
+                    ("wallet".to_string(), Value::String("alice".to_string())),
+                    ("amount".to_string(), Value::Float64(100.0)),
+                ])],
+            ),
+            (
+                "transfers".into(),
+                1001,
+                vec![HashMap::from([
+                    ("wallet".to_string(), Value::String("alice".to_string())),
+                    ("amount".to_string(), Value::Float64(200.0)),
+                ])],
+            ),
+        ],
     )
     .unwrap();
-    db.process_batch(
-        "transfers",
-        1001,
-        vec![HashMap::from([
-            ("wallet".to_string(), Value::String("alice".to_string())),
-            ("amount".to_string(), Value::Float64(200.0)),
-        ])],
-    )
-    .unwrap();
-    db.flush();
 
     // Rollback only block 1001
-    db.rollback(1000).unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = rollback_to(&mut db, 1000).unwrap().batch.unwrap();
 
     let mv_records: Vec<_> = batch.records_for("wallet_volume").iter().collect();
     assert_eq!(mv_records.len(), 1);
-    assert_eq!(mv_records[0].operation, DeltaOperation::Update);
+    assert_eq!(mv_records[0].operation, ChangeOp::Update);
     assert_eq!(
         mv_records[0].values.get("total_volume"),
         Some(&Value::Float64(100.0))
@@ -244,19 +255,22 @@ fn rollback_persists_metadata_atomically() {
     use crate::storage::memory::MemoryBackend;
 
     let storage = Arc::new(MemoryBackend::new());
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
 
-    // Process blocks 1-3
-    db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)])
-        .unwrap();
-    db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)])
-        .unwrap();
-    db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)])
-        .unwrap();
-    db.finalize(1).unwrap();
+    // Process blocks 1-3 with finalized head at 1.
+    ingest_with_finalized(
+        &mut db,
+        vec![
+            ("swaps".into(), 1, vec![make_swap("ETH", 10.0)]),
+            ("swaps".into(), 2, vec![make_swap("ETH", 20.0)]),
+            ("swaps".into(), 3, vec![make_swap("ETH", 30.0)]),
+        ],
+        1,
+    )
+    .unwrap();
 
     // Rollback to block 1
-    db.rollback(1).unwrap();
+    rollback_to(&mut db, 1).unwrap();
 
     // Verify metadata was persisted — latest_block should be 1
     let latest_bytes = storage.get_meta("latest_block").unwrap().unwrap();
@@ -285,31 +299,33 @@ fn rollback_survives_simulated_restart() {
 
     // Phase 1: process and finalize
     {
-        let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
-        db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)])
-            .unwrap();
-        db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)])
-            .unwrap();
-        db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)])
-            .unwrap();
-        db.finalize(1).unwrap();
+        let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
+        ingest_with_finalized(
+            &mut db,
+            vec![
+                ("swaps".into(), 1, vec![make_swap("ETH", 10.0)]),
+                ("swaps".into(), 2, vec![make_swap("ETH", 20.0)]),
+                ("swaps".into(), 3, vec![make_swap("ETH", 30.0)]),
+            ],
+            1,
+        )
+        .unwrap();
 
         // Rollback to block 1
-        db.rollback(1).unwrap();
-        db.flush();
+        rollback_to(&mut db, 1).unwrap();
     }
 
     // Phase 2: "restart" — open from same storage
     {
-        let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
+        let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
 
         // latest_block should be 1 (not 3 — the ghost head)
         assert_eq!(db.latest_block(), 1);
 
         // Process block 2 with new data — should work correctly
-        db.process_batch("swaps", 2, vec![make_swap("BTC", 50.0)])
+        let batch = ingest_one(&mut db, "swaps", 2, vec![make_swap("BTC", 50.0)])
+            .unwrap()
             .unwrap();
-        let batch = db.flush().unwrap();
 
         // Should have MV update with the new data
         let pool_vol = batch.tables.get("pool_volume").unwrap();
@@ -326,7 +342,7 @@ fn crash_recovery_replays_unfinalized_blocks() {
 
     // Phase 1: ingest blocks 1000-1002, finalize up to 1000
     {
-        let mut db = DeltaDb::open(Config::with_data_dir(
+        let mut db = Settle::open(Config::with_data_dir(
             DEX_SCHEMA,
             dir.path().to_str().unwrap(),
         ))
@@ -384,7 +400,7 @@ fn crash_recovery_replays_unfinalized_blocks() {
 
     // Phase 2: reopen and verify state was rebuilt
     {
-        let mut db = DeltaDb::open(Config::with_data_dir(
+        let mut db = Settle::open(Config::with_data_dir(
             DEX_SCHEMA,
             dir.path().to_str().unwrap(),
         ))
@@ -398,14 +414,14 @@ fn crash_recovery_replays_unfinalized_blocks() {
         //   qty = 10 + 5 + 3 = 18, cost = 20000 + 10500 + 6600 = 37100
         //   avg_cost = 37100/18 ≈ 2061.11
         //   pnl = 5 * (2300 - 2061.11) = 1194.44
-        db.process_batch(
+        let batch = ingest_one(
+            &mut db,
             "trades",
             1003,
             vec![make_trade("alice", "sell", 5.0, 2300.0)],
         )
+        .unwrap()
         .unwrap();
-
-        let batch = db.flush().unwrap();
 
         let mv_records: Vec<_> = batch.records_for("position_summary").iter().collect();
         assert_eq!(mv_records.len(), 1);
@@ -435,7 +451,7 @@ fn crash_recovery_replays_unfinalized_blocks() {
 
 #[test]
 fn resolve_fork_cursor_finds_common_ancestor() {
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     db.ingest(IngestInput {
         data: std::collections::HashMap::from([(
@@ -490,7 +506,7 @@ fn resolve_fork_cursor_finds_common_ancestor() {
 fn ingest_auto_rollback_on_fork() {
     // Verify that ingest() automatically rolls back when rollback_chain shrinks.
     // This tests the fork detection path in ingest().
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     // Ingest blocks 1 and 2. Block 2 is unfinalized (finalizedHead = 1).
     db.ingest(IngestInput {
@@ -550,11 +566,11 @@ fn ingest_auto_rollback_on_fork() {
         "latest_block must revert to fork point"
     );
 
-    // The batch must contain compensating deltas for block 2's data
-    let batch = batch.expect("rollback ingest must return a batch with compensating deltas");
+    // The batch must contain compensating changes for block 2's data
+    let batch = batch.expect("rollback ingest must return a batch with compensating changes");
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
     assert_eq!(mv_records.len(), 1);
-    assert_eq!(mv_records[0].operation, DeltaOperation::Update);
+    assert_eq!(mv_records[0].operation, ChangeOp::Update);
     // After rolling back block 2's 200.0, total should be back to 100.0
     assert_eq!(
         mv_records[0].values.get("total_volume"),
@@ -566,7 +582,7 @@ fn ingest_auto_rollback_on_fork() {
 fn ingest_auto_rollback_full_when_no_common_ancestor() {
     // When no common ancestor exists in the new chain, ingest() does a full
     // rollback to block 0 and processes fresh data.
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     db.ingest(IngestInput {
         data: std::collections::HashMap::from([(
@@ -627,7 +643,7 @@ fn ingest_auto_rollback_full_when_no_common_ancestor() {
 fn ingest_fork_detection_robust_against_asc_rollback_chain() {
     // If the portal sends rollbackChain in ascending order (oldest first),
     // ingest() must still detect fork correctly (no false rollback, no deep rollback).
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     // Ingest blocks 1, 2, 3. Block 3 is unfinalized.
     db.ingest(IngestInput {
@@ -704,7 +720,7 @@ fn ingest_fork_detection_robust_against_asc_rollback_chain() {
         "ASC rollbackChain must not trigger spurious rollback"
     );
     // Empty data + no rollback → None batch
-    assert!(batch.is_none(), "no delta with empty data and no fork");
+    assert!(batch.is_none(), "no change with empty data and no fork");
 }
 
 #[test]
@@ -713,7 +729,7 @@ fn ingest_no_spurious_rollback_on_multi_batch_advance() {
     // where each batch only contains NEW blocks (not yet in block_hashes).
     // Previously, resolve_fork_cursor would find an old finalized anchor and
     // trigger a rollback on every batch after the first.
-    let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     // Batch 1: blocks 1-3 (finalized=1, unfinalized=2,3)
     db.ingest(IngestInput {

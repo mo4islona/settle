@@ -25,7 +25,7 @@ use crate::schema::ast::Schema;
 use crate::storage::StorageBackend;
 use crate::storage::StorageWriteBatch;
 use crate::types::{
-    BlockCursor, BlockNumber, ColumnType, DeltaBatch, DeltaRecord, PerfNode, PerfNodeKind, Row,
+    BlockCursor, BlockNumber, ColumnType, ChangeBatch, ChangeRecord, PerfNode, PerfNodeKind, Row,
     RowMap,
 };
 
@@ -51,11 +51,11 @@ struct PipelineBranch {
 
 /// Top-level engine that wires the computation DAG:
 /// Raw Tables → Reducers → Materialized Views
-pub struct DeltaEngine {
+pub struct SettleEngine {
     raw_tables: HashMap<String, RawTableEngine>,
     reducers: HashMap<String, ReducerEngine>,
     mvs: HashMap<String, MVEngine>,
-    /// Tables marked as VIRTUAL — stored but no deltas emitted.
+    /// Tables marked as VIRTUAL — stored but no changes emitted.
     virtual_tables: HashSet<String>,
     /// Topologically sorted processing order.
     pipeline: Vec<PipelineNode>,
@@ -67,7 +67,7 @@ pub struct DeltaEngine {
     branch_index: HashMap<String, usize>,
     /// MV name → (branch_index, mv_index within branch) for O(1) lookup.
     mv_branch_index: HashMap<String, (usize, usize)>,
-    /// Sequence number for delta batches.
+    /// Sequence number for change batches.
     sequence: u64,
     /// Latest processed block number (for ordering/rollback logic).
     latest_block: Option<BlockNumber>,
@@ -78,7 +78,7 @@ pub struct DeltaEngine {
     block_hashes: BTreeMap<BlockNumber, String>,
 }
 
-impl DeltaEngine {
+impl SettleEngine {
     /// Build the engine from a parsed schema and storage backend.
     pub fn new(schema: &Schema, storage: Arc<dyn StorageBackend>) -> Self {
         let mut raw_tables = HashMap::new();
@@ -308,7 +308,7 @@ impl DeltaEngine {
     }
 
     /// Process a batch of rows for a raw table at the given block.
-    /// Cascades through reducers and MVs, returning all delta records.
+    /// Cascades through reducers and MVs, returning all change records.
     ///
     /// When multiple independent reducer branches exist (e.g. two reducers
     /// both sourcing from the same raw table), they are executed in parallel
@@ -318,7 +318,7 @@ impl DeltaEngine {
         table: &str,
         block: BlockNumber,
         row_maps: Vec<RowMap>,
-    ) -> Result<(Vec<DeltaRecord>, PerfNode)> {
+    ) -> Result<(Vec<ChangeRecord>, PerfNode)> {
         self.process_batch_inner(table, block, row_maps, None)
     }
 
@@ -329,7 +329,7 @@ impl DeltaEngine {
         block: BlockNumber,
         row_maps: Vec<RowMap>,
         write_batch: &mut StorageWriteBatch,
-    ) -> Result<(Vec<DeltaRecord>, PerfNode)> {
+    ) -> Result<(Vec<ChangeRecord>, PerfNode)> {
         self.process_batch_inner(table, block, row_maps, Some(write_batch))
     }
 
@@ -339,7 +339,7 @@ impl DeltaEngine {
         block: BlockNumber,
         row_maps: Vec<RowMap>,
         write_batch: Option<&mut StorageWriteBatch>,
-    ) -> Result<(Vec<DeltaRecord>, PerfNode)> {
+    ) -> Result<(Vec<ChangeRecord>, PerfNode)> {
         let pipeline_start = start_timer();
         let mut perf_children: Vec<PerfNode> = Vec::new();
 
@@ -347,20 +347,20 @@ impl DeltaEngine {
             return Err(Error::InvalidOperation(format!("unknown table: {table}")));
         }
 
-        let mut all_deltas = Vec::new();
+        let mut all_changes = Vec::new();
 
         // Phase 1: Raw table ingest
         let raw_start = start_timer();
         let raw_eng = self.raw_tables.get(table).unwrap();
         let is_virtual = self.virtual_tables.contains(table);
         if let Some(batch) = write_batch {
-            let deltas = raw_eng.ingest_to_batch(block, &row_maps, batch, is_virtual)?;
-            all_deltas.extend(deltas);
+            let changes = raw_eng.ingest_to_batch(block, &row_maps, batch, is_virtual)?;
+            all_changes.extend(changes);
         } else if is_virtual {
-            raw_eng.ingest_no_deltas(block, &row_maps)?;
+            raw_eng.ingest_no_changes(block, &row_maps)?;
         } else {
-            let deltas = raw_eng.ingest(block, &row_maps)?;
-            all_deltas.extend(deltas);
+            let changes = raw_eng.ingest(block, &row_maps)?;
+            all_changes.extend(changes);
         }
 
         perf_children.push(PerfNode {
@@ -394,8 +394,8 @@ impl DeltaEngine {
                     let mv = self.mvs.get_mut(mv_name).unwrap();
                     let source = mv.source().to_string();
                     if let Some(source_rows) = output_rows.get(&source) {
-                        let deltas = mv.process_block(block, source_rows);
-                        all_deltas.extend(deltas);
+                        let changes = mv.process_block(block, source_rows);
+                        all_changes.extend(changes);
                     }
                     perf_children.push(PerfNode {
                         kind: PerfNodeKind::MV,
@@ -413,17 +413,17 @@ impl DeltaEngine {
                     let branch_1 = &mut second[0];
 
                     let (result_0, result_1) = rayon::join(
-                        || -> Result<(Vec<DeltaRecord>, PerfNode)> {
+                        || -> Result<(Vec<ChangeRecord>, PerfNode)> {
                             let r_start = start_timer();
                             let source = branch_0.reducer.source();
-                            let mut deltas = Vec::new();
+                            let mut changes = Vec::new();
                             let mut mv_nodes = Vec::new();
                             if let Some(rows) = output_rows.get(source) {
                                 let enriched = branch_0.reducer.process_block_maps(block, rows)?;
                                 if !enriched.is_empty() {
                                     for (mv_name, mv) in branch_0.mv_entries.iter_mut() {
                                         let mv_start = start_timer();
-                                        deltas.extend(mv.process_block(block, &enriched));
+                                        changes.extend(mv.process_block(block, &enriched));
                                         mv_nodes.push(PerfNode {
                                             kind: PerfNodeKind::MV,
                                             name: mv_name.clone(),
@@ -434,7 +434,7 @@ impl DeltaEngine {
                                 }
                             }
                             Ok((
-                                deltas,
+                                changes,
                                 PerfNode {
                                     kind: PerfNodeKind::Reducer,
                                     name: branch_0.reducer_name.clone(),
@@ -443,17 +443,17 @@ impl DeltaEngine {
                                 },
                             ))
                         },
-                        || -> Result<(Vec<DeltaRecord>, PerfNode)> {
+                        || -> Result<(Vec<ChangeRecord>, PerfNode)> {
                             let r_start = start_timer();
                             let source = branch_1.reducer.source();
-                            let mut deltas = Vec::new();
+                            let mut changes = Vec::new();
                             let mut mv_nodes = Vec::new();
                             if let Some(rows) = output_rows.get(source) {
                                 let enriched = branch_1.reducer.process_block_maps(block, rows)?;
                                 if !enriched.is_empty() {
                                     for (mv_name, mv) in branch_1.mv_entries.iter_mut() {
                                         let mv_start = start_timer();
-                                        deltas.extend(mv.process_block(block, &enriched));
+                                        changes.extend(mv.process_block(block, &enriched));
                                         mv_nodes.push(PerfNode {
                                             kind: PerfNodeKind::MV,
                                             name: mv_name.clone(),
@@ -464,7 +464,7 @@ impl DeltaEngine {
                                 }
                             }
                             Ok((
-                                deltas,
+                                changes,
                                 PerfNode {
                                     kind: PerfNodeKind::Reducer,
                                     name: branch_1.reducer_name.clone(),
@@ -477,8 +477,8 @@ impl DeltaEngine {
 
                     let (d0, p0) = result_0?;
                     let (d1, p1) = result_1?;
-                    all_deltas.extend(d0);
-                    all_deltas.extend(d1);
+                    all_changes.extend(d0);
+                    all_changes.extend(d1);
                     perf_children.push(PerfNode {
                         kind: PerfNodeKind::Parallel,
                         name: "parallel".to_string(),
@@ -487,20 +487,20 @@ impl DeltaEngine {
                     });
                 } else {
                     // General N-branch parallel using par_iter_mut
-                    let results: Vec<Result<(Vec<DeltaRecord>, PerfNode)>> = self
+                    let results: Vec<Result<(Vec<ChangeRecord>, PerfNode)>> = self
                         .branches
                         .par_iter_mut()
                         .map(|branch| {
                             let r_start = start_timer();
                             let source = branch.reducer.source();
-                            let mut deltas = Vec::new();
+                            let mut changes = Vec::new();
                             let mut mv_nodes = Vec::new();
                             if let Some(rows) = output_rows.get(source) {
                                 let enriched = branch.reducer.process_block_maps(block, rows)?;
                                 if !enriched.is_empty() {
                                     for (mv_name, mv) in branch.mv_entries.iter_mut() {
                                         let mv_start = start_timer();
-                                        deltas.extend(mv.process_block(block, &enriched));
+                                        changes.extend(mv.process_block(block, &enriched));
                                         mv_nodes.push(PerfNode {
                                             kind: PerfNodeKind::MV,
                                             name: mv_name.clone(),
@@ -511,7 +511,7 @@ impl DeltaEngine {
                                 }
                             }
                             Ok((
-                                deltas,
+                                changes,
                                 PerfNode {
                                     kind: PerfNodeKind::Reducer,
                                     name: branch.reducer_name.clone(),
@@ -525,7 +525,7 @@ impl DeltaEngine {
                     let mut branch_nodes = Vec::new();
                     for result in results {
                         let (d, p) = result?;
-                        all_deltas.extend(d);
+                        all_changes.extend(d);
                         branch_nodes.push(p);
                     }
                     perf_children.push(PerfNode {
@@ -583,15 +583,15 @@ impl DeltaEngine {
                             let mv = &mut self.branches[bi].mv_entries[mi].1;
                             mv_source = mv.source().to_string();
                             if let Some(source_rows) = output_rows.get(&mv_source) {
-                                let deltas = mv.process_block(block, source_rows);
-                                all_deltas.extend(deltas);
+                                let changes = mv.process_block(block, source_rows);
+                                all_changes.extend(changes);
                             }
                         } else {
                             let mv = self.mvs.get_mut(name).unwrap();
                             mv_source = mv.source().to_string();
                             if let Some(source_rows) = output_rows.get(&mv_source) {
-                                let deltas = mv.process_block(block, source_rows);
-                                all_deltas.extend(deltas);
+                                let changes = mv.process_block(block, source_rows);
+                                all_changes.extend(changes);
                             }
                         }
                         let mv_node = PerfNode {
@@ -622,7 +622,7 @@ impl DeltaEngine {
             children: perf_children,
         };
 
-        Ok((all_deltas, perf_node))
+        Ok((all_changes, perf_node))
     }
 
     /// Replay unfinalized blocks from raw rows in storage.
@@ -801,7 +801,7 @@ impl DeltaEngine {
     }
 
     /// Roll back all state after fork_point.
-    pub fn rollback(&mut self, fork_point: BlockNumber) -> Result<Vec<DeltaRecord>> {
+    pub fn rollback(&mut self, fork_point: BlockNumber) -> Result<Vec<ChangeRecord>> {
         self.rollback_inner(fork_point, None)
     }
 
@@ -811,7 +811,7 @@ impl DeltaEngine {
         &mut self,
         fork_point: BlockNumber,
         batch: &mut StorageWriteBatch,
-    ) -> Result<Vec<DeltaRecord>> {
+    ) -> Result<Vec<ChangeRecord>> {
         self.rollback_inner(fork_point, Some(batch))
     }
 
@@ -819,18 +819,18 @@ impl DeltaEngine {
         &mut self,
         fork_point: BlockNumber,
         mut write_batch: Option<&mut StorageWriteBatch>,
-    ) -> Result<Vec<DeltaRecord>> {
-        let mut all_deltas = Vec::new();
+    ) -> Result<Vec<ChangeRecord>> {
+        let mut all_changes = Vec::new();
 
         // Roll back in reverse pipeline order
         for node in self.pipeline.iter().rev() {
             match node {
                 PipelineNode::MV(name) => {
                     if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
-                        all_deltas.extend(self.branches[bi].mv_entries[mi].1.rollback(fork_point));
+                        all_changes.extend(self.branches[bi].mv_entries[mi].1.rollback(fork_point));
                     } else {
                         let mv = self.mvs.get_mut(name).unwrap();
-                        all_deltas.extend(mv.rollback(fork_point));
+                        all_changes.extend(mv.rollback(fork_point));
                     }
                 }
                 PipelineNode::Reducer(name) => {
@@ -846,13 +846,13 @@ impl DeltaEngine {
                 }
                 PipelineNode::RawTable(name) => {
                     let raw_engine = self.raw_tables.get(name).unwrap();
-                    let deltas = if let Some(ref mut batch) = write_batch {
+                    let changes = if let Some(ref mut batch) = write_batch {
                         raw_engine.rollback_to_batch(fork_point, batch)?
                     } else {
                         raw_engine.rollback(fork_point)?
                     };
                     if !self.virtual_tables.contains(name) {
-                        all_deltas.extend(deltas);
+                        all_changes.extend(changes);
                     }
                 }
             }
@@ -863,7 +863,7 @@ impl DeltaEngine {
         let after = self.block_hashes.split_off(&(fork_point + 1));
         drop(after);
 
-        Ok(all_deltas)
+        Ok(all_changes)
     }
 
     /// Finalize all state up to and including the given block.
@@ -902,15 +902,15 @@ impl DeltaEngine {
         self.block_hashes = old_hashes;
     }
 
-    /// Create a DeltaBatch from a set of delta records.
-    pub fn make_batch(&mut self, records: Vec<DeltaRecord>) -> DeltaBatch {
+    /// Create a ChangeBatch from a set of change records.
+    pub fn make_batch(&mut self, records: Vec<ChangeRecord>) -> ChangeBatch {
         self.sequence += 1;
         // Group records by table name
-        let mut tables: HashMap<String, Vec<DeltaRecord>> = HashMap::new();
+        let mut tables: HashMap<String, Vec<ChangeRecord>> = HashMap::new();
         for record in records {
             tables.entry(record.table.clone()).or_default().push(record);
         }
-        DeltaBatch {
+        ChangeBatch {
             sequence: self.sequence,
             finalized_head: self.finalized_cursor(),
             latest_head: self.latest_cursor(),
@@ -1108,7 +1108,7 @@ mod tests {
     use super::*;
     use crate::schema::ast::*;
     use crate::storage::memory::MemoryBackend;
-    use crate::types::{ColumnType, DeltaOperation, RowMap, Value};
+    use crate::types::{ColumnType, ChangeOp, RowMap, Value};
 
     fn dex_schema() -> Schema {
         Schema {
@@ -1320,7 +1320,7 @@ mod tests {
     #[test]
     fn raw_table_to_mv_direct() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
 
         let rows = vec![
             HashMap::from([
@@ -1333,17 +1333,17 @@ mod tests {
             ]),
         ];
 
-        let (deltas, _) = engine.process_batch("swaps", 1000, rows).unwrap();
+        let (changes, _) = engine.process_batch("swaps", 1000, rows).unwrap();
 
         // Should have: 2 raw inserts + 1 MV insert
-        let raw_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "swaps").collect();
-        let mv_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "pool_volume").collect();
+        let raw_changes: Vec<_> = changes.iter().filter(|d| d.table == "swaps").collect();
+        let mv_changes: Vec<_> = changes.iter().filter(|d| d.table == "pool_volume").collect();
 
-        assert_eq!(raw_deltas.len(), 2);
-        assert_eq!(mv_deltas.len(), 1);
-        assert_eq!(mv_deltas[0].operation, DeltaOperation::Insert);
+        assert_eq!(raw_changes.len(), 2);
+        assert_eq!(mv_changes.len(), 1);
+        assert_eq!(mv_changes[0].operation, ChangeOp::Insert);
         assert_eq!(
-            mv_deltas[0].values.get("total"),
+            mv_changes[0].values.get("total"),
             Some(&Value::Float64(300.0))
         );
     }
@@ -1351,10 +1351,10 @@ mod tests {
     #[test]
     fn full_pipeline_raw_reducer_mv() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&dex_schema(), storage);
+        let mut engine = SettleEngine::new(&dex_schema(), storage);
 
         // Block 1000: alice buys 10 @ 2000
-        let (deltas, _) = engine
+        let (changes, _) = engine
             .process_batch(
                 "trades",
                 1000,
@@ -1363,14 +1363,14 @@ mod tests {
             .unwrap();
 
         // Raw insert + MV insert (position_summary)
-        let mv_deltas: Vec<_> = deltas
+        let mv_changes: Vec<_> = changes
             .iter()
             .filter(|d| d.table == "position_summary")
             .collect();
-        assert_eq!(mv_deltas.len(), 1);
-        assert_eq!(mv_deltas[0].operation, DeltaOperation::Insert);
+        assert_eq!(mv_changes.len(), 1);
+        assert_eq!(mv_changes[0].operation, ChangeOp::Insert);
         assert_eq!(
-            mv_deltas[0].values.get("trade_count"),
+            mv_changes[0].values.get("trade_count"),
             Some(&Value::UInt64(1))
         );
     }
@@ -1378,7 +1378,7 @@ mod tests {
     #[test]
     fn pipeline_rollback() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
 
         // Block 1000
         let _ = engine
@@ -1405,27 +1405,27 @@ mod tests {
             .unwrap();
 
         // Rollback block 1001
-        let deltas = engine.rollback(1000).unwrap();
+        let changes = engine.rollback(1000).unwrap();
 
         // MV should update back to 100
-        let mv_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "pool_volume").collect();
-        assert_eq!(mv_deltas.len(), 1);
-        assert_eq!(mv_deltas[0].operation, DeltaOperation::Update);
+        let mv_changes: Vec<_> = changes.iter().filter(|d| d.table == "pool_volume").collect();
+        assert_eq!(mv_changes.len(), 1);
+        assert_eq!(mv_changes[0].operation, ChangeOp::Update);
         assert_eq!(
-            mv_deltas[0].values.get("total"),
+            mv_changes[0].values.get("total"),
             Some(&Value::Float64(100.0))
         );
 
-        // Raw table should emit delete delta
-        let raw_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "swaps").collect();
-        assert_eq!(raw_deltas.len(), 1);
-        assert_eq!(raw_deltas[0].operation, DeltaOperation::Delete);
+        // Raw table should emit delete change
+        let raw_changes: Vec<_> = changes.iter().filter(|d| d.table == "swaps").collect();
+        assert_eq!(raw_changes.len(), 1);
+        assert_eq!(raw_changes[0].operation, ChangeOp::Delete);
     }
 
     #[test]
     fn pipeline_finalize() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
 
         let _ = engine
             .process_batch(
@@ -1454,12 +1454,12 @@ mod tests {
         assert_eq!(engine.finalized_block(), 1000);
 
         // Rollback to 1000 should only remove block 1001
-        let deltas = engine.rollback(1000).unwrap();
-        let mv_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "pool_volume").collect();
-        assert_eq!(mv_deltas.len(), 1);
+        let changes = engine.rollback(1000).unwrap();
+        let mv_changes: Vec<_> = changes.iter().filter(|d| d.table == "pool_volume").collect();
+        assert_eq!(mv_changes.len(), 1);
         // After finalize(1000) + rollback(1001→1000): total should be 100
         assert_eq!(
-            mv_deltas[0].values.get("total"),
+            mv_changes[0].values.get("total"),
             Some(&Value::Float64(100.0))
         );
     }
@@ -1467,7 +1467,7 @@ mod tests {
     #[test]
     fn full_pipeline_rollback_and_reingest() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&dex_schema(), storage);
+        let mut engine = SettleEngine::new(&dex_schema(), storage);
 
         // Block 1000: alice buys 10 @ 2000
         let _ = engine
@@ -1500,7 +1500,7 @@ mod tests {
         engine.rollback(1001).unwrap();
 
         // Re-ingest block 1002 with different trade
-        let (deltas, _) = engine
+        let (changes, _) = engine
             .process_batch(
                 "trades",
                 1002,
@@ -1509,14 +1509,14 @@ mod tests {
             .unwrap();
 
         // MV should get updated with new trade data
-        let mv_deltas: Vec<_> = deltas
+        let mv_changes: Vec<_> = changes
             .iter()
             .filter(|d| d.table == "position_summary")
             .collect();
-        assert_eq!(mv_deltas.len(), 1);
-        assert_eq!(mv_deltas[0].operation, DeltaOperation::Update);
+        assert_eq!(mv_changes.len(), 1);
+        assert_eq!(mv_changes[0].operation, ChangeOp::Update);
         assert_eq!(
-            mv_deltas[0].values.get("trade_count"),
+            mv_changes[0].values.get("trade_count"),
             Some(&Value::UInt64(3))
         );
     }
@@ -1524,7 +1524,7 @@ mod tests {
     #[test]
     fn make_batch_increments_sequence() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
 
         let batch1 = engine.make_batch(vec![]);
         assert_eq!(batch1.sequence, 1);
@@ -1536,7 +1536,7 @@ mod tests {
     #[test]
     fn unknown_table_returns_error() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
 
         let result = engine.process_batch("nonexistent", 1000, vec![]);
         assert!(result.is_err());
@@ -1613,10 +1613,10 @@ mod tests {
         };
 
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&schema, storage);
+        let mut engine = SettleEngine::new(&schema, storage);
 
         // Block 1: alice deposits 10
-        let (deltas, _) = engine
+        let (changes, _) = engine
             .process_batch(
                 "events",
                 1000,
@@ -1628,15 +1628,15 @@ mod tests {
             .unwrap();
 
         // Should have: events insert + summary insert (doubled=20)
-        let summary_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "summary").collect();
-        assert_eq!(summary_deltas.len(), 1);
+        let summary_changes: Vec<_> = changes.iter().filter(|d| d.table == "summary").collect();
+        assert_eq!(summary_changes.len(), 1);
         assert_eq!(
-            summary_deltas[0].values.get("latest_doubled"),
+            summary_changes[0].values.get("latest_doubled"),
             Some(&Value::Float64(20.0))
         );
 
         // Block 2: alice deposits 5 more (total=15, doubled=30)
-        let (deltas2, _) = engine
+        let (changes2, _) = engine
             .process_batch(
                 "events",
                 1001,
@@ -1647,7 +1647,7 @@ mod tests {
             )
             .unwrap();
 
-        let summary2: Vec<_> = deltas2.iter().filter(|d| d.table == "summary").collect();
+        let summary2: Vec<_> = changes2.iter().filter(|d| d.table == "summary").collect();
         assert_eq!(summary2.len(), 1);
         assert_eq!(
             summary2[0].values.get("latest_doubled"),
@@ -1655,18 +1655,18 @@ mod tests {
         );
 
         // Rollback block 1001
-        let rollback_deltas = engine.rollback(1000).unwrap();
-        let summary_rb: Vec<_> = rollback_deltas
+        let rollback_changes = engine.rollback(1000).unwrap();
+        let summary_rb: Vec<_> = rollback_changes
             .iter()
             .filter(|d| d.table == "summary")
             .collect();
         assert!(
             !summary_rb.is_empty(),
-            "rollback should produce summary deltas"
+            "rollback should produce summary changes"
         );
 
         // Re-ingest block 1001: alice deposits 20 (total=30, doubled=60)
-        let (deltas3, _) = engine
+        let (changes3, _) = engine
             .process_batch(
                 "events",
                 1001,
@@ -1677,7 +1677,7 @@ mod tests {
             )
             .unwrap();
 
-        let summary3: Vec<_> = deltas3.iter().filter(|d| d.table == "summary").collect();
+        let summary3: Vec<_> = changes3.iter().filter(|d| d.table == "summary").collect();
         assert_eq!(summary3.len(), 1);
         assert_eq!(
             summary3[0].values.get("latest_doubled"),
@@ -1737,7 +1737,7 @@ mod tests {
             ("amount".to_string(), Value::Float64(200.0)),
         ])];
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&schema, storage.clone());
+        let mut engine = SettleEngine::new(&schema, storage.clone());
 
         // Process blocks — raw rows go to storage, MV gets data
         let _ = engine.process_batch("events", 1000, rows1).unwrap();
@@ -1745,26 +1745,26 @@ mod tests {
 
         // Simulate crash recovery: create a fresh engine with the same storage
         // that has raw rows but no in-memory MV state.
-        let mut engine2 = DeltaEngine::new(&schema, storage);
+        let mut engine2 = SettleEngine::new(&schema, storage);
 
         // Replay unfinalized blocks — MV sources directly from raw table
         engine2.replay_unfinalized(1000, 1001).unwrap();
 
         // After replay, MV should have accumulated 100 + 200 = 300
-        // Process another block to get deltas that confirm the state
+        // Process another block to get changes that confirm the state
         let rows3 = vec![RowMap::from([
             ("pool".to_string(), Value::String("ETH".into())),
             ("amount".to_string(), Value::Float64(50.0)),
         ])];
-        let (deltas, _) = engine2.process_batch("events", 1002, rows3).unwrap();
-        let mv_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "pool_totals").collect();
+        let (changes, _) = engine2.process_batch("events", 1002, rows3).unwrap();
+        let mv_changes: Vec<_> = changes.iter().filter(|d| d.table == "pool_totals").collect();
         assert!(
-            !mv_deltas.is_empty(),
-            "MV should produce deltas after replay"
+            !mv_changes.is_empty(),
+            "MV should produce changes after replay"
         );
         // Total should be 100 + 200 + 50 = 350
         assert_eq!(
-            mv_deltas.last().unwrap().values.get("total"),
+            mv_changes.last().unwrap().values.get("total"),
             Some(&Value::Float64(350.0))
         );
     }
@@ -1813,7 +1813,7 @@ mod tests {
         };
 
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&schema, storage.clone());
+        let mut engine = SettleEngine::new(&schema, storage.clone());
 
         // Dynamically add a reducer that the MV sources from
         let reducer_def = ReducerDef {
@@ -1846,7 +1846,7 @@ mod tests {
         engine.add_reducer(reducer_def, storage).unwrap();
 
         // Process a batch — should not panic (the MV is now in a branch)
-        let (deltas, _) = engine
+        let (changes, _) = engine
             .process_batch(
                 "events",
                 1000,
@@ -1861,8 +1861,8 @@ mod tests {
         // Before the fix, mvs.get_mut(name).unwrap() would panic because
         // the MV was moved into a branch but mv_branch_index wasn't updated.
         assert!(
-            deltas.len() > 0,
-            "should produce some deltas without panicking"
+            changes.len() > 0,
+            "should produce some changes without panicking"
         );
     }
 
@@ -1984,7 +1984,7 @@ mod tests {
         };
 
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut engine = DeltaEngine::new(&schema, storage.clone());
+        let mut engine = SettleEngine::new(&schema, storage.clone());
 
         // Process block 1000
         let rows = vec![RowMap::from([
@@ -1994,7 +1994,7 @@ mod tests {
         engine.process_batch("events", 1000, rows).unwrap();
 
         // Full replay (simulates open() recovery) — both reducers see block 1000
-        let mut engine2 = DeltaEngine::new(&schema, storage.clone());
+        let mut engine2 = SettleEngine::new(&schema, storage.clone());
         engine2.replay_unfinalized(1000, 1000).unwrap();
 
         // Now replay_for counter_a ONLY — counter_b must NOT be double-replayed
@@ -2002,20 +2002,20 @@ mod tests {
             .replay_unfinalized_for(1000, 1000, "counter_a")
             .unwrap();
 
-        // Process block 1001 to get deltas
+        // Process block 1001 to get changes
         let rows2 = vec![RowMap::from([
             ("pool".to_string(), Value::String("ETH".into())),
             ("amount".to_string(), Value::Float64(50.0)),
         ])];
-        let (deltas, _) = engine2.process_batch("events", 1001, rows2).unwrap();
+        let (changes, _) = engine2.process_batch("events", 1001, rows2).unwrap();
 
         // counter_b was replayed once (full replay). State after block 1000 = 100.
         // Block 1001 adds 50 → state = 150, emits total=150.
         // mv_b SUM(total) = 100 (block 1000) + 150 (block 1001) = 250.
         // If counter_b were double-replayed, block 1000 state = 200,
         // block 1001 state = 250, SUM = 200 + 250 = 450.
-        let mv_b: Vec<_> = deltas.iter().filter(|d| d.table == "mv_b").collect();
-        assert!(!mv_b.is_empty(), "mv_b should have deltas");
+        let mv_b: Vec<_> = changes.iter().filter(|d| d.table == "mv_b").collect();
+        assert!(!mv_b.is_empty(), "mv_b should have changes");
         let sum_b = mv_b
             .last()
             .unwrap()

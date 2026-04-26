@@ -5,13 +5,14 @@
 //! 2. Ingest synthetic trade data across 100 blocks
 //! 3. Trigger rollback at block 75
 //! 4. Re-process blocks 75-100 with different data
-//! 5. Verify all deltas are correct
+//! 5. Verify all changes are correct
 //! 6. Flush to mock target, verify records
 
 use std::collections::HashMap;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::types::{DeltaBatch, DeltaOperation, DeltaRecord, RowMap, Value};
+use settle::db::{Config, Settle};
+use settle::test_helpers::{ingest_blocks, ingest_one, ingest_with_finalized, rollback_to};
+use settle::types::{ChangeBatch, ChangeOp, ChangeRecord, RowMap, Value};
 
 const DEX_SCHEMA: &str = include_str!("schema.sql");
 
@@ -31,16 +32,16 @@ fn make_swap(pool: &str, amount: f64) -> RowMap {
     ])
 }
 
-fn find_records<'a>(batch: &'a DeltaBatch, table: &str) -> Vec<&'a DeltaRecord> {
+fn find_records<'a>(batch: &'a ChangeBatch, table: &str) -> Vec<&'a ChangeRecord> {
     batch.records_for(table).iter().collect()
 }
 
 fn find_record_by_key<'a>(
-    batch: &'a DeltaBatch,
+    batch: &'a ChangeBatch,
     table: &str,
     key_col: &str,
     key_val: &Value,
-) -> Option<&'a DeltaRecord> {
+) -> Option<&'a ChangeRecord> {
     batch
         .records_for(table)
         .iter()
@@ -49,7 +50,7 @@ fn find_record_by_key<'a>(
 
 /// Collect all flushed batches, applying each to a mock target.
 struct MockTarget {
-    batches: Vec<DeltaBatch>,
+    batches: Vec<ChangeBatch>,
 }
 
 impl MockTarget {
@@ -57,7 +58,7 @@ impl MockTarget {
         Self { batches: vec![] }
     }
 
-    fn apply(&mut self, batch: DeltaBatch) {
+    fn apply(&mut self, batch: ChangeBatch) {
         self.batches.push(batch);
     }
 
@@ -68,13 +69,15 @@ impl MockTarget {
 
 #[test]
 fn full_dex_pipeline_100_blocks_with_rollback() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
     let mut target = MockTarget::new();
 
     let users = ["alice", "bob", "charlie"];
     let pools = ["ETH/USDC", "BTC/USDC"];
 
-    // Phase 1: Ingest blocks 1-100
+    // Phase 1: Ingest blocks 1-100, finalized_head = 50 (matches the original
+    // periodic finalization that stayed below the rollback target of 75).
+    let mut items: Vec<(String, u64, Vec<RowMap>)> = Vec::new();
     for block in 1..=100u64 {
         let mut trades = Vec::new();
         let mut swaps = Vec::new();
@@ -97,17 +100,11 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
             swaps.push(make_swap(pool, amount));
         }
 
-        db.process_batch("trades", block, trades).unwrap();
-        db.process_batch("swaps", block, swaps).unwrap();
-
-        // Finalize periodically, but stay below our rollback target of 75
-        if block % 20 == 0 && block >= 20 && block <= 60 {
-            db.finalize(block - 10).unwrap();
-        }
+        items.push(("trades".into(), block, trades));
+        items.push(("swaps".into(), block, swaps));
     }
 
-    // Flush phase 1
-    let batch1 = db.flush().unwrap();
+    let batch1 = ingest_with_finalized(&mut db, items, 50).unwrap().unwrap();
     assert!(batch1.record_count() > 0);
     assert!(batch1.latest_head.is_some());
     target.apply(batch1);
@@ -147,10 +144,8 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     }
 
     // Phase 2: Rollback to block 75
-    db.rollback(75).unwrap();
+    let rollback_batch = rollback_to(&mut db, 75).unwrap().batch.unwrap();
     assert_eq!(db.latest_block(), 75);
-
-    let rollback_batch = db.flush().unwrap();
     assert!(rollback_batch.record_count() > 0);
     target.apply(rollback_batch);
 
@@ -190,7 +185,8 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
         );
     }
 
-    // Phase 3: Re-ingest blocks 76-100 with different data (doubled amounts)
+    // Phase 3: Re-ingest blocks 76-100 with different data (doubled amounts).
+    let mut items: Vec<(String, u64, Vec<RowMap>)> = Vec::new();
     for block in 76..=100u64 {
         let mut trades = Vec::new();
         let mut swaps = Vec::new();
@@ -212,13 +208,12 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
             swaps.push(make_swap(pool, amount));
         }
 
-        db.process_batch("trades", block, trades).unwrap();
-        db.process_batch("swaps", block, swaps).unwrap();
+        items.push(("trades".into(), block, trades));
+        items.push(("swaps".into(), block, swaps));
     }
 
+    let reingest_batch = ingest_with_finalized(&mut db, items, 50).unwrap().unwrap();
     assert_eq!(db.latest_block(), 100);
-
-    let reingest_batch = db.flush().unwrap();
     assert!(reingest_batch.record_count() > 0);
     target.apply(reingest_batch);
 
@@ -276,28 +271,24 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
 
 #[test]
 fn rollback_to_finalized_boundary() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
 
-    // Ingest 50 blocks
-    for block in 1..=50u64 {
-        db.process_batch(
-            "trades",
-            block,
-            vec![make_trade("alice", "buy", 1.0, 2000.0)],
-        )
-        .unwrap();
-    }
-    db.flush();
-
-    // Finalize up to block 30
-    db.finalize(30).unwrap();
+    // Ingest 50 blocks with finalized_head = 30.
+    let items: Vec<(String, u64, Vec<RowMap>)> = (1..=50u64)
+        .map(|block| {
+            (
+                "trades".into(),
+                block,
+                vec![make_trade("alice", "buy", 1.0, 2000.0)],
+            )
+        })
+        .collect();
+    ingest_with_finalized(&mut db, items, 30).unwrap();
     assert_eq!(db.finalized_block(), 30);
 
     // Rollback to block 30 (the finalized boundary)
-    db.rollback(30).unwrap();
+    let batch = rollback_to(&mut db, 30).unwrap().batch.unwrap();
     assert_eq!(db.latest_block(), 30);
-
-    let batch = db.flush().unwrap();
     let pos = find_records(&batch, "position_summary");
     assert_eq!(pos.len(), 1);
     assert_eq!(pos[0].values.get("trade_count"), Some(&Value::UInt64(30)));
@@ -305,22 +296,39 @@ fn rollback_to_finalized_boundary() {
 
 #[test]
 fn multi_user_pnl_correctness() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+    let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
 
-    // Alice buys 10 @ 2000
-    db.process_batch("trades", 1, vec![make_trade("alice", "buy", 10.0, 2000.0)])
-        .unwrap();
-    // Bob buys 5 @ 3000
-    db.process_batch("trades", 2, vec![make_trade("bob", "buy", 5.0, 3000.0)])
-        .unwrap();
-    // Alice sells 5 @ 2500 (PnL = 5 * (2500 - 2000) = 2500)
-    db.process_batch("trades", 3, vec![make_trade("alice", "sell", 5.0, 2500.0)])
-        .unwrap();
-    // Bob sells 3 @ 2800 (PnL = 3 * (2800 - 3000) = -600)
-    db.process_batch("trades", 4, vec![make_trade("bob", "sell", 3.0, 2800.0)])
-        .unwrap();
-
-    let batch = db.flush().unwrap();
+    let batch = ingest_blocks(
+        &mut db,
+        vec![
+            // Alice buys 10 @ 2000
+            (
+                "trades".into(),
+                1,
+                vec![make_trade("alice", "buy", 10.0, 2000.0)],
+            ),
+            // Bob buys 5 @ 3000
+            (
+                "trades".into(),
+                2,
+                vec![make_trade("bob", "buy", 5.0, 3000.0)],
+            ),
+            // Alice sells 5 @ 2500 (PnL = 5 * (2500 - 2000) = 2500)
+            (
+                "trades".into(),
+                3,
+                vec![make_trade("alice", "sell", 5.0, 2500.0)],
+            ),
+            // Bob sells 3 @ 2800 (PnL = 3 * (2800 - 3000) = -600)
+            (
+                "trades".into(),
+                4,
+                vec![make_trade("bob", "sell", 3.0, 2800.0)],
+            ),
+        ],
+    )
+    .unwrap()
+    .unwrap();
 
     let alice_rec = find_record_by_key(
         &batch,
@@ -355,29 +363,28 @@ fn multi_user_pnl_correctness() {
 }
 
 #[test]
-fn delta_operations_are_correct() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+fn change_operations_are_correct() {
+    let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
 
     // Block 1: first insert for alice
-    db.process_batch("trades", 1, vec![make_trade("alice", "buy", 10.0, 2000.0)])
+    let b1 = ingest_one(&mut db, "trades", 1, vec![make_trade("alice", "buy", 10.0, 2000.0)])
+        .unwrap()
         .unwrap();
-    let b1 = db.flush().unwrap();
     let pos1 = find_records(&b1, "position_summary");
     assert_eq!(pos1.len(), 1);
-    assert_eq!(pos1[0].operation, DeltaOperation::Insert);
+    assert_eq!(pos1[0].operation, ChangeOp::Insert);
 
     // Block 2: update for alice
-    db.process_batch("trades", 2, vec![make_trade("alice", "buy", 5.0, 2100.0)])
+    let b2 = ingest_one(&mut db, "trades", 2, vec![make_trade("alice", "buy", 5.0, 2100.0)])
+        .unwrap()
         .unwrap();
-    let b2 = db.flush().unwrap();
     let pos2 = find_records(&b2, "position_summary");
     assert_eq!(pos2.len(), 1);
-    assert_eq!(pos2[0].operation, DeltaOperation::Update);
+    assert_eq!(pos2[0].operation, ChangeOp::Update);
 
-    // Rollback block 2 + block 1
-    db.rollback(0).unwrap();
-    let rb = db.flush().unwrap();
+    // Rollback block 2 + block 1 — drop everything via rollback_to(0)
+    let rb = rollback_to(&mut db, 0).unwrap().batch.unwrap();
     let pos_rb = find_records(&rb, "position_summary");
     assert_eq!(pos_rb.len(), 1);
-    assert_eq!(pos_rb[0].operation, DeltaOperation::Delete);
+    assert_eq!(pos_rb[0].operation, ChangeOp::Delete);
 }
