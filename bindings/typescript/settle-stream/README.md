@@ -1,11 +1,11 @@
-# @sqd-pipes/delta-db
+# @sqd-pipes/settle-stream
 
-Embedded rollback-aware computation engine for blockchain data. Routes raw events through **reducers** (TypeScript functions) and **materialized views**, producing delta records (insert/update/delete) for downstream targets.
+Embedded rollback-aware computation engine for blockchain data. Routes raw events through **reducers** (TypeScript functions) and **materialized views**, producing change records (insert/update/delete) for downstream targets.
 
 ## Install
 
 ```bash
-pnpm add @sqd-pipes/delta-db
+pnpm add @sqd-pipes/settle-stream
 ```
 
 ## Build from source
@@ -21,7 +21,7 @@ pnpm run build:debug  # debug
 ## Quick start
 
 ```typescript
-import { Pipeline, uint64, string, float64, interval } from '@sqd-pipes/delta-db'
+import { Pipeline, uint64, string, float64, interval } from '@sqd-pipes/settle-stream'
 
 const p = new Pipeline()
 
@@ -139,17 +139,17 @@ const db = p.build({ dataDir: ':memory:' })   // explicit in-memory (SQLite conv
 | `base58()`  | `Base58`   | `string`        |
 | `json<T>()` | `Json`     | `T` (default `any`) |
 
-### DeltaDb (low-level)
+### SettleStream (low-level)
 
 ```typescript
-import { DeltaDb } from '@sqd-pipes/delta-db'
+import { SettleStream } from '@sqd-pipes/settle-stream'
 
-const db = DeltaDb.open({ schema: 'CREATE TABLE ...', dataDir: './data' })
+const db = SettleStream.open({ schema: 'CREATE TABLE ...', dataDir: './data' })
 
 db.processBatch('table', blockNumber, rows)
 db.rollback(forkPoint)
 db.finalize(blockNumber)
-db.flush()        // → DeltaBatch | null
+db.flush()        // → ChangeBatch | null
 db.ingest(input)  // atomic: process + finalize + flush
 ```
 
@@ -159,7 +159,7 @@ db.ingest(input)  // atomic: process + finalize + flush
 
 ### Virtual tables
 
-Tables declared with `{ virtual: true }` are processed by reducers but don't emit raw row deltas:
+Tables declared with `{ virtual: true }` are processed by reducers but don't emit raw row changes:
 
 ```typescript
 const orders = p.table('orders', { ... }, { virtual: true })

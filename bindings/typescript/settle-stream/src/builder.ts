@@ -1,4 +1,4 @@
-import { DeltaDb, type StateFieldDef } from './delta-db'
+import { SettleStream, type StateFieldDef } from './settle-stream'
 
 // ─── Duration parsing ────────────────────────────────────────────
 
@@ -280,7 +280,7 @@ export class Pipeline {
     return new ViewHandle(name)
   }
 
-  build(opts?: { dataDir?: string; maxBufferSize?: number }): DeltaDb {
+  build(opts?: { dataDir?: string; maxBufferSize?: number }): SettleStream {
     const ddl: string[] = []
     for (const t of this.#tables) {
       ddl.push(tableToSql(t.name, t.columns, t.virtual))
@@ -292,7 +292,7 @@ export class Pipeline {
       ddl.push(v.sql)
     }
 
-    const db = DeltaDb.open({
+    const db = SettleStream.open({
       schema: ddl.join('\n'),
       dataDir: opts?.dataDir,
       maxBufferSize: opts?.maxBufferSize,

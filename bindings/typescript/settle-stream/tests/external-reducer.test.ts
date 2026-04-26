@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { DeltaDb } from '../src/index'
+import { SettleStream } from '../src/index'
 
 const TABLE_SCHEMA = `
   CREATE TABLE trades (
@@ -67,7 +67,7 @@ interface PnlState {
   cost_basis: number
 }
 
-function registerPnlReducer(db: DeltaDb) {
+function registerPnlReducer(db: SettleStream) {
   db.registerReducer<PnlState>({
     name: 'pnl',
     source: 'trades',
@@ -103,7 +103,7 @@ function registerPnlReducer(db: DeltaDb) {
 describe('External Reducer', () => {
   it('produces same MV output as Lua for PnL workload', async () => {
     // Lua version
-    const luaDb = DeltaDb.open({ schema: TABLE_SCHEMA + LUA_REDUCER + MV_SCHEMA })
+    const luaDb = SettleStream.open({ schema: TABLE_SCHEMA + LUA_REDUCER + MV_SCHEMA })
     const luaBatch = await luaDb.ingest({
       data: {
         trades: [
@@ -117,7 +117,7 @@ describe('External Reducer', () => {
     })
 
     // External version
-    const extDb = DeltaDb.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
+    const extDb = SettleStream.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
     registerPnlReducer(extDb)
     const extBatch = await extDb.ingest({
       data: {
@@ -144,7 +144,7 @@ describe('External Reducer', () => {
   })
 
   it('handles multiple groups correctly', async () => {
-    const db = DeltaDb.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
+    const db = SettleStream.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
     registerPnlReducer(db)
 
     const batch = await db.ingest({
@@ -170,7 +170,7 @@ describe('External Reducer', () => {
   })
 
   it('supports rollback', async () => {
-    const db = DeltaDb.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
+    const db = SettleStream.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
     registerPnlReducer(db)
 
     // Ingest blocks 1000 and 1001

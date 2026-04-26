@@ -1,4 +1,4 @@
-# RFC: Delta DB
+# RFC: SettleStream
 
 **Status:** Draft
 **Authors:** Evgeny Formanenko
@@ -6,7 +6,7 @@
 
 ## 1. Summary
 
-Delta DB is an embedded, rollback-aware computation engine that sits between a blockchain data source (Portal) and a downstream target database (Postgres, ClickHouse, etc.). It maintains incremental materialized views over streaming blockchain data, handles chain reorganizations (rollbacks) in a single place, and emits minimal delta records to downstream targets — eliminating the need for each target to implement its own rollback and aggregation logic.
+SettleStream is an embedded, rollback-aware computation engine that sits between a blockchain data source (Portal) and a downstream target database (Postgres, ClickHouse, etc.). It maintains incremental materialized views over streaming blockchain data, handles chain reorganizations (rollbacks) in a single place, and emits minimal change records to downstream targets — eliminating the need for each target to implement its own rollback and aggregation logic.
 
 ## 2. Problem Statement
 
@@ -24,13 +24,13 @@ Delta DB is an embedded, rollback-aware computation engine that sits between a b
 
 6. **No standard way to define derived tables.** Materialized views are implemented ad-hoc per use case with no shared schema or optimization.
 
-### What Delta DB solves
+### What SettleStream solves
 
-- **Single rollback implementation** — Delta DB is the only component that handles rollbacks. Downstream targets receive clean deltas (inserts, updates, deletes) and never need to reason about chain forks.
+- **Single rollback implementation** — SettleStream is the only component that handles rollbacks. Downstream targets receive clean changes (inserts, updates, deletes) and never need to reason about chain forks.
 - **Correct incremental aggregations** — Materialized views properly separate finalized and unfinalized state, supporting all aggregation types including `first`, `last`, and `avg`.
 - **Stateful computation** — Reducers enable sequential fold operations like PnL, running balances, and position tracking with full rollback support.
-- **Minimal downstream writes** — Delta DB computes diffs and emits only changed rows, reducing write amplification on the target database.
-- **Backpressure with eager merging** — When the downstream target is slow, Delta DB continues to accept and merge incoming batches, reducing the total number of flushes needed.
+- **Minimal downstream writes** — SettleStream computes diffs and emits only changed rows, reducing write amplification on the target database.
+- **Backpressure with eager merging** — When the downstream target is slow, SettleStream continues to accept and merge incoming batches, reducing the total number of flushes needed.
 - **Language-agnostic** — Schema is defined in SQL DDL. The engine is a Rust core. Host language SDKs (TypeScript, Python, etc.) are thin bindings.
 
 ## 3. Architecture
@@ -45,7 +45,7 @@ Host SDK (decode, transform)   ← TypeScript, Python, etc.
     |
     v
 +-----------------------------------------------+
-|                 Delta DB (Rust)                |
+|                 SettleStream (Rust)                |
 |                                                |
 |  +----------+   +-----------+   +-----------+  |
 |  |Raw Tables|-->| Reducers  |-->|Aggregate  |  |
@@ -53,10 +53,10 @@ Host SDK (decode, transform)   ← TypeScript, Python, etc.
 |  +----------+   +-----------+   +-----------+  |
 |       |              |               |         |
 |       v              v               v         |
-|                Delta Buffer                    |
+|                Change Buffer                    |
 +-----------------------------------------------+
     |
-    v  (delta records: insert / update / delete)
+    v  (change records: insert / update / delete)
 Target DB (Postgres, ClickHouse, Kafka, ...)
 ```
 
@@ -74,43 +74,43 @@ A reducer reads from a raw table, enriches each row with computed columns, and f
 
 ### 3.3 Deployment model
 
-Delta DB is an **embedded library** — a Rust engine with host language bindings (napi-rs for Node.js, PyO3 for Python, etc.). It runs in the same process as the host application. No separate service to deploy.
+SettleStream is an **embedded library** — a Rust engine with host language bindings (napi-rs for Node.js, PyO3 for Python, etc.). It runs in the same process as the host application. No separate service to deploy.
 
 > **Note:** If we later need a standalone mode (e.g., shared across multiple pipelines), the Rust core can be extracted into a separate process with a gRPC/Unix socket interface. The engine design should not assume embedding.
 
 ### 3.4 Integration with host SDKs
 
-Delta DB exposes itself as a target that wraps a single downstream target. Example in TypeScript (Pipes SDK):
+SettleStream exposes itself as a target that wraps a single downstream target. Example in TypeScript (Pipes SDK):
 
 ```typescript
-const deltaDb = new DeltaDB({
-  storage: './data/delta-db',
+const settleStream = new SettleStream({
+  storage: './data/settle-stream',
   schema: './schema.sql',       // SQL DDL file (language-agnostic)
   target: clickhouseTarget,
 })
 
-source.pipe(decoder).pipeTo(deltaDb)
+source.pipe(decoder).pipeTo(settleStream)
 ```
 
 Example in Python:
 
 ```python
-delta_db = DeltaDB(
-    storage="./data/delta-db",
+settle_stream = SettleStream(
+    storage="./data/settle-stream",
     schema="./schema.sql",
     target=clickhouse_target,
 )
-source.pipe(decoder).pipe_to(delta_db)
+source.pipe(decoder).pipe_to(settle_stream)
 ```
 
 The schema file is the same in both cases — a `.sql` file parsed by the Rust engine.
 
-> **Why a single target?** Data (raw rows, reducer snapshots, MV unfinalized state) can only be pruned after it has been **both finalized and acknowledged by the downstream target**. Multiple targets with independent cursors means the slowest target dictates pruning — a stalled target causes unbounded disk growth. A single target keeps the cursor/pruning model simple. For fan-out, use an external broker (Delta DB -> Kafka -> multiple consumers).
+> **Why a single target?** Data (raw rows, reducer snapshots, MV unfinalized state) can only be pruned after it has been **both finalized and acknowledged by the downstream target**. Multiple targets with independent cursors means the slowest target dictates pruning — a stalled target causes unbounded disk growth. A single target keeps the cursor/pruning model simple. For fan-out, use an external broker (SettleStream -> Kafka -> multiple consumers).
 
 ### 3.5 Backpressure model
 
 ```
-Source  --batch-->  Delta DB  --delta-->  Target DB
+Source  --batch-->  SettleStream  --change-->  Target DB
                       |                      |
                       |<------ack------------|
                       |
@@ -118,11 +118,11 @@ Source  --batch-->  Delta DB  --delta-->  Target DB
                while waiting for ack)
 ```
 
-1. Delta DB accepts a batch from the source and immediately updates its internal raw tables, reducers, and MVs.
-2. It then attempts to flush the computed deltas to the downstream target.
-3. If the downstream has not acknowledged the previous flush, Delta DB continues accepting and merging incoming batches internally.
-4. When the downstream acks, Delta DB flushes the accumulated delta (which may now represent multiple merged batches — reducing write amplification).
-5. The source is only backpressured if Delta DB's internal buffer exceeds a configurable memory limit.
+1. SettleStream accepts a batch from the source and immediately updates its internal raw tables, reducers, and MVs.
+2. It then attempts to flush the computed changes to the downstream target.
+3. If the downstream has not acknowledged the previous flush, SettleStream continues accepting and merging incoming batches internally.
+4. When the downstream acks, SettleStream flushes the accumulated change (which may now represent multiple merged batches — reducing write amplification).
+5. The source is only backpressured if SettleStream's internal buffer exceeds a configurable memory limit.
 
 ## 4. Schema Definition
 
@@ -227,7 +227,7 @@ Aggregate MV (pnl_5m)
     |  GROUP BY user, token, window_5m
     |  sum(trade_pnl), count(), sum(amount)
     v
-Delta Output
+Change Output
 ```
 
 The key insight: **the reducer computes per-trade PnL, and the aggregate MV just sums it**. The MV doesn't know anything about position tracking — it's a simple `sum()`. All the stateful complexity lives in the reducer.
@@ -595,7 +595,7 @@ CREATE MATERIALIZED VIEW positions AS
 |-------|-------|---------------|----------|-------------------|
 | alice | ETH   | 7             | 2,033.33 | 1,333.33          |
 
-**Delta records emitted to downstream:**
+**Change records emitted to downstream:**
 ```
 INSERT trades (block=1000, user=alice, token=ETH, side=buy, amount=10, price=2000)
 INSERT trades (block=1001, user=alice, token=ETH, side=buy, amount=5, price=2100)
@@ -631,7 +631,7 @@ Block 1002' (replaces 1002): alice SELLS 3 ETH @ $1900
    - `pnl_5m`: realized_pnl was 1333.33, now becomes -400. Emit `UPDATE`.
    - `positions`: position_size was 7, now 12. Emit `UPDATE`.
 
-6. **Delta records emitted:**
+6. **Change records emitted:**
    ```
    DELETE trades WHERE block_number = 1002
    INSERT trades (block=1002, user=alice, token=ETH, side=sell, amount=3, price=1900)
@@ -669,13 +669,13 @@ On **finalization** (block F becomes finalized):
 
 ### 5.9 Reducer execution model
 
-The Rust engine manages storage, rollback, snapshot management, and delta computation. The reducer process logic runs in one of several runtimes:
+The Rust engine manages storage, rollback, snapshot management, and change computation. The reducer process logic runs in one of several runtimes:
 
 ```
                          +-----------------+
                          |   Rust Engine    |
                          | (storage, state, |
-                         |  rollback, delta)|
+                         |  rollback, change)|
                          +--------+--------+
                                   |
                     +-------------+-------------+
@@ -692,7 +692,7 @@ The Rust engine manages storage, rollback, snapshot management, and delta comput
 | Lua | >100K rows/sec | Instant | Complex imperative logic |
 | WASM | >200K rows/sec | ~50ms | Production-grade, performance-critical |
 
-For all runtimes, the hot path (state reads/writes, snapshot management, delta computation) remains in Rust. The reducer process function is called per-row via the selected runtime.
+For all runtimes, the hot path (state reads/writes, snapshot management, change computation) remains in Rust. The reducer process function is called per-row via the selected runtime.
 
 ## 6. Aggregate Materialized Views
 
@@ -746,7 +746,7 @@ Key: unfinalized aggregation state is stored **per block number**, not as a flat
 When a rollback affects a time window (e.g., a 5-minute candle):
 1. Identify affected windows by checking which time windows contain blocks > fork cursor
 2. For each affected window: remove unfinalized contributions from rolled-back blocks
-3. Emit `UPDATE` delta with corrected values (or `DELETE` if window is now empty after rollback)
+3. Emit `UPDATE` change with corrected values (or `DELETE` if window is now empty after rollback)
 
 Edge case: a window spanning the finalized/unfinalized boundary. The finalized portion is immutable; only the unfinalized portion gets rolled back.
 
@@ -754,7 +754,7 @@ Edge case: a window spanning the finalized/unfinalized boundary. The finalized p
 
 ### 7.1 Storage engine
 
-Delta DB uses an embedded key-value store (RocksDB or redb) for its internal state:
+SettleStream uses an embedded key-value store (RocksDB or redb) for its internal state:
 
 | Partition | Contents | Lifecycle |
 |-----------|----------|-----------|
@@ -770,7 +770,7 @@ Block received (unfinalized)
   -> raw rows stored with block_number key
   -> reducer processes rows, state snapshot stored
   -> MV unfinalized accumulators updated
-  -> delta emitted to buffer
+  -> change emitted to buffer
 
 Block finalized (height F)
   -> reducer: state at F becomes finalized, discard snapshots <= F
@@ -781,7 +781,7 @@ Rollback to block N
   -> delete raw rows where block_number > N
   -> reducer: restore state snapshot at block N (or replay from finalized)
   -> MV: discard unfinalized contributions for blocks > N
-  -> emit compensating deltas downstream
+  -> emit compensating changes downstream
 ```
 
 ### 7.3 Unfinalized state bounds
@@ -792,37 +792,37 @@ Rollback to block N
 | Polygon | ~30 min | ~150 blocks |
 | Arbitrum | ~1 hour | ~3600 blocks (1 block/sec) |
 
-Delta DB supports a configurable maximum unfinalized window. If exceeded, a warning is logged but processing continues.
+SettleStream supports a configurable maximum unfinalized window. If exceeded, a warning is logged but processing continues.
 
 ### 7.4 Crash recovery
 
-Delta DB uses a write-ahead log (WAL) for atomicity:
+SettleStream uses a write-ahead log (WAL) for atomicity:
 
 1. Incoming batch writes go to WAL first
 2. WAL is applied to storage
 3. On crash, replay uncommitted WAL entries
 4. Downstream flushes are idempotent (each flush carries a monotonic sequence number; the downstream skips already-applied flushes)
 
-## 8. Delta Output
+## 8. Change Output
 
-### 8.1 Delta record format
+### 8.1 Change record format
 
 ```
-DeltaRecord:
+ChangeRecord:
   table:       string               -- raw table, reducer output, or MV name
   operation:   insert | update | delete
   key:         map<string, value>   -- primary key / group key
   values:      map<string, value>   -- full row for insert/update
   prev_values: map<string, value>   -- previous values (optional, for update)
 
-DeltaBatch:
+ChangeBatch:
   sequence:        uint64    -- monotonic flush sequence for idempotency
   finalized_block: uint64    -- highest finalized block in this batch
   latest_block:    uint64    -- highest processed block in this batch
-  records:         DeltaRecord[]
+  records:         ChangeRecord[]
 ```
 
-### 8.2 Delta semantics per object type
+### 8.2 Change semantics per object type
 
 | Object | Normal processing | Rollback |
 |--------|-------------------|----------|
@@ -832,7 +832,7 @@ DeltaBatch:
 
 ### 8.3 Target adapters
 
-Each downstream target interprets delta records according to its capabilities:
+Each downstream target interprets change records according to its capabilities:
 
 | Target | Insert | Update | Delete |
 |--------|--------|--------|--------|
@@ -843,8 +843,8 @@ Each downstream target interprets delta records according to its capabilities:
 Custom adapters implement:
 
 ```
-DeltaTarget interface:
-  apply(batch: DeltaBatch) -> void
+SettleStreamTarget interface:
+  apply(batch: ChangeBatch) -> void
   ack() -> void
 ```
 
@@ -854,15 +854,15 @@ DeltaTarget interface:
 
 ```
 1. Portal detects fork, throws ForkException with previousBlocks
-2. Host SDK calls deltaDb.fork(previousBlocks)
-3. Delta DB resolves fork cursor via resolveForkCursor() algorithm
-4. Delta DB rolls back internal state:
+2. Host SDK calls settleStream.fork(previousBlocks)
+3. SettleStream resolves fork cursor via resolveForkCursor() algorithm
+4. SettleStream rolls back internal state:
    a. Raw tables: delete rows where block_number > fork_point
    b. Reducers: restore state to fork_point (snapshot or replay)
    c. Aggregate MVs: discard unfinalized contributions > fork_point
-5. Delta DB computes compensating delta records
-6. Delta DB flushes compensating deltas to downstream targets
-7. Delta DB returns fork cursor to host SDK
+5. SettleStream computes compensating change records
+6. SettleStream flushes compensating changes to downstream targets
+7. SettleStream returns fork cursor to host SDK
 8. Portal resumes from fork cursor with correct chain data
 9. New blocks are processed normally — reducers pick up from restored state
 ```
@@ -907,7 +907,7 @@ CREATE MATERIALIZED VIEW candles_5m AS
 
 Suppose candle `(ETH/USDC, 12:00)` has aggregated 50 trades across blocks 1000-1003. Block 1003 gets rolled back (it contained 3 trades).
 
-1. Delta DB removes the per-block contributions for block 1003 from each accumulator
+1. SettleStream removes the per-block contributions for block 1003 from each accumulator
 2. `high`/`low`: recomputed from remaining per-block values (blocks 1000-1002)
 3. `first`: unchanged (block 1000 is still present)
 4. `last`: falls back to the latest value from block 1002
@@ -1003,35 +1003,35 @@ CREATE MATERIALIZED VIEW volume_5m AS
 ### Host wiring (TypeScript)
 
 ```typescript
-const deltaDb = new DeltaDB({
-  storage: './data/delta-db',
+const settleStream = new SettleStream({
+  storage: './data/settle-stream',
   schema: './schema.sql',
-  target: new ClickHouseDeltaTarget({ url: 'http://localhost:8123', database: 'dex' }),
+  target: new ClickHouseSettleStreamTarget({ url: 'http://localhost:8123', database: 'dex' }),
 })
 
-await source.pipe(decodeSwaps).pipeTo(deltaDb)
+await source.pipe(decodeSwaps).pipeTo(settleStream)
 ```
 
 ### Host wiring (Python)
 
 ```python
-delta_db = DeltaDB(
-    storage="./data/delta-db",
+settle_stream = SettleStream(
+    storage="./data/settle-stream",
     schema="./schema.sql",
-    target=ClickHouseDeltaTarget(url="http://localhost:8123", database="dex"),
+    target=ClickHouseSettleStreamTarget(url="http://localhost:8123", database="dex"),
 )
-await source.pipe(decode_swaps).pipe_to(delta_db)
+await source.pipe(decode_swaps).pipe_to(settle_stream)
 ```
 
 ### What ClickHouse receives
 
-Delta DB auto-creates these tables in ClickHouse and streams deltas into them:
+SettleStream auto-creates these tables in ClickHouse and streams changes into them:
 
 ```sql
--- Raw swaps (append-only from Delta DB's perspective)
+-- Raw swaps (append-only from SettleStream's perspective)
 CREATE TABLE swaps (...) ENGINE = MergeTree() ORDER BY (block_number);
 
--- PnL per 5m window (upserted by Delta DB on each flush)
+-- PnL per 5m window (upserted by SettleStream on each flush)
 CREATE TABLE pnl_5m (...) ENGINE = ReplacingMergeTree() ORDER BY (user, token, window_start);
 
 -- Current positions (upserted)
@@ -1124,7 +1124,7 @@ This needs a `current_market_price` that changes continuously — not just when 
 
 ### 11.3 Multi-chain
 
-One Delta DB instance per chain. Multi-chain coordination (e.g., cross-chain aggregation) is handled at a higher level by running multiple pipelines and merging in the downstream target.
+One SettleStream instance per chain. Multi-chain coordination (e.g., cross-chain aggregation) is handled at a higher level by running multiple pipelines and merging in the downstream target.
 
 ## 12. Performance Considerations
 
@@ -1149,10 +1149,10 @@ One Delta DB instance per chain. Multi-chain coordination (e.g., cross-chain agg
 
 ### 12.3 Batch merging optimization
 
-When downstream is slow, Delta DB merges pending batches:
+When downstream is slow, SettleStream merges pending batches:
 - Raw tables: accumulate rows (append-only)
 - Reducers: process rows eagerly, keep latest state
-- MVs: merge aggregation deltas (e.g., two pending `sum += 5` and `sum += 3` become `sum += 8`)
+- MVs: merge aggregation changes (e.g., two pending `sum += 5` and `sum += 3` become `sum += 8`)
 - Result: N batches collapse into 1 merged downstream flush
 
 ## 13. Implementation Plan
@@ -1166,7 +1166,7 @@ When downstream is slow, Delta DB merges pending batches:
 - Storage: RocksDB-based, snapshot rollback strategy
 - Aggregations: `sum`, `count`, `min`, `max`, `avg`, `first`, `last`
 - Time windowing: `toStartOfInterval`
-- Delta output: `insert` / `update` / `delete` records
+- Change output: `insert` / `update` / `delete` records
 - Single downstream target adapter (ClickHouse)
 - Backpressure with batch merging
 
@@ -1191,7 +1191,7 @@ When downstream is slow, Delta DB merges pending batches:
 
 ### Phase 3: Future
 
-- Distributed Delta DB (sharded by group key)
+- Distributed SettleStream (sharded by group key)
 - Temporal joins
 - Snapshot export/import for bootstrapping
 - Cross-chain aggregation
@@ -1199,7 +1199,7 @@ When downstream is slow, Delta DB merges pending batches:
 
 ## Appendix A: Comparison with Alternatives
 
-| Feature | Delta DB | Materialize | ClickHouse MVs | Flink | Pipes SDK Aggregator |
+| Feature | SettleStream | Materialize | ClickHouse MVs | Flink | Pipes SDK Aggregator |
 |---------|----------|-------------|----------------|-------|---------------------|
 | Rollback-aware | Yes | No | Partial | No | Yes |
 | Stateful reducers | Yes | No (SQL only) | No | Yes (Java) | No |
@@ -1208,7 +1208,7 @@ When downstream is slow, Delta DB merges pending batches:
 | Embedded (no infra) | Yes | No | No | No | Yes |
 | `first`/`last` rollback | Yes | Yes | No | N/A | Yes |
 | Scalable state | Yes (Rust+RocksDB) | Yes | Yes | Yes (RocksDB) | No (SQLite) |
-| Delta output | Yes | Yes (CDC) | No | Yes | No |
+| Change output | Yes | Yes (CDC) | No | Yes | No |
 | Language-agnostic | Yes (SQL+Lua+WASM) | SQL only | SQL only | Java/Scala | TypeScript only |
 | Open source | Yes | No (fully) | Yes | Yes | Yes |
 
@@ -1219,7 +1219,7 @@ When downstream is slow, Delta DB merges pending batches:
 - **Unfinalized block:** A block between the finalized height and chain tip, subject to reorgs.
 - **Rollback chain:** Ordered list of unfinalized block cursors maintained for fork recovery.
 - **Fork / Reorg:** When the chain switches to a different branch, invalidating previously indexed blocks.
-- **Delta record:** A minimal change record (`insert` / `update` / `delete`) emitted to downstream targets.
+- **Change record:** A minimal change record (`insert` / `update` / `delete`) emitted to downstream targets.
 - **Raw table:** Direct storage of incoming blockchain data rows.
 - **Reducer:** A stateful fold operation that enriches rows using accumulated per-group state. Processes rows sequentially, maintains mutable state, emits enriched rows.
 - **Aggregate MV:** A derived table whose contents are incrementally maintained via GROUP BY aggregation.
@@ -1517,7 +1517,7 @@ This is impossible in Options A, B, and E — it requires a loop over a dynamic-
 
 ### Option D: WASM Process Functions
 
-**Philosophy:** Maximum performance and language freedom. Users write reducers in any language that compiles to WebAssembly (Rust, Go, AssemblyScript, C, etc.), and Delta DB executes the compiled module.
+**Philosophy:** Maximum performance and language freedom. Users write reducers in any language that compiles to WebAssembly (Rust, Go, AssemblyScript, C, etc.), and SettleStream executes the compiled module.
 
 **Schema definition (SQL side):**
 
@@ -1537,7 +1537,7 @@ CREATE REDUCER pnl_tracker
 **WASM module (Rust source, compiled to .wasm):**
 
 ```rust
-use delta_db_sdk::*;
+use settle_stream_sdk::*;
 
 #[derive(State)]
 struct PnlState {
@@ -1583,7 +1583,7 @@ fn process_trade(state: &mut PnlState, row: &Row) -> PnlEmit {
 
 ```typescript
 // pnl_tracker.ts — compiled to .wasm via asc
-import { State, Row, Emit } from "@subsquid/delta-db-as";
+import { State, Row, Emit } from "@subsquid/settle-stream-as";
 
 export function process_trade(state: State, row: Row, emit: Emit): void {
   const avg_cost = state.getF64("quantity") > 0
@@ -1624,7 +1624,7 @@ For each row:
 **Complexity to implement:**
 - Runtime: `wasmtime` crate — well-supported, production-grade
 - ABI design: define memory layout for state/row/emit (flatbuffers or custom)
-- SDK: provide `delta_db_sdk` crate for Rust, `@subsquid/delta-db-as` for AssemblyScript
+- SDK: provide `settle_stream_sdk` crate for Rust, `@subsquid/settle-stream-as` for AssemblyScript
 - Build tooling: users need to compile to `.wasm` before deploying schema
 
 **Pros:**

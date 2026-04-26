@@ -1,12 +1,12 @@
 import { decode, Encoder } from '@msgpack/msgpack'
 import type { ReducerCtx } from './ddl'
-import { DeltaDb as NativeDeltaDb } from './native/native.js'
+import { SettleStream as NativeSettleStream } from './native/native.js'
 
 const encoder = new Encoder({ useBigInt64: true })
 
 // ─── Types ───────────────────────────────────────────────────────
 
-export interface DeltaDbConfig {
+export interface SettleStreamConfig {
   schema: string
   dataDir?: string
   maxBufferSize?: number
@@ -18,16 +18,16 @@ export interface DeltaDbConfig {
   cacheSize?: number
 }
 
-export interface DeltaDbCursor {
+export interface SettleStreamCursor {
   number: number
   hash: string
 }
 
-export type DeltaOperation = 'insert' | 'update' | 'delete'
+export type ChangeOp = 'insert' | 'update' | 'delete'
 
-export interface DeltaRecord {
+export interface ChangeRecord {
   table: string
-  operation: DeltaOperation
+  operation: ChangeOp
   key: Record<string, any>
   values: Record<string, any>
   prevValues: Record<string, any> | null
@@ -42,19 +42,19 @@ export interface PerfNode {
   children: PerfNode[]
 }
 
-export interface DeltaBatch {
+export interface ChangeBatch {
   sequence: number
-  finalizedHead: DeltaDbCursor | null
-  latestHead: DeltaDbCursor | null
-  tables: Record<string, DeltaRecord[]>
+  finalizedHead: SettleStreamCursor | null
+  latestHead: SettleStreamCursor | null
+  tables: Record<string, ChangeRecord[]>
   perf: PerfNode[]
 }
 
 export interface IngestInput {
   data: Record<string, Record<string, any>[]>
-  rollbackChain?: DeltaDbCursor[]
-  finalizedHead: DeltaDbCursor
-  onDelta?: (batch: DeltaBatch) => void | Promise<void>
+  rollbackChain?: SettleStreamCursor[]
+  finalizedHead: SettleStreamCursor
+  onChange?: (batch: ChangeBatch) => void | Promise<void>
 }
 
 export interface StateFieldDef {
@@ -73,40 +73,40 @@ export interface ExternalReducerOptions<TState = any, TRow = any, TEmit = any> {
 
 export type { ReducerCtx } from './ddl'
 
-// ─── DeltaDb class ───────────────────────────────────────────────
+// ─── SettleStream class ───────────────────────────────────────────────
 
-export class DeltaDb {
-  #native: InstanceType<typeof NativeDeltaDb>
+export class SettleStream {
+  #native: InstanceType<typeof NativeSettleStream>
 
-  private constructor(native: InstanceType<typeof NativeDeltaDb>) {
+  private constructor(native: InstanceType<typeof NativeSettleStream>) {
     this.#native = native
   }
 
-  static open(config: DeltaDbConfig): DeltaDb {
-    return new DeltaDb(NativeDeltaDb.open(config))
+  static open(config: SettleStreamConfig): SettleStream {
+    return new SettleStream(NativeSettleStream.open(config))
   }
 
-  async ingest(input: IngestInput): Promise<DeltaBatch | null> {
+  async ingest(input: IngestInput): Promise<ChangeBatch | null> {
     const buf = this.#native.ingest({
       data: Buffer.from(encoder.encode(input.data)),
       rollbackChain: input.rollbackChain,
       finalizedHead: input.finalizedHead,
     })
-    const batch = buf ? (decode(buf) as DeltaBatch) : null
-    if (batch && input.onDelta) {
-      await input.onDelta(batch)
+    const batch = buf ? (decode(buf) as ChangeBatch) : null
+    if (batch && input.onChange) {
+      await input.onChange(batch)
       this.#native.ack(batch.sequence)
     }
     return batch
   }
 
-  resolveForkCursor(previousBlocks: DeltaDbCursor[]): DeltaDbCursor | null {
+  resolveForkCursor(previousBlocks: SettleStreamCursor[]): SettleStreamCursor | null {
     return this.#native.resolveForkCursor(previousBlocks)
   }
 
-  flush(): DeltaBatch | null {
+  flush(): ChangeBatch | null {
     const buf = this.#native.flush()
-    return buf ? (decode(buf) as DeltaBatch) : null
+    return buf ? (decode(buf) as ChangeBatch) : null
   }
 
   ack(sequence: number): void {
@@ -121,7 +121,7 @@ export class DeltaDb {
     return this.#native.isBackpressured
   }
 
-  get cursor(): DeltaDbCursor | null {
+  get cursor(): SettleStreamCursor | null {
     return this.#native.cursor
   }
 

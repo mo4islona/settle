@@ -1,5 +1,5 @@
 import type { ColumnType } from './column'
-import type { StateFieldDef } from './delta-db'
+import type { StateFieldDef } from './settle-stream'
 
 // ─── Duration parsing ────────────────────────────────────────────
 

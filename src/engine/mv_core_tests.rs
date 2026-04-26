@@ -95,7 +95,7 @@ fn simple_sum_mv_def() -> MVDef {
 }
 
 #[test]
-fn simple_mv_insert_deltas() {
+fn simple_mv_insert_changes() {
     let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
 
     let rows = vec![
@@ -113,20 +113,20 @@ fn simple_mv_insert_deltas() {
         ]),
     ];
 
-    let deltas = mv.process_block(1000, &rows);
+    let changes = mv.process_block(1000, &rows);
 
-    // Two new groups -> two Insert deltas
-    assert_eq!(deltas.len(), 2);
-    assert!(deltas.iter().all(|d| d.operation == DeltaOperation::Insert));
+    // Two new groups -> two Insert changes
+    assert_eq!(changes.len(), 2);
+    assert!(changes.iter().all(|d| d.operation == ChangeOp::Insert));
 
-    let eth = deltas
+    let eth = changes
         .iter()
         .find(|d| d.key.get("pool") == Some(&Value::String("ETH/USDC".into())))
         .unwrap();
     assert_eq!(eth.values.get("total_volume"), Some(&Value::Float64(30.0)));
     assert_eq!(eth.values.get("swap_count"), Some(&Value::UInt64(2)));
 
-    let btc = deltas
+    let btc = changes
         .iter()
         .find(|d| d.key.get("pool") == Some(&Value::String("BTC/USDC".into())))
         .unwrap();
@@ -135,36 +135,36 @@ fn simple_mv_insert_deltas() {
 }
 
 #[test]
-fn mv_update_deltas_on_second_block() {
+fn mv_update_changes_on_second_block() {
     let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
 
     let rows1 = vec![make_row(&[
         ("pool", Value::String("ETH/USDC".into())),
         ("amount", Value::Float64(10.0)),
     ])];
-    let deltas1 = mv.process_block(1000, &rows1);
-    assert_eq!(deltas1.len(), 1);
-    assert_eq!(deltas1[0].operation, DeltaOperation::Insert);
+    let changes1 = mv.process_block(1000, &rows1);
+    assert_eq!(changes1.len(), 1);
+    assert_eq!(changes1[0].operation, ChangeOp::Insert);
 
     let rows2 = vec![make_row(&[
         ("pool", Value::String("ETH/USDC".into())),
         ("amount", Value::Float64(20.0)),
     ])];
-    let deltas2 = mv.process_block(1001, &rows2);
-    assert_eq!(deltas2.len(), 1);
-    assert_eq!(deltas2[0].operation, DeltaOperation::Update);
+    let changes2 = mv.process_block(1001, &rows2);
+    assert_eq!(changes2.len(), 1);
+    assert_eq!(changes2[0].operation, ChangeOp::Update);
     assert_eq!(
-        deltas2[0].values.get("total_volume"),
+        changes2[0].values.get("total_volume"),
         Some(&Value::Float64(30.0))
     );
     assert_eq!(
-        deltas2[0].prev_values.as_ref().unwrap().get("total_volume"),
+        changes2[0].prev_values.as_ref().unwrap().get("total_volume"),
         Some(&Value::Float64(10.0))
     );
 }
 
 #[test]
-fn mv_rollback_produces_update_delta() {
+fn mv_rollback_produces_update_change() {
     let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
 
     mv.process_block(
@@ -182,15 +182,15 @@ fn mv_rollback_produces_update_delta() {
         ])],
     );
 
-    let deltas = mv.rollback(1000);
-    assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].operation, DeltaOperation::Update);
+    let changes = mv.rollback(1000);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].operation, ChangeOp::Update);
     assert_eq!(
-        deltas[0].values.get("total_volume"),
+        changes[0].values.get("total_volume"),
         Some(&Value::Float64(10.0))
     );
     assert_eq!(
-        deltas[0].prev_values.as_ref().unwrap().get("total_volume"),
+        changes[0].prev_values.as_ref().unwrap().get("total_volume"),
         Some(&Value::Float64(30.0))
     );
 }
@@ -207,9 +207,9 @@ fn mv_rollback_produces_delete_when_empty() {
         ])],
     );
 
-    let deltas = mv.rollback(999); // rollback everything
-    assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].operation, DeltaOperation::Delete);
+    let changes = mv.rollback(999); // rollback everything
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].operation, ChangeOp::Delete);
 }
 
 #[test]
@@ -224,8 +224,8 @@ fn mv_rollback_noop_when_nothing_to_rollback() {
         ])],
     );
 
-    let deltas = mv.rollback(1000);
-    assert!(deltas.is_empty());
+    let changes = mv.rollback(1000);
+    assert!(changes.is_empty());
 }
 
 #[test]
@@ -258,12 +258,12 @@ fn mv_finalize_then_rollback() {
     mv.finalize(1001, &mut batch);
 
     // Rollback block 1002
-    let deltas = mv.rollback(1001);
-    assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].operation, DeltaOperation::Update);
+    let changes = mv.rollback(1001);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].operation, ChangeOp::Update);
     // Finalized sum: 10+20=30, block 1002 removed
     assert_eq!(
-        deltas[0].values.get("total_volume"),
+        changes[0].values.get("total_volume"),
         Some(&Value::Float64(30.0))
     );
 }
@@ -320,11 +320,11 @@ fn ohlcv_candle_end_to_end() {
     );
 
     // Rollback block 1003
-    let deltas = mv.rollback(1002);
-    assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].operation, DeltaOperation::Update);
+    let changes = mv.rollback(1002);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].operation, ChangeOp::Update);
 
-    let vals = &deltas[0].values;
+    let vals = &changes[0].values;
     assert_eq!(vals.get("open"), Some(&Value::Float64(100.0)));
     assert_eq!(vals.get("high"), Some(&Value::Float64(110.0))); // was 200, now 110
     assert_eq!(vals.get("low"), Some(&Value::Float64(90.0)));
@@ -357,9 +357,9 @@ fn ohlcv_multiple_pairs_isolated() {
     );
 
     // Rollback block 1000 — both groups should be deleted
-    let deltas = mv.rollback(999);
-    assert_eq!(deltas.len(), 2);
-    assert!(deltas.iter().all(|d| d.operation == DeltaOperation::Delete));
+    let changes = mv.rollback(999);
+    assert_eq!(changes.len(), 2);
+    assert!(changes.iter().all(|d| d.operation == ChangeOp::Delete));
 }
 
 #[test]
@@ -388,11 +388,11 @@ fn mv_different_time_windows() {
         ],
     );
 
-    // Should produce 2 Insert deltas (different windows = different groups)
+    // Should produce 2 Insert changes (different windows = different groups)
     // Already consumed by process_block, let's check via rollback
-    let deltas = mv.rollback(999);
-    assert_eq!(deltas.len(), 2);
-    assert!(deltas.iter().all(|d| d.operation == DeltaOperation::Delete));
+    let changes = mv.rollback(999);
+    assert_eq!(changes.len(), 2);
+    assert!(changes.iter().all(|d| d.operation == ChangeOp::Delete));
 }
 
 #[test]
@@ -425,25 +425,25 @@ fn full_cycle_ingest_rollback_reingest() {
     );
 
     // Rollback block 1002
-    let rollback_deltas = mv.rollback(1001);
-    assert_eq!(rollback_deltas.len(), 1);
+    let rollback_changes = mv.rollback(1001);
+    assert_eq!(rollback_changes.len(), 1);
     assert_eq!(
-        rollback_deltas[0].values.get("total_volume"),
+        rollback_changes[0].values.get("total_volume"),
         Some(&Value::Float64(30.0))
     );
 
     // Re-ingest block 1002 with different data (reorg)
-    let new_deltas = mv.process_block(
+    let new_changes = mv.process_block(
         1002,
         &[make_row(&[
             ("pool", Value::String("ETH/USDC".into())),
             ("amount", Value::Float64(5.0)),
         ])],
     );
-    assert_eq!(new_deltas.len(), 1);
-    assert_eq!(new_deltas[0].operation, DeltaOperation::Update);
+    assert_eq!(new_changes.len(), 1);
+    assert_eq!(new_changes[0].operation, ChangeOp::Update);
     assert_eq!(
-        new_deltas[0].values.get("total_volume"),
+        new_changes[0].values.get("total_volume"),
         Some(&Value::Float64(35.0))
     );
 }
@@ -486,9 +486,9 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
             ])],
         );
         // Rollback to block 1, removing block 2
-        let deltas = mv.rollback(1);
-        // BTC/USDC should get a Delete delta (it only had unfinalized data)
-        assert!(deltas.iter().any(|d| d.operation == DeltaOperation::Delete));
+        let changes = mv.rollback(1);
+        // BTC/USDC should get a Delete change (it only had unfinalized data)
+        assert!(changes.iter().any(|d| d.operation == ChangeOp::Delete));
 
         let mut batch = StorageWriteBatch::new();
         mv.finalize(1, &mut batch);

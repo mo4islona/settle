@@ -1,11 +1,11 @@
 {
-  "name": "@sqd-pipes/delta-db",
+  "name": "@sqd-pipes/settle-stream",
   "version": "0.0.1-alpha.11",
   "description": "Embedded rollback-aware computation engine for blockchain data",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "napi": {
-    "name": "delta-db"
+    "name": "settle-stream"
   },
   "scripts": {
     "build:native": "napi build --cargo-cwd ../../.. --features napi --release --platform --dts native.d.ts --js false src/native",

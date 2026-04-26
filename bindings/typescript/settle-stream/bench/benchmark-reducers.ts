@@ -10,7 +10,7 @@
  * Run: npx tsx examples/benchmark-reducers.ts
  */
 
-import { DeltaDb } from '../src/index'
+import { SettleStream } from '../src/index'
 
 // ─── Schemas ─────────────────────────────────────────────────────────
 
@@ -125,7 +125,7 @@ interface BenchResult {
   rowsPerSec: number
 }
 
-async function runBenchmark(name: string, db: DeltaDb, rows: Trade[], batchSize: number): Promise<BenchResult> {
+async function runBenchmark(name: string, db: SettleStream, rows: Trade[], batchSize: number): Promise<BenchResult> {
   const totalRows = rows.length
 
   const start = performance.now()
@@ -168,21 +168,21 @@ const trades = generateTrades(TOTAL_ROWS, NUM_USERS)
 
 // 1. Event Rules
 {
-  const db = DeltaDb.open({ schema: TABLE_SCHEMA + EVENT_RULES_REDUCER + MV_SCHEMA })
+  const db = SettleStream.open({ schema: TABLE_SCHEMA + EVENT_RULES_REDUCER + MV_SCHEMA })
   const r = await runBenchmark('Full pipeline — Event Rules', db, trades, BATCH_SIZE)
   printResult(r)
 }
 
 // 2. Lua
 {
-  const db = DeltaDb.open({ schema: TABLE_SCHEMA + LUA_REDUCER + MV_SCHEMA })
+  const db = SettleStream.open({ schema: TABLE_SCHEMA + LUA_REDUCER + MV_SCHEMA })
   const r = await runBenchmark('Full pipeline — Lua', db, trades, BATCH_SIZE)
   printResult(r)
 }
 
 // 3. External (JS callback)
 {
-  const db = DeltaDb.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER_PLACEHOLDER + MV_SCHEMA })
+  const db = SettleStream.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER_PLACEHOLDER + MV_SCHEMA })
 
   interface PnlState {
     quantity: number

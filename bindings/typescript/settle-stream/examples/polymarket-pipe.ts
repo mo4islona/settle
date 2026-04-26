@@ -1,4 +1,4 @@
-import { type DeltaBatch, deltaDbTarget } from './delta-db-target'
+import { type ChangeBatch, settleStreamTarget } from './settle-stream-target'
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -218,9 +218,9 @@ function _transform(data: PolymarketBatch): Record<string, Record<string, any>[]
 export function polymarketTarget(options: {
   dataDir?: string
   maxBufferSize?: number
-  onDelta: (ctx: { batch: DeltaBatch; ctx: any }) => unknown | Promise<unknown>
+  onChange: (ctx: { batch: ChangeBatch; ctx: any }) => unknown | Promise<unknown>
 }) {
-  return deltaDbTarget<PolymarketBatch>({
+  return settleStreamTarget<PolymarketBatch>({
     schema: SCHEMA,
     dataDir: options.dataDir,
     maxBufferSize: options.maxBufferSize,
@@ -237,6 +237,6 @@ export function polymarketTarget(options: {
         })),
       }
     },
-    onDelta: options.onDelta,
+    onChange: options.onChange,
   })
 }

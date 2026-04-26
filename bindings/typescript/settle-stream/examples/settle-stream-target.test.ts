@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  type DeltaBatch,
-  DeltaDb,
-  type DeltaDbCursor,
-  type DeltaRecord,
-  deltaDbTarget,
-} from '../examples/delta-db-target'
+  type ChangeBatch,
+  SettleStream,
+  type SettleStreamCursor,
+  type ChangeRecord,
+  settleStreamTarget,
+} from '../examples/settle-stream-target'
 
 // ─── Helpers ───────────────────────────────────────────────────────
 
@@ -18,7 +18,7 @@ function mockRead(
   }>,
 ) {
   return function read() {
-    const seenBlocks: Array<DeltaDbCursor> = []
+    const seenBlocks: Array<SettleStreamCursor> = []
 
     return (async function* () {
       for (const block of blocks) {
@@ -45,11 +45,11 @@ function mockRead(
   }
 }
 
-function allRecords(batch: DeltaBatch): DeltaRecord[] {
+function allRecords(batch: ChangeBatch): ChangeRecord[] {
   return Object.values(batch.tables).flat()
 }
 
-function findRecords(batch: DeltaBatch, table: string, op?: string): DeltaRecord[] {
+function findRecords(batch: ChangeBatch, table: string, op?: string): ChangeRecord[] {
   const records = batch.tables[table] ?? []
   return op ? records.filter((r) => r.operation === op) : records
 }
@@ -122,22 +122,22 @@ const MV_SCHEMA = `
     GROUP BY pool;
 `
 
-// ─── Low-level DeltaDb Tests ──────────────────────────────────────
+// ─── Low-level SettleStream Tests ──────────────────────────────────────
 
-describe('DeltaDb', () => {
+describe('SettleStream', () => {
   it('should open with a valid schema', () => {
-    const db = DeltaDb.open({ schema: SIMPLE_SCHEMA })
+    const db = SettleStream.open({ schema: SIMPLE_SCHEMA })
     expect(db).toBeDefined()
     expect(db.cursor).toBeNull()
     expect(db.pendingCount).toBe(0)
   })
 
   it('should reject invalid schema', () => {
-    expect(() => DeltaDb.open({ schema: 'NOT VALID SQL' })).toThrow()
+    expect(() => SettleStream.open({ schema: 'NOT VALID SQL' })).toThrow()
   })
 
-  it('should process a batch and flush deltas', () => {
-    const db = DeltaDb.open({ schema: SIMPLE_SCHEMA })
+  it('should process a batch and flush changes', () => {
+    const db = SettleStream.open({ schema: SIMPLE_SCHEMA })
 
     db.processBatch('transfers', 100, [
       { block_number: 100, tx_index: 0, from_addr: 'alice', to_addr: 'bob', value: 10.5 },
@@ -161,7 +161,7 @@ describe('DeltaDb', () => {
   })
 
   it('should handle multiple blocks', () => {
-    const db = DeltaDb.open({ schema: SIMPLE_SCHEMA })
+    const db = SettleStream.open({ schema: SIMPLE_SCHEMA })
 
     db.processBatch('transfers', 100, [
       { block_number: 100, tx_index: 0, from_addr: 'alice', to_addr: 'bob', value: 10 },
@@ -174,8 +174,8 @@ describe('DeltaDb', () => {
     expect(allRecords(batch!).length).toBe(2)
   })
 
-  it('should rollback and produce compensating deltas', () => {
-    const db = DeltaDb.open({ schema: SIMPLE_SCHEMA })
+  it('should rollback and produce compensating changes', () => {
+    const db = SettleStream.open({ schema: SIMPLE_SCHEMA })
 
     db.processBatch('transfers', 100, [
       { block_number: 100, tx_index: 0, from_addr: 'alice', to_addr: 'bob', value: 10 },
@@ -198,7 +198,7 @@ describe('DeltaDb', () => {
   })
 
   it('should finalize blocks', () => {
-    const db = DeltaDb.open({ schema: SIMPLE_SCHEMA })
+    const db = SettleStream.open({ schema: SIMPLE_SCHEMA })
 
     db.processBatch('transfers', 100, [
       { block_number: 100, tx_index: 0, from_addr: 'alice', to_addr: 'bob', value: 10 },
@@ -214,7 +214,7 @@ describe('DeltaDb', () => {
   })
 
   it('should track backpressure', () => {
-    const db = DeltaDb.open({ schema: SIMPLE_SCHEMA, maxBufferSize: 2 })
+    const db = SettleStream.open({ schema: SIMPLE_SCHEMA, maxBufferSize: 2 })
 
     expect(db.isBackpressured).toBe(false)
 
@@ -234,9 +234,9 @@ describe('DeltaDb', () => {
 
 // ─── Ingest + Fork Resolution Tests ──────────────────────────────
 
-describe('DeltaDb ingest', () => {
+describe('SettleStream ingest', () => {
   it('should ingest data and return batch with cursor', async () => {
-    const db = DeltaDb.open({ schema: SIMPLE_SCHEMA })
+    const db = SettleStream.open({ schema: SIMPLE_SCHEMA })
 
     const batch = await db.ingest({
       data: {
@@ -259,7 +259,7 @@ describe('DeltaDb ingest', () => {
   })
 
   it('should resolve fork cursor from stored hashes', async () => {
-    const db = DeltaDb.open({ schema: SIMPLE_SCHEMA })
+    const db = SettleStream.open({ schema: SIMPLE_SCHEMA })
 
     await db.ingest({
       data: {
@@ -293,9 +293,9 @@ describe('DeltaDb ingest', () => {
 
 // ─── Reducer + MV Pipeline Tests ───────────────────────────────────
 
-describe('DeltaDb with reducer pipeline', () => {
-  it('should produce deltas for raw table and downstream MV', () => {
-    const db = DeltaDb.open({ schema: REDUCER_SCHEMA })
+describe('SettleStream with reducer pipeline', () => {
+  it('should produce changes for raw table and downstream MV', () => {
+    const db = SettleStream.open({ schema: REDUCER_SCHEMA })
 
     db.processBatch('trades', 100, [
       { block_number: 100, user: 'alice', side: 'buy', amount: 10, price: 2000 },
@@ -320,7 +320,7 @@ describe('DeltaDb with reducer pipeline', () => {
   })
 
   it('should update MV state across blocks (buy then sell)', () => {
-    const db = DeltaDb.open({ schema: REDUCER_SCHEMA })
+    const db = SettleStream.open({ schema: REDUCER_SCHEMA })
 
     db.processBatch('trades', 100, [
       { block_number: 100, user: 'alice', side: 'buy', amount: 10, price: 2000 },
@@ -341,7 +341,7 @@ describe('DeltaDb with reducer pipeline', () => {
   })
 
   it('should rollback reducer state correctly', () => {
-    const db = DeltaDb.open({ schema: REDUCER_SCHEMA })
+    const db = SettleStream.open({ schema: REDUCER_SCHEMA })
 
     db.processBatch('trades', 100, [
       { block_number: 100, user: 'alice', side: 'buy', amount: 10, price: 2000 },
@@ -377,9 +377,9 @@ describe('DeltaDb with reducer pipeline', () => {
 
 // ─── Materialized View Tests ───────────────────────────────────────
 
-describe('DeltaDb with materialized view', () => {
-  it('should produce MV deltas from raw table inserts', () => {
-    const db = DeltaDb.open({ schema: MV_SCHEMA })
+describe('SettleStream with materialized view', () => {
+  it('should produce MV changes from raw table inserts', () => {
+    const db = SettleStream.open({ schema: MV_SCHEMA })
 
     db.processBatch('swaps', 100, [
       { block_number: 100, pool: 'ETH/USDC', amount: 1000 },
@@ -404,7 +404,7 @@ describe('DeltaDb with materialized view', () => {
   })
 
   it('should update MV on new block', () => {
-    const db = DeltaDb.open({ schema: MV_SCHEMA })
+    const db = SettleStream.open({ schema: MV_SCHEMA })
 
     db.processBatch('swaps', 100, [{ block_number: 100, pool: 'ETH/USDC', amount: 1000 }])
     const batch1 = db.flush()
@@ -422,15 +422,15 @@ describe('DeltaDb with materialized view', () => {
   })
 })
 
-// ─── deltaDbTarget (Pipes SDK integration) Tests ───────────────────
+// ─── settleStreamTarget (Pipes SDK integration) Tests ───────────────────
 
-describe('deltaDbTarget', () => {
-  it('should process blocks and call onDelta with delta batches', async () => {
-    const batches: DeltaBatch[] = []
+describe('settleStreamTarget', () => {
+  it('should process blocks and call onChange with change batches', async () => {
+    const batches: ChangeBatch[] = []
 
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema: SIMPLE_SCHEMA,
-      onDelta: ({ batch }: any) => {
+      onChange: ({ batch }: any) => {
         batches.push(batch)
       },
     })
@@ -466,11 +466,11 @@ describe('deltaDbTarget', () => {
   })
 
   it('should propagate finalized block from ctx', async () => {
-    const batches: DeltaBatch[] = []
+    const batches: ChangeBatch[] = []
 
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema: SIMPLE_SCHEMA,
-      onDelta: ({ batch }: any) => {
+      onChange: ({ batch }: any) => {
         batches.push(batch)
       },
     })
@@ -496,12 +496,12 @@ describe('deltaDbTarget', () => {
     expect(batches[batches.length - 1].finalizedHead?.number).toBe(950)
   })
 
-  it('should handle fork and produce compensating deltas via onDelta', async () => {
-    const allBatches: DeltaBatch[] = []
+  it('should handle fork and produce compensating changes via onChange', async () => {
+    const allBatches: ChangeBatch[] = []
 
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema: SIMPLE_SCHEMA,
-      onDelta: ({ batch }: any) => {
+      onChange: ({ batch }: any) => {
         allBatches.push(batch)
       },
     })
@@ -547,7 +547,7 @@ describe('deltaDbTarget', () => {
 
     expect(safeCursor).toEqual({ number: 100, hash: '0x64' })
 
-    // Compensating deltas delivered through onDelta (batch 4)
+    // Compensating changes delivered through onChange (batch 4)
     expect(allBatches.length).toBe(4)
     const compensating = allBatches[3]
     const deletes = allRecords(compensating).filter((r) => r.operation === 'delete')
@@ -555,9 +555,9 @@ describe('deltaDbTarget', () => {
   })
 
   it('should handle fork with empty previousBlocks', async () => {
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema: SIMPLE_SCHEMA,
-      onDelta: () => {},
+      onChange: () => {},
     })
 
     const safeCursor = await target.fork([])
@@ -565,11 +565,11 @@ describe('deltaDbTarget', () => {
   })
 
   it('should process full reducer pipeline through pipes target', async () => {
-    const batches: DeltaBatch[] = []
+    const batches: ChangeBatch[] = []
 
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema: REDUCER_SCHEMA,
-      onDelta: ({ batch }: any) => {
+      onChange: ({ batch }: any) => {
         batches.push(batch)
       },
     })
@@ -623,11 +623,11 @@ describe('deltaDbTarget', () => {
       );
     `
 
-    const batches: DeltaBatch[] = []
+    const batches: ChangeBatch[] = []
 
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema,
-      onDelta: ({ batch }: any) => {
+      onChange: ({ batch }: any) => {
         batches.push(batch)
       },
     })
@@ -658,11 +658,11 @@ describe('deltaDbTarget', () => {
   })
 
   it('should handle fork then re-ingest (full reorg scenario)', async () => {
-    const allBatches: DeltaBatch[] = []
+    const allBatches: ChangeBatch[] = []
 
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema: REDUCER_SCHEMA,
-      onDelta: ({ batch }: any) => {
+      onChange: ({ batch }: any) => {
         allBatches.push(batch)
       },
     })
@@ -692,7 +692,7 @@ describe('deltaDbTarget', () => {
 
     // Phase 2: Fork — rollback to block 100
     await target.fork([{ number: 100, hash: '0x64' }])
-    // Compensating deltas delivered via onDelta
+    // Compensating changes delivered via onChange
     expect(allBatches.length).toBe(3)
 
     // Phase 3: Re-ingest corrected blocks
@@ -725,13 +725,13 @@ describe('deltaDbTarget', () => {
 
 // ─── Sequence / Ack Tests ──────────────────────────────────────────
 
-describe('deltaDbTarget sequence tracking', () => {
+describe('settleStreamTarget sequence tracking', () => {
   it('should produce monotonically increasing sequence numbers', async () => {
     const sequences: number[] = []
 
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema: SIMPLE_SCHEMA,
-      onDelta: ({ batch }: any) => {
+      onChange: ({ batch }: any) => {
         sequences.push(batch.sequence)
       },
     })
@@ -769,13 +769,13 @@ describe('deltaDbTarget sequence tracking', () => {
 
 // ─── Edge Cases ────────────────────────────────────────────────────
 
-describe('deltaDbTarget edge cases', () => {
+describe('settleStreamTarget edge cases', () => {
   it('should handle blocks with empty table arrays', async () => {
-    const batches: DeltaBatch[] = []
+    const batches: ChangeBatch[] = []
 
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema: SIMPLE_SCHEMA,
-      onDelta: ({ batch }: any) => {
+      onChange: ({ batch }: any) => {
         batches.push(batch)
       },
     })
@@ -796,9 +796,9 @@ describe('deltaDbTarget edge cases', () => {
   })
 
   it('should reject unknown table names', async () => {
-    const target = deltaDbTarget({
+    const target = settleStreamTarget({
       schema: SIMPLE_SCHEMA,
-      onDelta: () => {},
+      onChange: () => {},
     })
 
     await expect(

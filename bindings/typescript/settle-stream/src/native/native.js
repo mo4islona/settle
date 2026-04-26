@@ -1,4 +1,4 @@
-/* Platform-aware native module loader for @sqd-pipes/delta-db */
+/* Platform-aware native module loader for @sqd-pipes/settle-stream */
 const { existsSync } = require('node:fs')
 const { join } = require('node:path')
 
@@ -17,10 +17,10 @@ function getPlatformFile() {
 
   const key = `${platform}-${arch}`
   // @ts-ignore
-  return suffixes[key] ? `delta-db.${suffixes[key]}.node` : null
+  return suffixes[key] ? `settle-stream.${suffixes[key]}.node` : null
 }
 
-// Try platform-specific file (e.g. delta-db.linux-x64-gnu.node)
+// Try platform-specific file (e.g. settle-stream.linux-x64-gnu.node)
 const platformFile = getPlatformFile()
 if (platformFile) {
   const platformPath = join(__dirname, platformFile)
@@ -35,7 +35,7 @@ if (platformFile) {
 
 // Fallback: try unqualified .node file (local dev build)
 if (!nativeBinding) {
-  const localFile = join(__dirname, 'delta-db.node')
+  const localFile = join(__dirname, 'settle-stream.node')
   if (existsSync(localFile)) {
     try {
       nativeBinding = require(localFile)

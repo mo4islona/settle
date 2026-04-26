@@ -287,7 +287,7 @@ describe('Pipeline builder', () => {
         expect(candles[1].values.tradeCount).toBe(1)
     })
 
-    it('supports virtual tables (no deltas emitted for raw rows)', async () => {
+    it('supports virtual tables (no changes emitted for raw rows)', async () => {
         const p = new Pipeline()
         const orders = p.table(
             'orders',

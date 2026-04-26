@@ -1,15 +1,15 @@
-import { type DeltaBatch, DeltaDb, type DeltaDbCursor } from '../src/index'
+import { type ChangeBatch, SettleStream, type SettleStreamCursor } from '../src/index'
 
 export * from '../src/index'
 
 export type Row = Record<string, any>
 
-export interface DeltaDbTargetOptions<TInput = Record<string, any[]>> {
+export interface SettleStreamTargetOptions<TInput = Record<string, any[]>> {
   /** SQL schema definition (CREATE TABLE, CREATE REDUCER, CREATE MATERIALIZED VIEW). */
   schema: string
   /** RocksDB data directory. Enables persistence and resumption. */
   dataDir?: string
-  /** Maximum delta buffer size before backpressure. Default: 10000. */
+  /** Maximum change buffer size before backpressure. Default: 10000. */
   maxBufferSize?: number
   /**
    * Map decoder output to schema tables.
@@ -19,34 +19,34 @@ export interface DeltaDbTargetOptions<TInput = Record<string, any[]>> {
    */
   transform?: (data: TInput) => Record<string, Row[]>
   /**
-   * Called with each delta batch (including rollback compensating deltas).
+   * Called with each change batch (including rollback compensating changes).
    * Apply records to your downstream store.
    */
-  onDelta: (ctx: { batch: DeltaBatch; ctx: any }) => unknown | Promise<unknown>
+  onChange: (ctx: { batch: ChangeBatch; ctx: any }) => unknown | Promise<unknown>
 }
 
 /**
  * Creates a Pipes SDK Target that routes decoded blockchain data
- * through Delta DB's computation pipeline (raw tables → reducers → MVs)
- * and flushes delta batches to a downstream store.
+ * through SettleStream's computation pipeline (raw tables → reducers → MVs)
+ * and flushes change batches to a downstream store.
  *
  * Each iteration is atomic — `db.ingest()` processes all tables, stores
  * block hashes, finalizes, and flushes in a single RocksDB WriteBatch.
  */
-export function deltaDbTarget<TInput = Record<string, any[]>>({
+export function settleStreamTarget<TInput = Record<string, any[]>>({
   schema,
   dataDir,
   maxBufferSize,
   transform,
-  onDelta,
-}: DeltaDbTargetOptions<TInput>): {
+  onChange,
+}: SettleStreamTargetOptions<TInput>): {
   write: (writer: {
-    read: (cursor?: DeltaDbCursor) => AsyncIterableIterator<{ data: TInput; ctx: any }>
+    read: (cursor?: SettleStreamCursor) => AsyncIterableIterator<{ data: TInput; ctx: any }>
     logger: any
   }) => Promise<void>
-  fork: (previousBlocks: DeltaDbCursor[]) => Promise<DeltaDbCursor | null>
+  fork: (previousBlocks: SettleStreamCursor[]) => Promise<SettleStreamCursor | null>
 } {
-  const db = DeltaDb.open({ schema, dataDir, maxBufferSize })
+  const db = SettleStream.open({ schema, dataDir, maxBufferSize })
 
   return {
     write: async ({ read }) => {
@@ -64,7 +64,7 @@ export function deltaDbTarget<TInput = Record<string, any[]>>({
         })
 
         if (batch) {
-          await onDelta({ batch, ctx })
+          await onChange({ batch, ctx })
           db.ack(batch.sequence)
         }
       }
@@ -82,7 +82,7 @@ export function deltaDbTarget<TInput = Record<string, any[]>>({
 
       const batch = db.flush()
       if (batch) {
-        await onDelta({ batch, ctx: null })
+        await onChange({ batch, ctx: null })
         db.ack(batch.sequence)
       }
 

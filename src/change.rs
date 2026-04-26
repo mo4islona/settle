@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::types::{BlockCursor, ChangeBatch, ChangeOp, ChangeRecord, PerfNode, Value};
 
-/// Buffers delta batches while downstream hasn't acknowledged.
+/// Buffers change batches while downstream hasn't acknowledged.
 /// Records are appended on push; merging is deferred to flush time.
 pub struct ChangeBuffer {
     /// Pending (unacked) records, appended in order.
@@ -51,7 +51,7 @@ impl ChangeBuffer {
         self.latest_head = latest_head;
     }
 
-    /// Push new delta records into the buffer (append-only, no merge on push).
+    /// Push new change records into the buffer (append-only, no merge on push).
     /// Merging is deferred to flush() time.
     pub fn push(
         &mut self,

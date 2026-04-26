@@ -5,13 +5,13 @@
 //! 2. Ingest synthetic trade data across 100 blocks
 //! 3. Trigger rollback at block 75
 //! 4. Re-process blocks 75-100 with different data
-//! 5. Verify all deltas are correct
+//! 5. Verify all changes are correct
 //! 6. Flush to mock target, verify records
 
 use std::collections::HashMap;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::types::{DeltaBatch, DeltaOperation, DeltaRecord, RowMap, Value};
+use settle_stream::db::{Config, SettleStream};
+use settle_stream::types::{ChangeBatch, ChangeOp, ChangeRecord, RowMap, Value};
 
 const DEX_SCHEMA: &str = include_str!("schema.sql");
 
@@ -31,16 +31,16 @@ fn make_swap(pool: &str, amount: f64) -> RowMap {
     ])
 }
 
-fn find_records<'a>(batch: &'a DeltaBatch, table: &str) -> Vec<&'a DeltaRecord> {
+fn find_records<'a>(batch: &'a ChangeBatch, table: &str) -> Vec<&'a ChangeRecord> {
     batch.records_for(table).iter().collect()
 }
 
 fn find_record_by_key<'a>(
-    batch: &'a DeltaBatch,
+    batch: &'a ChangeBatch,
     table: &str,
     key_col: &str,
     key_val: &Value,
-) -> Option<&'a DeltaRecord> {
+) -> Option<&'a ChangeRecord> {
     batch
         .records_for(table)
         .iter()
@@ -49,7 +49,7 @@ fn find_record_by_key<'a>(
 
 /// Collect all flushed batches, applying each to a mock target.
 struct MockTarget {
-    batches: Vec<DeltaBatch>,
+    batches: Vec<ChangeBatch>,
 }
 
 impl MockTarget {
@@ -57,7 +57,7 @@ impl MockTarget {
         Self { batches: vec![] }
     }
 
-    fn apply(&mut self, batch: DeltaBatch) {
+    fn apply(&mut self, batch: ChangeBatch) {
         self.batches.push(batch);
     }
 
@@ -68,7 +68,7 @@ impl MockTarget {
 
 #[test]
 fn full_dex_pipeline_100_blocks_with_rollback() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+    let mut db = SettleStream::open(Config::new(DEX_SCHEMA)).unwrap();
     let mut target = MockTarget::new();
 
     let users = ["alice", "bob", "charlie"];
@@ -276,7 +276,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
 
 #[test]
 fn rollback_to_finalized_boundary() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+    let mut db = SettleStream::open(Config::new(DEX_SCHEMA)).unwrap();
 
     // Ingest 50 blocks
     for block in 1..=50u64 {
@@ -308,7 +308,7 @@ fn rollback_to_finalized_boundary() {
 
 #[test]
 fn multi_user_pnl_correctness() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+    let mut db = SettleStream::open(Config::new(DEX_SCHEMA)).unwrap();
 
     // Alice buys 10 @ 2000
     db.process_batch("trades", 1, vec![make_trade("alice", "buy", 10.0, 2000.0)])
@@ -367,8 +367,8 @@ fn multi_user_pnl_correctness() {
 }
 
 #[test]
-fn delta_operations_are_correct() {
-    let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+fn change_operations_are_correct() {
+    let mut db = SettleStream::open(Config::new(DEX_SCHEMA)).unwrap();
 
     // Block 1: first insert for alice
     db.process_batch("trades", 1, vec![make_trade("alice", "buy", 10.0, 2000.0)])
@@ -376,7 +376,7 @@ fn delta_operations_are_correct() {
     let b1 = db.flush().unwrap();
     let pos1 = find_records(&b1, "position_summary");
     assert_eq!(pos1.len(), 1);
-    assert_eq!(pos1[0].operation, DeltaOperation::Insert);
+    assert_eq!(pos1[0].operation, ChangeOp::Insert);
 
     // Block 2: update for alice
     db.process_batch("trades", 2, vec![make_trade("alice", "buy", 5.0, 2100.0)])
@@ -384,12 +384,12 @@ fn delta_operations_are_correct() {
     let b2 = db.flush().unwrap();
     let pos2 = find_records(&b2, "position_summary");
     assert_eq!(pos2.len(), 1);
-    assert_eq!(pos2[0].operation, DeltaOperation::Update);
+    assert_eq!(pos2[0].operation, ChangeOp::Update);
 
     // Rollback block 2 + block 1
     db.rollback(0).unwrap();
     let rb = db.flush().unwrap();
     let pos_rb = find_records(&rb, "position_summary");
     assert_eq!(pos_rb.len(), 1);
-    assert_eq!(pos_rb[0].operation, DeltaOperation::Delete);
+    assert_eq!(pos_rb[0].operation, ChangeOp::Delete);
 }

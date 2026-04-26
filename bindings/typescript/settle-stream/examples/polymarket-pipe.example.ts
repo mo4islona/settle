@@ -1,15 +1,15 @@
 /**
- * Polymarket Delta DB — standalone example
+ * Polymarket SettleStream — standalone example
  *
- * Demonstrates the full pipeline: feeding raw orders into delta-db,
+ * Demonstrates the full pipeline: feeding raw orders into settle-stream,
  * processing through reducers (market_stats, insider_classifier) and
  * materialized views (token_summary, insider_positions), then decoding
- * the resulting delta batches.
+ * the resulting change batches.
  *
  * Run with: npx tsx examples/polymarket-pipe.example.ts
  */
 
-import { type DeltaBatch, DeltaDb } from '../src/index'
+import { type ChangeBatch, SettleStream } from '../src/index'
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -192,7 +192,7 @@ function transformOrders(orders: ParsedOrder[]): Record<string, any>[] {
   }))
 }
 
-// ── Delta batch decoder ────────────────────────────────────────────
+// ── Change batch decoder ────────────────────────────────────────────
 
 interface TokenSummary {
   assetId: string
@@ -214,13 +214,13 @@ interface InsiderPosition {
   detectedAt: number
 }
 
-interface DecodedDeltas {
+interface DecodedChanges {
   tokenSummaries: TokenSummary[]
   insiderPositions: InsiderPosition[]
   rawOrderCount: number
 }
 
-function decodeBatch(batch: DeltaBatch): DecodedDeltas {
+function decodeBatch(batch: ChangeBatch): DecodedChanges {
   const tokenSummaries: TokenSummary[] = []
   const insiderPositions: InsiderPosition[] = []
   let rawOrderCount = 0
@@ -296,15 +296,15 @@ function generateOrders(blockNumber: number, timestamp: number, count: number): 
 // ── Main ───────────────────────────────────────────────────────────
 
 function main() {
-  // Open delta-db with in-memory storage (no dataDir = no persistence)
-  const db = DeltaDb.open({ schema: SCHEMA })
+  // Open settle-stream with in-memory storage (no dataDir = no persistence)
+  const db = SettleStream.open({ schema: SCHEMA })
 
-  console.log('=== Polymarket Delta DB Example ===\n')
+  console.log('=== Polymarket SettleStream Example ===\n')
 
   // Process 10 blocks, 20 orders each
   const numBlocks = 10
   const ordersPerBlock = 20
-  const allBatches: DeltaBatch[] = []
+  const allBatches: ChangeBatch[] = []
 
   for (let i = 0; i < numBlocks; i++) {
     const blockNumber = 1000 + i
@@ -313,7 +313,7 @@ function main() {
     const orders = generateOrders(blockNumber, timestamp, ordersPerBlock)
     const rows = transformOrders(orders)
 
-    // Feed rows into delta-db
+    // Feed rows into settle-stream
     db.processBatch('orders', blockNumber, rows)
 
     // Finalize older blocks (keep last 3 unfinalized for rollback)
@@ -322,7 +322,7 @@ function main() {
     }
   }
 
-  // Flush all pending deltas
+  // Flush all pending changes
   const batch = db.flush()
   if (batch) {
     allBatches.push(batch)
@@ -336,7 +336,7 @@ function main() {
 
   if (batch) {
     const totalRecords = Object.values(batch.tables).reduce((s, r) => s + r.length, 0)
-    console.log(`Delta batch: sequence=${batch.sequence}, ${totalRecords} records`)
+    console.log(`Change batch: sequence=${batch.sequence}, ${totalRecords} records`)
 
     // Count records by table and operation
     console.log('\nRecords by table:')
@@ -399,7 +399,7 @@ function main() {
     const deletes = allRecords.filter((r) => r.operation === 'delete')
     const updates = allRecords.filter((r) => r.operation === 'update')
     console.log(
-      `After rollback to 1008: ${allRecords.length} compensating deltas ` +
+      `After rollback to 1008: ${allRecords.length} compensating changes ` +
         `(${deletes.length} deletes, ${updates.length} updates)`,
     )
     db.ack(rollbackBatch.sequence)

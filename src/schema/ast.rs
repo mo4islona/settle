@@ -11,7 +11,7 @@ pub struct TableDef {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     /// When true, the table is storage-only: rows are persisted and fed to
-    /// reducers/MVs, but no delta records are emitted to the output stream.
+    /// reducers/MVs, but no change records are emitted to the output stream.
     /// Set via `CREATE VIRTUAL TABLE ...` syntax.
     pub virtual_table: bool,
 }

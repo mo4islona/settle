@@ -1,21 +1,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::delta::DeltaBuffer;
-use crate::engine::dag::DeltaEngine;
+use crate::change::ChangeBuffer;
+use crate::engine::dag::SettleStreamEngine;
 use crate::error::{Error, Result};
 use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
 use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
 use crate::storage::{StorageBackend, StorageWriteBatch};
-use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, PerfNode, RowMap, Value};
+use crate::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, RowMap, Value};
 
-/// Configuration for opening a DeltaDb instance.
+/// Configuration for opening a SettleStream instance.
 #[non_exhaustive]
 pub struct Config {
     /// SQL schema definition string.
     pub schema: String,
-    /// Maximum number of pending delta records before backpressure.
+    /// Maximum number of pending change records before backpressure.
     pub max_buffer_size: usize,
     /// Path to RocksDB data directory. When set, data is persisted to disk.
     /// When None, uses in-memory storage (data lost on drop).
@@ -84,18 +84,18 @@ const META_LATEST_BLOCK: &str = "latest_block";
 const META_FINALIZED_BLOCK: &str = "finalized_block";
 const META_BLOCK_HASHES: &str = "block_hashes";
 
-/// Top-level Delta DB API.
+/// Top-level SettleStream API.
 ///
 /// Provides a simple interface for ingesting blockchain data,
-/// handling rollbacks, and producing delta batches for downstream targets.
-pub struct DeltaDb {
-    engine: DeltaEngine,
-    buffer: DeltaBuffer,
+/// handling rollbacks, and producing change batches for downstream targets.
+pub struct SettleStream {
+    engine: SettleStreamEngine,
+    buffer: ChangeBuffer,
     storage: Arc<dyn StorageBackend>,
 }
 
-impl DeltaDb {
-    /// Open a DeltaDb instance with the given configuration.
+impl SettleStream {
+    /// Open a SettleStream instance with the given configuration.
     /// Parses and validates the schema at open time.
     pub fn open(config: Config) -> Result<Self> {
         let schema = parse_schema(&config.schema)?;
@@ -113,7 +113,7 @@ impl DeltaDb {
             Arc::new(MemoryBackend::new())
         };
 
-        let mut engine = DeltaEngine::new(&schema, storage.clone());
+        let mut engine = SettleStreamEngine::new(&schema, storage.clone());
 
         // Restore persisted state
         if let Some(bytes) = storage.get_meta(META_LATEST_BLOCK)? {
@@ -145,7 +145,7 @@ impl DeltaDb {
             engine.replay_unfinalized(finalized + 1, latest)?;
         }
 
-        let buffer = DeltaBuffer::new(config.max_buffer_size);
+        let buffer = ChangeBuffer::new(config.max_buffer_size);
 
         Ok(Self {
             engine,
@@ -215,7 +215,7 @@ impl DeltaDb {
     }
 
     /// Process a batch of rows for a raw table at the given block number.
-    /// Delta records are buffered internally.
+    /// Change records are buffered internally.
     /// Returns true if backpressure should be applied (buffer is full).
     ///
     /// **Warning:** This method writes raw rows to storage immediately but does
@@ -232,10 +232,10 @@ impl DeltaDb {
         block: BlockNumber,
         rows: Vec<RowMap>,
     ) -> Result<bool> {
-        let (deltas, perf_node) = self.engine.process_batch(table, block, rows)?;
+        let (changes, perf_node) = self.engine.process_batch(table, block, rows)?;
 
         self.buffer.push(
-            deltas,
+            changes,
             self.engine.finalized_cursor(),
             self.engine.latest_cursor(),
             vec![perf_node],
@@ -245,18 +245,18 @@ impl DeltaDb {
     }
 
     /// Roll back all state after fork_point.
-    /// Compensating delta records are buffered.
+    /// Compensating change records are buffered.
     /// Raw-row deletions + metadata updates are committed atomically.
     pub fn rollback(&mut self, fork_point: BlockNumber) -> Result<()> {
         let mut batch = StorageWriteBatch::new();
-        let deltas = self.engine.rollback_to_batch(fork_point, &mut batch)?;
+        let changes = self.engine.rollback_to_batch(fork_point, &mut batch)?;
 
         // Persist updated latest_block + block_hashes atomically with raw-row deletions
         self.append_meta_to_batch(&mut batch)?;
         self.storage.commit(&batch)?;
 
         self.buffer.push(
-            deltas,
+            changes,
             self.engine.finalized_cursor(),
             self.engine.latest_cursor(),
             vec![],
@@ -275,9 +275,9 @@ impl DeltaDb {
         self.storage.commit(&batch)
     }
 
-    /// Flush all buffered delta records into a DeltaBatch.
+    /// Flush all buffered change records into a ChangeBatch.
     /// Returns None if there are no pending records.
-    pub fn flush(&mut self) -> Option<DeltaBatch> {
+    pub fn flush(&mut self) -> Option<ChangeBatch> {
         self.buffer.flush()
     }
 
@@ -286,7 +286,7 @@ impl DeltaDb {
         self.buffer.ack(sequence);
     }
 
-    /// Number of pending (unflushed) delta records.
+    /// Number of pending (unflushed) change records.
     pub fn pending_count(&self) -> usize {
         self.buffer.pending_count()
     }
@@ -333,13 +333,13 @@ impl DeltaDb {
     ///
     /// Replaces separate `process_batch` + `set_rollback_chain` + `finalize` + `flush`.
     /// Each row must contain a `block_number` field (UInt64).
-    pub fn ingest(&mut self, input: IngestInput) -> Result<Option<DeltaBatch>> {
+    pub fn ingest(&mut self, input: IngestInput) -> Result<Option<ChangeBatch>> {
         // Single WriteBatch for all storage writes (raw rows + finalize + meta)
         let mut write_batch = StorageWriteBatch::new();
 
-        // Collect deltas locally — only push to buffer on success to avoid
-        // partial deltas leaking into downstream output on failure.
-        let mut pending_deltas: Vec<(Vec<DeltaRecord>, Vec<PerfNode>)> = Vec::new();
+        // Collect changes locally — only push to buffer on success to avoid
+        // partial changes leaking into downstream output on failure.
+        let mut pending_changes: Vec<(Vec<ChangeRecord>, Vec<PerfNode>)> = Vec::new();
 
         // 0. Detect fork: compare new chain against stored block_hashes and rollback
         //    if our latest block is no longer on the canonical chain.
@@ -383,9 +383,9 @@ impl DeltaDb {
                     };
 
                     if fork_point < current_latest {
-                        let deltas =
+                        let changes =
                             self.engine.rollback_to_batch(fork_point, &mut write_batch)?;
-                        pending_deltas.push((deltas, vec![]));
+                        pending_changes.push((changes, vec![]));
                     }
                     fork_point
                 } else {
@@ -424,13 +424,13 @@ impl DeltaDb {
                 }
 
                 for (block, block_rows) in by_block {
-                    let (deltas, perf_node) = self.engine.process_batch_deferred(
+                    let (changes, perf_node) = self.engine.process_batch_deferred(
                         table,
                         block,
                         block_rows,
                         &mut write_batch,
                     )?;
-                    pending_deltas.push((deltas, vec![perf_node]));
+                    pending_changes.push((changes, vec![perf_node]));
                 }
             }
             Ok(())
@@ -438,15 +438,15 @@ impl DeltaDb {
 
         if let Err(e) = result {
             // Rollback in-memory state to recovery_block (the fork point, or 0 for fresh DB).
-            // pending_deltas is dropped — buffer stays clean.
+            // pending_changes is dropped — buffer stays clean.
             let _ = self.engine.rollback(recovery_block);
             return Err(e);
         }
 
-        // Success — push all deltas to buffer
-        for (deltas, perf) in pending_deltas {
+        // Success — push all changes to buffer
+        for (changes, perf) in pending_changes {
             self.buffer.push(
-                deltas,
+                changes,
                 self.engine.finalized_cursor(),
                 self.engine.latest_cursor(),
                 perf,

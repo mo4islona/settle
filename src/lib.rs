@@ -1,5 +1,5 @@
 pub mod db;
-pub mod delta;
+pub mod change;
 pub mod engine;
 pub mod error;
 pub mod json_conv;

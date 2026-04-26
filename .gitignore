@@ -1,2 +1,7 @@
 /target
 *.node
+node_modules/
+.agents/
+.claude/
+.idea/
+/pkg/

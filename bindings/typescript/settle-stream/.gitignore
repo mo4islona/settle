@@ -1,1 +1,6 @@
 dist/
+node_modules/
+npm/
+src/wasm/
+src/native/*.node
+.idea/

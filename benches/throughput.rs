@@ -6,12 +6,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use delta_db::db::{Config, DeltaDb};
-use delta_db::engine::reducer::ReducerEngine;
-use delta_db::reducer_runtime::fn_reducer::FnReducerRuntime;
-use delta_db::schema::parser::parse_schema;
-use delta_db::storage::memory::MemoryBackend;
-use delta_db::types::{ColumnRegistry, RowMap, Value};
+use settle_stream::db::{Config, SettleStream};
+use settle_stream::engine::reducer::ReducerEngine;
+use settle_stream::reducer_runtime::fn_reducer::FnReducerRuntime;
+use settle_stream::schema::parser::parse_schema;
+use settle_stream::storage::memory::MemoryBackend;
+use settle_stream::types::{ColumnRegistry, RowMap, Value};
 
 const RAW_ONLY_SCHEMA: &str = r#"
     CREATE TABLE events (
@@ -277,7 +277,7 @@ fn bench_raw_ingestion(backend: Backend) -> BenchResult {
     let total_rows = 200_000;
     let batch_size = 100;
     let (cfg, _dir) = make_config(RAW_ONLY_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows).map(make_raw_row).collect();
 
@@ -305,7 +305,7 @@ fn bench_raw_with_mv(backend: Backend) -> BenchResult {
     let total_rows = 200_000;
     let batch_size = 100;
     let (cfg, _dir) = make_config(RAW_WITH_MV_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows).map(make_raw_row_for_mv).collect();
 
@@ -334,7 +334,7 @@ fn bench_full_pipeline_event_rules(backend: Backend) -> BenchResult {
     let batch_size = 50;
     let num_users = 100;
     let (cfg, _dir) = make_config(REDUCER_EVENT_RULES_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {
@@ -380,7 +380,7 @@ fn bench_full_pipeline_lua(backend: Backend) -> BenchResult {
     let batch_size = 50;
     let num_users = 100;
     let (cfg, _dir) = make_config(REDUCER_LUA_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {
@@ -426,7 +426,7 @@ fn bench_full_pipeline_fn_reducer(backend: Backend) -> BenchResult {
     let batch_size = 50;
     let num_users = 100;
     let (cfg, _dir) = make_config(REDUCER_FN_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     // Inject the FnReducer runtime
     db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()));
@@ -642,7 +642,7 @@ fn bench_rollback(backend: Backend) -> BenchResult {
     let rows_per_block = 134; // ~10K total rows
     let num_users = 50;
     let (cfg, _dir) = make_config(REDUCER_EVENT_RULES_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let total_rows = num_blocks * rows_per_block;
     for block in 1..=num_blocks as u64 {
@@ -678,7 +678,7 @@ fn bench_ingest(backend: Backend) -> BenchResult {
     let total_rows = 100_000;
     let batch_size = 5_000;
     let (cfg, _dir) = make_config(RAW_WITH_MV_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows).map(make_raw_row_for_mv).collect();
 
@@ -701,13 +701,13 @@ fn bench_ingest(backend: Backend) -> BenchResult {
         data.insert("events".to_string(), rows_with_bn);
 
         let batch = db
-            .ingest(delta_db::db::IngestInput {
+            .ingest(settle_stream::db::IngestInput {
                 data,
-                rollback_chain: vec![delta_db::types::BlockCursor {
+                rollback_chain: vec![settle_stream::types::BlockCursor {
                     number: block,
                     hash: format!("0x{block:x}"),
                 }],
-                finalized_head: delta_db::types::BlockCursor {
+                finalized_head: settle_stream::types::BlockCursor {
                     number: if block > 0 { block - 1 } else { 0 },
                     hash: format!("0x{:x}", if block > 0 { block - 1 } else { 0 }),
                 },
@@ -736,7 +736,7 @@ fn bench_many_group_keys(backend: Backend) -> BenchResult {
     let num_keys = 100_000;
     let batch_size = 1000;
     let (cfg, _dir) = make_config(REDUCER_EVENT_RULES_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let start = Instant::now();
     for batch_idx in 0..(num_keys / batch_size) {
@@ -976,7 +976,7 @@ fn bench_polymarket_market_stats(backend: Backend) -> BenchResult {
     let total_rows = 200_000;
     let batch_size = 500;
     let (cfg, _dir) = make_config(POLYMARKET_MARKET_STATS_ONLY, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| make_polymarket_order(i, 10_000))
@@ -1008,7 +1008,7 @@ fn bench_polymarket_insider_detect(backend: Backend) -> BenchResult {
     let batch_size = 500;
     let num_traders = 100_000;
     let (cfg, _dir) = make_config(POLYMARKET_INSIDER_ONLY, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| make_polymarket_order(i, num_traders))
@@ -1040,7 +1040,7 @@ fn bench_polymarket_full_pipeline(backend: Backend) -> BenchResult {
     let batch_size = 500;
     let num_traders = 100_000;
     let (cfg, _dir) = make_config(POLYMARKET_FULL_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| make_polymarket_order(i, num_traders))
@@ -1072,7 +1072,7 @@ fn bench_polymarket_high_cardinality(backend: Backend) -> BenchResult {
     let batch_size = 1000;
     let num_traders = 1_000_000;
     let (cfg, _dir) = make_config(POLYMARKET_FULL_SCHEMA, backend);
-    let mut db = DeltaDb::open(cfg).unwrap();
+    let mut db = SettleStream::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| make_polymarket_order(i, num_traders))
@@ -1145,7 +1145,7 @@ fn run_backend_benchmarks(backend: Backend) -> Vec<BenchResult> {
 }
 
 fn main() {
-    println!("=== Delta DB Benchmarks ===\n");
+    println!("=== SettleStream Benchmarks ===\n");
 
     let mut results: Vec<BenchResult> = Vec::new();
 
