@@ -11,6 +11,7 @@ use crate::storage::{StorageBackend, StorageWriteBatch};
 use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, PerfNode, RowMap, Value};
 
 /// Configuration for opening a DeltaDb instance.
+#[non_exhaustive]
 pub struct Config {
     /// SQL schema definition string.
     pub schema: String,
@@ -107,7 +108,7 @@ impl DeltaDb {
                 disable_compaction: config.disable_compaction,
                 cache_size: config.cache_size,
             };
-            Arc::new(RocksDbBackend::open(dir, &rocks_config)?)
+            Arc::new(RocksDbBackend::open_with_config(dir, &rocks_config)?)
         } else {
             Arc::new(MemoryBackend::new())
         };

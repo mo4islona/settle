@@ -124,8 +124,13 @@ pub struct RocksDbBackend {
 }
 
 impl RocksDbBackend {
-    /// Open (or create) a RocksDB database at the given path.
-    pub fn open(path: impl AsRef<Path>, config: &RocksDbConfig) -> Result<Self> {
+    /// Open (or create) a RocksDB database at the given path with default tuning.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_config(path, &RocksDbConfig::default())
+    }
+
+    /// Open (or create) a RocksDB database at the given path with custom tuning options.
+    pub fn open_with_config(path: impl AsRef<Path>, config: &RocksDbConfig) -> Result<Self> {
         let comp_type = match config.compression.as_deref() {
             Some("none") => DBCompressionType::None,
             Some("zstd") => DBCompressionType::Zstd,
@@ -631,7 +636,7 @@ mod tests {
 
     fn test_backend() -> (RocksDbBackend, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let backend = RocksDbBackend::open(dir.path(), &RocksDbConfig::default()).unwrap();
+        let backend = RocksDbBackend::open(dir.path()).unwrap();
         (backend, dir)
     }
 
@@ -898,14 +903,14 @@ mod tests {
 
         // Write data
         {
-            let b = RocksDbBackend::open(path, &RocksDbConfig::default()).unwrap();
+            let b = RocksDbBackend::open(path).unwrap();
             b.put_raw_rows("t", 100, b"test_row_data").unwrap();
             b.put_meta("cursor", b"100").unwrap();
         }
 
         // Reopen and verify
         {
-            let b = RocksDbBackend::open(path, &RocksDbConfig::default()).unwrap();
+            let b = RocksDbBackend::open(path).unwrap();
             let rows = b.get_raw_rows("t", 100, 100).unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].1, b"test_row_data");
@@ -923,7 +928,7 @@ mod tests {
                 compression: Some(compression.to_string()),
                 ..Default::default()
             };
-            let b = RocksDbBackend::open(dir.path(), &config).unwrap();
+            let b = RocksDbBackend::open_with_config(dir.path(), &config).unwrap();
             b.put_raw_rows("t", 1, b"data").unwrap();
             assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
         }
@@ -936,7 +941,7 @@ mod tests {
             compression: Some("brotli".to_string()),
             ..Default::default()
         };
-        assert!(RocksDbBackend::open(dir.path(), &config).is_err());
+        assert!(RocksDbBackend::open_with_config(dir.path(), &config).is_err());
     }
 
     #[test]
@@ -947,7 +952,7 @@ mod tests {
             cache_size: Some(4 * 1024 * 1024),
             ..Default::default()
         };
-        let b = RocksDbBackend::open(dir.path(), &config).unwrap();
+        let b = RocksDbBackend::open_with_config(dir.path(), &config).unwrap();
         b.put_raw_rows("t", 1, b"data").unwrap();
         assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
 
@@ -957,7 +962,7 @@ mod tests {
             cache_size: Some(0),
             ..Default::default()
         };
-        let b2 = RocksDbBackend::open(dir2.path(), &config2).unwrap();
+        let b2 = RocksDbBackend::open_with_config(dir2.path(), &config2).unwrap();
         b2.put_raw_rows("t", 1, b"data").unwrap();
         assert_eq!(b2.get_raw_rows("t", 1, 1).unwrap().len(), 1);
     }
@@ -969,7 +974,7 @@ mod tests {
             disable_compaction: true,
             ..Default::default()
         };
-        let b = RocksDbBackend::open(dir.path(), &config).unwrap();
+        let b = RocksDbBackend::open_with_config(dir.path(), &config).unwrap();
         b.put_raw_rows("t", 1, b"data").unwrap();
         assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
     }
