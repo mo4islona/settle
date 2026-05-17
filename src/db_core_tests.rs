@@ -139,9 +139,10 @@ fn unknown_table_returns_error() {
 }
 
 #[test]
-fn empty_flush_returns_none() {
+fn empty_db_has_no_pending() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
-    assert!(db.flush().is_none());
+    assert!(!db.is_awaiting_ack());
+    assert_eq!(db.pending_count(), 0);
 }
 
 #[test]
@@ -163,8 +164,7 @@ fn sequence_numbers_increment() {
 fn ingest_groups_rows_by_block_number() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    let batch = db
-        .ingest(IngestInput {
+    let batch = ingest_input(&mut db, IngestInput {
             data: std::collections::HashMap::from([(
                 "swaps".to_string(),
                 vec![
@@ -207,7 +207,7 @@ fn ingest_groups_rows_by_block_number() {
 fn ingest_stores_block_hashes_and_cursor() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    db.ingest(IngestInput {
+    ingest_input(&mut db, IngestInput {
         data: std::collections::HashMap::from([(
             "swaps".to_string(),
             vec![HashMap::from([
@@ -237,7 +237,7 @@ fn ingest_stores_block_hashes_and_cursor() {
 fn ingest_errors_on_missing_block_number() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    let result = db.ingest(IngestInput {
+    let result = ingest_input(&mut db, IngestInput {
         data: std::collections::HashMap::from([(
             "swaps".to_string(),
             vec![HashMap::from([
@@ -266,7 +266,7 @@ fn ingest_persists_and_restores_state() {
         let mut db =
             Settle::open(Config::with_data_dir(schema, dir.path().to_str().unwrap())).unwrap();
 
-        db.ingest(IngestInput {
+        ingest_input(&mut db, IngestInput {
             data: std::collections::HashMap::from([(
                 "swaps".to_string(),
                 vec![HashMap::from([
@@ -307,8 +307,7 @@ fn ingest_persists_and_restores_state() {
 fn ingest_batches_perf_into_single_array() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    let batch = db
-        .ingest(IngestInput {
+    let batch = ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "swaps".to_string(),
                 vec![

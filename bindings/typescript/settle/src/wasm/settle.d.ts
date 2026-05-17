@@ -8,13 +8,12 @@ export class Settle {
     free(): void;
     [Symbol.dispose](): void;
     /**
-     * Acknowledge a flushed batch by sequence number.
+     * Acknowledge the pending batch by sequence number and durably commit
+     * its writes. `sequence` is passed as f64 (JS number); values up to 2^53
+     * preserve exact precision. Throws typed errors via the structured-
+     * reason prefix protocol.
      */
     ack(sequence: number): void;
-    /**
-     * Flush buffered changes. Returns a change batch object, or null if empty.
-     */
-    flush(): any;
     /**
      * Atomically handle a fork (409 from Portal).
      *
@@ -24,7 +23,7 @@ export class Settle {
      *
      * Throws if no common ancestor is found (fork too deep / unrecoverable).
      */
-    handle_fork(previous_blocks: any): any;
+    handleFork(previous_blocks: any): any;
     /**
      * Atomic ingest: process all tables, finalize, and return change batch.
      * Input and output are plain JS objects — no msgpack encoding needed.
@@ -42,20 +41,36 @@ export class Settle {
      *
      * Must be called before any `ingest` calls that use this reducer.
      */
-    register_reducer(name: string, source: string, group_by: any, state: any, callback: Function): void;
+    registerReducer(name: string, source: string, group_by: any, state: any, callback: Function): void;
+    /**
+     * Attach a JS callback to an existing reducer that was declared in
+     * SQL with `LANGUAGE EXTERNAL`, and replay unfinalized blocks. Errors
+     * if no such reducer exists OR if a callback is already registered
+     * for that name.
+     */
+    registerReducerCallback(name: string, callback: Function): void;
     /**
      * Find the common ancestor between our state and the portal's chain.
      * Returns the matching block cursor, or null if no common ancestor found.
      */
-    resolve_fork_cursor(previous_blocks: any): any;
+    resolveForkCursor(previous_blocks: any): any;
     /**
      * Current cursor: latest processed block + hash. Null if no blocks processed.
      */
     readonly cursor: any;
     /**
+     * Whether a previously-returned ChangeBatch is still awaiting `ack()`.
+     */
+    readonly isAwaitingAck: boolean;
+    /**
      * Whether backpressure should be applied.
      */
     readonly isBackpressured: boolean;
+    /**
+     * Whether an unrecoverable commit failure has poisoned this instance.
+     * Once true the only recovery is to drop the instance and reopen.
+     */
+    readonly isPoisoned: boolean;
     /**
      * Number of pending (unflushed) change records.
      */
@@ -67,16 +82,18 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_settle_free: (a: number, b: number) => void;
-    readonly settle_ack: (a: number, b: number) => void;
+    readonly settle_ack: (a: number, b: number) => [number, number];
     readonly settle_cursor: (a: number) => any;
-    readonly settle_flush: (a: number) => [number, number, number];
-    readonly settle_handle_fork: (a: number, b: any) => [number, number, number];
+    readonly settle_handleFork: (a: number, b: any) => [number, number, number];
     readonly settle_ingest: (a: number, b: any) => [number, number, number];
+    readonly settle_isAwaitingAck: (a: number) => number;
     readonly settle_isBackpressured: (a: number) => number;
+    readonly settle_isPoisoned: (a: number) => number;
     readonly settle_new: (a: number, b: number) => [number, number, number];
     readonly settle_pendingCount: (a: number) => number;
-    readonly settle_register_reducer: (a: number, b: number, c: number, d: number, e: number, f: any, g: any, h: any) => [number, number];
-    readonly settle_resolve_fork_cursor: (a: number, b: any) => [number, number, number];
+    readonly settle_registerReducer: (a: number, b: number, c: number, d: number, e: number, f: any, g: any, h: any) => [number, number];
+    readonly settle_registerReducerCallback: (a: number, b: number, c: number, d: any) => [number, number];
+    readonly settle_resolveForkCursor: (a: number, b: any) => [number, number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

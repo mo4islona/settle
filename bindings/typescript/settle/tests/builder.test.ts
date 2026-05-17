@@ -1,4 +1,5 @@
 import {describe, expect, it} from 'vitest'
+import { ingestAndAck } from "./util"
 import {datetime, float64, interval, Pipeline, string, uint64, type SlidingWindowOptions} from '../src'
 
 describe('Pipeline builder', () => {
@@ -47,7 +48,7 @@ describe('Pipeline builder', () => {
         })
 
         const db = p.build()
-        const batch = await db.ingest({
+        const batch = await ingestAndAck(db, {
             data: {
                 trades: [
                     {block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000},
@@ -96,7 +97,7 @@ describe('Pipeline builder', () => {
             })
 
         const db = p.build()
-        const batch = await db.ingest({
+        const batch = await ingestAndAck(db, {
             data: {
                 trades: [
                     {block_number: 1, user: 'alice', side: 'buy', amount: 10, price: 100},
@@ -143,7 +144,7 @@ describe('Pipeline builder', () => {
         const db = p.build()
 
         // Ingest blocks 1 and 2
-        await db.ingest({
+        await ingestAndAck(db, {
             data: {
                 t: [
                     {block_number: 1, k: 'a', v: 10},
@@ -155,7 +156,7 @@ describe('Pipeline builder', () => {
         })
 
         // Rollback block 2: ingest with rollbackChain that only includes block 1
-        const batch = await db.ingest({
+        const batch = await ingestAndAck(db, {
             data: {},
             finalizedHead: {number: 1, hash: '0x1'},
             rollbackChain: [{number: 1, hash: '0x1'}],
@@ -206,7 +207,7 @@ describe('Pipeline builder', () => {
         })
 
         const db = p.build()
-        const batch = await db.ingest({
+        const batch = await ingestAndAck(db, {
             data: {
                 events: [
                     {block_number: 1, user: 'alice', amount: 10},
@@ -258,7 +259,7 @@ describe('Pipeline builder', () => {
             })
 
         const db = p.build()
-        const batch = await db.ingest({
+        const batch = await ingestAndAck(db, {
             data: {
                 swaps: [
                     {block_number: 1, pool: 'ETH/USDC', block_time: 60000, price: 2000, volume: 100},
@@ -314,7 +315,7 @@ describe('Pipeline builder', () => {
             })
 
         const db = p.build()
-        const batch = await db.ingest({
+        const batch = await ingestAndAck(db, {
             data: {
                 orders: [{block_number: 1, trader: 'alice', amount: 100}],
             },
@@ -353,7 +354,7 @@ describe('Pipeline builder', () => {
         const db = p.build()
 
         // Ingest blocks 1 and 2
-        const batch1 = await db.ingest({
+        const batch1 = await ingestAndAck(db, {
             data: {
                 trades: [
                     {block_number: 1, pair: 'ETH', volume: 100, block_time: 0},
@@ -372,7 +373,7 @@ describe('Pipeline builder', () => {
         expect(latest1.values.tradeCount).toBe(2)
 
         // Block 3: ETH volume=50 at t=1hr+1s → block 1 expires
-        const batch2 = await db.ingest({
+        const batch2 = await ingestAndAck(db, {
             data: {
                 trades: [
                     {block_number: 3, pair: 'ETH', volume: 50, block_time: 3_601_000},
@@ -414,7 +415,7 @@ describe('Pipeline builder', () => {
         const db = p.build()
 
         // DOGE at t=0
-        await db.ingest({
+        await ingestAndAck(db, {
             data: {
                 trades: [{block_number: 1, pair: 'DOGE', volume: 1000, block_time: 0}],
             },
@@ -423,7 +424,7 @@ describe('Pipeline builder', () => {
         })
 
         // ETH at t=1hr+1s → DOGE expires completely
-        const batch = await db.ingest({
+        const batch = await ingestAndAck(db, {
             data: {
                 trades: [{block_number: 2, pair: 'ETH', volume: 100, block_time: 3_601_000}],
             },

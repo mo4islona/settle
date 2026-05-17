@@ -6,6 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { ingestAndAck } from "./util"
 import { datetime, float64, interval, Pipeline, string, uint64 } from '../src/index'
 
 const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
@@ -173,7 +174,7 @@ describe('Uniswap PnL pipeline', () => {
     const db = buildPipeline().build()
 
     // amount0 > 0 = sender buys token0, amount1 < 0 = sender pays token1
-    const batch = await db.ingest({
+    const batch = await ingestAndAck(db, {
       data: {
         swaps: [
           {
@@ -221,7 +222,7 @@ describe('Uniswap PnL pipeline', () => {
 
     // Block 1: alice buys 1 WETH @ 2000 (amount0>0 = buy token0)
     // Block 2: alice buys 1 more WETH @ 2200, then sells 1 WETH @ 2400
-    const batch = await db.ingest({
+    const batch = await ingestAndAck(db, {
       data: {
         swaps: [
           {
@@ -279,7 +280,7 @@ describe('Uniswap PnL pipeline', () => {
 
     // Block 1: establish WETH price at 2000 USDC
     // Block 2: swap TOKEN_X / WETH → price resolved via ETH cross
-    const batch = await db.ingest({
+    const batch = await ingestAndAck(db, {
       data: {
         swaps: [
           {
@@ -323,7 +324,7 @@ describe('Uniswap PnL pipeline', () => {
     const db = buildPipeline().build()
 
     // Ingest blocks 1 and 2
-    await db.ingest({
+    await ingestAndAck(db, {
       data: {
         swaps: [
           {
@@ -355,7 +356,7 @@ describe('Uniswap PnL pipeline', () => {
     })
 
     // Rollback block 2: ingest with rollbackChain that only includes block 1
-    const batch = await db.ingest({
+    const batch = await ingestAndAck(db, {
       data: {},
       finalizedHead: { number: 1, hash: '0x1' },
       rollbackChain: [{ number: 1, hash: '0x1' }],
@@ -371,7 +372,7 @@ describe('Uniswap PnL pipeline', () => {
   it('isolates wallet PnL per sender', async () => {
     const db = buildPipeline().build()
 
-    const batch = await db.ingest({
+    const batch = await ingestAndAck(db, {
       data: {
         swaps: [
           {

@@ -13,6 +13,7 @@ export {
 } from './ddl'
 export {
   type ChangeBatch,
+  type ISettle,
   Settle,
   type SettleConfig,
   type SettleCursor,
@@ -22,4 +23,14 @@ export {
   type IngestInput,
   type StateFieldDef,
 } from './settle'
-export { Pipeline, ReducerHandle, TableHandle, ViewHandle } from './pipeline'
+export { SettlePendingAckError, SettleWrongAckSequenceError } from './errors'
+export {
+  type BuildOptions,
+  type CompiledPipeline,
+  type CompiledReducer,
+  openCompiled,
+  Pipeline,
+  ReducerHandle,
+  TableHandle,
+  ViewHandle,
+} from './pipeline'

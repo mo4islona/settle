@@ -23,12 +23,23 @@ ethnum = "1.5.2"
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
+tracing = "0.1"
+web-time = "1"
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+# End-to-end tests in `tests/e2e/` spin up a real Postgres container via
+# testcontainers. Requires a running Docker daemon — `cargo test --tests`
+# will run them. Filter with `cargo test --test integration` to skip the
+# Docker-dependent suite.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
 
 [features]
 # Default features for native (Node.js) builds.
@@ -39,6 +50,14 @@ rocksdb = ["dep:rocksdb"]
 rayon = ["dep:rayon"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen"]
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
 
 [[test]]
 name = "dex"

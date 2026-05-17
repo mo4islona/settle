@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
+// `web_time::Instant` is `std::time::Instant` on native and a JS-Date-backed
+// shim on `wasm32-unknown-unknown` (where the real `Instant::now()` panics).
+use web_time::Instant;
 
 use crate::change::ChangeBuffer;
 use crate::engine::dag::SettleEngine;
@@ -29,6 +33,11 @@ pub struct Config {
     pub disable_compaction: bool,
     /// Block cache size in bytes. None = RocksDB default, 0 = disable.
     pub cache_size: Option<usize>,
+    /// How long an unacked pending batch may live before `ingest()` logs a
+    /// warning when blocked by it. The block itself happens immediately —
+    /// the threshold only controls log noise. `handle_fork()` does not log
+    /// (it rejects with `PendingAck` straight away).
+    pub ack_warning_threshold: Duration,
 }
 
 impl Config {
@@ -43,6 +52,7 @@ impl Config {
             compression: None,
             disable_compaction: false,
             cache_size: None,
+            ack_warning_threshold: Duration::from_secs(10),
         }
     }
 
@@ -56,7 +66,16 @@ impl Config {
             compression: None,
             disable_compaction: false,
             cache_size: None,
+            ack_warning_threshold: Duration::from_secs(10),
         }
+    }
+
+    /// Threshold after which a still-pending unacked batch causes a warning
+    /// log on each subsequent `ingest()` / `handle_fork()` call (which all
+    /// return `Err(PendingAck)` immediately regardless).
+    pub fn ack_warning_threshold(mut self, threshold: Duration) -> Self {
+        self.ack_warning_threshold = threshold;
+        self
     }
 
     pub fn max_buffer_size(mut self, size: usize) -> Self {
@@ -68,7 +87,39 @@ impl Config {
         self.storage = Some(storage);
         self
     }
+
+    /// Set the on-disk RocksDB directory. Pass [`MEMORY`] (`":memory:"`) — or
+    /// just call `Config::new(schema)` without this — to keep everything in
+    /// memory. Same convention as SQLite.
+    pub fn data_dir(mut self, path: impl Into<String>) -> Self {
+        let p = path.into();
+        self.data_dir = if p == MEMORY { None } else { Some(p) };
+        self
+    }
+
+    /// RocksDB compression algorithm. Accepts
+    /// `"none" | "snappy" | "zstd" | "lz4"`.
+    pub fn compression(mut self, algo: impl Into<String>) -> Self {
+        self.compression = Some(algo.into());
+        self
+    }
+
+    /// Disable RocksDB background compaction.
+    pub fn disable_compaction(mut self, value: bool) -> Self {
+        self.disable_compaction = value;
+        self
+    }
+
+    /// RocksDB block-cache size in bytes.
+    pub fn cache_size(mut self, bytes: usize) -> Self {
+        self.cache_size = Some(bytes);
+        self
+    }
 }
+
+/// Sentinel value (SQLite convention) — passing this as `data_dir` is
+/// equivalent to leaving it unset, i.e. open the database in memory.
+pub const MEMORY: &str = ":memory:";
 
 /// Input for the atomic `ingest()` method.
 pub struct IngestInput {
@@ -92,6 +143,22 @@ pub struct ForkResult {
 const META_LATEST_BLOCK: &str = "latest_block";
 const META_FINALIZED_BLOCK: &str = "finalized_block";
 const META_BLOCK_HASHES: &str = "block_hashes";
+const META_NEXT_SEQUENCE: &str = "next_sequence";
+
+/// State stashed between a successful `ingest()` / `handle_fork()` and the
+/// caller's `ack()`. The on-disk view is one batch behind the engine
+/// in-memory view; this struct holds the write batch that advances disk to
+/// in-memory when `ack()` succeeds.
+///
+/// `pending` is only set for the data path (where the caller received a
+/// `ChangeBatch` and owns the apply→ack handshake). On the heartbeat path
+/// (empty-batch immediate commit) a commit failure poisons the instance
+/// instead — see [`Settle::poisoned`].
+struct PendingAck {
+    sequence: u64,
+    write_batch: StorageWriteBatch,
+    since: Instant,
+}
 
 /// Top-level Settle API.
 ///
@@ -101,6 +168,21 @@ pub struct Settle {
     engine: SettleEngine,
     buffer: ChangeBuffer,
     storage: Arc<dyn StorageBackend>,
+    pending: Option<PendingAck>,
+    ack_warning_threshold: Duration,
+    /// Set when a non-recoverable commit (heartbeat immediate-commit) fails.
+    /// In that case the engine's in-memory state has already mutated past
+    /// disk (e.g. `engine.finalize` pruned `block_snapshots`) and naively
+    /// retrying would re-run `finalize` against the pruned state, writing
+    /// an *empty* batch and silently leaving CF_REDUCER_FIN stale. Every
+    /// public mutating method short-circuits with `Error::Poisoned` once
+    /// this is set; the only recovery is `drop` + reopen, which rebuilds
+    /// in-memory state from disk via `replay_unfinalized`.
+    poisoned: Option<String>,
+    /// Names of reducers whose runtime has been explicitly installed via
+    /// `register_reducer_callback`. Enforces the strict "one callback per
+    /// name, drop+reopen to change" contract.
+    runtimes_attached: std::collections::HashSet<String>,
 }
 
 impl Settle {
@@ -163,49 +245,139 @@ impl Settle {
             engine.replay_unfinalized(finalized + 1, latest)?;
         }
 
-        let buffer = ChangeBuffer::new(config.max_buffer_size);
+        let mut buffer = ChangeBuffer::new(config.max_buffer_size);
+        // Restore monotonic sequence across restart. Default 1 on fresh DB.
+        if let Some(bytes) = storage.get_meta(META_NEXT_SEQUENCE)? {
+            let seq = u64::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| Error::Storage("corrupt next_sequence metadata".into()))?,
+            );
+            buffer.set_next_sequence(seq);
+        }
 
         Ok(Self {
             engine,
             buffer,
             storage,
+            pending: None,
+            ack_warning_threshold: config.ack_warning_threshold,
+            poisoned: None,
+            runtimes_attached: std::collections::HashSet::new(),
         })
+    }
+
+    /// Returns true if a previously-produced `ChangeBatch` is still awaiting
+    /// `ack()`. While true, mutating APIs (`ingest`, `handle_fork`,
+    /// `register_reducer`, `register_reducer_callback`, `replay_reducer`) return
+    /// `Err(PendingAck)`. Use to surface state in dashboards / readiness probes.
+    pub fn is_awaiting_ack(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// True if a previous immediate-commit failure has poisoned this
+    /// instance. The only recovery is `drop` + reopen.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    /// Early gate for every mutating API: if a prior immediate-commit
+    /// failure mutated in-memory state past disk, refuse further work
+    /// instead of silently producing stale writes.
+    fn guard_not_poisoned(&self) -> Result<()> {
+        if let Some(reason) = &self.poisoned {
+            return Err(Error::Poisoned(reason.clone()));
+        }
+        Ok(())
     }
 
     /// Replace the runtime for a named reducer (for External/FnReducer injection).
     /// Replays unfinalized blocks so the reducer catches up with current state.
-    pub fn set_reducer_runtime(
+    ///
+    /// Returns `Err(PendingAck)` if an unacked batch is in flight — the engine
+    /// in-memory state is ahead of disk, so a replay against the on-disk
+    /// finalized state would rebuild inconsistent reducer state.
+    /// Attach a reducer runtime to an existing reducer declared in SQL
+    /// with `LANGUAGE EXTERNAL`. Replays unfinalized blocks so the runtime
+    /// catches up with current state.
+    ///
+    /// **Strict**: errors if no reducer named `name` exists, AND errors if
+    /// a runtime is already attached for that name. To change a runtime,
+    /// drop and reopen the instance.
+    pub fn register_reducer_callback(
         &mut self,
         name: &str,
         runtime: Box<dyn crate::reducer_runtime::ReducerRuntime>,
     ) -> Result<()> {
+        self.guard_not_poisoned()?;
+        self.guard_no_pending()?;
         if !self.engine.has_reducer(name) {
             return Err(Error::InvalidOperation(format!(
-                "set_reducer_runtime: unknown reducer '{name}'"
+                "register_reducer_callback: unknown reducer '{name}' — \
+                 use register_reducer to create a brand-new reducer"
+            )));
+        }
+        // The reducer must be declared `LANGUAGE EXTERNAL`. Attaching a
+        // callback to a Lua/EventRules reducer silently never invokes it
+        // (those bodies have their own embedded runtime) — fail loud
+        // rather than let the caller think a callback is wired up.
+        if !self.engine.reducer_is_external(name) {
+            return Err(Error::InvalidOperation(format!(
+                "register_reducer_callback: reducer '{name}' is not declared \
+                 LANGUAGE EXTERNAL — callbacks can only be attached to external reducers"
+            )));
+        }
+        // Strict: a runtime can only be attached once per name. To change
+        // a runtime, drop and reopen the Settle instance.
+        if self.runtimes_attached.contains(name) {
+            return Err(Error::InvalidOperation(format!(
+                "register_reducer_callback: runtime for '{name}' is already attached — \
+                 drop and reopen the instance to change it"
             )));
         }
         self.engine.set_reducer_runtime(name, runtime);
+        self.runtimes_attached.insert(name.to_string());
 
-        // Replay only this reducer and its downstream MVs — a full replay
-        // would double-process non-external reducers that were already replayed
-        // during open().
+        // Replay only this reducer and its downstream MVs. Reset their
+        // in-memory state to the finalized baseline first — otherwise the
+        // replay applies on top of state already populated by prior ingests,
+        // doubling every emit / aggregate contribution.
         let finalized = self.engine.finalized_block();
         let latest = self.engine.latest_block();
         if latest > finalized {
+            self.engine.reset_reducer_branch_for_replay(name, finalized)?;
             self.engine
                 .replay_unfinalized_for(finalized + 1, latest, name)?;
         }
         Ok(())
     }
 
-    /// Register an external reducer definition.
-    /// The reducer is added to the engine's pipeline and unfinalized blocks
-    /// are replayed so it catches up with the current state.
+    /// Register a *new* external reducer definition. The reducer is added
+    /// to the engine's pipeline and unfinalized blocks are replayed so its
+    /// in-memory state catches up with disk.
+    ///
+    /// Returns `Err(InvalidOperation)` if a reducer with this name already
+    /// exists — call `replay_reducer(name)` or `register_reducer_callback(name, …)`
+    /// instead to re-attach / re-replay an existing slot. Silently appending
+    /// a duplicate `PipelineNode::Reducer` would double-apply state on every
+    /// subsequent ingest.
+    ///
+    /// Returns `Err(PendingAck)` if an unacked batch is in flight; returns
+    /// `Err(Poisoned)` if a previous commit failure poisoned the instance.
     pub fn register_reducer(&mut self, def: crate::schema::ast::ReducerDef) -> Result<()> {
+        self.guard_not_poisoned()?;
+        self.guard_no_pending()?;
         let name = def.name.clone();
+        if self.engine.has_reducer(&name) {
+            return Err(Error::InvalidOperation(format!(
+                "register_reducer: reducer '{name}' already exists — \
+                 use `replay_reducer` or `register_reducer_callback` to re-attach"
+            )));
+        }
         self.engine.add_reducer(def, self.storage.clone())?;
 
-        // Replay only this reducer and its downstream MVs
+        // Newly-added reducer starts with empty state — replay rebuilds it
+        // from the unfinalized range without any double-counting risk.
         let finalized = self.engine.finalized_block();
         let latest = self.engine.latest_block();
         if latest > finalized {
@@ -217,10 +389,19 @@ impl Settle {
 
     /// Replay unfinalized blocks for a specific reducer and its downstream MVs.
     /// Used after installing an external reducer's JS callback.
+    ///
+    /// Returns `Err(PendingAck)` if an unacked batch is in flight.
     pub fn replay_reducer(&mut self, name: &str) -> Result<()> {
+        self.guard_not_poisoned()?;
+        self.guard_no_pending()?;
         let finalized = self.engine.finalized_block();
         let latest = self.engine.latest_block();
         if latest > finalized {
+            // Reset reducer + downstream MVs to finalized baseline BEFORE
+            // replaying. Without this, a replay called after the reducer
+            // already processed the unfinalized range would double every
+            // emit and aggregate contribution.
+            self.engine.reset_reducer_branch_for_replay(name, finalized)?;
             self.engine
                 .replay_unfinalized_for(finalized + 1, latest, name)?;
         }
@@ -232,48 +413,89 @@ impl Settle {
         self.engine.has_reducer(name)
     }
 
-    /// Flush all buffered change records into a ChangeBatch.
-    /// Returns None if there are no pending records.
-    pub fn flush(&mut self) -> Option<ChangeBatch> {
-        self.buffer.flush()
+    /// Whether the named reducer is declared `LANGUAGE EXTERNAL` — only
+    /// these can have a host-language callback attached via
+    /// `register_reducer_callback`. Returns false for Lua / EventRules
+    /// reducers and for unknown names.
+    pub fn reducer_is_external(&self, name: &str) -> bool {
+        self.engine.reducer_is_external(name)
     }
 
-    /// Acknowledge a previously flushed batch by sequence number.
-    pub fn ack(&mut self, sequence: u64) {
-        self.buffer.ack(sequence);
+    /// Acknowledge a previously returned `ChangeBatch` and durably commit the
+    /// pending state.
+    ///
+    /// Behaviour:
+    /// - `pending == None` → `Ok(())` (idempotent — covers double-ack after
+    ///   success, stale ack on startup before any new ingest).
+    /// - `pending == Some(p)`, `sequence != p.sequence` →
+    ///   `Err(WrongAckSequence)`. Pending is unchanged; this signals a
+    ///   protocol bug on the caller side.
+    /// - `pending == Some(p)`, matches: `storage.commit(&p.write_batch)`. On
+    ///   `Err`, pending is preserved — caller MUST retry by calling
+    ///   `ack(sequence)` again with the SAME sequence (NOT `ingest()`,
+    ///   which would return `Err(PendingAck)`). On `Ok`, `last_committed_meta`
+    ///   is refreshed and pending is cleared.
+    pub fn ack(&mut self, sequence: u64) -> Result<()> {
+        self.guard_not_poisoned()?;
+        let Some(p) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        if p.sequence != sequence {
+            return Err(Error::WrongAckSequence {
+                expected: p.sequence,
+                got: sequence,
+            });
+        }
+        // CRITICAL: only `take()` after a successful commit. Otherwise a
+        // commit failure would silently drop the write_batch and leave engine
+        // state ahead of disk with no path to recover.
+        self.storage.commit(&p.write_batch)?;
+        self.pending = None;
+        Ok(())
     }
 
-    /// Number of pending (unflushed) change records.
+    /// Number of pending (unflushed) change records inside the buffer.
+    ///
+    /// Note: this is the buffer's record count; it does NOT reflect the
+    /// `pending` ack slot. Use `is_awaiting_ack()` for that.
     pub fn pending_count(&self) -> usize {
         self.buffer.pending_count()
     }
 
-    /// Whether backpressure should be applied.
+    /// Whether buffer backpressure should be applied.
     pub fn is_backpressured(&self) -> bool {
         self.buffer.is_full()
     }
 
-    /// Current latest processed block number.
+    /// Current logical latest processed block (engine in-memory view). If a
+    /// `ChangeBatch` is awaiting `ack()`, this reflects the not-yet-durable
+    /// state — use `is_awaiting_ack()` to distinguish.
     pub fn latest_block(&self) -> BlockNumber {
         self.engine.latest_block()
     }
 
-    /// Current latest processed block as a cursor (number + hash).
     pub fn latest_cursor(&self) -> Option<BlockCursor> {
         self.engine.latest_cursor()
     }
 
-    /// Current finalized block number.
     pub fn finalized_block(&self) -> BlockNumber {
         self.engine.finalized_block()
     }
 
-    /// Current finalized block as a cursor (number + hash).
     pub fn finalized_cursor(&self) -> Option<BlockCursor> {
         self.engine.finalized_cursor()
     }
 
-    /// Find the common ancestor between our state and the Portal's chain.
+    /// Find the highest block in `previous_blocks` whose hash matches our
+    /// stored hash — including hashes added via `set_rollback_chain` for
+    /// blocks we haven't ingested data for (Solana-style gappy chains).
+    ///
+    /// May return a cursor with `number > latest_block`. This is informational
+    /// only: `handle_fork` clamps the resolved cursor to `latest_block`
+    /// internally to avoid advancing past blocks with no data. Callers that
+    /// want the "what would handle_fork pick" answer should consume the
+    /// result of `handle_fork` directly rather than pre-flighting through
+    /// this method.
     pub fn resolve_fork_cursor(
         &self,
         previous_blocks: &[(BlockNumber, &str)],
@@ -284,13 +506,30 @@ impl Settle {
     /// Atomically handle a fork (409 from Portal).
     ///
     /// Finds the highest common ancestor in `rollback_chain`, rolls back all
-    /// state after that point, commits compensating changes and updated metadata
-    /// atomically, and returns the cursor to resume from plus any change batch.
+    /// state after that point, and (a) if no compensating records resulted —
+    /// commits metadata immediately and returns `batch: None`, or (b)
+    /// otherwise stashes the write batch as `pending` and returns the
+    /// compensating `ChangeBatch` to the caller. Caller MUST call
+    /// `ack(batch.sequence)` after applying the batch to durably commit.
     ///
-    /// Uses the current internal finalized block — no need to pass it in.
-    ///
-    /// Returns `Err` if no common ancestor is found (fork too deep / unrecoverable).
+    /// Returns `Err(PendingAck)` if an unacked batch is already in flight —
+    /// caller must ack it first, then retry. Returns `Err(InvalidOperation)`
+    /// if `rollback_chain` is empty or no common ancestor exists.
     pub fn handle_fork(&mut self, mut rollback_chain: Vec<BlockCursor>) -> Result<ForkResult> {
+        // 0. Poison gate (see `ingest` for rationale).
+        self.guard_not_poisoned()?;
+        // 1. Pending guard — before validation, so caller gets a clean
+        //    "ack first" signal instead of "bad input" derived from
+        //    uncommitted engine state.
+        self.guard_no_pending()?;
+
+        // 2. Validation: empty chain has no resolvable common ancestor.
+        if rollback_chain.is_empty() {
+            return Err(Error::InvalidOperation(
+                "rollback_chain must not be empty".into(),
+            ));
+        }
+
         // Sort DESC to ensure we find the HIGHEST common ancestor first,
         // matching the same contract as ingest()'s rollback_chain handling.
         rollback_chain.sort_unstable_by_key(|c| std::cmp::Reverse(c.number));
@@ -300,9 +539,14 @@ impl Settle {
             .map(|c| (c.number, c.hash.as_str()))
             .collect();
 
+        // `resolve_fork_cursor_bounded` ignores matches with number > latest_block.
+        // The unbounded `resolve_fork_cursor` is fine for the read API (caller
+        // may have stored future hashes intentionally via rollback_chain), but
+        // for the rollback path it would silently advance the cursor onto a
+        // block we have no data for and lose blocks in between.
         let cursor = self
             .engine
-            .resolve_fork_cursor(&previous_blocks)
+            .resolve_fork_cursor_bounded(&previous_blocks)
             .ok_or_else(|| {
                 Error::InvalidOperation(
                     "Fork too deep: no common ancestor found in block hashes".into(),
@@ -322,7 +566,6 @@ impl Settle {
         self.engine.set_rollback_chain(&chain);
 
         self.append_meta_to_batch(&mut write_batch)?;
-        self.storage.commit(&write_batch)?;
 
         self.buffer.push(
             changes,
@@ -333,15 +576,92 @@ impl Settle {
         self.buffer
             .set_heads(self.engine.finalized_cursor(), self.engine.latest_cursor());
 
-        let batch = self.buffer.flush();
-        Ok(ForkResult { cursor, batch })
+        let batch_opt = self.buffer.flush();
+        // META_NEXT_SEQUENCE is written AFTER flush so the persisted value
+        // reflects what `buffer.next_sequence` will be on the next call.
+        write_batch.put_meta(
+            META_NEXT_SEQUENCE,
+            &self.buffer.next_sequence().to_be_bytes(),
+        );
+
+        match batch_opt {
+            None => {
+                // Heartbeat-style fork. Commit immediately; on failure
+                // poison the instance (engine state already rolled-back
+                // past disk — retry would re-encode against the mutated
+                // state and could silently land inconsistent writes).
+                if let Err(e) = self.storage.commit(&write_batch) {
+                    self.poisoned =
+                        Some(format!("heartbeat handle_fork commit failed: {e}"));
+                    return Err(e);
+                }
+                Ok(ForkResult { cursor, batch: None })
+            }
+            Some(batch) => {
+                self.pending = Some(PendingAck {
+                    sequence: batch.sequence,
+                    write_batch,
+                    since: Instant::now(),
+                });
+                Ok(ForkResult {
+                    cursor,
+                    batch: Some(batch),
+                })
+            }
+        }
     }
 
-    /// Atomic ingest: process all tables, store rollback chain, finalize, flush.
+    /// Atomic ingest: process all tables, store rollback chain, finalize.
     ///
-    /// Replaces separate `process_batch` + `set_rollback_chain` + `finalize` + `flush`.
-    /// Each row must contain a `block_number` field (UInt64).
+    /// Returns `Ok(Some(batch))` and stashes the underlying write batch in
+    /// `pending` — caller MUST call `ack(batch.sequence)` after successfully
+    /// applying the batch to durably commit. Returns `Ok(None)` for heartbeat
+    /// ingests (no records produced after merge) where the disk write is
+    /// committed immediately and nothing requires ack.
+    ///
+    /// Returns `Err(PendingAck)` if a previous batch is still awaiting ack —
+    /// caller must `ack(seq)` it first (or `drop` and reopen). Returns
+    /// `Err(InvalidOperation)` if `finalized_head` regresses below the
+    /// currently committed finalized block (finality is monotonic; going
+    /// above `latest_block` is allowed for gappy chains like Solana).
+    ///
+    /// Each row in `data` must contain a `block_number` field (UInt64).
     pub fn ingest(&mut self, input: IngestInput) -> Result<Option<ChangeBatch>> {
+        // 0. Poison gate. Any prior immediate-commit failure made in-memory
+        //    state diverge from disk; reject all further work so the caller
+        //    drops and reopens rather than silently producing stale writes.
+        self.guard_not_poisoned()?;
+
+        // 1. Pending guard — before any read of engine state, since engine
+        //    may be ahead of disk when a pending exists. Reading
+        //    `engine.finalized_block()` for validation would compare against
+        //    the uncommitted finalize and reject valid inputs.
+        if let Some(p) = &self.pending {
+            let since = p.since.elapsed();
+            if since > self.ack_warning_threshold {
+                tracing::warn!(
+                    sequence = p.sequence,
+                    since = ?since,
+                    "ack pending, ingest blocked"
+                );
+            }
+            return Err(Error::PendingAck {
+                sequence: p.sequence,
+                since,
+            });
+        }
+
+        // 2. Validation: finality must not regress. Going above current
+        //    latest is allowed — some chains (Solana) skip block numbers and
+        //    finality may come from an out-of-band source.
+        let current_finalized = self.engine.finalized_block();
+        if input.finalized_head.number < current_finalized {
+            return Err(Error::InvalidOperation(format!(
+                "finalized_head.number ({}) < current finalized_block ({}); finality must be monotonic",
+                input.finalized_head.number, current_finalized
+            )));
+        }
+
         // Single WriteBatch for all storage writes (raw rows + finalize + meta)
         let mut write_batch = StorageWriteBatch::new();
 
@@ -384,7 +704,9 @@ impl Settle {
                         )))
                         .collect();
 
-                    let fork_point = match self.engine.resolve_fork_cursor(&new_chain) {
+                    // Use `_bounded` so a stale future hash can't push the
+                    // resolved fork point above latest and cause silent skips.
+                    let fork_point = match self.engine.resolve_fork_cursor_bounded(&new_chain) {
                         Some(ref c) if c.number < current_latest => c.number,
                         Some(_) => current_latest, // no divergence
                         None => 0,                 // no common ancestor: full rollback
@@ -409,6 +731,35 @@ impl Settle {
         //    Tables are sorted by name for deterministic processing order across
         //    multiple tables (HashMap iteration order is non-deterministic).
         let result = (|| -> Result<()> {
+            // Dedup guard (FORK_ISSUES.md issue #1): reject any block at or
+            // below the current (post-fork-detection) latest. Re-ingesting an
+            // already-processed block would double reducer/MV aggregates.
+            // For real chain reorgs the caller must use handle_fork() to roll
+            // state back BEFORE feeding new-chain data — relying on ingest()'s
+            // in-line fork detection to also delete duplicate content at the
+            // fork point is not supported.
+            let post_fork_latest = self.engine.latest_block();
+            if post_fork_latest > 0 {
+                let min_input = input
+                    .data
+                    .values()
+                    .flat_map(|rows| {
+                        rows.iter().filter_map(|r| match r.get("block_number") {
+                            Some(Value::UInt64(n)) => Some(*n),
+                            _ => None,
+                        })
+                    })
+                    .min();
+                if let Some(min) = min_input
+                    && min <= post_fork_latest
+                {
+                    return Err(Error::InvalidOperation(format!(
+                        "duplicate ingest: block {min} is at or below latest_block {post_fork_latest} — \
+                         use handle_fork() for chain reorgs"
+                    )));
+                }
+            }
+
             let mut tables: Vec<(&String, &Vec<RowMap>)> = input.data.iter().collect();
             tables.sort_by_key(|(name, _)| name.as_str());
 
@@ -446,9 +797,30 @@ impl Settle {
         })();
 
         if let Err(e) = result {
-            // Rollback in-memory state to recovery_block (the fork point, or 0 for fresh DB).
-            // pending_changes is dropped — buffer stays clean.
-            let _ = self.engine.rollback(recovery_block);
+            // Rollback in-memory state to recovery_block (fork point, or 0 for
+            // fresh DB). Use the *_to_batch variant with a throwaway batch so
+            // the rollback stays in-memory only: raw rows from this ingest
+            // were never committed (they live in `write_batch`, dropped below),
+            // so storage has no `> recovery_block` rows to delete on disk.
+            // Pre-deferred-commit code path called `engine.rollback()` which
+            // does a separate `storage.commit(empty)` — if that side-commit
+            // fails (disk full / I/O error), engine state gets stuck partial
+            // while disk META still points at the old `latest_block`.
+            //
+            // Propagate the original error after attempting in-memory rollback;
+            // if the in-memory rollback itself errors (extremely rare — it
+            // mutates Rust collections), surface that as a separate
+            // `Error::Rollback` so the caller knows the instance is in a
+            // questionable state and should be dropped + reopened.
+            let mut throwaway = StorageWriteBatch::new();
+            if let Err(rollback_err) =
+                self.engine.rollback_to_batch(recovery_block, &mut throwaway)
+            {
+                return Err(Error::Rollback(format!(
+                    "ingest failed ({e}) and recovery rollback also failed ({rollback_err}); \
+                     instance state is inconsistent — drop and reopen",
+                )));
+            }
             return Err(e);
         }
 
@@ -509,20 +881,67 @@ impl Settle {
         ));
         self.engine.set_rollback_chain(&chain);
 
-        // 3. Finalize atomically
+        // 3. Finalize: populate write_batch with finalized state + meta.
+        //    Note: engine.finalize() destructively prunes in-memory snapshots
+        //    even though storage.commit() hasn't run yet. This is intentional:
+        //    on crash before ack, drop() loses in-memory state, and on reopen
+        //    `replay_unfinalized` rebuilds it from on-disk CF_REDUCER_FIN.
+        //    On commit success (in ack or heartbeat path), in-memory and disk
+        //    agree.
         self.engine
             .finalize(input.finalized_head.number, &mut write_batch);
         self.append_meta_to_batch(&mut write_batch)?;
-        self.storage.commit(&write_batch)?;
 
         // 4. Update buffer heads with correct cursors (hashes now stored)
         self.buffer
             .set_heads(self.engine.finalized_cursor(), self.engine.latest_cursor());
 
-        // 5. Flush
-        let batch = self.buffer.flush();
+        // 5. Flush. After this, buffer.next_sequence has been incremented
+        //    (if a batch was produced) — persist the post-increment value so
+        //    sequences stay monotonic across restart.
+        let batch_opt = self.buffer.flush();
+        write_batch.put_meta(
+            META_NEXT_SEQUENCE,
+            &self.buffer.next_sequence().to_be_bytes(),
+        );
 
-        Ok(batch)
+        match batch_opt {
+            None => {
+                // Heartbeat: nothing to apply downstream, so nothing to ack.
+                // Commit immediately to avoid orphaning the finalize writes
+                // (engine.finalize() already pruned in-memory snapshots).
+                // On failure, poison the instance — `engine.finalize()`'s
+                // in-memory pruning is past disk and a naive retry would
+                // re-`finalize` against the pruned state and write an empty
+                // batch, silently leaving CF_REDUCER_FIN stale.
+                if let Err(e) = self.storage.commit(&write_batch) {
+                    self.poisoned = Some(format!("heartbeat ingest commit failed: {e}"));
+                    return Err(e);
+                }
+                Ok(None)
+            }
+            Some(batch) => {
+                // Stash for ack. storage.commit is deferred.
+                self.pending = Some(PendingAck {
+                    sequence: batch.sequence,
+                    write_batch,
+                    since: Instant::now(),
+                });
+                Ok(Some(batch))
+            }
+        }
+    }
+
+    /// Returns `Err(PendingAck)` when an unacked batch is in flight, with the
+    /// pending sequence and elapsed time included. Used to gate mutating APIs.
+    fn guard_no_pending(&self) -> Result<()> {
+        if let Some(p) = &self.pending {
+            return Err(Error::PendingAck {
+                sequence: p.sequence,
+                since: p.since.elapsed(),
+            });
+        }
+        Ok(())
     }
 
     /// Append engine metadata (latest_block, finalized_block, block_hashes)

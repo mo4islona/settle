@@ -10,7 +10,7 @@ fn ingest_rejects_negative_block_number() {
         CREATE TABLE t (block_number UInt64, x Float64);
     "#;
     let mut db = Settle::open(Config::new(schema)).unwrap();
-    let result = db.ingest(IngestInput {
+    let result = ingest_input(&mut db, IngestInput {
         data: HashMap::from([(
             "t".to_string(),
             vec![HashMap::from([
@@ -39,7 +39,7 @@ fn ingest_rejects_float_block_number() {
         CREATE TABLE t (block_number UInt64, x Float64);
     "#;
     let mut db = Settle::open(Config::new(schema)).unwrap();
-    let result = db.ingest(IngestInput {
+    let result = ingest_input(&mut db, IngestInput {
         data: HashMap::from([(
             "t".to_string(),
             vec![HashMap::from([
@@ -69,7 +69,7 @@ fn partial_ingest_failure_rolls_back() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     // Successful ingest — block 1000
-    db.ingest(IngestInput {
+    ingest_input(&mut db, IngestInput {
         data: HashMap::from([(
             "swaps".to_string(),
             vec![{
@@ -90,7 +90,7 @@ fn partial_ingest_failure_rolls_back() {
     .unwrap();
 
     // Failed ingest — block 1001 has invalid block_number type
-    let err = db.ingest(IngestInput {
+    let err = ingest_input(&mut db, IngestInput {
         data: HashMap::from([(
             "swaps".to_string(),
             vec![{
@@ -108,8 +108,7 @@ fn partial_ingest_failure_rolls_back() {
     assert!(err.is_err());
 
     // Retry with valid data — should NOT double-count block 1000
-    let batch = db
-        .ingest(IngestInput {
+    let batch = ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "swaps".to_string(),
                 vec![{
@@ -159,8 +158,7 @@ fn failed_ingest_does_not_leak_changes_to_buffer() {
     let mut db = Settle::open(Config::new(schema)).unwrap();
 
     // First ingest succeeds — consumed by flush inside ingest()
-    let batch1 = db
-        .ingest(IngestInput {
+    let batch1 = ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "t".to_string(),
                 vec![HashMap::from([
@@ -181,7 +179,7 @@ fn failed_ingest_does_not_leak_changes_to_buffer() {
     assert!(batch1.is_some());
 
     // Second ingest fails — bad block_number
-    let err = db.ingest(IngestInput {
+    let err = ingest_input(&mut db, IngestInput {
         data: HashMap::from([(
             "t".to_string(),
             vec![HashMap::from([
@@ -198,8 +196,7 @@ fn failed_ingest_does_not_leak_changes_to_buffer() {
     assert!(err.is_err());
 
     // Third ingest succeeds
-    let batch3 = db
-        .ingest(IngestInput {
+    let batch3 = ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "t".to_string(),
                 vec![HashMap::from([

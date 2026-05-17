@@ -45,7 +45,7 @@ fn pnl_fn_runtime() -> crate::reducer_runtime::fn_reducer::FnReducerRuntime {
 
 fn open_with_fn_reducer() -> Settle {
     let mut db = Settle::open(Config::new(EXTERNAL_PNL_SCHEMA)).unwrap();
-    db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+    db.register_reducer_callback("pnl", Box::new(pnl_fn_runtime()))
         .unwrap();
     db
 }
@@ -260,11 +260,11 @@ fn external_reducer_crash_recovery() {
         let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
         config.storage = Some(storage.clone());
         let mut db = Settle::open(config).unwrap();
-        db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+        db.register_reducer_callback("pnl", Box::new(pnl_fn_runtime()))
             .unwrap();
 
         // Block 1000: finalized
-        db.ingest(IngestInput {
+        ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "trades".to_string(),
                 vec![{
@@ -285,7 +285,7 @@ fn external_reducer_crash_recovery() {
         .unwrap();
 
         // Block 1001: unfinalized (persisted via ingest but not finalized)
-        db.ingest(IngestInput {
+        ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "trades".to_string(),
                 vec![{
@@ -314,12 +314,11 @@ fn external_reducer_crash_recovery() {
         let mut db = Settle::open(config).unwrap();
 
         // Install callback — triggers replay of unfinalized blocks
-        db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+        db.register_reducer_callback("pnl", Box::new(pnl_fn_runtime()))
             .unwrap();
 
         // Process a new block — MV should reflect all 3 blocks
-        let batch = db
-            .ingest(IngestInput {
+        let batch = ingest_input(&mut db, IngestInput {
                 data: HashMap::from([(
                     "trades".to_string(),
                     vec![{
@@ -386,10 +385,10 @@ fn replay_reducer_catches_up_existing_external() {
         let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
         config.storage = Some(storage.clone());
         let mut db = Settle::open(config).unwrap();
-        db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+        db.register_reducer_callback("pnl", Box::new(pnl_fn_runtime()))
             .unwrap();
 
-        db.ingest(IngestInput {
+        ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "trades".to_string(),
                 vec![{
@@ -415,7 +414,7 @@ fn replay_reducer_catches_up_existing_external() {
         })
         .unwrap();
 
-        db.ingest(IngestInput {
+        ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "trades".to_string(),
                 vec![{
@@ -445,14 +444,13 @@ fn replay_reducer_catches_up_existing_external() {
         // This is what napi.rs does for existing reducers:
         // 1. Store callback (simulated by set_reducer_runtime)
         // 2. Call replay_reducer
-        db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+        db.register_reducer_callback("pnl", Box::new(pnl_fn_runtime()))
             .unwrap();
         // set_reducer_runtime already calls replay_unfinalized_for,
         // but let's also verify replay_reducer works standalone:
         // (In NAPI path, replay_reducer is called instead of set_reducer_runtime)
 
-        let batch = db
-            .ingest(IngestInput {
+        let batch = ingest_input(&mut db, IngestInput {
                 data: HashMap::from([(
                     "trades".to_string(),
                     vec![{
@@ -572,7 +570,7 @@ fn external_runtime_replay_uses_real_external_runtime() {
 
         let _ctx = install_test_context(pnl_batch_cb());
 
-        db.ingest(IngestInput {
+        ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "trades".to_string(),
                 vec![{
@@ -592,7 +590,7 @@ fn external_runtime_replay_uses_real_external_runtime() {
         })
         .unwrap();
 
-        db.ingest(IngestInput {
+        ingest_input(&mut db, IngestInput {
             data: HashMap::from([(
                 "trades".to_string(),
                 vec![{
@@ -628,8 +626,7 @@ fn external_runtime_replay_uses_real_external_runtime() {
         db.replay_reducer("pnl").unwrap();
 
         // Ingest block 1002 — MV output should incorporate all 3 blocks
-        let batch = db
-            .ingest(IngestInput {
+        let batch = ingest_input(&mut db, IngestInput {
                 data: HashMap::from([(
                     "trades".to_string(),
                     vec![{
