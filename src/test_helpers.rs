@@ -16,6 +16,29 @@ pub fn block_hash(n: BlockNumber) -> String {
     format!("0x{n:016x}")
 }
 
+/// Forwards to `Settle::ingest` and auto-acks the resulting batch (if any).
+/// Tests that intentionally exercise pending-ack semantics should call
+/// `Settle::ingest` + `Settle::ack` manually instead.
+pub fn ingest_input(
+    db: &mut Settle,
+    input: IngestInput,
+) -> Result<Option<ChangeBatch>> {
+    let batch = db.ingest(input)?;
+    if let Some(ref b) = batch {
+        db.ack(b.sequence)?;
+    }
+    Ok(batch)
+}
+
+/// Forwards to `Settle::handle_fork` and auto-acks the resulting batch (if any).
+pub fn handle_fork(db: &mut Settle, rollback_chain: Vec<BlockCursor>) -> Result<crate::db::ForkResult> {
+    let result = db.handle_fork(rollback_chain)?;
+    if let Some(ref b) = result.batch {
+        db.ack(b.sequence)?;
+    }
+    Ok(result)
+}
+
 pub fn cursor(n: BlockNumber) -> BlockCursor {
     BlockCursor {
         number: n,
@@ -25,6 +48,10 @@ pub fn cursor(n: BlockNumber) -> BlockCursor {
 
 /// Single-table, single-block ingest. The block stays unfinalized — its hash
 /// is stored so a later `rollback_to(block)` can target it.
+///
+/// Auto-acks the produced batch so subsequent reads of `latest_block` etc.
+/// reflect the just-ingested state. Tests that need to inspect uncommitted
+/// state should call `db.ingest` directly.
 pub fn ingest_one(
     db: &mut Settle,
     table: &str,
@@ -37,7 +64,7 @@ pub fn ingest_one(
 
 /// Multi-block, multi-table ingest. All ingested blocks stay unfinalized
 /// relative to the engine's current finalized head, so `rollback_to` can
-/// target any of them.
+/// target any of them. Auto-acks.
 pub fn ingest_blocks(
     db: &mut Settle,
     items: Vec<(String, BlockNumber, Vec<RowMap>)>,
@@ -46,11 +73,23 @@ pub fn ingest_blocks(
     ingest_with_finalized(db, items, finalized)
 }
 
-/// Multi-block ingest that lets the caller pick the finalized head. Every
-/// block in `items` whose number is above `finalized` is injected into
-/// `rollback_chain`, so the engine stores its hash and the block can be
-/// targeted by `rollback_to`.
+/// Multi-block ingest that lets the caller pick the finalized head. Auto-acks.
 pub fn ingest_with_finalized(
+    db: &mut Settle,
+    items: Vec<(String, BlockNumber, Vec<RowMap>)>,
+    finalized: BlockNumber,
+) -> Result<Option<ChangeBatch>> {
+    let batch = ingest_with_finalized_no_ack(db, items, finalized)?;
+    if let Some(ref b) = batch {
+        db.ack(b.sequence)?;
+    }
+    Ok(batch)
+}
+
+/// Same as `ingest_with_finalized` but does NOT call `ack`. Use when the test
+/// needs to inspect/exercise pending-ack semantics (drop without ack,
+/// duplicate-ingest-while-pending, etc.).
+pub fn ingest_with_finalized_no_ack(
     db: &mut Settle,
     items: Vec<(String, BlockNumber, Vec<RowMap>)>,
     finalized: BlockNumber,
@@ -76,7 +115,8 @@ pub fn ingest_with_finalized(
     })
 }
 
-/// Roll the engine back to `fork_point`.
+/// Roll the engine back to `fork_point`. Auto-acks any produced batch so
+/// subsequent reads see the rolled-back state.
 ///
 /// For `fork_point > 0`, calls `handle_fork(vec![cursor(fork_point)])` —
 /// the fork point must be a block whose hash was previously stored by one
@@ -93,10 +133,17 @@ pub fn rollback_to(db: &mut Settle, fork_point: BlockNumber) -> Result<ForkResul
             rollback_chain: vec![],
             finalized_head: cursor(0),
         })?;
+        if let Some(ref b) = batch {
+            db.ack(b.sequence)?;
+        }
         return Ok(ForkResult {
             cursor: cursor(0),
             batch,
         });
     }
-    db.handle_fork(vec![cursor(fork_point)])
+    let result = db.handle_fork(vec![cursor(fork_point)])?;
+    if let Some(ref b) = result.batch {
+        db.ack(b.sequence)?;
+    }
+    Ok(result)
 }

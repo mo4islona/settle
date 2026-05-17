@@ -47,19 +47,19 @@ describe('Web (WASM) Settle', () => {
   })
 
   it('creates a Settle instance', () => {
-    const db = new Settle({ schema: SCHEMA })
+    const db = Settle.open({ schema: SCHEMA })
     expect(db).toBeTruthy()
   })
 
   it('throws if Settle created before init', async () => {
     // Re-import a fresh module to simulate uninitialized state is not easily
     // possible in a single test file, so we just verify the happy path here.
-    const db = new Settle({ schema: SCHEMA })
+    const db = Settle.open({ schema: SCHEMA })
     expect(db).toBeTruthy()
   })
 
   it('ingest returns null when no rows produce changes', async () => {
-    const db = new Settle({ schema: SCHEMA })
+    const db = Settle.open({ schema: SCHEMA })
     const result = await db.ingest({
       data: {},
       finalizedHead: { number: 1, hash: '0x1' },
@@ -68,7 +68,7 @@ describe('Web (WASM) Settle', () => {
   })
 
   it('ingest returns a ChangeBatch with correct shape', async () => {
-    const db = new Settle({ schema: SCHEMA })
+    const db = Settle.open({ schema: SCHEMA })
     const batch = await db.ingest({
       data: {
         events: [
@@ -87,7 +87,7 @@ describe('Web (WASM) Settle', () => {
   })
 
   it('cursor reflects latest ingested block', async () => {
-    const db = new Settle({ schema: SCHEMA })
+    const db = Settle.open({ schema: SCHEMA })
     expect(db.cursor).toBeNull()
 
     await db.ingest({
@@ -99,49 +99,49 @@ describe('Web (WASM) Settle', () => {
   })
 
   it('pendingCount and isBackpressured reflect buffer state', async () => {
-    const db = new Settle({ schema: SCHEMA })
+    const db = Settle.open({ schema: SCHEMA })
     expect(db.pendingCount).toBe(0)
     expect(db.isBackpressured).toBe(false)
   })
 
-  it('flush returns null when buffer is empty', () => {
-    const db = new Settle({ schema: SCHEMA })
-    expect(db.flush()).toBeNull()
+  it('fresh db has no pending ack', () => {
+    const db = Settle.open({ schema: SCHEMA })
+    expect(db.isAwaitingAck).toBe(false)
   })
 
-  it('ack does not throw', async () => {
-    const db = new Settle({ schema: SCHEMA })
+  it('ack after successful ingest commits pending state', async () => {
+    const db = Settle.open({ schema: SCHEMA })
     const batch = await db.ingest({
       data: { events: [{ block_number: 1, user: 'alice', amount: 10 }] },
       finalizedHead: { number: 1, hash: '0x1' },
     })
+    expect(batch).toBeTruthy()
+    expect(db.isAwaitingAck).toBe(true)
     expect(() => db.ack(batch!.sequence)).not.toThrow()
+    expect(db.isAwaitingAck).toBe(false)
   })
 
-  it('ingest calls onChange and acks automatically', async () => {
-    const db = new Settle({ schema: SCHEMA })
-    let captured: any = null
+  it('caller applies batch then acks (no onChange callback)', async () => {
+    const db = Settle.open({ schema: SCHEMA })
 
-    await db.ingest({
+    const batch = await db.ingest({
       data: { events: [{ block_number: 1, user: 'alice', amount: 10 }] },
       finalizedHead: { number: 1, hash: '0x1' },
-      onChange: async (batch) => {
-        captured = batch
-      },
     })
 
-    expect(captured).toBeTruthy()
-    expect(captured.tables.events).toHaveLength(1)
+    expect(batch).toBeTruthy()
+    expect(batch!.tables.events).toHaveLength(1)
+    db.ack(batch!.sequence)
   })
 
   it('resolveForkCursor returns null when no match', () => {
-    const db = new Settle({ schema: SCHEMA })
+    const db = Settle.open({ schema: SCHEMA })
     const cursor = db.resolveForkCursor([{ number: 999, hash: '0xdead' }])
     expect(cursor).toBeNull()
   })
 
   it('resolveForkCursor finds common ancestor', async () => {
-    const db = new Settle({ schema: SCHEMA })
+    const db = Settle.open({ schema: SCHEMA })
 
     await db.ingest({
       data: { events: [{ block_number: 1, user: 'alice', amount: 1 }] },
@@ -162,19 +162,15 @@ describe('Web (WASM) Settle', () => {
     expect(cursor).toEqual({ number: 2, hash: '0x2' })
   })
 
-  it('registerReducer and ingest with external reducer', async () => {
-    const db = new Settle({ schema: SCHEMA + EXTERNAL_REDUCER_SCHEMA })
+  it('registerReducerCallback and ingest with external reducer', async () => {
+    const db = Settle.open({ schema: SCHEMA + EXTERNAL_REDUCER_SCHEMA })
 
-    db.registerReducer<{ total: number }>({
-      name: 'totals',
-      source: 'events',
-      groupBy: ['user'],
-      state: [{ name: 'total', columnType: 'Float64', defaultValue: '0' }],
-      reduce(state, row) {
-        const newTotal = state.total + row.amount
-        state.update({ total: newTotal })
-        state.emit({ running_total: newTotal })
-      },
+    // Reducer is declared in SQL with LANGUAGE EXTERNAL — attach the JS
+    // callback through `registerReducerCallback` (the strict API).
+    db.registerReducerCallback<{ total: number }>('totals', (state, row: any) => {
+      const newTotal = state.total + row.amount
+      state.update({ total: newTotal })
+      state.emit({ running_total: newTotal })
     })
 
     const batch = await db.ingest({

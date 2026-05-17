@@ -20,7 +20,10 @@ export interface SettleConfig {
   disableCompaction?: boolean
   /**
    * Block cache size in bytes. Omit for RocksDB default (~8MB per CF), 0 to disable.
-   * Supports values up to i64::MAX (~9.2 EB). Negative values are rejected.
+   * Capped at the target's `usize::MAX` (≈18 EB on 64-bit, ≈4 GB on 32-bit);
+   * values above that are rejected. JS `number` precision is exact only up to
+   * `2^53` (≈9 PB), so larger values cannot be passed reliably from JS anyway.
+   * Negative values are rejected.
    */
   cacheSize?: number
 }
@@ -65,14 +68,29 @@ export declare class Settle {
   /** Open a new Settle instance. */
   static open(config: SettleConfig): Settle
   /**
-   * Register an external reducer with a JS batch callback.
+   * Register a brand-new external reducer + JS batch callback.
+   *
+   * **Strict semantics**: errors if a reducer with this name already
+   * exists (whether declared in SQL via `LANGUAGE EXTERNAL` or registered
+   * via a prior call). To attach a callback to a reducer that was
+   * declared in SQL, use `registerReducerCallback(name, callback)`.
+   * To change a callback after it's registered, drop and reopen the
+   * instance — silent hot-reload is not supported.
    *
    * The callback receives an array of `{ state, rows }` groups and must
    * return an array of `{ state, emits }` results (same length, same order).
-   *
-   * Must be called before any `processBatch` or `ingest` calls.
    */
   registerReducer(config: ExternalReducerConfig, callback: (...args: any[]) => any): void
+  /**
+   * Attach a JS callback to an existing reducer that was declared in
+   * SQL with `LANGUAGE EXTERNAL`, and re-replay unfinalized blocks
+   * through it.
+   *
+   * **Strict semantics**: errors if no reducer named `name` exists,
+   * AND errors if a callback is already registered for that name. To
+   * change a registered callback, drop and reopen the instance.
+   */
+  registerReducerCallback(name: string, callback: (...args: any[]) => any): void
   /**
    * Process a batch of rows for a raw table.
    * Atomic ingest: process all tables, store rollback chain, finalize, flush.
@@ -96,16 +114,37 @@ export declare class Settle {
    */
   handleFork(previousBlocks: Array<SettleCursor>): ForkResultJs
   /**
-   * Flush buffered changes into a msgpack-encoded batch.
-   * Returns null if no pending records.
+   * Acknowledge the pending batch by sequence number and durably commit
+   * its writes. `sequence` is passed as `i64` — the JS-side accepts a
+   * non-negative integer up to `Number.MAX_SAFE_INTEGER` (2^53), well
+   * below `i64::MAX`; the TS wrapper rejects fractional / out-of-range
+   * values before they reach this boundary.
+   *
+   * Returns the typed errors `SettlePendingAckError` / `SettleWrongAckSequenceError`
+   * via the structured-reason prefix protocol; the TS wrapper rethrows them
+   * as typed classes.
    */
-  flush(): Buffer | null
-  /** Acknowledge a flushed batch by sequence number. */
   ack(sequence: number): void
-  /** Number of pending (unflushed) change records. */
+  /**
+   * Number of pending (unflushed) change records in the buffer. Does NOT
+   * reflect the pending-ack slot — see `isAwaitingAck` for that.
+   */
   get pendingCount(): number
   /** Whether backpressure should be applied. */
   get isBackpressured(): boolean
+  /**
+   * Whether a previously-returned `ChangeBatch` is still awaiting `ack()`.
+   * While true, mutating APIs (`ingest`, `handleFork`, `registerReducer`)
+   * throw `SettlePendingAckError`.
+   */
+  get isAwaitingAck(): boolean
+  /**
+   * Whether an unrecoverable commit failure has poisoned this instance.
+   * Once true the only recovery is to drop the instance and reopen — all
+   * mutating calls reject with `Error("instance poisoned ...")` so the
+   * caller does not silently produce stale writes.
+   */
+  get isPoisoned(): boolean
   /** Current cursor: latest processed block + hash. Null if no blocks processed. */
   get cursor(): SettleCursor | null
 }

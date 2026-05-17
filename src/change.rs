@@ -138,10 +138,18 @@ impl ChangeBuffer {
         })
     }
 
-    /// Acknowledge a batch (currently a no-op; future: track acked sequences).
-    pub fn ack(&mut self, _sequence: u64) {
-        // In a full implementation, this would track which sequences have been
-        // acknowledged by the downstream target to enable retry/resume.
+    /// Acknowledge a batch (no-op at the buffer level; durability is handled by Settle).
+    pub fn ack(&mut self, _sequence: u64) {}
+
+    /// Next sequence number that will be assigned to the next produced ChangeBatch.
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    /// Restore the next sequence number (used on open() to maintain monotonic
+    /// sequence across restart from persisted META_NEXT_SEQUENCE).
+    pub fn set_next_sequence(&mut self, v: u64) {
+        self.next_sequence = v;
     }
 }
 

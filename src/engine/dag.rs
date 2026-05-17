@@ -289,6 +289,20 @@ impl SettleEngine {
         self.reducers.contains_key(name) || self.branch_index.contains_key(name)
     }
 
+    /// Whether the named reducer's `ReducerDef::body` is `External` —
+    /// i.e. callable from a host-language callback. Returns false for
+    /// `Lua` / `EventRules` reducers (which have their own embedded
+    /// runtime and ignore any host-side callback), and for unknown names.
+    pub fn reducer_is_external(&self, name: &str) -> bool {
+        if let Some(idx) = self.branch_index.get(name) {
+            self.branches[*idx].reducer.is_external()
+        } else if let Some(r) = self.reducers.get(name) {
+            r.is_external()
+        } else {
+            false
+        }
+    }
+
     /// Replace the runtime for a named reducer (used for External/FnReducer injection).
     /// Searches both branches and the reducers HashMap.
     pub fn set_reducer_runtime(
@@ -639,6 +653,71 @@ impl SettleEngine {
 
     /// Replay only a specific reducer and its direct downstream MVs.
     /// Note: only 1 level of MV depth (MV→MV chaining is not supported).
+    /// Reset the named reducer and its downstream MVs to their in-memory
+    /// state at `fork_point` (typically `finalized_block`). Called before
+    /// `replay_unfinalized_for` so the replay rebuilds state from a clean
+    /// baseline instead of accumulating on top of already-processed blocks.
+    ///
+    /// Without this reset, calling `replay_reducer` (or `set_reducer_runtime`)
+    /// after the reducer has already processed unfinalized blocks would
+    /// double-count: every emit fires twice, every aggregation tracks two
+    /// contributions per block.
+    ///
+    /// Does NOT touch raw-table storage — this is a pure in-memory reset of
+    /// the reducer + downstream MV state.
+    pub fn reset_reducer_branch_for_replay(
+        &mut self,
+        reducer_name: &str,
+        fork_point: BlockNumber,
+    ) -> Result<()> {
+        // Reset the reducer itself (covers both branch-hosted and HashMap-hosted).
+        if let Some(idx) = self.branch_index.get(reducer_name).copied() {
+            self.branches[idx].reducer.rollback(fork_point)?;
+        } else if let Some(reducer) = self.reducers.get_mut(reducer_name) {
+            reducer.rollback(fork_point)?;
+        } else {
+            return Err(Error::InvalidOperation(format!(
+                "reset_reducer_branch_for_replay: unknown reducer '{reducer_name}'"
+            )));
+        }
+
+        // Reset MVs that source from this reducer. `mv.rollback` returns
+        // compensating change records, which we discard — replay will
+        // re-emit them via `process_block`.
+        let mv_names: Vec<String> = self
+            .pipeline
+            .iter()
+            .filter_map(|node| {
+                if let PipelineNode::MV(name) = node {
+                    let source = if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
+                        self.branches[bi].mv_entries[mi].1.source().to_string()
+                    } else if let Some(mv) = self.mvs.get(name) {
+                        mv.source().to_string()
+                    } else {
+                        return None;
+                    };
+                    if source == reducer_name {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for name in &mv_names {
+            if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
+                let _ = self.branches[bi].mv_entries[mi].1.rollback(fork_point);
+            } else if let Some(mv) = self.mvs.get_mut(name) {
+                let _ = mv.rollback(fork_point);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn replay_unfinalized_for(
         &mut self,
         from_block: BlockNumber,
@@ -820,6 +899,15 @@ impl SettleEngine {
         fork_point: BlockNumber,
         mut write_batch: Option<&mut StorageWriteBatch>,
     ) -> Result<Vec<ChangeRecord>> {
+        // Guard: fork_point cannot raise latest_block. If the caller passes
+        // a fork point above current latest (e.g. via stale future hashes that
+        // somehow leaked into block_hashes), do nothing — no rollback work to
+        // perform and latest_block must not advance without underlying data.
+        let current_latest = self.latest_block.unwrap_or(0);
+        if fork_point > current_latest {
+            return Ok(Vec::new());
+        }
+
         let mut all_changes = Vec::new();
 
         // Roll back in reverse pipeline order
@@ -897,9 +985,23 @@ impl SettleEngine {
 
         self.finalized_block = block;
 
-        // Remove hashes for blocks below finalized (keep finalized itself as anchor)
+        // Remove hashes for blocks below finalized (keep finalized itself as
+        // anchor). On gappy chains (Solana-style) `latest_block` may be
+        // BELOW `finalized` — the caller knows finality out-of-band for a
+        // block whose data they haven't ingested. In that case the plain
+        // split_off would drop `latest_block`'s hash too, leaving
+        // `latest_cursor()` returning an empty hash. Preserve it explicitly.
+        let preserve_latest = self
+            .latest_block
+            .filter(|&latest| latest < block)
+            .and_then(|latest| self.block_hashes.get(&latest).map(|h| (latest, h.clone())));
+
         let old_hashes = self.block_hashes.split_off(&block);
         self.block_hashes = old_hashes;
+
+        if let Some((latest, hash)) = preserve_latest {
+            self.block_hashes.insert(latest, hash);
+        }
     }
 
     /// Create a ChangeBatch from a set of change records.
@@ -971,11 +1073,40 @@ impl SettleEngine {
 
     /// Find the highest block in `previous_blocks` whose hash matches
     /// our stored hash. Returns the common ancestor as a BlockCursor.
+    ///
+    /// May return a cursor with `number > latest_block` when the caller has
+    /// stored future hashes via `set_rollback_chain` (e.g. Solana-style
+    /// chains where finality is known out-of-band for blocks we haven't
+    /// ingested data for). For rollback purposes use
+    /// `resolve_fork_cursor_bounded` which clamps to `latest_block`.
     pub fn resolve_fork_cursor(
         &self,
         previous_blocks: &[(BlockNumber, &str)],
     ) -> Option<BlockCursor> {
         for &(number, hash) in previous_blocks {
+            if self.block_hashes.get(&number).map(|h| h.as_str()) == Some(hash) {
+                return Some(BlockCursor {
+                    number,
+                    hash: hash.to_string(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Like `resolve_fork_cursor` but skips matches with `number > latest_block`.
+    /// Used by `handle_fork` so a stale future hash (e.g. one left behind by
+    /// a prior rollback that then heartbeat-committed the rollback_chain)
+    /// can't silently advance the cursor past blocks we have no data for.
+    pub fn resolve_fork_cursor_bounded(
+        &self,
+        previous_blocks: &[(BlockNumber, &str)],
+    ) -> Option<BlockCursor> {
+        let latest = self.latest_block.unwrap_or(0);
+        for &(number, hash) in previous_blocks {
+            if number > latest {
+                continue;
+            }
             if self.block_hashes.get(&number).map(|h| h.as_str()) == Some(hash) {
                 return Some(BlockCursor {
                     number,

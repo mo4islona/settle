@@ -2,7 +2,9 @@
 // reachable from integration tests under `tests/` and benches under `benches/`.
 // Re-export them here so the unit tests under `db::` keep their existing
 // `use super::test_helpers::*;` import without further plumbing.
-pub use crate::test_helpers::{ingest_blocks, ingest_one, ingest_with_finalized, rollback_to};
+pub use crate::test_helpers::{
+    handle_fork, ingest_blocks, ingest_input, ingest_one, ingest_with_finalized, rollback_to,
+};
 
 use crate::types::{RowMap, Value};
 use std::collections::HashMap;

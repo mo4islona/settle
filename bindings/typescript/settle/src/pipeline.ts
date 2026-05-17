@@ -7,7 +7,57 @@ import {
   type ViewOptions,
   viewToSql,
 } from './ddl'
-import { Settle, type StateFieldDef } from './settle'
+import { Settle, type ExternalReducerOptions, type ISettle, type SettleConfig, type StateFieldDef } from './settle'
+
+export interface CompiledReducer {
+  name: string
+  source: string
+  groupBy: string[]
+  stateFields: StateFieldDef[]
+  reduce: (state: any, row: any) => void
+}
+
+export interface CompiledPipeline {
+  schema: string
+  reducers: CompiledReducer[]
+}
+
+export interface BuildOptions {
+  dataDir?: string
+  maxBufferSize?: number
+  compression?: 'none' | 'snappy' | 'zstd' | 'lz4'
+  disableCompaction?: boolean
+  cacheSize?: number
+}
+
+/**
+ * Open a Settle instance from a `CompiledPipeline` and register every
+ * reducer's reduce-callback. Accepts any `ISettle` constructor — Node, Web,
+ * or a test double. The schema/dataDir/etc. are forwarded as `SettleConfig`.
+ */
+export function openCompiled<S extends ISettle>(
+  Settle: { open(config: SettleConfig): S },
+  compiled: CompiledPipeline,
+  opts?: BuildOptions,
+): S {
+  const dataDir = opts?.dataDir === ':memory:' ? undefined : opts?.dataDir
+  const db = Settle.open({
+    schema: compiled.schema,
+    dataDir,
+    maxBufferSize: opts?.maxBufferSize,
+    compression: opts?.compression,
+    disableCompaction: opts?.disableCompaction,
+    cacheSize: opts?.cacheSize,
+  })
+  for (const r of compiled.reducers) {
+    // Reducer was declared in SQL above (via `reducerToSql` → `LANGUAGE
+    // EXTERNAL`), so attach the JS callback to that existing slot rather
+    // than calling `registerReducer` (which is strict — errors on the
+    // already-declared name).
+    db.registerReducerCallback(r.name, r.reduce)
+  }
+  return db
+}
 
 // ─── Internal types ──────────────────────────────────────────────
 
@@ -65,7 +115,12 @@ export class Pipeline {
     return new ViewHandle(name)
   }
 
-  build(opts?: { dataDir?: string; maxBufferSize?: number }): Settle {
+  /**
+   * Produce DDL + reducer specs without touching any Settle implementation.
+   * Use this to drive a Settle instance from an environment-specific runtime
+   * (e.g. the WASM Settle in the browser).
+   */
+  compile(): CompiledPipeline {
     const ddl: string[] = []
     for (const t of this.#tables) {
       ddl.push(tableToSql(t.name, t.columns, t.virtual))
@@ -76,27 +131,20 @@ export class Pipeline {
     for (const v of this.#views) {
       ddl.push(v.sql)
     }
-
-    // ':memory:' (or omitted) uses in-memory storage — same convention as SQLite
-    const dataDir = opts?.dataDir === ':memory:' ? undefined : opts?.dataDir
-
-    const db = Settle.open({
+    return {
       schema: ddl.join('\n'),
-      dataDir,
-      maxBufferSize: opts?.maxBufferSize,
-    })
-
-    for (const r of this.#reducers) {
-      db.registerReducer({
+      reducers: this.#reducers.map((r) => ({
         name: r.name,
         source: r.source,
         groupBy: r.groupBy,
-        state: r.stateFields,
+        stateFields: r.stateFields,
         reduce: r.reduce,
-      })
+      })),
     }
+  }
 
-    return db
+  build(opts?: BuildOptions): Settle {
+    return openCompiled(Settle, this.compile(), opts)
   }
 }
 

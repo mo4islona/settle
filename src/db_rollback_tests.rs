@@ -348,7 +348,7 @@ fn crash_recovery_replays_unfinalized_blocks() {
         ))
         .unwrap();
 
-        db.ingest(IngestInput {
+        ingest_input(&mut db, IngestInput {
             data: std::collections::HashMap::from([(
                 "trades".to_string(),
                 vec![
@@ -453,7 +453,7 @@ fn crash_recovery_replays_unfinalized_blocks() {
 fn resolve_fork_cursor_finds_common_ancestor() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    db.ingest(IngestInput {
+    ingest_input(&mut db, IngestInput {
         data: std::collections::HashMap::from([(
             "swaps".to_string(),
             vec![
@@ -509,7 +509,7 @@ fn ingest_auto_rollback_on_fork() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     // Ingest blocks 1 and 2. Block 2 is unfinalized (finalizedHead = 1).
-    db.ingest(IngestInput {
+    ingest_input(&mut db, IngestInput {
         data: std::collections::HashMap::from([(
             "swaps".to_string(),
             vec![
@@ -546,8 +546,7 @@ fn ingest_auto_rollback_on_fork() {
 
     // Rollback: send ingest with rollback_chain that omits block 2.
     // ingest() must detect the fork and roll back to block 1.
-    let batch = db
-        .ingest(IngestInput {
+    let batch = ingest_input(&mut db, IngestInput {
             data: std::collections::HashMap::new(),
             rollback_chain: vec![BlockCursor {
                 number: 1,
@@ -584,7 +583,7 @@ fn ingest_auto_rollback_full_when_no_common_ancestor() {
     // rollback to block 0 and processes fresh data.
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-    db.ingest(IngestInput {
+    ingest_input(&mut db, IngestInput {
         data: std::collections::HashMap::from([(
             "swaps".to_string(),
             vec![{
@@ -607,8 +606,7 @@ fn ingest_auto_rollback_full_when_no_common_ancestor() {
     assert_eq!(db.latest_block(), 1);
 
     // New chain has completely different hashes — no common ancestor
-    let batch = db
-        .ingest(IngestInput {
+    let batch = ingest_input(&mut db, IngestInput {
             data: std::collections::HashMap::from([(
                 "swaps".to_string(),
                 vec![{
@@ -646,7 +644,7 @@ fn ingest_fork_detection_robust_against_asc_rollback_chain() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     // Ingest blocks 1, 2, 3. Block 3 is unfinalized.
-    db.ingest(IngestInput {
+    ingest_input(&mut db, IngestInput {
         data: std::collections::HashMap::from([(
             "swaps".to_string(),
             vec![
@@ -692,8 +690,7 @@ fn ingest_fork_detection_robust_against_asc_rollback_chain() {
 
     // Second ingest: SAME chain but rollbackChain sent in ASCENDING order.
     // No fork has occurred — ingest() must NOT roll back anything.
-    let batch = db
-        .ingest(IngestInput {
+    let batch = ingest_input(&mut db, IngestInput {
             data: std::collections::HashMap::new(),
             rollback_chain: vec![
                 // ASC order — oldest first (wrong but must be tolerated)
@@ -732,7 +729,7 @@ fn ingest_no_spurious_rollback_on_multi_batch_advance() {
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     // Batch 1: blocks 1-3 (finalized=1, unfinalized=2,3)
-    db.ingest(IngestInput {
+    ingest_input(&mut db, IngestInput {
         data: std::collections::HashMap::from([(
             "swaps".to_string(),
             vec![
@@ -776,8 +773,7 @@ fn ingest_no_spurious_rollback_on_multi_batch_advance() {
     // block_hashes already has {1,2,3} from batch 1.
     // Without the "advancing" guard, resolve_fork_cursor would find block 1
     // (finalized anchor) and falsely rollback to 1.
-    let batch = db
-        .ingest(IngestInput {
+    let batch = ingest_input(&mut db, IngestInput {
             data: std::collections::HashMap::from([(
                 "swaps".to_string(),
                 vec![

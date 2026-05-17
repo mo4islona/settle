@@ -5,11 +5,29 @@ use napi::bindgen_prelude::*;
 use napi::sys;
 use napi_derive::napi;
 
-use crate::db::{Config, Settle as Inner, IngestInput as IngestInputInner};
+use crate::db::{Config, IngestInput as IngestInputInner, Settle as Inner};
+use crate::error::Error as SettleError;
 use crate::msgpack_conv::{decode_data_from_msgpack, encode_batch_to_msgpack};
 use crate::reducer_runtime::external::install_context;
 use crate::schema::ast::{ReducerBody, ReducerDef, StateField};
 use crate::types::{BlockCursor, ColumnType};
+
+/// Convert a `SettleError` to a NAPI error. Typed variants (`PendingAck`,
+/// `WrongAckSequence`) are surfaced with a structured prefix that the TS
+/// wrapper recognizes and rethrows as a typed JS class. Other variants stay
+/// as plain `GenericFailure` with the error display string.
+fn settle_err_to_napi(e: SettleError) -> napi::Error {
+    match e {
+        SettleError::PendingAck { sequence, since } => napi::Error::from_reason(format!(
+            "__SETTLE_PENDING_ACK__ sequence={sequence} since_ms={}",
+            since.as_millis()
+        )),
+        SettleError::WrongAckSequence { expected, got } => napi::Error::from_reason(format!(
+            "__SETTLE_WRONG_ACK_SEQUENCE__ expected={expected} got={got}"
+        )),
+        other => napi::Error::new(Status::GenericFailure, format!("{other}")),
+    }
+}
 
 /// Configuration for opening a Settle instance.
 #[napi(object)]
@@ -94,9 +112,23 @@ pub struct Settle {
     inner: Inner,
     /// Stored raw napi_ref handles for external reducer callbacks (prevent GC).
     external_callbacks: HashMap<String, sys::napi_ref>,
-    /// Raw napi_env for cleanup on drop.
-    #[allow(dead_code)]
+    /// Raw napi_env, captured at open() for callback-ref cleanup on Drop.
     raw_env: sys::napi_env,
+}
+
+impl Drop for Settle {
+    fn drop(&mut self) {
+        // Release the strong references we created in `register_reducer` so
+        // the underlying JS callbacks become eligible for GC. Without this
+        // every registered reducer permanently roots its callback —
+        // a leak that compounds for long-lived processes that open
+        // multiple `Settle` instances over their lifetime.
+        for (_name, raw_ref) in self.external_callbacks.drain() {
+            unsafe {
+                sys::napi_delete_reference(self.raw_env, raw_ref);
+            }
+        }
+    }
 }
 
 #[napi]
@@ -144,12 +176,17 @@ impl Settle {
         })
     }
 
-    /// Register an external reducer with a JS batch callback.
+    /// Register a brand-new external reducer + JS batch callback.
+    ///
+    /// **Strict semantics**: errors if a reducer with this name already
+    /// exists (whether declared in SQL via `LANGUAGE EXTERNAL` or registered
+    /// via a prior call). To attach a callback to a reducer that was
+    /// declared in SQL, use `registerReducerCallback(name, callback)`.
+    /// To change a callback after it's registered, drop and reopen the
+    /// instance — silent hot-reload is not supported.
     ///
     /// The callback receives an array of `{ state, rows }` groups and must
     /// return an array of `{ state, emits }` results (same length, same order).
-    ///
-    /// Must be called before any `processBatch` or `ingest` calls.
     #[napi]
     pub fn register_reducer(
         &mut self,
@@ -157,7 +194,32 @@ impl Settle {
         config: ExternalReducerConfig,
         callback: JsFunction,
     ) -> Result<()> {
-        // Create a raw napi_ref to prevent GC of the callback
+        // Strict: a reducer with this name must NOT already exist (in SQL
+        // or registered previously). If it does, the caller probably meant
+        // `registerReducerCallback` (attach callback to existing SQL slot).
+        if self.inner.has_reducer(&config.name) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "registerReducer: reducer '{}' already exists — \
+                     use registerReducerCallback to attach a callback to a \
+                     SQL-declared external reducer, or drop and reopen the \
+                     instance to change a previously-registered callback",
+                    config.name,
+                ),
+            ));
+        }
+        if self.external_callbacks.contains_key(&config.name) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "registerReducer: callback for '{}' is already registered",
+                    config.name,
+                ),
+            ));
+        }
+
+        // Create the raw napi_ref protecting the JS callback from GC.
         let mut raw_ref: sys::napi_ref = std::ptr::null_mut();
         let status =
             unsafe { sys::napi_create_reference(env.raw(), callback.raw(), 1, &mut raw_ref) };
@@ -169,45 +231,105 @@ impl Settle {
         }
         self.external_callbacks.insert(config.name.clone(), raw_ref);
 
-        // If the reducer already exists in the engine (defined via SQL with
-        // LANGUAGE EXTERNAL), we only need to store the callback — the
-        // ExternalRuntime will pick it up from the thread-local context.
-        // Then replay unfinalized blocks (skipped during open() because
-        // no JS context existed at that point).
-        if self.inner.has_reducer(&config.name) {
-            // Install JS context for the replay call
-            let _guard = install_context(env, &self.external_callbacks);
-            self.inner
-                .replay_reducer(&config.name)
-                .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
-        } else {
-            let state_fields: Vec<StateField> = config
-                .state
-                .into_iter()
-                .map(|f| {
-                    let column_type = parse_column_type(&f.column_type);
-                    StateField {
-                        name: f.name,
-                        column_type,
-                        default: f.default_value,
-                    }
-                })
-                .collect();
+        let state_fields: Vec<StateField> = config
+            .state
+            .into_iter()
+            .map(|f| {
+                let column_type = parse_column_type(&f.column_type);
+                StateField {
+                    name: f.name,
+                    column_type,
+                    default: f.default_value,
+                }
+            })
+            .collect();
 
-            let def = ReducerDef {
-                name: config.name.clone(),
-                source: config.source,
-                group_by: config.group_by,
-                state: state_fields,
-                body: ReducerBody::External { id: config.name },
-                requires: vec![],
-            };
+        let def = ReducerDef {
+            name: config.name.clone(),
+            source: config.source,
+            group_by: config.group_by,
+            state: state_fields,
+            body: ReducerBody::External {
+                id: config.name.clone(),
+            },
+            requires: vec![],
+        };
 
-            // Install JS context for the replay inside register_reducer
-            let _guard = install_context(env, &self.external_callbacks);
-            self.inner
-                .register_reducer(def)
-                .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
+        let _guard = install_context(env, &self.external_callbacks);
+        if let Err(e) = self.inner.register_reducer(def).map_err(settle_err_to_napi) {
+            // Strict roll-back: there was no previous callback (we checked
+            // above), so we just remove what we just inserted.
+            self.external_callbacks.remove(&config.name);
+            unsafe {
+                sys::napi_delete_reference(env.raw(), raw_ref);
+            }
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Attach a JS callback to an existing reducer that was declared in
+    /// SQL with `LANGUAGE EXTERNAL`, and re-replay unfinalized blocks
+    /// through it.
+    ///
+    /// **Strict semantics**: errors if no reducer named `name` exists,
+    /// AND errors if a callback is already registered for that name. To
+    /// change a registered callback, drop and reopen the instance.
+    #[napi]
+    pub fn register_reducer_callback(
+        &mut self,
+        env: Env,
+        name: String,
+        callback: JsFunction,
+    ) -> Result<()> {
+        if !self.inner.has_reducer(&name) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "registerReducerCallback: no reducer named '{name}' — \
+                     use registerReducer to create a brand-new reducer",
+                ),
+            ));
+        }
+        if !self.inner.reducer_is_external(&name) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "registerReducerCallback: reducer '{name}' is not declared \
+                     LANGUAGE EXTERNAL — Lua and EventRules reducers have their \
+                     own embedded runtime and ignore host callbacks",
+                ),
+            ));
+        }
+        if self.external_callbacks.contains_key(&name) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "registerReducerCallback: callback for '{name}' is already \
+                     registered — drop and reopen the instance to change it",
+                ),
+            ));
+        }
+
+        let mut raw_ref: sys::napi_ref = std::ptr::null_mut();
+        let status =
+            unsafe { sys::napi_create_reference(env.raw(), callback.raw(), 1, &mut raw_ref) };
+        if status != sys::Status::napi_ok {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "failed to create callback reference",
+            ));
+        }
+        self.external_callbacks.insert(name.clone(), raw_ref);
+
+        let _guard = install_context(env, &self.external_callbacks);
+        if let Err(e) = self.inner.replay_reducer(&name).map_err(settle_err_to_napi) {
+            self.external_callbacks.remove(&name);
+            unsafe {
+                sys::napi_delete_reference(env.raw(), raw_ref);
+            }
+            return Err(e);
         }
 
         Ok(())
@@ -250,10 +372,7 @@ impl Settle {
             None
         };
 
-        let batch = self
-            .inner
-            .ingest(ingest_input)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
+        let batch = self.inner.ingest(ingest_input).map_err(settle_err_to_napi)?;
 
         Ok(batch.map(|b| Buffer::from(encode_batch_to_msgpack(&b))))
     }
@@ -298,10 +417,7 @@ impl Settle {
             })
             .collect();
 
-        let result = self
-            .inner
-            .handle_fork(chain)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let result = self.inner.handle_fork(chain).map_err(settle_err_to_napi)?;
 
         let batch = result
             .batch
@@ -313,22 +429,30 @@ impl Settle {
         })
     }
 
-    /// Flush buffered changes into a msgpack-encoded batch.
-    /// Returns null if no pending records.
+    /// Acknowledge the pending batch by sequence number and durably commit
+    /// its writes. `sequence` is passed as `i64` — the JS-side accepts a
+    /// non-negative integer up to `Number.MAX_SAFE_INTEGER` (2^53), well
+    /// below `i64::MAX`; the TS wrapper rejects fractional / out-of-range
+    /// values before they reach this boundary.
+    ///
+    /// Returns the typed errors `SettlePendingAckError` / `SettleWrongAckSequenceError`
+    /// via the structured-reason prefix protocol; the TS wrapper rethrows them
+    /// as typed classes.
     #[napi]
-    pub fn flush(&mut self) -> Option<Buffer> {
+    pub fn ack(&mut self, sequence: i64) -> napi::Result<()> {
+        if sequence < 0 {
+            return Err(napi::Error::new(
+                Status::InvalidArg,
+                "ack sequence must be non-negative",
+            ));
+        }
         self.inner
-            .flush()
-            .map(|b| Buffer::from(encode_batch_to_msgpack(&b)))
+            .ack(sequence as u64)
+            .map_err(settle_err_to_napi)
     }
 
-    /// Acknowledge a flushed batch by sequence number.
-    #[napi]
-    pub fn ack(&mut self, sequence: u32) {
-        self.inner.ack(sequence as u64);
-    }
-
-    /// Number of pending (unflushed) change records.
+    /// Number of pending (unflushed) change records in the buffer. Does NOT
+    /// reflect the pending-ack slot — see `isAwaitingAck` for that.
     #[napi(getter)]
     pub fn pending_count(&self) -> u32 {
         self.inner.pending_count() as u32
@@ -338,6 +462,23 @@ impl Settle {
     #[napi(getter)]
     pub fn is_backpressured(&self) -> bool {
         self.inner.is_backpressured()
+    }
+
+    /// Whether a previously-returned `ChangeBatch` is still awaiting `ack()`.
+    /// While true, mutating APIs (`ingest`, `handleFork`, `registerReducer`)
+    /// throw `SettlePendingAckError`.
+    #[napi(getter)]
+    pub fn is_awaiting_ack(&self) -> bool {
+        self.inner.is_awaiting_ack()
+    }
+
+    /// Whether an unrecoverable commit failure has poisoned this instance.
+    /// Once true the only recovery is to drop the instance and reopen — all
+    /// mutating calls reject with `Error("instance poisoned ...")` so the
+    /// caller does not silently produce stale writes.
+    #[napi(getter)]
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
     }
 
     /// Current cursor: latest processed block + hash. Null if no blocks processed.

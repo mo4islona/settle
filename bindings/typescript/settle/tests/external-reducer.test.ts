@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { ingestAndAck } from "./util"
 import { Settle } from '../src/index'
 
 const TABLE_SCHEMA = `
@@ -68,35 +69,29 @@ interface PnlState {
 }
 
 function registerPnlReducer(db: Settle) {
-  db.registerReducer<PnlState>({
-    name: 'pnl',
-    source: 'trades',
-    groupBy: ['user'],
-    state: [
-      { name: 'quantity', columnType: 'Float64', defaultValue: '0' },
-      { name: 'cost_basis', columnType: 'Float64', defaultValue: '0' },
-    ],
-    reduce(state, row) {
-      if (row.side === 'buy') {
-        const newState = {
-          quantity: state.quantity + row.amount,
-          cost_basis: state.cost_basis + row.amount * row.price,
-        }
-        state.update(newState)
-        state.emit({ trade_pnl: 0, position_size: newState.quantity })
-      } else {
-        const avgCost = state.cost_basis / state.quantity
-        const newState = {
-          quantity: state.quantity - row.amount,
-          cost_basis: state.cost_basis - row.amount * avgCost,
-        }
-        state.update(newState)
-        state.emit({
-          trade_pnl: row.amount * (row.price - avgCost),
-          position_size: newState.quantity,
-        })
+  // `pnl` is declared in SQL via `LANGUAGE EXTERNAL` — attach the callback
+  // through `registerReducerCallback`, not `registerReducer` (which is
+  // strict and errors on a name that already exists).
+  db.registerReducerCallback<PnlState>('pnl', (state, row: any) => {
+    if (row.side === 'buy') {
+      const newState = {
+        quantity: state.quantity + row.amount,
+        cost_basis: state.cost_basis + row.amount * row.price,
       }
-    },
+      state.update(newState)
+      state.emit({ trade_pnl: 0, position_size: newState.quantity })
+    } else {
+      const avgCost = state.cost_basis / state.quantity
+      const newState = {
+        quantity: state.quantity - row.amount,
+        cost_basis: state.cost_basis - row.amount * avgCost,
+      }
+      state.update(newState)
+      state.emit({
+        trade_pnl: row.amount * (row.price - avgCost),
+        position_size: newState.quantity,
+      })
+    }
   })
 }
 
@@ -104,7 +99,7 @@ describe('External Reducer', () => {
   it('produces same MV output as Lua for PnL workload', async () => {
     // Lua version
     const luaDb = Settle.open({ schema: TABLE_SCHEMA + LUA_REDUCER + MV_SCHEMA })
-    const luaBatch = await luaDb.ingest({
+    const luaBatch = await ingestAndAck(luaDb, {
       data: {
         trades: [
           { block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000 },
@@ -119,7 +114,7 @@ describe('External Reducer', () => {
     // External version
     const extDb = Settle.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
     registerPnlReducer(extDb)
-    const extBatch = await extDb.ingest({
+    const extBatch = await ingestAndAck(extDb, {
       data: {
         trades: [
           { block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000 },
@@ -147,7 +142,7 @@ describe('External Reducer', () => {
     const db = Settle.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA })
     registerPnlReducer(db)
 
-    const batch = await db.ingest({
+    const batch = await ingestAndAck(db, {
       data: {
         trades: [
           { block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000 },
@@ -174,7 +169,7 @@ describe('External Reducer', () => {
     registerPnlReducer(db)
 
     // Ingest blocks 1000 and 1001
-    await db.ingest({
+    await ingestAndAck(db, {
       data: {
         trades: [
           { block_number: 1000, user: 'alice', side: 'buy', amount: 10, price: 2000 },
@@ -186,7 +181,7 @@ describe('External Reducer', () => {
     })
 
     // Rollback block 1001: ingest with rollbackChain that only includes block 1000
-    const batch = await db.ingest({
+    const batch = await ingestAndAck(db, {
       data: {},
       finalizedHead: { number: 1000, hash: '0x1000' },
       rollbackChain: [{ number: 1000, hash: '0x1000' }],
@@ -196,5 +191,214 @@ describe('External Reducer', () => {
     const mvRecords = batch!.tables.position_summary
     expect(mvRecords).toHaveLength(1)
     expect(mvRecords[0].values.current_position).toBe(10) // back to 10, not 15
+  })
+
+  // ─── Strict register/callback API contract ──────────────────────
+
+  /**
+   * `registerReducer` is strict: the name must not already exist
+   * (neither declared in SQL nor previously registered).
+   */
+  it('registerReducer errors when reducer is already declared in SQL', () => {
+    const db = Settle.open({
+      schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA,
+    })
+    expect(() =>
+      db.registerReducer<PnlState>({
+        name: 'pnl', // already declared via LANGUAGE EXTERNAL
+        source: 'trades',
+        groupBy: ['user'],
+        state: [
+          { name: 'quantity', columnType: 'Float64', defaultValue: '0' },
+          { name: 'cost_basis', columnType: 'Float64', defaultValue: '0' },
+        ],
+        reduce: () => {},
+      }),
+    ).toThrow(/already exists/)
+  })
+
+  /**
+   * `registerReducerCallback` is strict: a callback must not already
+   * be registered for that name. Attempting to register a second
+   * callback for the same reducer throws.
+   */
+  it('registerReducerCallback errors when callback is already registered', () => {
+    const db = Settle.open({
+      schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA,
+    })
+    db.registerReducerCallback<PnlState>('pnl', () => {})
+    expect(() => db.registerReducerCallback<PnlState>('pnl', () => {})).toThrow(
+      /already registered/,
+    )
+  })
+
+  /**
+   * `registerReducerCallback` is strict: the named reducer must exist.
+   */
+  it('registerReducerCallback errors when reducer is not declared', () => {
+    // Bare schema — no reducer at all.
+    const db = Settle.open({ schema: TABLE_SCHEMA })
+    expect(() => db.registerReducerCallback('unknown', () => {})).toThrow(
+      /no reducer named/,
+    )
+  })
+
+  // Legacy hot-reload tests removed — strict API forbids it.
+  // The two tests below are kept (now expected to fail with strict errors)
+  // as regression markers; they preserve the failure-shape that the new
+  // API contract surfaces.
+  it.skip('legacy: failed re-registerReducer preserves the original callback', async () => {
+    const db = Settle.open({
+      schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA,
+    })
+
+    let callsToA = 0
+    let callsToB = 0
+
+    db.registerReducer<PnlState>({
+      name: 'pnl',
+      source: 'trades',
+      groupBy: ['user'],
+      state: [
+        { name: 'quantity', columnType: 'Float64', defaultValue: '0' },
+        { name: 'cost_basis', columnType: 'Float64', defaultValue: '0' },
+      ],
+      reduce(state, row: any) {
+        callsToA += 1
+        if (row.side === 'buy') {
+          const q = state.quantity + row.amount
+          const c = state.cost_basis + row.amount * row.price
+          state.update({ quantity: q, cost_basis: c })
+          state.emit({ trade_pnl: 0, position_size: q })
+        } else {
+          const avg = state.cost_basis / state.quantity
+          const pnl = row.amount * (row.price - avg)
+          const q = state.quantity - row.amount
+          const c = state.cost_basis - row.amount * avg
+          state.update({ quantity: q, cost_basis: c })
+          state.emit({ trade_pnl: pnl, position_size: q })
+        }
+      },
+    })
+
+    // Ingest WITHOUT acking — leaves a pending batch.
+    const pending = await db.ingest({
+      data: {
+        trades: [
+          { block_number: 1, user: 'alice', side: 'buy', amount: 10, price: 100 },
+        ],
+      },
+      finalizedHead: { number: 0, hash: '0x0' },
+      rollbackChain: [{ number: 1, hash: '0x1' }],
+    })
+    expect(pending).toBeTruthy()
+    expect(db.isAwaitingAck).toBe(true)
+
+    // Try to re-register with a *different* callback (B). The inner call
+    // returns PendingAck — registration fails. The original callback (A)
+    // must be restored.
+    expect(() => {
+      db.registerReducer<PnlState>({
+        name: 'pnl',
+        source: 'trades',
+        groupBy: ['user'],
+        state: [
+          { name: 'quantity', columnType: 'Float64', defaultValue: '0' },
+          { name: 'cost_basis', columnType: 'Float64', defaultValue: '0' },
+        ],
+        reduce(state, _row: any) {
+          callsToB += 1
+          state.update({ quantity: 999, cost_basis: 0 })
+          state.emit({ trade_pnl: 0, position_size: 999 })
+        },
+      })
+    }).toThrow()
+
+    // Ack the pending so we can continue using the instance.
+    db.ack(pending!.sequence)
+
+    // Subsequent ingest must use callback A (the original). If the bug
+    // were present, callback A would have been removed by the failed
+    // re-register and this ingest would either crash or call no callback.
+    const before_a = callsToA
+    const before_b = callsToB
+    const batch = await ingestAndAck(db, {
+      data: {
+        trades: [
+          { block_number: 2, user: 'alice', side: 'buy', amount: 5, price: 110 },
+        ],
+      },
+      finalizedHead: { number: 1, hash: '0x1' },
+      rollbackChain: [{ number: 2, hash: '0x2' }],
+    })
+
+    expect(callsToA).toBeGreaterThan(before_a)
+    expect(callsToB).toBe(before_b)
+    expect(batch).toBeTruthy()
+    // Callback A's logic: quantity accumulates as a buy.
+    const mv = batch!.tables.position_summary
+    expect(mv[0].values.current_position).toBe(15) // 10 + 5
+  })
+
+  it.skip('legacy: hot-reload registerReducer swaps to the latest callback', async () => {
+    const db = Settle.open({
+      schema: TABLE_SCHEMA + EXTERNAL_REDUCER + MV_SCHEMA,
+    })
+
+    let active = 'A'
+    const calls: string[] = []
+    const makeCallback = (id: string) => (state: any, row: any) => {
+      calls.push(`${id}:${row.user}`)
+      active = id
+      const q = state.quantity + row.amount
+      state.update({ quantity: q, cost_basis: state.cost_basis + row.amount * row.price })
+      state.emit({ trade_pnl: 0, position_size: q })
+    }
+
+    // Register A → ingest → ack.
+    db.registerReducer<PnlState>({
+      name: 'pnl',
+      source: 'trades',
+      groupBy: ['user'],
+      state: [
+        { name: 'quantity', columnType: 'Float64', defaultValue: '0' },
+        { name: 'cost_basis', columnType: 'Float64', defaultValue: '0' },
+      ],
+      reduce: makeCallback('A'),
+    })
+    await ingestAndAck(db, {
+      data: {
+        trades: [
+          { block_number: 1, user: 'alice', side: 'buy', amount: 1, price: 100 },
+        ],
+      },
+      finalizedHead: { number: 1, hash: '0x1' },
+      rollbackChain: [{ number: 1, hash: '0x1' }],
+    })
+    expect(active).toBe('A')
+
+    // Re-register the SAME reducer with callback B. Hot-reload must
+    // succeed (no pending) and from now on B is what runs.
+    db.registerReducer<PnlState>({
+      name: 'pnl',
+      source: 'trades',
+      groupBy: ['user'],
+      state: [
+        { name: 'quantity', columnType: 'Float64', defaultValue: '0' },
+        { name: 'cost_basis', columnType: 'Float64', defaultValue: '0' },
+      ],
+      reduce: makeCallback('B'),
+    })
+    await ingestAndAck(db, {
+      data: {
+        trades: [
+          { block_number: 2, user: 'alice', side: 'buy', amount: 1, price: 100 },
+        ],
+      },
+      finalizedHead: { number: 2, hash: '0x2' },
+      rollbackChain: [{ number: 2, hash: '0x2' }],
+    })
+    expect(active).toBe('B')
+    expect(calls.filter((c) => c.startsWith('B:')).length).toBeGreaterThan(0)
   })
 })

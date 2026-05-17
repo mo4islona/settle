@@ -1,0 +1,83 @@
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: Rust (lib + integration + e2e PG)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build (tests, default features)
+        run: cargo build --tests
+
+      - name: cargo test (lib)
+        run: cargo test --lib
+
+      # `tests/e2e/` spins up real `postgres:16-alpine` containers via
+      # testcontainers. Docker is pre-installed on `ubuntu-latest` runners.
+      - name: cargo test (integration + e2e + workspace tests)
+        run: cargo test --tests
+
+  typescript:
+    name: TypeScript bindings (Node + WASM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (with wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Install dependencies
+        working-directory: bindings/typescript/settle
+        # `--no-frozen-lockfile` because the package declares
+        # `optionalDependencies` on platform-specific NAPI binaries
+        # (`@settle/stream-*`) that are only published as part of the npm
+        # release flow. CI environments without those artifacts can't
+        # satisfy a frozen lockfile.
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build native (napi)
+        working-directory: bindings/typescript/settle
+        run: pnpm run build:native
+
+      - name: Build WASM
+        working-directory: bindings/typescript/settle
+        run: pnpm run build:wasm
+
+      - name: Build TypeScript
+        working-directory: bindings/typescript/settle
+        run: pnpm run build:ts
+
+      - name: vitest
+        working-directory: bindings/typescript/settle
+        run: pnpm test

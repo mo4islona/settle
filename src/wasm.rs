@@ -44,6 +44,7 @@ impl Settle {
     /// return an array of `{ state, emits }` results (same length, same order).
     ///
     /// Must be called before any `ingest` calls that use this reducer.
+    #[wasm_bindgen(js_name = registerReducer)]
     pub fn register_reducer(
         &mut self,
         name: &str,
@@ -52,6 +53,23 @@ impl Settle {
         state: JsValue,
         callback: Function,
     ) -> Result<(), JsError> {
+        // Strict: error if reducer already exists (declared in SQL via
+        // `LANGUAGE EXTERNAL` or registered previously). To attach a
+        // callback to an existing reducer, use registerReducerCallback.
+        if self.inner.has_reducer(name) {
+            return Err(JsError::new(&format!(
+                "registerReducer: reducer '{name}' already exists — \
+                 use registerReducerCallback to attach a callback to a \
+                 SQL-declared external reducer, or drop and reopen the \
+                 instance to change a previously-registered callback",
+            )));
+        }
+        if self.external_callbacks.contains_key(name) {
+            return Err(JsError::new(&format!(
+                "registerReducer: callback for '{name}' is already registered",
+            )));
+        }
+
         let group_by: Vec<String> = serde_wasm_bindgen::from_value(group_by).map_err(to_js_err)?;
         let state_fields: Vec<WasmStateField> =
             serde_wasm_bindgen::from_value(state).map_err(to_js_err)?;
@@ -67,22 +85,62 @@ impl Settle {
             })
             .collect();
 
-        let _guard = self.install_context();
+        let def = ReducerDef {
+            name: name.to_string(),
+            source: source.to_string(),
+            group_by,
+            state,
+            body: ReducerBody::External {
+                id: name.to_string(),
+            },
+            requires: vec![],
+        };
 
-        if self.inner.has_reducer(name) {
-            self.inner.replay_reducer(name).map_err(to_js_err)?;
-        } else {
-            let def = ReducerDef {
-                name: name.to_string(),
-                source: source.to_string(),
-                group_by,
-                state,
-                body: ReducerBody::External {
-                    id: name.to_string(),
-                },
-                requires: vec![],
-            };
-            self.inner.register_reducer(def).map_err(to_js_err)?;
+        let _guard = self.install_context();
+        if let Err(e) = self.inner.register_reducer(def).map_err(settle_err_to_js) {
+            self.external_callbacks.remove(name);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Attach a JS callback to an existing reducer that was declared in
+    /// SQL with `LANGUAGE EXTERNAL`, and replay unfinalized blocks. Errors
+    /// if no such reducer exists OR if a callback is already registered
+    /// for that name.
+    #[wasm_bindgen(js_name = registerReducerCallback)]
+    pub fn register_reducer_callback(
+        &mut self,
+        name: &str,
+        callback: Function,
+    ) -> Result<(), JsError> {
+        if !self.inner.has_reducer(name) {
+            return Err(JsError::new(&format!(
+                "registerReducerCallback: no reducer named '{name}' — \
+                 use registerReducer to create a brand-new reducer",
+            )));
+        }
+        if !self.inner.reducer_is_external(name) {
+            return Err(JsError::new(&format!(
+                "registerReducerCallback: reducer '{name}' is not declared \
+                 LANGUAGE EXTERNAL — Lua and EventRules reducers have their \
+                 own embedded runtime and ignore host callbacks",
+            )));
+        }
+        if self.external_callbacks.contains_key(name) {
+            return Err(JsError::new(&format!(
+                "registerReducerCallback: callback for '{name}' is already \
+                 registered — drop and reopen the instance to change it",
+            )));
+        }
+
+        self.external_callbacks.insert(name.to_string(), callback);
+
+        let _guard = self.install_context();
+        if let Err(e) = self.inner.replay_reducer(name).map_err(settle_err_to_js) {
+            self.external_callbacks.remove(name);
+            return Err(e);
         }
 
         Ok(())
@@ -132,25 +190,48 @@ impl Settle {
         };
 
         let _guard = self.install_context();
-        let batch = self.inner.ingest(ingest_input).map_err(to_js_err)?;
+        let batch = self.inner.ingest(ingest_input).map_err(settle_err_to_js)?;
         match batch {
             Some(b) => to_js(&encode_batch_to_json_value(&b)).map_err(to_js_err),
             None => Ok(JsValue::NULL),
         }
     }
 
-    /// Flush buffered changes. Returns a change batch object, or null if empty.
-    pub fn flush(&mut self) -> Result<JsValue, JsError> {
-        let _guard = self.install_context();
-        match self.inner.flush() {
-            Some(b) => to_js(&encode_batch_to_json_value(&b)).map_err(to_js_err),
-            None => Ok(JsValue::NULL),
+    /// Acknowledge the pending batch by sequence number and durably commit
+    /// its writes. `sequence` is passed as f64 (JS number); values up to 2^53
+    /// preserve exact precision. Throws typed errors via the structured-
+    /// reason prefix protocol.
+    pub fn ack(&mut self, sequence: f64) -> Result<(), JsError> {
+        // Reject NaN/inf, negatives, fractional values, and values beyond
+        // f64's integer-exact range (2^53). The TS wrapper validates these
+        // too, but a Wasm consumer calling the export directly could pass
+        // e.g. `1.9` — casting f64→u64 would silently truncate to 1 and
+        // ack the wrong sequence.
+        if !sequence.is_finite()
+            || sequence < 0.0
+            || sequence.fract() != 0.0
+            || sequence > 9_007_199_254_740_992.0
+        {
+            return Err(JsError::new(
+                "ack sequence must be a non-negative integer within JS safe range (≤ 2^53)",
+            ));
         }
+        self.inner
+            .ack(sequence as u64)
+            .map_err(settle_err_to_js)
     }
 
-    /// Acknowledge a flushed batch by sequence number.
-    pub fn ack(&mut self, sequence: u32) {
-        self.inner.ack(sequence as u64);
+    /// Whether a previously-returned ChangeBatch is still awaiting `ack()`.
+    #[wasm_bindgen(getter, js_name = isAwaitingAck)]
+    pub fn is_awaiting_ack(&self) -> bool {
+        self.inner.is_awaiting_ack()
+    }
+
+    /// Whether an unrecoverable commit failure has poisoned this instance.
+    /// Once true the only recovery is to drop the instance and reopen.
+    #[wasm_bindgen(getter, js_name = isPoisoned)]
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
     }
 
     /// Number of pending (unflushed) change records.
@@ -182,6 +263,7 @@ impl Settle {
 
     /// Find the common ancestor between our state and the portal's chain.
     /// Returns the matching block cursor, or null if no common ancestor found.
+    #[wasm_bindgen(js_name = resolveForkCursor)]
     pub fn resolve_fork_cursor(&self, previous_blocks: JsValue) -> Result<JsValue, JsError> {
         let mut blocks: Vec<WasmCursor> =
             serde_wasm_bindgen::from_value(previous_blocks).map_err(to_js_err)?;
@@ -210,6 +292,7 @@ impl Settle {
     /// block — no need to pass it in.
     ///
     /// Throws if no common ancestor is found (fork too deep / unrecoverable).
+    #[wasm_bindgen(js_name = handleFork)]
     pub fn handle_fork(&mut self, previous_blocks: JsValue) -> Result<JsValue, JsError> {
         let blocks: Vec<WasmCursor> =
             serde_wasm_bindgen::from_value(previous_blocks).map_err(to_js_err)?;
@@ -222,7 +305,7 @@ impl Settle {
             })
             .collect();
 
-        let result = self.inner.handle_fork(chain).map_err(to_js_err)?;
+        let result = self.inner.handle_fork(chain).map_err(settle_err_to_js)?;
 
         let cursor = to_js(&WasmCursor {
             number: result.cursor.number as u32,
@@ -296,4 +379,20 @@ fn parse_column_type(s: &str) -> ColumnType {
 
 fn to_js_err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
+}
+
+/// Convert a `SettleError` to a JS error. Typed variants get a structured
+/// prefix the TS wrapper rethrows as a typed class; everything else falls
+/// through to the plain message.
+fn settle_err_to_js(e: crate::error::Error) -> JsError {
+    match e {
+        crate::error::Error::PendingAck { sequence, since } => JsError::new(&format!(
+            "__SETTLE_PENDING_ACK__ sequence={sequence} since_ms={}",
+            since.as_millis()
+        )),
+        crate::error::Error::WrongAckSequence { expected, got } => JsError::new(&format!(
+            "__SETTLE_WRONG_ACK_SEQUENCE__ expected={expected} got={got}"
+        )),
+        other => JsError::new(&other.to_string()),
+    }
 }

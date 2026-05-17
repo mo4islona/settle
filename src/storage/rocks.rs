@@ -546,18 +546,18 @@ impl StorageBackend for RocksDbBackend {
                 BatchOp::DeleteRawRowsAfter { table, after_block } => {
                     if *after_block < BlockNumber::MAX {
                         let cf = self.db.cf_handle(CF_RAW).expect("raw CF");
+                        // `delete_range_cf` is a single range-tombstone op
+                        // that is order-independent within the WriteBatch
+                        // (the tombstone applies at the SST/MemTable level,
+                        // not via per-key last-write-wins). Replaces an
+                        // earlier iterate-then-delete implementation whose
+                        // correctness depended on `DeleteRawRowsAfter` ops
+                        // appearing before `PutRawRows` ops in the batch —
+                        // a non-obvious invariant that a refactor could
+                        // silently violate, causing data loss.
                         let start = raw_key(table, *after_block + 1);
-                        let ub = upper_bound(&raw_table_prefix(table));
-                        let mut opts = ReadOptions::default();
-                        opts.set_iterate_upper_bound(ub);
-                        for item in self.db.iterator_cf_opt(
-                            cf,
-                            opts,
-                            IteratorMode::From(&start, Direction::Forward),
-                        ) {
-                            let (k, _) = item.map_err(to_err)?;
-                            wb.delete_cf(cf, &k);
-                        }
+                        let end = upper_bound(&raw_table_prefix(table));
+                        wb.delete_range_cf(cf, &start, &end);
                     }
                 }
             }
