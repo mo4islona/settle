@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Result;
 use crate::reducer_runtime::event_rules::EventRulesRuntime;
@@ -39,8 +39,11 @@ pub struct ReducerEngine {
     /// Only contains unfinalized blocks. Used for rollback.
     block_snapshots: FxHashMap<Vec<u8>, BTreeMap<BlockNumber, Vec<Value>>>,
     /// Tracks which blocks have been processed and which group keys were touched.
-    /// BTreeMap for O(log N) range queries during rollback/finalize.
-    block_groups: BTreeMap<BlockNumber, HashSet<Vec<u8>>>,
+    /// BTreeMap for O(log N) range queries during rollback/finalize. FxHash on
+    /// the per-block key sets: keys are trusted internal `Vec<u8>` group keys
+    /// inserted once per touched group per block (hot path) — matches the
+    /// FxHash already used for `state_cache` / `block_snapshots`.
+    block_groups: BTreeMap<BlockNumber, FxHashSet<Vec<u8>>>,
     /// Pre-computed column IDs for group-by columns (resolved against source registry).
     /// Enables direct Vec indexing instead of HashMap lookups.
     group_by_ids: Vec<Option<ColumnId>>,
@@ -241,7 +244,7 @@ impl ReducerEngine {
     /// Fast per-row path: no grouping overhead, no row cloning.
     fn process_block_per_row(&mut self, block: BlockNumber, rows: &[Row]) -> Result<Vec<RowMap>> {
         let mut output_maps: Vec<RowMap> = Vec::new();
-        let mut touched_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut touched_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
 
         for row in rows {
             let group_key_bytes = self.compute_group_key_bytes(row);
@@ -269,10 +272,17 @@ impl ReducerEngine {
             touched_keys.insert(group_key_bytes);
 
             for mut emit_row in emits {
-                // Add group-by columns to the output row for downstream MVs
+                // Add group-by columns to the output row for downstream MVs.
+                // Check presence with a borrowed `&str` and only clone the
+                // column name when actually inserting — the Lua/EventRules
+                // emit usually already carries the group-by column, so the
+                // eager `col.clone()` in the old `entry()` form was a wasted
+                // String allocation on every emit (per-row hot path).
                 for col in &self.def.group_by {
-                    if let Some(v) = row.get(col.as_str()) {
-                        emit_row.entry(col.clone()).or_insert_with(|| v.clone());
+                    if !emit_row.contains_key(col.as_str()) {
+                        if let Some(v) = row.get(col.as_str()) {
+                            emit_row.insert(col.clone(), v.clone());
+                        }
                     }
                 }
                 output_maps.push(emit_row);
@@ -379,8 +389,10 @@ impl ReducerEngine {
             );
             for (emit_idx, mut emit_row) in batch.emits.into_iter().enumerate() {
                 for col in &self.def.group_by {
-                    if let Some(v) = first_row.get(col.as_str()) {
-                        emit_row.entry(col.clone()).or_insert_with(|| v.clone());
+                    if !emit_row.contains_key(col.as_str()) {
+                        if let Some(v) = first_row.get(col.as_str()) {
+                            emit_row.insert(col.clone(), v.clone());
+                        }
                     }
                 }
                 // Map back to original row index for ordering
@@ -452,7 +464,7 @@ impl ReducerEngine {
         }
 
         // Collect all affected group keys (consume by value to avoid cloning)
-        let mut affected_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut affected_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
         for (_block, keys) in rolled_back {
             for key in keys {
                 affected_keys.insert(key);
@@ -491,7 +503,7 @@ impl ReducerEngine {
         let remaining = self.block_groups.split_off(&(block + 1));
         let finalized_block_groups = std::mem::replace(&mut self.block_groups, remaining);
 
-        let mut finalized_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut finalized_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
         for keys in finalized_block_groups.values() {
             finalized_keys.extend(keys.iter().cloned());
         }
