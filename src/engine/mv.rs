@@ -75,6 +75,12 @@ pub struct MVEngine {
     current_watermark: i64,
     /// Group keys removed since last finalize (for storage cleanup).
     removed_groups: Vec<GroupKey>,
+    /// Groups touched since the last successful `finalize`. Unchanged groups
+    /// already have their state on disk from the previous finalize; re-
+    /// persisting them is wasted work that dominated the bench (see
+    /// BENCHMARKS.md "Optimization Roadmap Baseline 2026-05-29"). Populated
+    /// in `process_block`, `rollback`, drained by `finalize`.
+    dirty_groups: FxHashSet<GroupKey>,
 }
 
 impl MVEngine {
@@ -227,6 +233,7 @@ impl MVEngine {
             block_times,
             current_watermark,
             removed_groups: Vec::new(),
+            dirty_groups: FxHashSet::default(),
         }
     }
 
@@ -305,7 +312,12 @@ impl MVEngine {
         }
 
         // Emit changes for all touched groups
-        self.emit_changes(&touched_keys)
+        let changes = self.emit_changes(&touched_keys);
+        // Mark touched groups as dirty so the next finalize knows what to
+        // persist. Consume `touched_keys` here — its only other use was the
+        // borrow passed to `emit_changes` above.
+        self.dirty_groups.extend(touched_keys);
+        changes
     }
 
     /// Roll back all blocks after fork_point.
@@ -355,7 +367,9 @@ impl MVEngine {
         }
 
         // Emit changes (updates or deletes)
-        self.emit_changes(&touched_keys)
+        let changes = self.emit_changes(&touched_keys);
+        self.dirty_groups.extend(touched_keys);
+        changes
     }
 
     /// Finalize all blocks up to and including the given block.
@@ -363,18 +377,32 @@ impl MVEngine {
     pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
         let is_sliding = self.sliding_window.is_some();
 
+        // Take dirty_groups so we can borrow self.groups mutably below. After
+        // finalize completes, dirty_groups is empty (default) — exactly what we
+        // want; the take is the "clear".
+        let dirty = std::mem::take(&mut self.dirty_groups);
+
         if !is_sliding {
-            // Standard path: merge per-block data into finalized state
-            for aggs in self.groups.values_mut() {
-                for agg in aggs.iter_mut() {
-                    agg.finalize_up_to(block);
+            // Standard path: merge per-block data into finalized state. Only
+            // dirty groups can have un-merged per-block data — untouched groups
+            // were already finalized last time.
+            for key in &dirty {
+                if let Some(aggs) = self.groups.get_mut(key) {
+                    for agg in aggs.iter_mut() {
+                        agg.finalize_up_to(block);
+                    }
                 }
             }
         }
         // For sliding windows: do NOT call finalize_up_to — keep per-block data
 
-        // Persist state for all groups
-        for (group_key, aggs) in &self.groups {
+        // Persist state only for dirty groups. Unchanged group state is already
+        // on disk from the previous finalize.
+        for group_key in &dirty {
+            let aggs = match self.groups.get(group_key) {
+                Some(a) => a,
+                None => continue, // removed since being marked dirty
+            };
             let gk_bytes = storage::encode_group_key(group_key);
             let prev = self.prev_output.get(group_key);
             let state_bytes = if is_sliding {

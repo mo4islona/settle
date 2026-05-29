@@ -155,7 +155,7 @@ samply load /tmp/profile_polymarket.json.gz
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
 | **Baseline** | 2026-05-29 | **51.05s** | **31.78s** | — | — | **49.4%** | **15.0%** | **25.4%** | wasted finalize(0); см. roadmap |
 | **T1** (`finalize` early-return) | 2026-05-29 | **5.62s** | **31.54s** | **−89% / 9.1×** | ≈0 (−0.7%) | 49.8% | 15.0% | 25.3% | original синтетический; realistic = real worst case теперь |
-| T2 (dirty-tracking) | — | — | — | — | target −10..−15% | target ≤25% | — | — | — |
+| **T2** (dirty-tracking) | 2026-05-29 | **5.37s** | **6.60s** | ≈0 | **−79% / 4.8×** | **исчез из top-15** | **0.86%** | 58.4% | rayon idle стал доминантой |
 | T3 (inline serialize) | — | — | — | — | target −5..−10% | target ≤15% | target ≤7% | — | — |
 | T4 (rayon fix) | — | — | — | — | target −30..−50% | — | — | target <5% | — |
 | T5 (im-rc snapshots) | — | — | — | — | target −5..−10% | — | — | — | повторный flamegraph |
@@ -201,6 +201,46 @@ Original теперь меряет «всё кроме finalize» — meaningles
 **Production implication:** T1 даёт speedup пропорциональный доле heartbeat ingest'ов (без сдвига finalized_head). Если consumer всегда продвигает finality (каждый block) — speedup ≈ 0. Если часто heartbeat'ит (мониторинг, watermarks без новых finalized данных) — proportional.
 
 **Bonus:** T1 fix'ит производственный bug — heartbeat ingest без новых данных раньше перезаписывал все group state на disk, теперь skip'ает.
+
+### T2 наблюдения (2026-05-29)
+
+**Изменение:** В `MVEngine` (`src/engine/mv.rs`) добавлено поле `dirty_groups: FxHashSet<GroupKey>`. Заполняется в `process_block` и `rollback` после `emit_changes` (через `self.dirty_groups.extend(touched_keys)`). В `finalize` теперь `mem::take(&mut self.dirty_groups)` → iterate ONLY dirty для `finalize_up_to` и `put_mv_state`. Untouched groups оставляются на диске as-is. 311 тестов библиотеки прошли без изменений.
+
+**Wall-clock (median of 2 runs):**
+
+| Bench | T1 | T2 | Δ |
+|---|---:|---:|---:|
+| `profile_polymarket` (original) | 5.62s | **5.37s** | ≈0 (noise; на original finalize не вызывается вообще после T1) |
+| `profile_polymarket_realistic` | 31.54s | **6.60s** | **−79% (4.8×)** |
+
+Гипотеза подтверждена: на Polymarket-like нагрузке per-batch tронуто ~500 уникальных группы (batch=500 rows), а total groups ~10K+ (assets × traders subset). Persist'ить все 10K вместо 500 = ~20× wasted work. После T2 цена finalize пропорциональна реальному изменению, не общему числу групп.
+
+**Realistic теперь ~равен original** — обе версии бенча сходятся к одному уровню (5-7s), потому что для обоих finalize теперь делает только needed work.
+
+**Flamegraph attribution на T2-realistic:**
+
+| % self | Function | vs T1 baseline |
+|---:|---|---|
+| 58.42 | `__psynch_cvwait` | +33pp (доминанта; рабочие thread'ы простаивают) |
+| 3.78 | `_xzm_free` | −3pp |
+| 2.38 | `Sip13::Hasher::write` | +1pp |
+| 1.97 | `_platform_memcmp` | ≈0 |
+| 0.86 | `rmp::encode::*` (sum) | **−14pp** |
+| `MV::finalize` | вне top-15 inclusive | **−49pp inclusive** |
+| `BTreeMap::clone_subtree` | вне top-25 | −2pp |
+
+**Категории self-time:**
+
+| Категория | T1 | T2 | Δ |
+|---|---:|---:|---:|
+| serialize | 15.0% | **1.9%** | −13.1pp |
+| input | 5.2% | 0.6% | −4.6pp |
+| storage | 0.6% | 0.2% | −0.4pp |
+| bookkeeping | 1.4% | 3.0% | +1.6pp (относительный рост, абсолютный baseline) |
+
+**Следующий приоритет:** `__psynch_cvwait` 58.4% self + rayon `wait_until_cold` 70.9% inclusive показывают что workers сидят без работы. T3 (inline serialize) теперь даст ≤2% — почти ничего. **Следующий tier — T4 (investigate rayon parallelism)**, потенциально biggest win (+50-100%). Перепрыгнуть T3.
+
+**Также:** main thread inclusive 29% (vs 68% на T1). Это значит **главный thread теперь делает ~30% wall time, остальное rayon overhead/wait**. Если parallelism исправить — main thread полностью насытится.
 
 ## History
 
