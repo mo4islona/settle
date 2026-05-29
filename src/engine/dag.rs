@@ -41,6 +41,28 @@ enum PipelineNode {
     MV(String),
 }
 
+/// A node whose finalized state can be persisted independently of all others.
+/// Reducers and MVs write disjoint storage keys, so finalize work fans out
+/// across the rayon pool (each into its own write batch, merged afterward).
+#[cfg(feature = "rayon")]
+trait FinalizeNode: Send {
+    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch);
+}
+
+#[cfg(feature = "rayon")]
+impl FinalizeNode for ReducerEngine {
+    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
+        self.finalize(block, batch);
+    }
+}
+
+#[cfg(feature = "rayon")]
+impl FinalizeNode for MVEngine {
+    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
+        self.finalize(block, batch);
+    }
+}
+
 /// An independent reducer→MV chain that can be processed in parallel.
 /// Engines are stored inline to avoid HashMap extraction/reinsertion per batch.
 struct PipelineBranch {
@@ -973,6 +995,51 @@ impl SettleEngine {
             return;
         }
 
+        // Finalize is pure persistence: each reducer/MV serializes its own
+        // group state into the batch with disjoint storage keys. These tasks
+        // are independent, so fan them out across the rayon pool — each writes
+        // into its own sub-batch which is merged afterward. This was the single
+        // largest serial section on the main thread (~38% inclusive).
+        #[cfg(feature = "rayon")]
+        {
+            let mut nodes: Vec<&mut dyn FinalizeNode> = Vec::new();
+            for branch in &mut self.branches {
+                nodes.push(&mut branch.reducer);
+                for (_, mv) in &mut branch.mv_entries {
+                    nodes.push(mv);
+                }
+            }
+            for reducer in self.reducers.values_mut() {
+                nodes.push(reducer);
+            }
+            for mv in self.mvs.values_mut() {
+                nodes.push(mv);
+            }
+
+            if nodes.len() == 1 {
+                nodes[0].finalize_into(block, batch);
+            } else if nodes.len() > 1 {
+                // Force one rayon task per node (`with_max_len(1)`): the default
+                // range split would put the two heavy nodes (heavy reducer +
+                // its heavy MV, adjacent in `nodes`) in the same half and run
+                // them on one worker — no parallelism. One task per node lets
+                // work-stealing spread the heavy finalizes across workers.
+                let sub_batches: Vec<StorageWriteBatch> = nodes
+                    .par_iter_mut()
+                    .with_max_len(1)
+                    .map(|node| {
+                        let mut sub = StorageWriteBatch::new();
+                        node.finalize_into(block, &mut sub);
+                        sub
+                    })
+                    .collect();
+                for sub in sub_batches {
+                    batch.ops.extend(sub.ops);
+                }
+            }
+        }
+
+        #[cfg(not(feature = "rayon"))]
         for node in &self.pipeline {
             match node {
                 PipelineNode::Reducer(name) => {

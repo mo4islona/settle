@@ -645,28 +645,61 @@ fn resolve_output_name(item: &SelectItem) -> String {
     }
 }
 
+// MV group state binary layout (avoids the old `Vec<Vec<u8>>` + double-rmp
+// re-encode that dominated finalize serialization):
+//   num_aggs: u8
+//   per agg: len: u32 LE, then `len` bytes (per-agg rmp blob)
+//   prev flag: u8 (0 = None, 1 = Some)
+//   if Some: len: u32 LE, then rmp(prev_output map)
+// Per-agg blobs reuse the existing, test-covered rmp codecs (to_bytes /
+// to_finalized_bytes / from_bytes) — only the outer framing changed.
+
+fn write_mv_group(buf: &mut Vec<u8>, agg_blob: impl Fn(&dyn AggregationFunc) -> Vec<u8>, aggs: &[Box<dyn AggregationFunc>], prev_output: Option<&HashMap<String, Value>>) {
+    buf.push(aggs.len() as u8);
+    for a in aggs {
+        let blob = agg_blob(a.as_ref());
+        buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&blob);
+    }
+    match prev_output {
+        None => buf.push(0),
+        Some(map) => {
+            buf.push(1);
+            let pb = rmp_serde::to_vec(map).expect("prev_output serialization should not fail");
+            buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&pb);
+        }
+    }
+}
+
 /// Serialize an MV group's full state (finalized + per-block) for sliding window persistence.
 fn serialize_mv_group_full(
     aggs: &[Box<dyn AggregationFunc>],
     prev_output: Option<&HashMap<String, Value>>,
 ) -> Vec<u8> {
-    let agg_bytes: Vec<Vec<u8>> = aggs.iter().map(|a| a.to_bytes()).collect();
-    rmp_serde::to_vec(&(agg_bytes, prev_output))
-        .expect("MV group state serialization should not fail")
+    let mut buf = Vec::with_capacity(16 + aggs.len() * 24);
+    write_mv_group(&mut buf, |a| a.to_bytes(), aggs, prev_output);
+    buf
 }
 
 /// Serialize an MV group's aggregation state + prev_output for persistence.
-/// Format: MessagePack-encoded (Vec<Vec<u8>>, Option<HashMap<String, Value>>)
 fn serialize_mv_group(
     aggs: &[Box<dyn AggregationFunc>],
     prev_output: Option<&HashMap<String, Value>>,
 ) -> Vec<u8> {
-    let agg_bytes: Vec<Vec<u8>> = aggs.iter().map(|a| a.to_finalized_bytes()).collect();
-    rmp_serde::to_vec(&(agg_bytes, prev_output))
-        .expect("MV group state serialization should not fail")
+    let mut buf = Vec::with_capacity(16 + aggs.len() * 24);
+    write_mv_group(&mut buf, |a| a.to_finalized_bytes(), aggs, prev_output);
+    buf
 }
 
-/// Deserialize an MV group's state from bytes.
+fn read_u32(bytes: &[u8], pos: &mut usize) -> Option<usize> {
+    let end = pos.checked_add(4)?;
+    let v = u32::from_le_bytes(bytes.get(*pos..end)?.try_into().ok()?) as usize;
+    *pos = end;
+    Some(v)
+}
+
+/// Deserialize an MV group's state from bytes (see `write_mv_group` layout).
 fn deserialize_mv_group(
     bytes: &[u8],
     agg_funcs: &[AggFunc],
@@ -674,16 +707,33 @@ fn deserialize_mv_group(
     Vec<Box<dyn AggregationFunc>>,
     Option<HashMap<String, Value>>,
 )> {
-    let (agg_bytes, prev_output): (Vec<Vec<u8>>, Option<HashMap<String, Value>>) =
-        rmp_serde::from_slice(bytes).ok()?;
-    if agg_bytes.len() != agg_funcs.len() {
+    let mut pos = 0usize;
+    let n = *bytes.get(pos)? as usize;
+    pos += 1;
+    if n != agg_funcs.len() {
         return None;
     }
-    let aggs: Vec<Box<dyn AggregationFunc>> = agg_funcs
-        .iter()
-        .zip(agg_bytes.iter())
-        .map(|(func, bytes)| restore_agg(func, bytes))
-        .collect();
+    let mut aggs: Vec<Box<dyn AggregationFunc>> = Vec::with_capacity(n);
+    for func in agg_funcs {
+        let len = read_u32(bytes, &mut pos)?;
+        let end = pos.checked_add(len)?;
+        let blob = bytes.get(pos..end)?;
+        pos = end;
+        aggs.push(restore_agg(func, blob));
+    }
+    let prev_output = match *bytes.get(pos)? {
+        0 => {
+            None
+        }
+        1 => {
+            pos += 1;
+            let len = read_u32(bytes, &mut pos)?;
+            let end = pos.checked_add(len)?;
+            let pb = bytes.get(pos..end)?;
+            rmp_serde::from_slice(pb).ok()?
+        }
+        _ => return None,
+    };
     Some((aggs, prev_output))
 }
 
