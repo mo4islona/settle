@@ -1,233 +1,309 @@
 # Backfill mode — durable checkpoint ≠ finality
 
-## Problem
+Status: **implemented** (commit on `perf/finalize-serialization`, PR #23).
+Non-breaking, off by default (`Config::backfill_checkpoint_interval = 1`).
 
-On historical backfill the caller marks each ingested block final immediately
-(`finalized_head == latest block in batch`, no confirmation lag). Today every
-`finalize()` serializes + commits all changed reducer/MV group state to RocksDB.
-Measured cost of that persist on backfill (RocksDB, finality at tip, 490K rows):
+## TL;DR
 
-| Batch | persist ON | persist OFF (probe) | gain |
-|---|---:|---:|---:|
-| 5 000 | 87K rows/s | 130K rows/s | +50% |
-| 25 000 | 132K rows/s | 170K rows/s | +29% |
+On historical backfill, persisting derived reducer/MV state to RocksDB on every
+finalized block is 22–33% of wall time. This feature **defers that persistence**:
+derived state is written every `N` blocks (a "checkpoint") instead of every
+block. The in-memory aggregate is always current; only the *disk write* is
+batched. A crash replays at most `N` blocks of raw rows from the last
+checkpoint — extra work, never data loss.
 
-So derived-state persistence is 22–33% of backfill wall. We want to defer it.
+Measured gain (RocksDB, finality at tip, 490K rows, `profile_backfill`):
 
-## Current durability model (verified against code)
+| Batch | persist every block | deferred (interval=100) | gain |
+|------:|--------------------:|------------------------:|-----:|
+| 5 000 | 87K rows/s | 127K rows/s | **+45%** |
+| 25 000 | 132K rows/s | 178K rows/s | **+35%** |
 
-`ingest()`:
-1. `process_batch_deferred` → raw rows into `write_batch`; reducer/MV in-memory
-   state updated.
-2. `engine.finalize(F)` → for newly-finalized blocks: serialize reducer
-   (`set_reducer_finalized`) + MV (`put_mv_state`) state into `write_batch`;
-   **prune** in-memory `block_snapshots`/`block_groups` ≤ F; advance
-   `engine.finalized_block = F`.
-3. `append_meta_to_batch` → `META_LATEST_BLOCK`, `META_FINALIZED_BLOCK`,
-   `META_BLOCK_HASHES` into `write_batch`.
-4. data path: stash `write_batch` as `pending`; caller applies ChangeBatch to
-   target, calls `ack` → `storage.commit(write_batch)`. heartbeat path
-   (no records): commit immediately.
-
-Recovery (`open()`):
-- read `F = META_FINALIZED_BLOCK`, `L = META_LATEST_BLOCK`.
-- reducer/MV restore finalized state from disk (in their `new()`).
-- `replay_unfinalized(F+1, L)` — re-feed raw rows F+1..L through reducers+MVs.
-
-Crash-safety invariant: disk is exactly one atomic batch behind in-memory; on
-crash before ack the whole batch is lost together, disk stays at a consistent
-`(F_prev, L_prev)`, recovery replays `F_prev+1..L_prev`.
-
-Two facts that make this work and that we rely on:
-- **Raw rows are never evicted** (`dag.rs` raw-table finalize = "not implemented
-  yet"), so raw rows for every block ≥ 1 are on disk and replayable.
-- In `engine.finalize`, the persist and the prune are coupled; `state_cache`
-  (reducer) and `groups` (MV) are NOT pruned — they keep the live value.
-
-## Key simplifying insight
-
-In **true backfill** the caller passes `finalized_head.number == max(block in
-batch)` every ingest, so after each ingest `finalized == latest`:
-
-- No unfinalized blocks exist. Therefore reducer `state_cache[key]` ==
-  the finalized state as-of-`finalized` (no unfinalized contributions to strip).
-- `block_snapshots` are immediately prunable (rollback can only target
-  ≥ finalized = latest ⇒ no-op), exactly as today.
-- MV finalized accumulators (`SumAgg.finalized` etc.) are already the as-of-F
-  value after `finalize_up_to(F)`.
-
-⇒ At a checkpoint we can persist **directly from live in-memory state**
-(`state_cache` for reducer, current finalized aggs for MV) with no snapshot
-gymnastics. The dangerous "lag" case (state_cache includes unfinalized) cannot
-occur because we only defer when there is no lag.
-
-## Design
-
-Decouple two watermarks:
-
-- **finality watermark `F`** (`finalized_block`, `META_FINALIZED_BLOCK`):
-  unchanged meaning — bounds rollback, advances as caller reports finality.
-- **durability checkpoint `D`** (`META_DURABLE_BLOCK`, new): highest block whose
-  derived reducer/MV state is actually persisted to disk. Invariant **D ≤ F**.
-
-### Eligibility (per ingest)
-
-Deferral is enabled only when ALL hold:
-1. The ingest is "no-lag": `finalized_head.number >= latest_block_in_batch`
-   (caller commits immediately). With lag, behave exactly as today.
-2. `D + checkpoint_interval > F` after this finalize (not yet time to checkpoint).
-3. Config opt-in: `backfill_checkpoint_interval > 1` (default 1 = today's
-   behavior, every finalize persists, D tracks F).
-
-When deferral is NOT enabled, `finalize` persists as today and sets `D = F`.
-
-### finalize(F) changes
-
-```
-should_persist = (F - last_durable >= checkpoint_interval) || !no_lag || forced
-for each node: node.finalize(F, batch, should_persist)
-  - always: in-memory merge (MV finalize_up_to) + prune ≤ F as today
-  - if should_persist: serialize changed-since-D groups into batch
-  - if !should_persist: accumulate changed group keys into a per-node
-    "pending_durable" set (do NOT drain dirty / do NOT write to batch)
-finalized_block = F
-if should_persist:
-  batch.put_meta(META_DURABLE_BLOCK, F); last_durable = F; clear pending_durable
-```
-
-Because deferral requires no-lag, "changed-since-D group state" == live
-`state_cache[key]` (reducer) / live finalized aggs[key] (MV). So persisting at
-checkpoint reads live memory; no retained snapshots needed beyond today's.
-
-### Per-node "pending_durable" set
-
-- **reducer**: `FxHashSet<Vec<u8>>` of group keys whose finalized state changed
-  since last durable checkpoint. On checkpoint, for each: persist
-  `encode_values(state_cache[key])`. (state_cache == finalized in no-lag.)
-- **MV**: reuse the existing dirty mechanism but accumulate instead of drain —
-  a `pending_durable: FxHashSet<GroupKey>`. On checkpoint, persist current
-  finalized aggs for each (same `serialize_mv_group`). Also carry the existing
-  `removed_groups` deletions to checkpoint time.
-
-### Recovery change
-
-`open()`: replay start = `D+1` (was `F+1`), where `D = META_DURABLE_BLOCK`
-(default = F for DBs written before this feature, so back-compat is exact).
-`replay_unfinalized(D+1, L)`. Raw rows D+1..L are on disk (never evicted).
-Reducer/MV restore disk state as-of-D, replay rebuilds D+1..L.
-
-### Mode transition (backfill → tip)
-
-When an ingest arrives with lag (`finalized_head < latest_in_batch`) or finality
-stops jumping, force a checkpoint at the current F BEFORE processing so D catches
-up to F, then resume per-batch persist. This guarantees once we leave backfill,
-D == F and behavior is identical to today.
-
-Also force-checkpoint on clean shutdown is N/A (no Drop hook persists today); a
-crash mid-backfill simply replays from the last D — correct, just more work.
-
-## Crash scenarios (to be adversarially verified)
-
-1. Crash mid-backfill before ack of batch K: disk at (F_{K-1}, D_last). Recovery
-   restores as-of-D_last, replays D_last+1..L_{K-1}. Raw rows present. ✓
-2. Crash right after a checkpoint commit: D advanced + derived persisted
-   atomically (same write_batch). Recovery replays D+1..L. ✓
-3. Rollback during backfill: finality monotonic, rollback bounded ≥ F ≥ D ⇒
-   never touches persisted ≤ D state. ✓ (but verify handle_fork path + the
-   `recovery_block` in-ingest rollback path don't assume D==F)
-4. Gappy chains (Solana, latest may be < finalized): no-lag eligibility uses
-   `finalized >= latest_in_batch`; verify this doesn't mis-trigger.
-5. Sliding-window MV (does NOT call finalize_up_to, keeps per-block data):
-   deferring its persist must still persist `block_times` meta correctly and not
-   corrupt window expiry on replay.
-6. Chained reducers (reducer sourcing another reducer): replay order from D+1.
-7. External reducers needing host callback: replay skips them today; with D+1
-   range, ensure no double-processing / no gap.
-8. `process_batch` non-deferred (used in tests) — must be unaffected.
-9. ack-failure / poison path: deferred derived state lives only in memory until
-   checkpoint; a commit failure of a NON-checkpoint batch loses only raw rows +
-   meta for that batch (recoverable via replay). A checkpoint-batch commit
-   failure must preserve pending_durable so retry re-persists (don't clear
-   pending_durable until commit success — tricky with current ack model).
-
-## Open risk (the hard one)
-
-Scenario 9 + the existing pending/ack split: `finalize` mutates in-memory
-(`last_durable`, clears `pending_durable`, prunes) BEFORE `storage.commit`
-happens (commit is on ack). If the checkpoint batch's commit fails:
-- today: poison on heartbeat; on data path, `pending` retains the write_batch
-  for retry — but `engine.finalize` already cleared `pending_durable` and
-  advanced `last_durable` in memory. A retry of `ack` re-commits the SAME
-  write_batch (which DOES contain the derived state), so disk lands correct.
-  ✓ as long as we DON'T re-run finalize on retry (ack just re-commits the stored
-  batch — verified: `ack` only does `storage.commit(p.write_batch)`).
-- The danger is only if we advanced `last_durable` in memory but the batch that
-  carried `META_DURABLE_BLOCK` never commits AND we then process more ingests
-  thinking D advanced. But pending-ack BLOCKS further ingest until ack succeeds
-  (guard_no_pending). So we can't proceed past an uncommitted checkpoint. ✓
-  Must double-check the heartbeat (immediate-commit) checkpoint path: on failure
-  it poisons ⇒ drop+reopen ⇒ recovery from on-disk D (old) ⇒ replays more. ✓
-
-## Config surface
-
-`Config.backfill_checkpoint_interval: u64` (blocks), default `1`
-(= current behavior, feature off). Builder `.backfill_checkpoint_interval(n)`.
-No on-disk format change (only a new optional meta key `durable_block`).
-NON-breaking.
+On `vs_postgres_simple_agg` (lighter pipeline) the deferral-safe pipelines
+(EventRules, MV-only) show **−10…−22% engine time**; the external-reducer
+pipeline is unchanged (deferral is gated off for it by design).
 
 ---
 
-# v2 — Resolution (adversarial review folded in)
+## 1. Background: the current durability model
 
-8-scenario adversarial review returned **NO-GO** on the v1 design: 4 critical
-silent-corruption holes + 3 major gaps. Root cause: v1 advanced the *persisted*
-finality watermark + pruned rollback data past D every batch, while persisting
-derived state only at D, but recovery anchors baseline AND replay range on F.
-The (D,F] window then existed on neither disk nor replay.
+Each `ingest()` builds one atomic `write_batch` and commits it (on `ack`, or
+immediately for heartbeats):
 
-## Final contract (implemented)
+```
+        ingest(rows, finalized_head = F)
+                 │
+                 ▼
+   ┌──────────────────────────────────────┐
+   │ 1. raw rows of the block → write_batch│   source data
+   │ 2. reducers/MVs update state IN MEMORY │   live aggregates
+   │ 3. finalize(F): serialize derived      │   ◄── the 22–33% cost
+   │      state of newly-final blocks       │       on backfill
+   │      → write_batch  +  prune snapshots  │
+   │ 4. meta (latest, finalized) → write_batch│
+   └───────────────────┬──────────────────┘
+                       │ storage.commit()
+                       ▼
+                  ┌──────────┐
+                  │ RocksDB  │
+                  └──────────┘
+```
 
-**Option A — on-disk `finalized` IS the durable watermark.** We never persist a
-finality watermark ahead of the derived state it implies. Concretely:
+Recovery (`open()`):
 
-- New engine field `durable_block D` (in-memory `finalized_block F` may run
-  ahead for rollback bounding). On-disk `META_FINALIZED_BLOCK` is written as
-  **D, not F** (`append_meta_to_batch` change). So recovery's existing
-  `set_finalized_block(disk) ; if latest>finalized replay(finalized+1,latest)`
-  already does the right thing — **zero recovery-code change** (B1).
-- `D = min(F, latest_block)` at every checkpoint — clamps to replayable raw data,
-  fixing gappy chains where F>latest (B2).
-- Deferral is **whole-pipeline gated**: `defer_allowed = no sliding MV AND no
-  external reducer anywhere`. If false, persist every finalize (D==F, exactly
-  today's behavior). Kills B4 (sliding) and B5 (external/external-chained) by
-  construction.
-- `finalize(block, batch, persist)`:
-  - always: in-memory merge (MV `finalize_up_to`) + `block_groups` prune.
-  - `persist=false`: reducer accumulates finalized keys into `pending_durable`
-    AND **retains their snapshots** (so a later checkpoint reads the correct
-    as-of-finalized value even if lag appears); MV accumulates dirty into
-    `pending_durable`, leaves `removed_groups` to accumulate. No disk writes.
-  - `persist=true`: persist `pending_durable ∪ this-batch keys`; reducer reads
-    `find_snapshot_at_or_before(block)` (snapshots were retained), MV serializes
-    live cumulative aggs; then prune. MV deletes `removed_groups` **only for keys
-    not currently present** (membership-wins reconcile — B3).
-- No-op guard updated: skip only when `block==finalized_block && has_finalized &&
-  (!persist || durable>=block)` — so a forced checkpoint with `durable<block`
-  still runs even when finality didn't advance (B7).
-- Rollback leaves `durable` unchanged (monotonic floor). Under Option A on-disk
-  finalized==durable==derived, so the fork/None=>0 divergence v1 feared cannot
-  occur (B6).
-- ack/atomicity unchanged and preserved: D is written in the SAME write_batch as
-  its derived state; ack only re-commits the stored batch (B8).
+```
+  read F = META_FINALIZED_BLOCK,  L = META_LATEST_BLOCK
+  reducers/MVs restore finalized state from disk
+  replay_unfinalized(F+1 .. L)   ── re-feed raw rows through the pipeline
+```
 
-## Config
-`Config.backfill_checkpoint_interval: u64`, default `1` (feature OFF = exact
-current behavior). Non-breaking: no new on-disk key (reuses META_FINALIZED_BLOCK
-semantics), Memory backend unaffected.
+Crash-safety invariant: **disk is exactly one atomic batch behind memory.** On
+a crash before `ack`, the whole batch is lost together; disk stays at a
+consistent `(F, L)`; recovery replays `F+1..L`.
 
-## Test gates (must pass)
-1. no-lag backfill, interval=100, ack several non-checkpoint batches, drop+reopen
-   without a checkpoint → aggregates == from-scratch.
-2. gappy F>latest across checkpoint + deferred sub-F block + crash → survives.
-3. MV remove/re-add across interval + crash → group present, correct value.
-4. (sliding & external pipelines: assert deferral disabled, behavior == today.)
+Two facts this relies on, both verified in the codebase:
+
+- **Raw rows are never evicted** (`dag.rs`: raw-table finalize is a no-op), so
+  the raw rows for every block ≥ 1 are on disk and replayable.
+- `finalize` couples *persist* with *prune*, but `state_cache` (reducer) and
+  `groups` (MV) keep the live value — they are not pruned.
+
+---
+
+## 2. The opportunity
+
+On **historical backfill** the caller marks each block final at the batch tip
+(`finalized_head == max block in batch`, no confirmation lag). So the pipeline
+serializes + writes all changed group state on *every* block, even though:
+
+- the data is historical (won't be rolled back), and
+- the live aggregate is already correct in memory.
+
+That per-block disk write is pure durability overhead we can amortize.
+
+---
+
+## 3. Design: two watermarks
+
+Decouple finality from durability.
+
+```
+ blocks:  1   2   3  … 97  98  99 100  101 102 …
+          ═══════════════════════════╗
+          finalized (per the source)  ║  still arriving
+                                      ║
+   F (finality)  ─────────────────────╨─►  bounds rollback; advances with source
+   D (durable)   ───────────────►          derived state actually on disk
+                                  └── invariant: D ≤ min(F, latest)
+```
+
+- **F = `finalized_block`** (in memory): unchanged meaning — bounds rollback.
+- **D = `durable_block`** (new): highest block whose derived state is on disk.
+
+Today, and on the chain tip, `D == F` (we persist every finalize). Under
+backfill deferral, `D` lags `F`: the derived state for `(D, F]` lives only in
+memory and is rebuilt from raw rows on recovery.
+
+### The one load-bearing decision (Option A)
+
+**On disk, `META_FINALIZED_BLOCK` stores `D`, not `F`.**
+
+This makes recovery correct with **zero changes to recovery code**: `open()`
+already restores `finalized = META_FINALIZED_BLOCK` and replays
+`finalized+1 .. latest`. With the field holding `D`, that becomes
+`replay(D+1 .. latest)` automatically. Back-compat is exact: for non-deferred
+operation `D == F`, so old databases read identically.
+
+> The earlier naive design (persist `F` to disk, persist derived state only at
+> `D`) was **rejected**: recovery would replay `F+1..L`, silently skipping the
+> `(D, F]` blocks whose state was never written — permanent silent corruption.
+> See §6.
+
+---
+
+## 4. How finalize works under deferral
+
+`finalize(block, batch, persist)` — the `persist` flag is decided by `db.rs`.
+
+```
+ finalize(block, batch, persist):
+   ── always ──────────────────────────────────────────
+   merge per-block data into the cumulative aggregate (MV finalize_up_to)
+   prune block_groups ≤ block        (rollback tracking; safe — never rolled back)
+
+   ── if persist == false  (defer) ────────────────────
+   record changed group keys into `pending_durable`
+   RETAIN their block_snapshots       (so a later checkpoint reads the right value)
+   return                              (no disk writes)
+
+   ── if persist == true  (checkpoint) ────────────────
+   to_persist = pending_durable ∪ this-batch's changed keys
+   for each key: serialize current state → batch        (reducer: encode_values;
+                                                          MV: serialize_mv_group)
+   drain pending_durable, prune snapshots ≤ block
+   advance durable_block = min(block, latest)            ◄── clamp (gappy chains)
+```
+
+`db.rs` decides `persist`:
+
+```
+ persist = NOT (deferral active) OR (interval elapsed)
+
+ deferral active = backfill_checkpoint_interval > 1
+                   AND engine.defer_allowed()              (gating, §5)
+                   AND finalized_head ≥ latest_in_batch    (no-lag = backfill)
+
+ interval elapsed = finalized_head − durable_block ≥ backfill_checkpoint_interval
+```
+
+Timeline, interval = 1000, 100 blocks/batch:
+
+```
+ batch1 [1..100]    persist=false  defer   D=0     pending={…}
+ batch2 [101..200]  persist=false  defer   D=0     pending grows
+ …
+ batch10[901..1000] persist=true   CHECK   D=1000  pending flushed, snapshots pruned
+ batch11[1001..1100]persist=false  defer   D=1000  pending grows
+ …
+                    └── disk touched once per 10 batches, not every batch
+```
+
+The no-op-finalize guard was updated so a *forced* checkpoint with
+`durable < block` still runs even when finality didn't advance (otherwise a
+checkpoint at the same `F` would be skipped).
+
+---
+
+## 5. Gating: where deferral is OFF
+
+Deferral is disabled for the whole pipeline (`compute_defer_allowed()` at
+construction) when it contains either:
+
+| Pipeline feature | Defer? | Why |
+|---|:---:|---|
+| reducer (Lua/EventRules) + tumbling MV | ✅ on | running aggregate is replayable from raw rows |
+| **sliding-window MV** | ❌ off | `block_times` meta + per-block agg data form one atomic unit; splitting their persist watermark corrupts window replay |
+| **external reducer** (`LANGUAGE EXTERNAL`) | ❌ off | recovery replay *skips* external reducers (no host callback at `open()`), so deferred state could never be rebuilt |
+
+Confirmed live in `vs_postgres_simple_agg`: the `settle_fn` (external) rows do
+not speed up under `,backfill`; `settle_er` / `settle_mv` do.
+
+---
+
+## 6. Recovery & crash safety
+
+```
+ CRASH mid-backfill (D=0 on disk, memory had reached block 700)
+        │  memory lost; disk holds:
+        ▼
+   ┌─────────────────────────────────┐
+   │ raw rows:   blocks 1..700        │   (raw rows never evicted)
+   │ derived:    as of D = 0  (empty) │
+   │ META_FINALIZED_BLOCK = 0  (= D)  │   ◄── Option A: we stored D
+   └─────────────────────────────────┘
+        │  reopen()
+        ▼
+   replay_unfinalized(D+1 .. latest) = replay(1 .. 700)
+        │  re-feed raw rows through reducer/MV
+        ▼
+   derived state fully rebuilt ✅   (cost: replay ≤ interval blocks)
+```
+
+Why the naive variant corrupts, and why Option A is safe:
+
+```
+  NAIVE (rejected):  disk META_FINALIZED = F(700), derived = D(0)
+                     reopen → replay(F+1..L) = replay(701..)  ← skips 1..700
+                     💀 aggregates for 1..700 lost, silently, forever
+
+  OPTION A (shipped): disk META_FINALIZED = D(0)
+                     reopen → replay(D+1..L) = replay(1..)    ← covers everything ✅
+```
+
+### Adversarial review (8 scenarios)
+
+Before implementing, the design was attacked by 8 independent reviewers. The
+naive "defer + advance finality" design was **NO-GO** — 4 silent-corruption
+holes. The shipped v2 folds in every fix:
+
+| # | Hole found | Fix in v2 |
+|---|---|---|
+| 1 | recovery anchored on F, skips `(D,F]` | Option A: persist D as `META_FINALIZED_BLOCK` |
+| 6 | gappy chain `F > latest` → empty replay range strands data | clamp `D ≤ min(F, latest)` |
+| 4 | sliding-window: `block_times` vs aggs split watermark | gate sliding-window pipelines off deferral |
+| 5 | external reducer state unrebuildable (replay skips it) | gate external-reducer pipelines off deferral |
+| 8 | MV group removed-then-re-added in one interval → deleted on disk | checkpoint reconcile: current membership wins (persist set ∩ present; delete set ∖ present) |
+| 7 | forced checkpoint skipped by no-op guard | guard bypassed when `durable < block` |
+| — | ack-retry / poison path | already correct: `ack` re-commits the stored batch, never re-runs finalize; `pending` blocks further ingest until commit |
+
+### MV remove/re-add reconcile (hole #8)
+
+```
+  block D+1: group G appears        → G in pending_durable, on disk: absent
+  block D+2: G's aggregate → empty  → G removed from memory, G in removed_groups
+  block D+3: G re-appears           → G back in memory, in pending_durable
+  CHECKPOINT: G is in BOTH pending_durable (persist) AND removed_groups (delete)
+
+  rule: current in-memory membership wins
+        persist = pending_durable ∩ present(groups)     → G persisted ✅
+        delete  = removed_groups  ∖ present(groups)      → G NOT deleted ✅
+```
+
+---
+
+## 7. Config & compatibility
+
+```rust
+Config::with_data_dir(schema, dir)
+    .backfill_checkpoint_interval(1000)   // blocks; default 1 = persist every finalize
+```
+
+- **Default `1`** = exact pre-feature behavior (`D == F` always).
+- **Non-breaking on disk**: no new meta key (`META_FINALIZED_BLOCK` is reused
+  to mean "durable"); the Memory backend is unaffected.
+- Has effect only on **no-lag** ingest (historical backfill) and only for
+  **deferral-safe** pipelines (§5). On the chain tip (finality lags) it is a
+  no-op regardless of the interval.
+
+---
+
+## 8. Tests
+
+`src/backfill_tests.rs` (gated on the `rocksdb` feature), 7 crash/recovery
+cases:
+
+1. no-lag backfill, no checkpoint reached, drop+reopen → MV rebuilt from replay.
+2. same for a Lua reducer + MV pipeline (reducer `pending_durable` path).
+3. deferred output == always-persist output (deferral changes timing, not values).
+4. checkpoint advances `durable` mid-backfill, then crash → tail replayed.
+5. gappy chain `F > latest` across a checkpoint + crash → sub-F block survives
+   (clamp).
+6. deferral disabled for a sliding-window pipeline (durable tracks finality).
+7. deferral disabled for an external-reducer pipeline.
+
+Full suite: 318 lib + 49 integration green.
+
+## 9. Benchmark
+
+`benches/profile_backfill.rs` — RocksDB, finality at tip:
+
+```
+SETTLE_BATCH=5000  SETTLE_INTERVAL=1   ./profile_backfill   # persist every block
+SETTLE_BATCH=5000  SETTLE_INTERVAL=100 ./profile_backfill   # deferred
+```
+
+`benches/vs_postgres_simple_agg.rs` adds a `,backfill` mode alongside `,fin`
+(no-lag, persist every block) and tip, so the per-pipeline deferral effect is
+visible against the Postgres baseline.
+
+---
+
+## Appendix: relevant code
+
+| Concern | Location |
+|---|---|
+| watermarks, `finalize(persist)`, clamp, gating | `src/engine/dag.rs` |
+| reducer defer (`pending_durable`, snapshot retention) | `src/engine/reducer.rs` `finalize` |
+| MV defer + remove/re-add reconcile | `src/engine/mv.rs` `finalize` |
+| persist `durable` as `META_FINALIZED_BLOCK`; persist decision | `src/db.rs` `append_meta_to_batch`, `ingest` |
+| recovery (unchanged; anchors on the stored watermark) | `src/db.rs` `open` |
