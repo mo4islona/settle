@@ -44,6 +44,11 @@ pub struct ReducerEngine {
     /// inserted once per touched group per block (hot path) — matches the
     /// FxHash already used for `state_cache` / `block_snapshots`.
     block_groups: BTreeMap<BlockNumber, FxHashSet<Vec<u8>>>,
+    /// Group keys finalized since the last DURABLE checkpoint but not yet
+    /// persisted (backfill deferral). While a key sits here its `block_snapshots`
+    /// are RETAINED (not pruned) so the eventual checkpoint can read its correct
+    /// as-of-finalized value. Empty unless deferral is active. See design v2.
+    pending_durable: FxHashSet<Vec<u8>>,
     /// Pre-computed column IDs for group-by columns (resolved against source registry).
     /// Enables direct Vec indexing instead of HashMap lookups.
     group_by_ids: Vec<Option<ColumnId>>,
@@ -83,6 +88,7 @@ impl ReducerEngine {
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            pending_durable: FxHashSet::default(),
             group_by_ids,
             source_registry,
             chained: false,
@@ -157,6 +163,7 @@ impl ReducerEngine {
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            pending_durable: FxHashSet::default(),
             group_by_ids: vec![],
             source_registry: Arc::new(empty_registry),
             chained: true,
@@ -188,6 +195,7 @@ impl ReducerEngine {
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            pending_durable: FxHashSet::default(),
             group_by_ids,
             source_registry,
             chained: false,
@@ -496,10 +504,17 @@ impl ReducerEngine {
     }
 
     /// Finalize state up to the given block.
-    /// Collects finalized state writes into the provided batch for atomic commit.
-    /// Drops in-memory snapshots for finalized blocks.
-    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
-        // Split off blocks > block, keeping blocks <= block for finalization
+    ///
+    /// `persist` controls durability. When true (the default / checkpoint),
+    /// finalized state is serialized into the batch and in-memory snapshots ≤
+    /// block are pruned, as before. When false (backfill deferral), the changed
+    /// group keys are accumulated into `pending_durable` and their snapshots are
+    /// RETAINED (not pruned) so the eventual checkpoint reads the correct
+    /// as-of-finalized value — no disk writes happen. See design v2.
+    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
+        // Split off blocks > block, keeping blocks <= block for finalization.
+        // (Always prune block_groups — it only tracks block→key for rollback,
+        // and finalized blocks ≤ block are never rolled back.)
         let remaining = self.block_groups.split_off(&(block + 1));
         let finalized_block_groups = std::mem::replace(&mut self.block_groups, remaining);
 
@@ -508,17 +523,30 @@ impl ReducerEngine {
             finalized_keys.extend(keys.iter().cloned());
         }
 
-        // For each group key, add finalized state to batch and drop old snapshots
-        for group_key_bytes in &finalized_keys {
+        if !persist {
+            // Defer: remember the keys (snapshots intentionally retained so a
+            // later checkpoint can read the correct as-of-block value even if
+            // lag later moves state_cache ahead).
+            self.pending_durable.extend(finalized_keys);
+            return;
+        }
+
+        // Checkpoint: persist accumulated deferred keys + this batch's keys.
+        let mut to_persist = std::mem::take(&mut self.pending_durable);
+        to_persist.extend(finalized_keys);
+
+        for group_key_bytes in &to_persist {
             // Find the most recent state at or before the finalization block.
             // Snapshots are positional Vec<Value>, encoded with the fast binary
-            // codec (no string keys, no msgpack).
+            // codec (no string keys, no msgpack). For deferred keys the snapshot
+            // was retained; for this-batch keys it is freshly present.
             if let Some(state) = self.find_snapshot_at_or_before(group_key_bytes, block) {
                 let state_bytes = storage::encode_values(&state);
                 batch.set_reducer_finalized(&self.def.name, group_key_bytes, &state_bytes);
             }
 
-            // Remove in-memory snapshots for blocks <= finalization point
+            // Remove in-memory snapshots for blocks <= finalization point now
+            // that they are durable.
             if let Some(snapshots) = self.block_snapshots.get_mut(group_key_bytes) {
                 let remaining = snapshots.split_off(&(block + 1));
                 *snapshots = remaining;
@@ -912,7 +940,7 @@ mod tests {
 
         // Finalize up to 1000
         let mut batch = StorageWriteBatch::new();
-        engine.finalize(1000, &mut batch);
+        engine.finalize(1000, &mut batch, true);
         storage.commit(&batch).unwrap();
 
         // Block 1002: buy 3 (will be rolled back)
