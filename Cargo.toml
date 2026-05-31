@@ -25,6 +25,11 @@ js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 tracing = "0.1"
 web-time = "1"
+# Faster allocator for the hot ingest path (small per-event map/Vec churn).
+# Default-on for native builds; gated off for wasm (its C core won't compile
+# on wasm32) via the #[global_allocator] cfg in lib.rs. A/B: +13-15% on the
+# simple_agg / polymarket pipelines vs the system allocator.
+mimalloc = { version = "0.1", optional = true }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }
@@ -45,10 +50,11 @@ anyhow = "1"
 [features]
 # Default features for native (Node.js) builds.
 # For WASM builds use: --no-default-features --features wasm
-default = ["lua", "rocksdb", "rayon"]
+default = ["lua", "rocksdb", "rayon", "mimalloc"]
 lua = ["dep:mlua"]
 rocksdb = ["dep:rocksdb"]
 rayon = ["dep:rayon"]
+mimalloc = ["dep:mimalloc"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen"]
 
