@@ -328,3 +328,46 @@ fn defer_disabled_for_sliding_window() {
         "sliding-window pipeline must persist every finalize (no deferral)"
     );
 }
+
+/// Cluster B fork-safety regression: under active backfill deferral the
+/// in-memory finality watermark runs ahead of the durable watermark, and
+/// `block_hashes` retain entries for the finalized-but-not-durable range. A
+/// fork signal resolving onto one of those sub-finalized blocks MUST be
+/// rejected — rolling derived state back below finality would corrupt the
+/// durable recovery anchor and wedge the instance (durable > latest). The
+/// rollback must error cleanly and leave engine state untouched.
+#[test]
+fn fork_below_finality_during_deferral_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let cfg = Config::with_data_dir(MV_SCHEMA, &path).backfill_checkpoint_interval(100);
+    let mut db = Settle::open(cfg).unwrap();
+
+    // No-lag backfill 1..50 (finalized == block). interval=100 never fires, so
+    // durable stays 0 while finality reaches 50 and hashes for 1..50 survive.
+    for b in 1..=50u64 {
+        ingest_block(&mut db, "orders", b, b, vec![order("A", 1000)]);
+    }
+    assert_eq!(db.durable_block(), 0, "no checkpoint should have fired");
+    assert_eq!(db.finalized_block(), 50);
+    assert_eq!(db.latest_block(), 50);
+
+    // Fork onto block 30 (< finalized 50). The hash matches a retained entry,
+    // so pre-fix the bounded resolver would have found it and rolled back below
+    // finality. It must now be refused.
+    assert!(
+        db.handle_fork(vec![cursor(30)]).is_err(),
+        "handle_fork below finalized must be rejected"
+    );
+
+    // State untouched: no partial rollback, watermarks intact.
+    assert_eq!(db.durable_block(), 0, "rejected fork must not mutate durable");
+    assert_eq!(db.finalized_block(), 50, "rejected fork must not mutate finalized");
+    assert_eq!(db.latest_block(), 50, "rejected fork must not mutate latest");
+
+    // And the pipeline is still correct: the next no-lag block aggregates on top
+    // of the intact 50-block state (proving no corruption / no lost contributions).
+    let batch = ingest_block(&mut db, "orders", 51, 51, vec![order("A", 1000)]).unwrap();
+    let total = mv_value(&batch, "summary", "asset_id", "A", "total").unwrap();
+    assert_eq!(total, 51_000.0, "MV must still reflect all 51 blocks");
+}

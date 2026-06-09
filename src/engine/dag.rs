@@ -956,6 +956,26 @@ impl SettleEngine {
             return Ok(Vec::new());
         }
 
+        // Finality floor: a fork/rollback must never cross below the finalized
+        // watermark — finalized state is irreversible. Pre-deferral this was
+        // enforced implicitly because `finalize` pruned `block_hashes` to
+        // `finalized_block`, so the resolver could not find a sub-finalized
+        // ancestor. Backfill deferral now prunes only to `durable_block` (which
+        // lags finality), so hashes for `(durable_block, finalized_block]`
+        // survive and a fork signal could otherwise resolve below finality —
+        // rolling derived state back past the durable watermark, corrupting the
+        // recovery anchor and wedging the instance (durable > latest). Reject it
+        // here at the single chokepoint all rollback paths funnel through. With
+        // deferral off (`durable == finalized`) this can never fire for an
+        // in-range fork, so behavior is identical to before the feature.
+        if fork_point < self.finalized_block {
+            return Err(Error::InvalidOperation(format!(
+                "rollback target block {fork_point} is below finalized block {} — \
+                 finalized state is irreversible",
+                self.finalized_block
+            )));
+        }
+
         let mut all_changes = Vec::new();
 
         // Roll back in reverse pipeline order
@@ -1250,8 +1270,16 @@ impl SettleEngine {
         previous_blocks: &[(BlockNumber, &str)],
     ) -> Option<BlockCursor> {
         let latest = self.latest_block.unwrap_or(0);
+        let finalized = self.finalized_block;
         for &(number, hash) in previous_blocks {
-            if number > latest {
+            // Skip matches above latest (no data) and below finalized (finality
+            // is irreversible). Under backfill deferral `block_hashes` retains
+            // hashes for finalized-but-not-yet-durable blocks; resolving a fork
+            // onto one of those would roll state back below finality. Resolving
+            // *to* `finalized` itself stays allowed (it only matches when the
+            // hash agrees, i.e. finality is intact — it rolls back the
+            // unfinalized tail). See the finality floor in `rollback_inner`.
+            if number > latest || number < finalized {
                 continue;
             }
             if self.block_hashes.get(&number).map(|h| h.as_str()) == Some(hash) {
@@ -1758,6 +1786,39 @@ mod tests {
             mv_changes[0].values.get("total"),
             Some(&Value::Float64(100.0))
         );
+    }
+
+    #[test]
+    fn rollback_below_finalized_is_rejected() {
+        // Finality floor (Cluster B): rollback_inner must refuse any fork point
+        // below finalized_block — finalized state is irreversible. Rolling back
+        // to == finalized is allowed (removes the unfinalized tail); below is an
+        // error, regardless of which blocks still have retained hashes.
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
+        for (b, amt) in [(1000u64, 100.0), (1001, 200.0), (1002, 300.0)] {
+            engine
+                .process_batch(
+                    "swaps",
+                    b,
+                    vec![HashMap::from([
+                        ("pool".to_string(), Value::String("ETH/USDC".into())),
+                        ("amount".to_string(), Value::Float64(amt)),
+                    ])],
+                )
+                .unwrap();
+        }
+        let mut batch = StorageWriteBatch::new();
+        engine.finalize(1001, &mut batch, true);
+        assert_eq!(engine.finalized_block(), 1001);
+
+        // Below finalized → rejected, no mutation.
+        assert!(engine.rollback(1000).is_err(), "rollback below finalized must error");
+        assert_eq!(engine.latest_block(), 1002, "rejected rollback must not move latest");
+
+        // At finalized → allowed (removes unfinalized block 1002 only).
+        engine.rollback(1001).expect("rollback to finalized is allowed");
+        assert_eq!(engine.latest_block(), 1001);
     }
 
     #[test]
