@@ -1,3 +1,13 @@
+// Use mimalloc as the global allocator on native builds. The hot ingest path
+// churns many small short-lived maps/Vecs per event; mimalloc's machinery is
+// markedly faster than the system allocator here (+13-15% on the simple_agg /
+// polymarket pipelines). Gated off for wasm (mimalloc's C core won't build on
+// wasm32) and behind the default-on `mimalloc` feature so pure-Rust embedders
+// can opt out with `--no-default-features`.
+#[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod db;
 pub mod change;
 pub mod engine;

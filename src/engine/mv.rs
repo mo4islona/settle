@@ -75,6 +75,17 @@ pub struct MVEngine {
     current_watermark: i64,
     /// Group keys removed since last finalize (for storage cleanup).
     removed_groups: Vec<GroupKey>,
+    /// Groups touched since the last successful `finalize`. Unchanged groups
+    /// already have their state on disk from the previous finalize; re-
+    /// persisting them is wasted work that dominated the bench (see
+    /// BENCHMARKS.md "Optimization Roadmap Baseline 2026-05-29"). Populated
+    /// in `process_block`, `rollback`, drained by `finalize`.
+    dirty_groups: FxHashSet<GroupKey>,
+    /// Group keys changed since the last DURABLE checkpoint but not yet
+    /// persisted (backfill deferral). Accumulated across non-checkpoint
+    /// finalizes; drained when a checkpoint persists. Empty unless deferral is
+    /// active. See docs/backfill-mode-design.md.
+    pending_durable: FxHashSet<GroupKey>,
 }
 
 impl MVEngine {
@@ -227,6 +238,8 @@ impl MVEngine {
             block_times,
             current_watermark,
             removed_groups: Vec::new(),
+            dirty_groups: FxHashSet::default(),
+            pending_durable: FxHashSet::default(),
         }
     }
 
@@ -236,6 +249,13 @@ impl MVEngine {
 
     pub fn source(&self) -> &str {
         &self.def.source
+    }
+
+    /// Whether this MV uses a sliding window. Sliding-window MVs are excluded
+    /// from backfill persist-deferral (block_times + per-block agg data form an
+    /// atomic unit; deferring them would corrupt window replay — see design v2).
+    pub fn is_sliding(&self) -> bool {
+        self.sliding_window.is_some()
     }
 
     /// Process a batch of rows from a single block.
@@ -305,7 +325,12 @@ impl MVEngine {
         }
 
         // Emit changes for all touched groups
-        self.emit_changes(&touched_keys)
+        let changes = self.emit_changes(&touched_keys);
+        // Mark touched groups as dirty so the next finalize knows what to
+        // persist. Consume `touched_keys` here — its only other use was the
+        // borrow passed to `emit_changes` above.
+        self.dirty_groups.extend(touched_keys);
+        changes
     }
 
     /// Roll back all blocks after fork_point.
@@ -355,26 +380,64 @@ impl MVEngine {
         }
 
         // Emit changes (updates or deletes)
-        self.emit_changes(&touched_keys)
+        let changes = self.emit_changes(&touched_keys);
+        self.dirty_groups.extend(touched_keys);
+        changes
     }
 
     /// Finalize all blocks up to and including the given block.
-    /// Persists finalized aggregation state to the batch for atomic commit.
-    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
+    ///
+    /// `persist` controls durability: when true (the default / checkpoint),
+    /// finalized state is serialized into the batch as before. When false
+    /// (backfill deferral), the in-memory merge still happens — keeping the
+    /// cumulative finalized aggregate live and correct — but disk writes are
+    /// deferred: changed keys accumulate in `pending_durable` and are persisted
+    /// at the next checkpoint. The cumulative agg lives in `self.groups`, so a
+    /// later checkpoint serializes the correct as-of value. See design v2.
+    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
         let is_sliding = self.sliding_window.is_some();
 
+        // Take dirty_groups so we can borrow self.groups mutably below. After
+        // finalize completes, dirty_groups is empty (default) — exactly what we
+        // want; the take is the "clear".
+        let dirty = std::mem::take(&mut self.dirty_groups);
+
         if !is_sliding {
-            // Standard path: merge per-block data into finalized state
-            for aggs in self.groups.values_mut() {
-                for agg in aggs.iter_mut() {
-                    agg.finalize_up_to(block);
+            // Standard path: merge per-block data into finalized state. Only
+            // dirty groups can have un-merged per-block data — untouched groups
+            // were already finalized last time. This runs regardless of
+            // `persist` — it keeps the in-memory cumulative aggregate correct.
+            for key in &dirty {
+                if let Some(aggs) = self.groups.get_mut(key) {
+                    for agg in aggs.iter_mut() {
+                        agg.finalize_up_to(block);
+                    }
                 }
             }
         }
         // For sliding windows: do NOT call finalize_up_to — keep per-block data
 
-        // Persist state for all groups
-        for (group_key, aggs) in &self.groups {
+        if !persist {
+            // Defer: remember the changed keys; the cumulative agg is already
+            // updated in memory. removed_groups is left to accumulate (drained
+            // only at a checkpoint). No disk writes, no block_groups prune skip.
+            self.pending_durable.extend(dirty);
+            if !is_sliding {
+                let remaining = self.block_groups.split_off(&(block + 1));
+                self.block_groups = remaining;
+            }
+            return;
+        }
+
+        // Checkpoint: persist accumulated deferred keys + this batch's keys.
+        let mut to_persist = std::mem::take(&mut self.pending_durable);
+        to_persist.extend(dirty);
+
+        for group_key in &to_persist {
+            let aggs = match self.groups.get(group_key) {
+                Some(a) => a,
+                None => continue, // removed since being marked dirty (handled below)
+            };
             let gk_bytes = storage::encode_group_key(group_key);
             let prev = self.prev_output.get(group_key);
             let state_bytes = if is_sliding {
@@ -392,10 +455,15 @@ impl MVEngine {
             batch.put_meta(&format!("mv_block_times:{}", self.def.name), &bt_bytes);
         }
 
-        // Delete stale groups from storage (expired/removed since last finalize)
-        for key in self.removed_groups.drain(..) {
-            let gk_bytes = storage::encode_group_key(&key);
-            batch.delete_mv_state(&self.def.name, &gk_bytes);
+        // Delete stale groups from storage. Membership-wins reconcile: only
+        // delete keys NOT currently present — a key removed then re-added within
+        // a deferral interval is present in `to_persist` (put above) and must
+        // NOT also be deleted (design v2 B3).
+        for key in std::mem::take(&mut self.removed_groups) {
+            if !self.groups.contains_key(&key) {
+                let gk_bytes = storage::encode_group_key(&key);
+                batch.delete_mv_state(&self.def.name, &gk_bytes);
+            }
         }
 
         if !is_sliding {
@@ -617,28 +685,61 @@ fn resolve_output_name(item: &SelectItem) -> String {
     }
 }
 
+// MV group state binary layout (avoids the old `Vec<Vec<u8>>` + double-rmp
+// re-encode that dominated finalize serialization):
+//   num_aggs: u8
+//   per agg: len: u32 LE, then `len` bytes (per-agg rmp blob)
+//   prev flag: u8 (0 = None, 1 = Some)
+//   if Some: len: u32 LE, then rmp(prev_output map)
+// Per-agg blobs reuse the existing, test-covered rmp codecs (to_bytes /
+// to_finalized_bytes / from_bytes) — only the outer framing changed.
+
+fn write_mv_group(buf: &mut Vec<u8>, agg_blob: impl Fn(&dyn AggregationFunc) -> Vec<u8>, aggs: &[Box<dyn AggregationFunc>], prev_output: Option<&HashMap<String, Value>>) {
+    buf.push(aggs.len() as u8);
+    for a in aggs {
+        let blob = agg_blob(a.as_ref());
+        buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&blob);
+    }
+    match prev_output {
+        None => buf.push(0),
+        Some(map) => {
+            buf.push(1);
+            let pb = rmp_serde::to_vec(map).expect("prev_output serialization should not fail");
+            buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&pb);
+        }
+    }
+}
+
 /// Serialize an MV group's full state (finalized + per-block) for sliding window persistence.
 fn serialize_mv_group_full(
     aggs: &[Box<dyn AggregationFunc>],
     prev_output: Option<&HashMap<String, Value>>,
 ) -> Vec<u8> {
-    let agg_bytes: Vec<Vec<u8>> = aggs.iter().map(|a| a.to_bytes()).collect();
-    rmp_serde::to_vec(&(agg_bytes, prev_output))
-        .expect("MV group state serialization should not fail")
+    let mut buf = Vec::with_capacity(16 + aggs.len() * 24);
+    write_mv_group(&mut buf, |a| a.to_bytes(), aggs, prev_output);
+    buf
 }
 
 /// Serialize an MV group's aggregation state + prev_output for persistence.
-/// Format: MessagePack-encoded (Vec<Vec<u8>>, Option<HashMap<String, Value>>)
 fn serialize_mv_group(
     aggs: &[Box<dyn AggregationFunc>],
     prev_output: Option<&HashMap<String, Value>>,
 ) -> Vec<u8> {
-    let agg_bytes: Vec<Vec<u8>> = aggs.iter().map(|a| a.to_finalized_bytes()).collect();
-    rmp_serde::to_vec(&(agg_bytes, prev_output))
-        .expect("MV group state serialization should not fail")
+    let mut buf = Vec::with_capacity(16 + aggs.len() * 24);
+    write_mv_group(&mut buf, |a| a.to_finalized_bytes(), aggs, prev_output);
+    buf
 }
 
-/// Deserialize an MV group's state from bytes.
+fn read_u32(bytes: &[u8], pos: &mut usize) -> Option<usize> {
+    let end = pos.checked_add(4)?;
+    let v = u32::from_le_bytes(bytes.get(*pos..end)?.try_into().ok()?) as usize;
+    *pos = end;
+    Some(v)
+}
+
+/// Deserialize an MV group's state from bytes (see `write_mv_group` layout).
 fn deserialize_mv_group(
     bytes: &[u8],
     agg_funcs: &[AggFunc],
@@ -646,16 +747,33 @@ fn deserialize_mv_group(
     Vec<Box<dyn AggregationFunc>>,
     Option<HashMap<String, Value>>,
 )> {
-    let (agg_bytes, prev_output): (Vec<Vec<u8>>, Option<HashMap<String, Value>>) =
-        rmp_serde::from_slice(bytes).ok()?;
-    if agg_bytes.len() != agg_funcs.len() {
+    let mut pos = 0usize;
+    let n = *bytes.get(pos)? as usize;
+    pos += 1;
+    if n != agg_funcs.len() {
         return None;
     }
-    let aggs: Vec<Box<dyn AggregationFunc>> = agg_funcs
-        .iter()
-        .zip(agg_bytes.iter())
-        .map(|(func, bytes)| restore_agg(func, bytes))
-        .collect();
+    let mut aggs: Vec<Box<dyn AggregationFunc>> = Vec::with_capacity(n);
+    for func in agg_funcs {
+        let len = read_u32(bytes, &mut pos)?;
+        let end = pos.checked_add(len)?;
+        let blob = bytes.get(pos..end)?;
+        pos = end;
+        aggs.push(restore_agg(func, blob));
+    }
+    let prev_output = match *bytes.get(pos)? {
+        0 => {
+            None
+        }
+        1 => {
+            pos += 1;
+            let len = read_u32(bytes, &mut pos)?;
+            let end = pos.checked_add(len)?;
+            let pb = bytes.get(pos..end)?;
+            rmp_serde::from_slice(pb).ok()?
+        }
+        _ => return None,
+    };
     Some((aggs, prev_output))
 }
 

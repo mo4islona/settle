@@ -25,6 +25,11 @@ js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 tracing = "0.1"
 web-time = "1"
+# Faster allocator for the hot ingest path (small per-event map/Vec churn).
+# Default-on for native builds; gated off for wasm (its C core won't compile
+# on wasm32) via the #[global_allocator] cfg in lib.rs. A/B: +13-15% on the
+# simple_agg / polymarket pipelines vs the system allocator.
+mimalloc = { version = "0.1", optional = true }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }
@@ -40,14 +45,16 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
+anyhow = "1"
 
 [features]
 # Default features for native (Node.js) builds.
 # For WASM builds use: --no-default-features --features wasm
-default = ["lua", "rocksdb", "rayon"]
+default = ["lua", "rocksdb", "rayon", "mimalloc"]
 lua = ["dep:mlua"]
 rocksdb = ["dep:rocksdb"]
 rayon = ["dep:rayon"]
+mimalloc = ["dep:mimalloc"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen"]
 
@@ -86,6 +93,45 @@ harness = false
 [[bench]]
 name = "profile_breakdown"
 harness = false
+
+[[bench]]
+name = "vs_postgres_raw"
+harness = false
+
+[[bench]]
+name = "vs_postgres_simple_agg"
+harness = false
+
+[[bench]]
+name = "vs_postgres_stateful"
+harness = false
+
+[[bench]]
+name = "vs_postgres_reorg"
+harness = false
+
+[[bench]]
+name = "profile_settle_simple_agg"
+harness = false
+
+[[bench]]
+name = "profile_settle_mv_only"
+harness = false
+
+[[bench]]
+name = "profile_phases"
+harness = false
+
+[[bench]]
+name = "profile_polymarket_realistic"
+harness = false
+
+[[bench]]
+name = "profile_backfill"
+harness = false
+
+[profile.bench]
+debug = true
 
 [profile.wasm-release]
 inherits = "release"

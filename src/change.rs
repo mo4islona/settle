@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use rustc_hash::FxHashMap;
+
 use crate::types::{BlockCursor, ChangeBatch, ChangeOp, ChangeRecord, PerfNode, Value};
 
 /// Buffers change batches while downstream hasn't acknowledged.
@@ -77,7 +79,10 @@ impl ChangeBuffer {
         // Merge records by (table, key) identity in a single pass.
         // Hash is used for fast lookup; key equality is verified to prevent collisions.
         // Vec<usize> handles the rare case of 3+ records with the same hash but different keys.
-        let mut index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(self.pending.len());
+        // FxHashMap: the key is our own already-mixed u64 (from `hash_change_key`),
+        // so SipHash over it is pure overhead — FxHash on the flush hot path.
+        let mut index: FxHashMap<u64, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(self.pending.len(), Default::default());
         let mut merged: Vec<ChangeRecord> = Vec::with_capacity(self.pending.len());
 
         for record in self.pending.drain(..) {
@@ -205,14 +210,19 @@ fn is_cancelled(record: &ChangeRecord) -> bool {
 }
 
 fn hash_change_key(table: &str, key: &HashMap<String, Value>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use core::hash::{Hash, Hasher};
+    use rustc_hash::FxHasher;
+    // FxHash, not SipHash: this runs per key-field per emit on the flush hot
+    // path (it was ~6.9% `Sip13::write` in the flamegraph). The hash only feeds
+    // an internal dedup index whose buckets re-check key equality in `flush()`,
+    // so collision resistance is irrelevant here — speed is what matters.
+    let mut hasher = FxHasher::default();
     table.hash(&mut hasher);
     // Order-independent hash: XOR + rotate for better mixing than wrapping_add.
     // Still commutative — collisions are handled by key equality check in flush().
     let mut combined: u64 = 0;
     for (k, v) in key {
-        let mut field_hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut field_hasher = FxHasher::default();
         k.hash(&mut field_hasher);
         v.hash(&mut field_hasher);
         combined ^= field_hasher.finish().rotate_left(5);

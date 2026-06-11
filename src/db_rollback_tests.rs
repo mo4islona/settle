@@ -578,6 +578,90 @@ fn ingest_auto_rollback_on_fork() {
 }
 
 #[test]
+fn deferral_fork_below_finality_rejected_cleanly() {
+    // Cluster B fork-safety regression (was `repro_deferral_fork_wedge`).
+    // Deferral active (interval=100). Ingest blocks 1..50, each no-lag
+    // (finalized == block) so finalize advances finalized_block to 50 but NOT
+    // durable_block (deferred, interval never reached); block_hashes for 1..50
+    // are retained (pruned only to durable=0). Before the fix, a fork resolving
+    // onto a sub-finalized block (30) rolled derived state back below finality,
+    // left finalized_block stale at 50 > latest 30, and wedged the instance.
+    // The fix refuses any rollback below finalized at the chokepoint, so the
+    // sub-finality reorg is rejected cleanly and the instance stays consistent
+    // and usable.
+    let mut db = Settle::open(
+        Config::new(SIMPLE_SCHEMA).backfill_checkpoint_interval(100),
+    )
+    .unwrap();
+
+    for b in 1..=50u64 {
+        let input = IngestInput {
+            data: std::collections::HashMap::from([(
+                "swaps".to_string(),
+                vec![{
+                    let mut r = make_swap("ETH", 1.0);
+                    r.insert("block_number".into(), Value::UInt64(b));
+                    r
+                }],
+            )]),
+            rollback_chain: vec![BlockCursor {
+                number: b,
+                hash: crate::test_helpers::block_hash(b),
+            }],
+            finalized_head: BlockCursor {
+                number: b,
+                hash: crate::test_helpers::block_hash(b),
+            },
+        };
+        ingest_input(&mut db, input).unwrap();
+    }
+
+    assert_eq!(db.finalized_block(), 50, "finalized advanced");
+    assert_eq!(db.durable_block(), 0, "durable deferred (interval never reached)");
+
+    // Fork: a new canonical chain that shares blocks 1..30 but diverges at 31,
+    // i.e. a reorg resolving to common ancestor 30 — BELOW finalized (50).
+    // resolve_fork_cursor_bounded iterates DESC; 31 hash differs, 30 matches.
+    let fork_chain = vec![
+        BlockCursor { number: 31, hash: "0xforked31".into() },
+        BlockCursor { number: 30, hash: crate::test_helpers::block_hash(30) },
+    ];
+    assert!(
+        handle_fork(&mut db, fork_chain).is_err(),
+        "fork resolving below finalized must be rejected — finality is irreversible"
+    );
+
+    // No partial rollback: watermarks untouched, finalized <= latest preserved.
+    assert_eq!(db.finalized_block(), 50, "rejected fork must not mutate finalized");
+    assert_eq!(db.durable_block(), 0, "rejected fork must not mutate durable");
+    assert_eq!(db.latest_block(), 50, "rejected fork must not roll back latest");
+
+    // Instance is NOT wedged: a valid no-lag continuation still ingests and
+    // advances both watermarks.
+    let next = IngestInput {
+        data: std::collections::HashMap::from([(
+            "swaps".to_string(),
+            vec![{
+                let mut r = make_swap("ETH", 1.0);
+                r.insert("block_number".into(), Value::UInt64(51));
+                r
+            }],
+        )]),
+        rollback_chain: vec![BlockCursor {
+            number: 51,
+            hash: crate::test_helpers::block_hash(51),
+        }],
+        finalized_head: BlockCursor {
+            number: 51,
+            hash: crate::test_helpers::block_hash(51),
+        },
+    };
+    ingest_input(&mut db, next).expect("instance must remain usable after a rejected fork");
+    assert_eq!(db.finalized_block(), 51);
+    assert_eq!(db.latest_block(), 51);
+}
+
+#[test]
 fn ingest_auto_rollback_full_when_no_common_ancestor() {
     // When no common ancestor exists in the new chain, ingest() does a full
     // rollback to block 0 and processes fresh data.

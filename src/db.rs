@@ -13,7 +13,9 @@ use crate::storage::memory::MemoryBackend;
 #[cfg(feature = "rocksdb")]
 use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
 use crate::storage::{StorageBackend, StorageWriteBatch};
-use crate::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, PerfNodeKind, RowMap, Value};
+use crate::types::{
+    BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, PerfNodeKind, RowMap, Value,
+};
 
 /// Configuration for opening a Settle instance.
 #[non_exhaustive]
@@ -38,6 +40,15 @@ pub struct Config {
     /// the threshold only controls log noise. `handle_fork()` does not log
     /// (it rejects with `PendingAck` straight away).
     pub ack_warning_threshold: Duration,
+    /// Backfill durability checkpoint interval, in blocks. Default `1` =
+    /// persist derived reducer/MV state on every finalize (exact pre-feature
+    /// behavior). When `> 1` AND the ingest is no-lag (finalized head at the
+    /// batch tip, i.e. historical backfill) AND the pipeline is deferral-safe
+    /// (no sliding-window MV, no external reducer), derived-state persistence
+    /// is deferred and only flushed every `interval` blocks. Recovery replays
+    /// raw rows from the last durable checkpoint, so a crash mid-interval costs
+    /// extra replay but never loses data. See docs/backfill-mode-design.md.
+    pub backfill_checkpoint_interval: u64,
 }
 
 impl Config {
@@ -53,6 +64,7 @@ impl Config {
             disable_compaction: false,
             cache_size: None,
             ack_warning_threshold: Duration::from_secs(10),
+            backfill_checkpoint_interval: 1,
         }
     }
 
@@ -67,6 +79,7 @@ impl Config {
             disable_compaction: false,
             cache_size: None,
             ack_warning_threshold: Duration::from_secs(10),
+            backfill_checkpoint_interval: 1,
         }
     }
 
@@ -113,6 +126,17 @@ impl Config {
     /// RocksDB block-cache size in bytes.
     pub fn cache_size(mut self, bytes: usize) -> Self {
         self.cache_size = Some(bytes);
+        self
+    }
+
+    /// Backfill durability checkpoint interval, in blocks (default 1 = persist
+    /// every finalize). Set `> 1` to defer derived-state persistence on no-lag
+    /// historical backfill, flushing every `n` blocks. Safe: recovery replays
+    /// raw rows from the last checkpoint. Has no effect at chain tip (where
+    /// finality lags), nor for pipelines with sliding-window MVs or external
+    /// reducers (those always persist every finalize).
+    pub fn backfill_checkpoint_interval(mut self, n: u64) -> Self {
+        self.backfill_checkpoint_interval = n.max(1);
         self
     }
 }
@@ -183,6 +207,9 @@ pub struct Settle {
     /// `register_reducer_callback`. Enforces the strict "one callback per
     /// name, drop+reopen to change" contract.
     runtimes_attached: std::collections::HashSet<String>,
+    /// Backfill durability checkpoint interval (blocks). 1 = persist every
+    /// finalize. See `Config::backfill_checkpoint_interval`.
+    backfill_checkpoint_interval: u64,
 }
 
 impl Settle {
@@ -264,6 +291,7 @@ impl Settle {
             ack_warning_threshold: config.ack_warning_threshold,
             poisoned: None,
             runtimes_attached: std::collections::HashSet::new(),
+            backfill_checkpoint_interval: config.backfill_checkpoint_interval,
         })
     }
 
@@ -345,7 +373,8 @@ impl Settle {
         let finalized = self.engine.finalized_block();
         let latest = self.engine.latest_block();
         if latest > finalized {
-            self.engine.reset_reducer_branch_for_replay(name, finalized)?;
+            self.engine
+                .reset_reducer_branch_for_replay(name, finalized)?;
             self.engine
                 .replay_unfinalized_for(finalized + 1, latest, name)?;
         }
@@ -401,7 +430,8 @@ impl Settle {
             // replaying. Without this, a replay called after the reducer
             // already processed the unfinalized range would double every
             // emit and aggregate contribution.
-            self.engine.reset_reducer_branch_for_replay(name, finalized)?;
+            self.engine
+                .reset_reducer_branch_for_replay(name, finalized)?;
             self.engine
                 .replay_unfinalized_for(finalized + 1, latest, name)?;
         }
@@ -480,6 +510,15 @@ impl Settle {
 
     pub fn finalized_block(&self) -> BlockNumber {
         self.engine.finalized_block()
+    }
+
+    /// Highest block whose derived (reducer/MV) state is durably persisted to
+    /// disk. Equals `finalized_block()` in normal operation; under backfill
+    /// deferral it lags finality (derived state for `(durable, finalized]` is
+    /// in memory only, rebuilt from raw rows on recovery). Persisted as the
+    /// on-disk finalized watermark so recovery replays from `durable + 1`.
+    pub fn durable_block(&self) -> BlockNumber {
+        self.engine.durable_block()
     }
 
     pub fn finalized_cursor(&self) -> Option<BlockCursor> {
@@ -591,11 +630,13 @@ impl Settle {
                 // past disk — retry would re-encode against the mutated
                 // state and could silently land inconsistent writes).
                 if let Err(e) = self.storage.commit(&write_batch) {
-                    self.poisoned =
-                        Some(format!("heartbeat handle_fork commit failed: {e}"));
+                    self.poisoned = Some(format!("heartbeat handle_fork commit failed: {e}"));
                     return Err(e);
                 }
-                Ok(ForkResult { cursor, batch: None })
+                Ok(ForkResult {
+                    cursor,
+                    batch: None,
+                })
             }
             Some(batch) => {
                 self.pending = Some(PendingAck {
@@ -626,7 +667,7 @@ impl Settle {
     /// above `latest_block` is allowed for gappy chains like Solana).
     ///
     /// Each row in `data` must contain a `block_number` field (UInt64).
-    pub fn ingest(&mut self, input: IngestInput) -> Result<Option<ChangeBatch>> {
+    pub fn ingest(&mut self, mut input: IngestInput) -> Result<Option<ChangeBatch>> {
         // 0. Poison gate. Any prior immediate-commit failure made in-memory
         //    state diverge from disk; reject all further work so the caller
         //    drops and reopens rather than silently producing stale writes.
@@ -760,8 +801,13 @@ impl Settle {
                 }
             }
 
-            let mut tables: Vec<(&String, &Vec<RowMap>)> = input.data.iter().collect();
-            tables.sort_by_key(|(name, _)| name.as_str());
+            // Consume input.data by value — rows are moved into per-block
+            // buckets instead of cloned (the deep RowMap clone here was 12%
+            // inclusive in the flamegraph). The earlier min_input dedup check
+            // already read input.data, so taking it now is safe.
+            let mut tables: Vec<(String, Vec<RowMap>)> =
+                std::mem::take(&mut input.data).into_iter().collect();
+            tables.sort_by(|a, b| a.0.cmp(&b.0));
 
             for (table, rows) in tables {
                 let mut by_block: BTreeMap<BlockNumber, Vec<RowMap>> = BTreeMap::new();
@@ -780,12 +826,12 @@ impl Settle {
                             )));
                         }
                     };
-                    by_block.entry(block).or_default().push(row.clone());
+                    by_block.entry(block).or_default().push(row);
                 }
 
                 for (block, block_rows) in by_block {
                     let (changes, perf_node) = self.engine.process_batch_deferred(
-                        table,
+                        &table,
                         block,
                         block_rows,
                         &mut write_batch,
@@ -813,8 +859,9 @@ impl Settle {
             // `Error::Rollback` so the caller knows the instance is in a
             // questionable state and should be dropped + reopened.
             let mut throwaway = StorageWriteBatch::new();
-            if let Err(rollback_err) =
-                self.engine.rollback_to_batch(recovery_block, &mut throwaway)
+            if let Err(rollback_err) = self
+                .engine
+                .rollback_to_batch(recovery_block, &mut throwaway)
             {
                 return Err(Error::Rollback(format!(
                     "ingest failed ({e}) and recovery rollback also failed ({rollback_err}); \
@@ -888,8 +935,28 @@ impl Settle {
         //    `replay_unfinalized` rebuilds it from on-disk CF_REDUCER_FIN.
         //    On commit success (in ack or heartbeat path), in-memory and disk
         //    agree.
+        //
+        //    Backfill deferral: when the ingest is no-lag (finalized head at the
+        //    batch tip — historical backfill), the pipeline is deferral-safe,
+        //    and the checkpoint interval hasn't elapsed, we DEFER persisting
+        //    derived state (`persist = false`). The durable watermark
+        //    (META_FINALIZED_BLOCK) then stays put and recovery replays raw rows
+        //    from it. Any lag (tip operation), interval elapse, or a
+        //    deferral-unsafe pipeline forces a persisting checkpoint, catching
+        //    the durable watermark up to true finality. See design v2.
+        let target_finalized = input.finalized_head.number;
+        let persist = {
+            let latest = self.engine.latest_block();
+            let durable = self.engine.durable_block();
+            let no_lag = target_finalized >= latest;
+            let defer_active =
+                self.backfill_checkpoint_interval > 1 && self.engine.defer_allowed() && no_lag;
+            let reached_interval =
+                target_finalized.saturating_sub(durable) >= self.backfill_checkpoint_interval;
+            !defer_active || reached_interval
+        };
         self.engine
-            .finalize(input.finalized_head.number, &mut write_batch);
+            .finalize(target_finalized, &mut write_batch, persist);
         self.append_meta_to_batch(&mut write_batch)?;
 
         // 4. Update buffer heads with correct cursors (hashes now stored)
@@ -944,13 +1011,22 @@ impl Settle {
         Ok(())
     }
 
-    /// Append engine metadata (latest_block, finalized_block, block_hashes)
+    /// Append engine metadata (latest_block, durable watermark, block_hashes)
     /// to a write batch for atomic commit.
+    ///
+    /// `META_FINALIZED_BLOCK` stores the engine's DURABLE watermark, not the
+    /// in-memory finality watermark. Under backfill deferral the two diverge:
+    /// derived state on disk is only as-of `durable_block`, so recovery must
+    /// replay raw rows from `durable_block + 1`. On disk the field's meaning is
+    /// exactly "state is durable as of this block" — for non-deferred operation
+    /// `durable_block == finalized_block`, so this is back-compatible with DBs
+    /// written before backfill mode existed. The client still sees the true
+    /// finality watermark via `finalized_cursor()` in the ChangeBatch.
     fn append_meta_to_batch(&self, batch: &mut StorageWriteBatch) -> Result<()> {
         batch.put_meta(META_LATEST_BLOCK, &self.engine.latest_block().to_be_bytes());
         batch.put_meta(
             META_FINALIZED_BLOCK,
-            &self.engine.finalized_block().to_be_bytes(),
+            &self.engine.durable_block().to_be_bytes(),
         );
         let hashes_json = serde_json::to_vec(self.engine.block_hashes())
             .map_err(|e| Error::Storage(format!("failed to serialize block_hashes: {e}")))?;
@@ -978,3 +1054,7 @@ mod external_tests;
 #[cfg(test)]
 #[path = "db_validation_tests.rs"]
 mod validation_tests;
+
+#[cfg(all(test, feature = "rocksdb"))]
+#[path = "backfill_tests.rs"]
+mod backfill_tests;

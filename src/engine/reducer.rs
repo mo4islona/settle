@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Result;
 use crate::reducer_runtime::event_rules::EventRulesRuntime;
@@ -26,14 +26,29 @@ pub struct ReducerEngine {
     storage: Arc<dyn StorageBackend>,
     /// Cached default state (computed once from def.state).
     default_state: State,
+    /// State field names in schema (def.state) order. Used to convert the
+    /// hot `HashMap` state to/from the positional `Vec<Value>` representation
+    /// used by snapshots and finalized storage.
+    state_field_names: Vec<String>,
     /// Current hot state per group key.
     state_cache: FxHashMap<Vec<u8>, State>,
-    /// In-memory state snapshots: group_key -> (block -> state).
+    /// In-memory state snapshots: group_key -> (block -> positional state values).
+    /// Stored positionally (schema field order) so the per-block snapshot clone
+    /// is a cheap `Vec<Value>` copy instead of a full `HashMap` clone with N
+    /// string-key allocations (was the dominant cost in the finalize path).
     /// Only contains unfinalized blocks. Used for rollback.
-    block_snapshots: FxHashMap<Vec<u8>, BTreeMap<BlockNumber, State>>,
+    block_snapshots: FxHashMap<Vec<u8>, BTreeMap<BlockNumber, Vec<Value>>>,
     /// Tracks which blocks have been processed and which group keys were touched.
-    /// BTreeMap for O(log N) range queries during rollback/finalize.
-    block_groups: BTreeMap<BlockNumber, HashSet<Vec<u8>>>,
+    /// BTreeMap for O(log N) range queries during rollback/finalize. FxHash on
+    /// the per-block key sets: keys are trusted internal `Vec<u8>` group keys
+    /// inserted once per touched group per block (hot path) — matches the
+    /// FxHash already used for `state_cache` / `block_snapshots`.
+    block_groups: BTreeMap<BlockNumber, FxHashSet<Vec<u8>>>,
+    /// Group keys finalized since the last DURABLE checkpoint but not yet
+    /// persisted (backfill deferral). While a key sits here its `block_snapshots`
+    /// are RETAINED (not pruned) so the eventual checkpoint can read its correct
+    /// as-of-finalized value. Empty unless deferral is active. See design v2.
+    pending_durable: FxHashSet<Vec<u8>>,
     /// Pre-computed column IDs for group-by columns (resolved against source registry).
     /// Enables direct Vec indexing instead of HashMap lookups.
     group_by_ids: Vec<Option<ColumnId>>,
@@ -62,15 +77,18 @@ impl ReducerEngine {
 
         let source_registry = Arc::new(source_registry.clone());
         let default_state = compute_default_state(&def);
+        let state_field_names = def.state.iter().map(|f| f.name.clone()).collect();
 
         Self {
             def,
             runtime,
             storage,
             default_state,
+            state_field_names,
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            pending_durable: FxHashSet::default(),
             group_by_ids,
             source_registry,
             chained: false,
@@ -134,15 +152,18 @@ impl ReducerEngine {
         let runtime = Self::make_runtime(&def, &empty_registry, modules);
 
         let default_state = compute_default_state(&def);
+        let state_field_names = def.state.iter().map(|f| f.name.clone()).collect();
 
         Self {
             def,
             runtime,
             storage,
             default_state,
+            state_field_names,
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            pending_durable: FxHashSet::default(),
             group_by_ids: vec![],
             source_registry: Arc::new(empty_registry),
             chained: true,
@@ -163,15 +184,18 @@ impl ReducerEngine {
             .collect();
         let source_registry = Arc::new(source_registry.clone());
         let default_state = compute_default_state(&def);
+        let state_field_names = def.state.iter().map(|f| f.name.clone()).collect();
 
         Self {
             def,
             runtime,
             storage,
             default_state,
+            state_field_names,
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            pending_durable: FxHashSet::default(),
             group_by_ids,
             source_registry,
             chained: false,
@@ -228,7 +252,7 @@ impl ReducerEngine {
     /// Fast per-row path: no grouping overhead, no row cloning.
     fn process_block_per_row(&mut self, block: BlockNumber, rows: &[Row]) -> Result<Vec<RowMap>> {
         let mut output_maps: Vec<RowMap> = Vec::new();
-        let mut touched_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut touched_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
 
         for row in rows {
             let group_key_bytes = self.compute_group_key_bytes(row);
@@ -242,6 +266,7 @@ impl ReducerEngine {
                     &self.def.name,
                     &group_key_bytes,
                     &self.default_state,
+                    &self.state_field_names,
                 )?;
                 self.state_cache
                     .entry(group_key_bytes.clone())
@@ -255,24 +280,35 @@ impl ReducerEngine {
             touched_keys.insert(group_key_bytes);
 
             for mut emit_row in emits {
-                // Add group-by columns to the output row for downstream MVs
+                // Add group-by columns to the output row for downstream MVs.
+                // Check presence with a borrowed `&str` and only clone the
+                // column name when actually inserting — the Lua/EventRules
+                // emit usually already carries the group-by column, so the
+                // eager `col.clone()` in the old `entry()` form was a wasted
+                // String allocation on every emit (per-row hot path).
                 for col in &self.def.group_by {
-                    if let Some(v) = row.get(col.as_str()) {
-                        emit_row.entry(col.clone()).or_insert_with(|| v.clone());
+                    if !emit_row.contains_key(col.as_str()) {
+                        if let Some(v) = row.get(col.as_str()) {
+                            emit_row.insert(col.clone(), v.clone());
+                        }
                     }
                 }
                 output_maps.push(emit_row);
             }
         }
 
-        // Save in-memory snapshot for each touched group key (one clone per key per block)
+        // Save in-memory snapshot for each touched group key (one positional
+        // Vec<Value> per key per block — cheap vs a full HashMap clone).
         let block_keys = self.block_groups.entry(block).or_default();
         for group_key_bytes in touched_keys {
-            let state = self.state_cache.get(&group_key_bytes).unwrap();
+            let snapshot = {
+                let state = self.state_cache.get(&group_key_bytes).unwrap();
+                state_to_values(state, &self.state_field_names)
+            };
             self.block_snapshots
                 .entry(group_key_bytes.clone())
                 .or_default()
-                .insert(block, state.clone());
+                .insert(block, snapshot);
             block_keys.insert(group_key_bytes);
         }
 
@@ -298,6 +334,7 @@ impl ReducerEngine {
                     &self.def.name,
                     e.key(),
                     &self.default_state,
+                    &self.state_field_names,
                 )?;
                 e.insert(loaded);
             }
@@ -340,11 +377,12 @@ impl ReducerEngine {
             let key = &key_order[i];
             let (_, row_indices) = &group_map[key];
 
-            // Snapshot state before inserting into cache (avoids double lookup)
+            // Snapshot state (positional) before moving it into the cache.
+            let snapshot = state_to_values(&batch.state, &self.state_field_names);
             self.block_snapshots
                 .entry(key.clone())
                 .or_default()
-                .insert(block, batch.state.clone());
+                .insert(block, snapshot);
             self.state_cache.insert(key.clone(), batch.state);
             block_keys.insert(key.clone());
 
@@ -359,8 +397,10 @@ impl ReducerEngine {
             );
             for (emit_idx, mut emit_row) in batch.emits.into_iter().enumerate() {
                 for col in &self.def.group_by {
-                    if let Some(v) = first_row.get(col.as_str()) {
-                        emit_row.entry(col.clone()).or_insert_with(|| v.clone());
+                    if !emit_row.contains_key(col.as_str()) {
+                        if let Some(v) = first_row.get(col.as_str()) {
+                            emit_row.insert(col.clone(), v.clone());
+                        }
                     }
                 }
                 // Map back to original row index for ordering
@@ -432,7 +472,7 @@ impl ReducerEngine {
         }
 
         // Collect all affected group keys (consume by value to avoid cloning)
-        let mut affected_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut affected_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
         for (_block, keys) in rolled_back {
             for key in keys {
                 affected_keys.insert(key);
@@ -464,27 +504,49 @@ impl ReducerEngine {
     }
 
     /// Finalize state up to the given block.
-    /// Collects finalized state writes into the provided batch for atomic commit.
-    /// Drops in-memory snapshots for finalized blocks.
-    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
-        // Split off blocks > block, keeping blocks <= block for finalization
+    ///
+    /// `persist` controls durability. When true (the default / checkpoint),
+    /// finalized state is serialized into the batch and in-memory snapshots ≤
+    /// block are pruned, as before. When false (backfill deferral), the changed
+    /// group keys are accumulated into `pending_durable` and their snapshots are
+    /// RETAINED (not pruned) so the eventual checkpoint reads the correct
+    /// as-of-finalized value — no disk writes happen. See design v2.
+    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
+        // Split off blocks > block, keeping blocks <= block for finalization.
+        // (Always prune block_groups — it only tracks block→key for rollback,
+        // and finalized blocks ≤ block are never rolled back.)
         let remaining = self.block_groups.split_off(&(block + 1));
         let finalized_block_groups = std::mem::replace(&mut self.block_groups, remaining);
 
-        let mut finalized_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut finalized_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
         for keys in finalized_block_groups.values() {
             finalized_keys.extend(keys.iter().cloned());
         }
 
-        // For each group key, add finalized state to batch and drop old snapshots
-        for group_key_bytes in &finalized_keys {
-            // Find the most recent state at or before the finalization block
+        if !persist {
+            // Defer: remember the keys (snapshots intentionally retained so a
+            // later checkpoint can read the correct as-of-block value even if
+            // lag later moves state_cache ahead).
+            self.pending_durable.extend(finalized_keys);
+            return;
+        }
+
+        // Checkpoint: persist accumulated deferred keys + this batch's keys.
+        let mut to_persist = std::mem::take(&mut self.pending_durable);
+        to_persist.extend(finalized_keys);
+
+        for group_key_bytes in &to_persist {
+            // Find the most recent state at or before the finalization block.
+            // Snapshots are positional Vec<Value>, encoded with the fast binary
+            // codec (no string keys, no msgpack). For deferred keys the snapshot
+            // was retained; for this-batch keys it is freshly present.
             if let Some(state) = self.find_snapshot_at_or_before(group_key_bytes, block) {
-                let state_bytes = storage::encode_state(&state);
+                let state_bytes = storage::encode_values(&state);
                 batch.set_reducer_finalized(&self.def.name, group_key_bytes, &state_bytes);
             }
 
-            // Remove in-memory snapshots for blocks <= finalization point
+            // Remove in-memory snapshots for blocks <= finalization point now
+            // that they are durable.
             if let Some(snapshots) = self.block_snapshots.get_mut(group_key_bytes) {
                 let remaining = snapshots.split_off(&(block + 1));
                 *snapshots = remaining;
@@ -498,8 +560,8 @@ impl ReducerEngine {
     /// Find state at or before the given block from in-memory snapshots,
     /// falling back to storage (finalized state) or defaults.
     fn find_state_at_or_before(&self, group_key_bytes: &[u8], block: BlockNumber) -> Result<State> {
-        if let Some(state) = self.find_snapshot_at_or_before(group_key_bytes, block) {
-            return Ok(state);
+        if let Some(values) = self.find_snapshot_at_or_before(group_key_bytes, block) {
+            return Ok(values_to_state(&values, &self.state_field_names));
         }
         // Fall back to finalized state in storage
         load_state_from(
@@ -507,22 +569,24 @@ impl ReducerEngine {
             &self.def.name,
             group_key_bytes,
             &self.default_state,
+            &self.state_field_names,
         )
     }
 
     /// Look up the most recent in-memory snapshot at or before the given block.
+    /// Returns the positional state values (schema field order).
     fn find_snapshot_at_or_before(
         &self,
         group_key_bytes: &[u8],
         block: BlockNumber,
-    ) -> Option<State> {
+    ) -> Option<Vec<Value>> {
         self.block_snapshots
             .get(group_key_bytes)
             .and_then(|snapshots| {
                 snapshots
                     .range(..=block)
                     .next_back()
-                    .map(|(_, state)| state.clone())
+                    .map(|(_, values)| values.clone())
             })
     }
 
@@ -565,16 +629,38 @@ fn compute_default_state(def: &ReducerDef) -> State {
 }
 
 /// Load reducer state from storage, avoiding borrowing the entire ReducerEngine.
+/// Finalized state is persisted positionally (see `finalize`), so decode the
+/// `Vec<Value>` and rebuild the hot `HashMap` state by schema field order.
 fn load_state_from(
     storage: &dyn StorageBackend,
     reducer_name: &str,
     group_key_bytes: &[u8],
     default_state: &State,
+    field_names: &[String],
 ) -> Result<State> {
     if let Some(bytes) = storage.get_reducer_finalized(reducer_name, group_key_bytes)? {
-        return Ok(storage::decode_state(&bytes));
+        let values = storage::decode_values(&bytes);
+        return Ok(values_to_state(&values, field_names));
     }
     Ok(default_state.clone())
+}
+
+/// Convert the hot `HashMap` state into a positional `Vec<Value>` in schema
+/// field order. Avoids cloning string keys (the dominant snapshot cost).
+fn state_to_values(state: &State, field_names: &[String]) -> Vec<Value> {
+    field_names
+        .iter()
+        .map(|name| state.get(name).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
+/// Rebuild a `HashMap` state from positional values and schema field order.
+fn values_to_state(values: &[Value], field_names: &[String]) -> State {
+    field_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), values.get(i).cloned().unwrap_or(Value::Null)))
+        .collect()
 }
 
 fn parse_default(default_str: &str, column_type: &crate::types::ColumnType) -> Value {
@@ -854,7 +940,7 @@ mod tests {
 
         // Finalize up to 1000
         let mut batch = StorageWriteBatch::new();
-        engine.finalize(1000, &mut batch);
+        engine.finalize(1000, &mut batch, true);
         storage.commit(&batch).unwrap();
 
         // Block 1002: buy 3 (will be rolled back)

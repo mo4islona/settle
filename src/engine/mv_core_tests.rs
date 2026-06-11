@@ -255,7 +255,7 @@ fn mv_finalize_then_rollback() {
     );
 
     let mut batch = StorageWriteBatch::new();
-    mv.finalize(1001, &mut batch);
+    mv.finalize(1001, &mut batch, true);
 
     // Rollback block 1002
     let changes = mv.rollback(1001);
@@ -470,7 +470,7 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
             ])],
         );
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(1, &mut batch);
+        mv.finalize(1, &mut batch, true);
         storage.commit(&batch).unwrap();
     }
 
@@ -491,7 +491,7 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
         assert!(changes.iter().any(|d| d.operation == ChangeOp::Delete));
 
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(1, &mut batch);
+        mv.finalize(1, &mut batch, true);
         storage.commit(&batch).unwrap();
     }
 
