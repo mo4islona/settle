@@ -437,7 +437,8 @@ fn bench_full_pipeline_fn_reducer(backend: Backend) -> BenchResult {
     let mut db = Settle::open(cfg).unwrap();
 
     // Inject the FnReducer runtime
-    db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()));
+    db.register_reducer_callback("pnl", Box::new(pnl_fn_runtime()))
+        .unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {
