@@ -324,10 +324,10 @@ impl MVEngine {
             // Feed values to each aggregation using pre-computed agg info
             for feed in &self.agg_feeds {
                 let value = match feed.source_col.as_deref() {
-                    Some(col) => row.get(col).cloned().unwrap_or(Value::Null),
-                    None => Value::UInt64(1),
+                    Some(col) => row.get(col).unwrap_or(&Value::Null),
+                    None => &Value::UInt64(1),
                 };
-                aggs[feed.agg_index].add_block(block, std::slice::from_ref(&value));
+                aggs[feed.agg_index].add_block(block, std::slice::from_ref(value));
             }
 
             // Track block -> group key mapping for rollback
