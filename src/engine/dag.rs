@@ -4,22 +4,6 @@ use std::sync::Arc;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
-// wasm32 does not support std::time::Instant. Use a zero-cost stub instead.
-#[cfg(not(target_arch = "wasm32"))]
-fn start_timer() -> std::time::Instant {
-    std::time::Instant::now()
-}
-#[cfg(not(target_arch = "wasm32"))]
-fn elapsed_ms(t: std::time::Instant) -> f64 {
-    t.elapsed().as_secs_f64() * 1000.0
-}
-#[cfg(target_arch = "wasm32")]
-fn start_timer() -> () {}
-#[cfg(target_arch = "wasm32")]
-fn elapsed_ms(_: ()) -> f64 {
-    0.0
-}
-
 use crate::error::{Error, Result};
 use crate::schema::ast::Schema;
 use crate::storage::StorageBackend;
@@ -30,6 +14,7 @@ use crate::types::{
 };
 
 use super::mv::MVEngine;
+use super::perf::PerfTimer;
 use super::raw_table::RawTableEngine;
 use super::reducer::ReducerEngine;
 
@@ -79,8 +64,9 @@ impl PipelineBranch {
         &mut self,
         block: BlockNumber,
         output_rows: &HashMap<String, Vec<RowMap>>,
-    ) -> Result<(Vec<ChangeRecord>, PerfNode)> {
-        let r_start = start_timer();
+        perf: bool,
+    ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
+        let timer = PerfTimer::start(perf);
         let mut changes = Vec::new();
         let mut mv_nodes = Vec::new();
 
@@ -88,24 +74,14 @@ impl PipelineBranch {
             let enriched = self.reducer.process_block_maps(block, rows)?;
             if !enriched.is_empty() {
                 for (mv_name, mv) in &mut self.mv_entries {
-                    let mv_start = start_timer();
+                    let mv_timer = PerfTimer::start(perf);
                     changes.extend(mv.process_block(block, &enriched));
-                    mv_nodes.push(PerfNode {
-                        kind: PerfNodeKind::MV,
-                        name: mv_name.clone(),
-                        duration_ms: elapsed_ms(mv_start),
-                        children: vec![],
-                    });
+                    mv_nodes.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
             }
         }
 
-        let node = PerfNode {
-            kind: PerfNodeKind::Reducer,
-            name: self.reducer_name.clone(),
-            duration_ms: elapsed_ms(r_start),
-            children: mv_nodes,
-        };
+        let node = timer.stop(PerfNodeKind::Reducer, &self.reducer_name, mv_nodes);
         Ok((changes, node))
     }
 }
@@ -154,6 +130,8 @@ pub struct SettleEngine {
     /// last finalized block — heartbeat ingests with stale `finalized_head`
     /// otherwise re-serialize every MV group state on every call.
     has_finalized: bool,
+    /// Whether ingest builds the `PerfNode` timing tree.
+    collect_perf: bool,
     /// Block number → hash for all known blocks.
     /// Populated by set_rollback_chain(). Used for fork resolution and cursors.
     block_hashes: BTreeMap<BlockNumber, String>,
@@ -310,6 +288,7 @@ impl SettleEngine {
             durable_block: None,
             defer_allowed,
             has_finalized: false,
+            collect_perf: true,
             block_hashes: BTreeMap::new(),
         }
     }
@@ -421,7 +400,7 @@ impl SettleEngine {
         table: &str,
         block: BlockNumber,
         row_maps: Vec<RowMap>,
-    ) -> Result<(Vec<ChangeRecord>, PerfNode)> {
+    ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
         self.process_batch_inner(table, block, row_maps, None)
     }
 
@@ -432,7 +411,7 @@ impl SettleEngine {
         block: BlockNumber,
         row_maps: Vec<RowMap>,
         write_batch: &mut StorageWriteBatch,
-    ) -> Result<(Vec<ChangeRecord>, PerfNode)> {
+    ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
         self.process_batch_inner(table, block, row_maps, Some(write_batch))
     }
 
@@ -442,8 +421,9 @@ impl SettleEngine {
         block: BlockNumber,
         row_maps: Vec<RowMap>,
         write_batch: Option<&mut StorageWriteBatch>,
-    ) -> Result<(Vec<ChangeRecord>, PerfNode)> {
-        let pipeline_start = start_timer();
+    ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
+        let perf = self.collect_perf;
+        let pipeline_timer = PerfTimer::start(perf);
         let mut perf_children: Vec<PerfNode> = Vec::new();
 
         if !self.raw_tables.contains_key(table) {
@@ -453,7 +433,7 @@ impl SettleEngine {
         let mut all_changes = Vec::new();
 
         // Phase 1: Raw table ingest
-        let raw_start = start_timer();
+        let raw_timer = PerfTimer::start(perf);
         let raw_eng = self.raw_tables.get(table).unwrap();
         let is_virtual = self.virtual_tables.contains(table);
         if let Some(batch) = write_batch {
@@ -465,13 +445,7 @@ impl SettleEngine {
             let changes = raw_eng.ingest(block, &row_maps)?;
             all_changes.extend(changes);
         }
-
-        perf_children.push(PerfNode {
-            kind: PerfNodeKind::RawTable,
-            name: table.to_string(),
-            duration_ms: elapsed_ms(raw_start),
-            children: vec![],
-        });
+        perf_children.extend(raw_timer.stop(PerfNodeKind::RawTable, table, vec![]));
 
         // Output rows for downstream consumption (reducers + MVs)
         let mut output_rows: HashMap<String, Vec<RowMap>> = HashMap::new();
@@ -493,64 +467,50 @@ impl SettleEngine {
             {
                 // Phase 2a: Process MVs that source directly from raw tables
                 for mv_name in &self.direct_mvs {
-                    let mv_start = start_timer();
+                    let mv_timer = PerfTimer::start(perf);
                     let mv = self.mvs.get_mut(mv_name).unwrap();
                     let source = mv.source().to_string();
                     if let Some(source_rows) = output_rows.get(&source) {
                         let changes = mv.process_block(block, source_rows);
                         all_changes.extend(changes);
                     }
-                    perf_children.push(PerfNode {
-                        kind: PerfNodeKind::MV,
-                        name: mv_name.clone(),
-                        duration_ms: elapsed_ms(mv_start),
-                        children: vec![],
-                    });
+                    perf_children.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
 
                 // Phase 2b: Process reducer branches in parallel.
-                let parallel_start = start_timer();
+                let parallel_timer = PerfTimer::start(perf);
+                let mut branch_nodes = Vec::new();
+                let mut take = |result: Result<(Vec<ChangeRecord>, Option<PerfNode>)>| {
+                    let (changes, node) = result?;
+                    all_changes.extend(changes);
+                    branch_nodes.extend(node);
+                    Ok::<(), Error>(())
+                };
+
                 if self.branches.len() == 2 {
                     let (first, second) = self.branches.split_at_mut(1);
-                    let branch_0 = &mut first[0];
-                    let branch_1 = &mut second[0];
-
                     let (result_0, result_1) = rayon::join(
-                        || branch_0.process_block(block, &output_rows),
-                        || branch_1.process_block(block, &output_rows),
+                        || first[0].process_block(block, &output_rows, perf),
+                        || second[0].process_block(block, &output_rows, perf),
                     );
-
-                    let (d0, p0) = result_0?;
-                    let (d1, p1) = result_1?;
-                    all_changes.extend(d0);
-                    all_changes.extend(d1);
-                    perf_children.push(PerfNode {
-                        kind: PerfNodeKind::Parallel,
-                        name: "parallel".to_string(),
-                        duration_ms: elapsed_ms(parallel_start),
-                        children: vec![p0, p1],
-                    });
+                    take(result_0)?;
+                    take(result_1)?;
                 } else {
-                    // General N-branch parallel using par_iter_mut
-                    let results: Vec<Result<(Vec<ChangeRecord>, PerfNode)>> = self
+                    let results: Vec<_> = self
                         .branches
                         .par_iter_mut()
-                        .map(|branch| branch.process_block(block, &output_rows))
+                        .map(|branch| branch.process_block(block, &output_rows, perf))
                         .collect();
-
-                    let mut branch_nodes = Vec::new();
                     for result in results {
-                        let (d, p) = result?;
-                        all_changes.extend(d);
-                        branch_nodes.push(p);
+                        take(result)?;
                     }
-                    perf_children.push(PerfNode {
-                        kind: PerfNodeKind::Parallel,
-                        name: "parallel".to_string(),
-                        duration_ms: elapsed_ms(parallel_start),
-                        children: branch_nodes,
-                    });
                 }
+
+                perf_children.extend(parallel_timer.stop(
+                    PerfNodeKind::Parallel,
+                    "parallel",
+                    branch_nodes,
+                ));
             } // #[cfg(feature = "rayon")]
         } else {
             // Sequential execution: process branches + remaining engines.
@@ -561,7 +521,7 @@ impl SettleEngine {
                 match node {
                     PipelineNode::RawTable(_) => {} // Already processed in Phase 1
                     PipelineNode::Reducer(name) => {
-                        let r_start = start_timer();
+                        let timer = PerfTimer::start(perf);
                         let enriched = if let Some(branch) =
                             self.branch_index.get(name).map(|&i| &mut self.branches[i])
                         {
@@ -580,20 +540,16 @@ impl SettleEngine {
                                 Vec::new()
                             }
                         };
-                        let idx = perf_children.len();
-                        reducer_perf_idx.insert(name.clone(), idx);
-                        perf_children.push(PerfNode {
-                            kind: PerfNodeKind::Reducer,
-                            name: name.clone(),
-                            duration_ms: elapsed_ms(r_start),
-                            children: vec![],
-                        });
+                        if let Some(node) = timer.stop(PerfNodeKind::Reducer, name, vec![]) {
+                            reducer_perf_idx.insert(name.clone(), perf_children.len());
+                            perf_children.push(node);
+                        }
                         if !enriched.is_empty() {
                             output_rows.insert(name.clone(), enriched);
                         }
                     }
                     PipelineNode::MV(name) => {
-                        let mv_start = start_timer();
+                        let timer = PerfTimer::start(perf);
                         let mv_source;
                         if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
                             let mv = &mut self.branches[bi].mv_entries[mi].1;
@@ -610,17 +566,12 @@ impl SettleEngine {
                                 all_changes.extend(changes);
                             }
                         }
-                        let mv_node = PerfNode {
-                            kind: PerfNodeKind::MV,
-                            name: name.clone(),
-                            duration_ms: elapsed_ms(mv_start),
-                            children: vec![],
-                        };
                         // Nest under parent reducer if exists, otherwise add as sibling
-                        if let Some(&idx) = reducer_perf_idx.get(&mv_source) {
-                            perf_children[idx].children.push(mv_node);
-                        } else {
-                            perf_children.push(mv_node);
+                        if let Some(node) = timer.stop(PerfNodeKind::MV, name, vec![]) {
+                            match reducer_perf_idx.get(&mv_source) {
+                                Some(&idx) => perf_children[idx].children.push(node),
+                                None => perf_children.push(node),
+                            }
                         }
                     }
                 }
@@ -639,13 +590,7 @@ impl SettleEngine {
             self.durable_block = block.checked_sub(1);
         }
 
-        let perf_node = PerfNode {
-            kind: PerfNodeKind::Pipeline,
-            name: table.to_string(),
-            duration_ms: elapsed_ms(pipeline_start),
-            children: perf_children,
-        };
-
+        let perf_node = pipeline_timer.stop(PerfNodeKind::Pipeline, table, perf_children);
         Ok((all_changes, perf_node))
     }
 
@@ -1194,6 +1139,11 @@ impl SettleEngine {
     /// raw rows from the block after it, or from block 0 without it.
     pub fn durable_block(&self) -> Option<BlockNumber> {
         self.durable_block
+    }
+
+    /// Turn the per-ingest `PerfNode` timing tree on or off.
+    pub fn set_collect_perf(&mut self, on: bool) {
+        self.collect_perf = on;
     }
 
     /// Whether backfill persist-deferral is structurally safe for this pipeline

@@ -301,6 +301,22 @@ fn ingest_persists_and_restores_state() {
     }
 }
 
+/// With perf collection off, ingest returns the same changes and no timings.
+#[test]
+fn collect_perf_off_leaves_perf_empty() {
+    let ingest = |collect: bool| {
+        let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).collect_perf(collect)).unwrap();
+        let rows = vec![make_swap("ETH", 100.0), make_swap("BTC", 5.0)];
+        ingest_one(&mut db, "swaps", 1000, rows).unwrap().unwrap()
+    };
+
+    let (on, off) = (ingest(true), ingest(false));
+    assert_eq!(on.perf.len(), 1);
+    assert!(off.perf.is_empty());
+    assert_eq!(off.records_for("pool_volume").len(), 2);
+    assert_eq!(off.records_for("swaps").len(), on.records_for("swaps").len());
+}
+
 /// ingest() with multiple blocks must batch perf nodes into a flat array,
 /// not create nested per-push arrays.
 #[test]
