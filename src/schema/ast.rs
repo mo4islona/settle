@@ -63,6 +63,10 @@ pub struct MVDef {
     pub sliding_window: Option<SlidingWindowDef>,
 }
 
+/// The most aggregate columns an MV can have: the persisted group state
+/// stores the aggregate count in one byte.
+pub const MAX_MV_AGGREGATES: usize = u8::MAX as usize;
+
 #[derive(Debug, Clone)]
 pub struct StateField {
     pub name: String,

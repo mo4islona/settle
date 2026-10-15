@@ -102,13 +102,14 @@ pub type StateBytes = Vec<u8>;
 pub type GroupKeyBytes = Vec<u8>;
 
 /// Encode a group key (Vec<Value>) into deterministic bytes for storage keying.
+/// Uses the fast tag-based binary codec (no msgpack string/marker overhead).
 pub fn encode_group_key(key: &[Value]) -> GroupKeyBytes {
-    rmp_serde::to_vec(key).expect("group key serialization should not fail")
+    encode_values(key)
 }
 
 /// Decode a group key from storage bytes.
 pub fn decode_group_key(bytes: &[u8]) -> GroupKey {
-    rmp_serde::from_slice(bytes).expect("group key deserialization should not fail")
+    decode_values(bytes).into_iter().collect()
 }
 
 /// Encode reducer state (RowMap) to bytes.
@@ -119,6 +120,34 @@ pub fn encode_state(state: &RowMap) -> StateBytes {
 /// Decode reducer state from bytes.
 pub fn decode_state(bytes: &[u8]) -> RowMap {
     rmp_serde::from_slice(bytes).expect("state deserialization should not fail")
+}
+
+/// Encode a positional list of `Value`s (reducer state in schema field order)
+/// using the fast tag-based binary codec — no string keys, no msgpack overhead.
+/// Format: `count: u32 LE` then one `encode_value` per value.
+pub fn encode_values(values: &[Value]) -> StateBytes {
+    let mut buf = Vec::with_capacity(4 + values.len() * 9);
+    buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    for v in values {
+        encode_value(&mut buf, v);
+    }
+    buf
+}
+
+/// Decode a positional list of `Value`s encoded by [`encode_values`].
+pub fn decode_values(bytes: &[u8]) -> Vec<Value> {
+    let mut pos = 0usize;
+    let n = u32::from_le_bytes(
+        read_bytes(bytes, &mut pos, 4)
+            .expect("decode_values: missing length header")
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(decode_value(bytes, &mut pos).expect("decode_values: malformed value"));
+    }
+    out
 }
 
 // --- Custom binary row encoding ---

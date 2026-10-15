@@ -13,7 +13,9 @@ use crate::storage::memory::MemoryBackend;
 #[cfg(feature = "rocksdb")]
 use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
 use crate::storage::{StorageBackend, StorageWriteBatch};
-use crate::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, PerfNodeKind, RowMap, Value};
+use crate::types::{
+    BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, PerfNodeKind, RowMap, Value,
+};
 
 /// Configuration for opening a Settle instance.
 #[non_exhaustive]
@@ -345,7 +347,8 @@ impl Settle {
         let finalized = self.engine.finalized_block();
         let latest = self.engine.latest_block();
         if latest > finalized {
-            self.engine.reset_reducer_branch_for_replay(name, finalized)?;
+            self.engine
+                .reset_reducer_branch_for_replay(name, finalized)?;
             self.engine
                 .replay_unfinalized_for(finalized + 1, latest, name)?;
         }
@@ -401,7 +404,8 @@ impl Settle {
             // replaying. Without this, a replay called after the reducer
             // already processed the unfinalized range would double every
             // emit and aggregate contribution.
-            self.engine.reset_reducer_branch_for_replay(name, finalized)?;
+            self.engine
+                .reset_reducer_branch_for_replay(name, finalized)?;
             self.engine
                 .replay_unfinalized_for(finalized + 1, latest, name)?;
         }
@@ -591,11 +595,13 @@ impl Settle {
                 // past disk — retry would re-encode against the mutated
                 // state and could silently land inconsistent writes).
                 if let Err(e) = self.storage.commit(&write_batch) {
-                    self.poisoned =
-                        Some(format!("heartbeat handle_fork commit failed: {e}"));
+                    self.poisoned = Some(format!("heartbeat handle_fork commit failed: {e}"));
                     return Err(e);
                 }
-                Ok(ForkResult { cursor, batch: None })
+                Ok(ForkResult {
+                    cursor,
+                    batch: None,
+                })
             }
             Some(batch) => {
                 self.pending = Some(PendingAck {
@@ -626,7 +632,7 @@ impl Settle {
     /// above `latest_block` is allowed for gappy chains like Solana).
     ///
     /// Each row in `data` must contain a `block_number` field (UInt64).
-    pub fn ingest(&mut self, input: IngestInput) -> Result<Option<ChangeBatch>> {
+    pub fn ingest(&mut self, mut input: IngestInput) -> Result<Option<ChangeBatch>> {
         // 0. Poison gate. Any prior immediate-commit failure made in-memory
         //    state diverge from disk; reject all further work so the caller
         //    drops and reopens rather than silently producing stale writes.
@@ -760,8 +766,13 @@ impl Settle {
                 }
             }
 
-            let mut tables: Vec<(&String, &Vec<RowMap>)> = input.data.iter().collect();
-            tables.sort_by_key(|(name, _)| name.as_str());
+            // Consume input.data by value — rows are moved into per-block
+            // buckets instead of cloned (the deep RowMap clone here was 12%
+            // inclusive in the flamegraph). The earlier min_input dedup check
+            // already read input.data, so taking it now is safe.
+            let mut tables: Vec<(String, Vec<RowMap>)> =
+                std::mem::take(&mut input.data).into_iter().collect();
+            tables.sort_by(|a, b| a.0.cmp(&b.0));
 
             for (table, rows) in tables {
                 let mut by_block: BTreeMap<BlockNumber, Vec<RowMap>> = BTreeMap::new();
@@ -780,12 +791,12 @@ impl Settle {
                             )));
                         }
                     };
-                    by_block.entry(block).or_default().push(row.clone());
+                    by_block.entry(block).or_default().push(row);
                 }
 
                 for (block, block_rows) in by_block {
                     let (changes, perf_node) = self.engine.process_batch_deferred(
-                        table,
+                        &table,
                         block,
                         block_rows,
                         &mut write_batch,
@@ -813,8 +824,9 @@ impl Settle {
             // `Error::Rollback` so the caller knows the instance is in a
             // questionable state and should be dropped + reopened.
             let mut throwaway = StorageWriteBatch::new();
-            if let Err(rollback_err) =
-                self.engine.rollback_to_batch(recovery_block, &mut throwaway)
+            if let Err(rollback_err) = self
+                .engine
+                .rollback_to_batch(recovery_block, &mut throwaway)
             {
                 return Err(Error::Rollback(format!(
                     "ingest failed ({e}) and recovery rollback also failed ({rollback_err}); \
