@@ -2020,6 +2020,7 @@ dependencies = [
 name = "settle"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "ethnum",
  "js-sys",
  "mlua",
