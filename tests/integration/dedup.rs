@@ -1,9 +1,9 @@
 //! E2E: no data duplication on common Portal re-ingest patterns.
 //!
 //! Each test exercises a real RocksDB-backed `Settle` and inspects the MV
-//! state through the emitted `ChangeBatch`. The first test currently
-//! documents Issue #1 (FORK_ISSUES.md) — re-ingest of an identical block
-//! doubles aggregates because `ingest()` has no dedup guard.
+//! state through the emitted `ChangeBatch`. The first test pins the dedup
+//! guard: re-ingesting an identical block would double aggregates, so
+//! `ingest()` rejects it.
 
 use std::collections::HashMap;
 
@@ -29,10 +29,9 @@ fn cursor_with_hash(n: u64, hash: &str) -> BlockCursor {
     }
 }
 
-/// Issue #1 (FORK_ISSUES.md): re-ingesting a block at or below
-/// `latest_block` would double reducer/MV aggregates. The dedup guard in
-/// `Settle::ingest()` returns `Err` instead, so caller bugs / Portal retry
-/// glitches surface immediately.
+/// Re-ingesting a block at or below `latest_block` would double reducer/MV
+/// aggregates. The dedup guard in `Settle::ingest()` returns `Err` instead, so
+/// caller bugs / Portal retry glitches surface immediately.
 #[test]
 fn re_ingest_same_block_returns_error() {
     let tmp = TempDir::new().unwrap();
