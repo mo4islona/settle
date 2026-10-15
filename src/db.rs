@@ -40,8 +40,7 @@ pub struct Config {
     /// (it rejects with `PendingAck` straight away).
     pub ack_warning_threshold: Duration,
     /// Backfill durability checkpoint interval, in blocks. Default `1` =
-    /// persist derived reducer/MV state on every finalize (exact pre-feature
-    /// behavior). When `> 1` AND the ingest is no-lag (finalized head at the
+    /// persist derived reducer/MV state on every finalize. When `> 1` AND the ingest is no-lag (finalized head at the
     /// batch tip, i.e. historical backfill) AND the pipeline is deferral-safe
     /// (no sliding-window MV, no external reducer), derived-state persistence
     /// is deferred and only flushed every `interval` blocks. Recovery replays
@@ -791,9 +790,9 @@ impl Settle {
         //    Tables are sorted by name for deterministic processing order across
         //    multiple tables (HashMap iteration order is non-deterministic).
         let result = (|| -> Result<()> {
-            // Dedup guard (FORK_ISSUES.md issue #1): reject any block at or
-            // below the current (post-fork-detection) latest. Re-ingesting an
-            // already-processed block would double reducer/MV aggregates.
+            // Dedup guard: reject any block at or below the current
+            // (post-fork-detection) latest. Re-ingesting an already-processed
+            // block would double reducer/MV aggregates.
             // For real chain reorgs the caller must use handle_fork() to roll
             // state back BEFORE feeding new-chain data — relying on ingest()'s
             // in-line fork detection to also delete duplicate content at the
@@ -820,10 +819,9 @@ impl Settle {
                 }
             }
 
-            // Consume input.data by value — rows are moved into per-block
-            // buckets instead of cloned (the deep RowMap clone here was 12%
-            // inclusive in the flamegraph). The earlier min_input dedup check
-            // already read input.data, so taking it now is safe.
+            // Consume input.data by value: rows move into per-block buckets
+            // instead of a deep RowMap clone. The earlier min_input dedup
+            // check already read input.data, so taking it now is safe.
             let mut tables: Vec<(String, Vec<RowMap>)> =
                 std::mem::take(&mut input.data).into_iter().collect();
             tables.sort_by(|a, b| a.0.cmp(&b.0));
@@ -867,12 +865,8 @@ impl Settle {
             // fresh DB). The undo stays in-memory only: raw rows from this
             // ingest were never committed (they live in `write_batch`, dropped
             // below), so storage has no `> recovery_block` rows to delete on
-            // disk. Pre-deferred-commit code path called `engine.rollback()`
-            // which does a separate `storage.commit(empty)` — if that
-            // side-commit fails (disk full / I/O error), engine state gets
-            // stuck partial while disk META still points at the old
-            // `latest_block`. Not a chain rollback: on gappy chains
-            // recovery_block can be below finality.
+            // disk, and no separate commit can fail half-way. Not a chain
+            // rollback: on gappy chains recovery_block can be below finality.
             //
             // Propagate the original error after attempting in-memory rollback;
             // if the in-memory rollback itself errors (extremely rare — it

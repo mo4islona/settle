@@ -35,7 +35,7 @@ pub struct ReducerEngine {
     /// In-memory state snapshots: group_key -> (block -> positional state values).
     /// Stored positionally (schema field order) so the per-block snapshot clone
     /// is a cheap `Vec<Value>` copy instead of a full `HashMap` clone with N
-    /// string-key allocations (was the dominant cost in the finalize path).
+    /// string-key allocations.
     /// Holds unfinalized blocks for rollback, plus, for each key in
     /// `pending_durable`, its newest finalized snapshot.
     block_snapshots: FxHashMap<Vec<u8>, BTreeMap<BlockNumber, Vec<Value>>>,
@@ -281,11 +281,9 @@ impl ReducerEngine {
 
             for mut emit_row in emits {
                 // Add group-by columns to the output row for downstream MVs.
-                // Check presence with a borrowed `&str` and only clone the
-                // column name when actually inserting — the Lua/EventRules
-                // emit usually already carries the group-by column, so the
-                // eager `col.clone()` in the old `entry()` form was a wasted
-                // String allocation on every emit (per-row hot path).
+                // Check with a borrowed `&str` before the clone: the emit
+                // usually carries the column already, and `entry()` would
+                // allocate the key on every emit.
                 for col in &self.def.group_by {
                     if !emit_row.contains_key(col.as_str()) {
                         if let Some(v) = row.get(col.as_str()) {
