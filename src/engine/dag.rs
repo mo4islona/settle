@@ -928,21 +928,21 @@ impl SettleEngine {
                                 let mv = &mut self.branches[bi].mv_entries[mi].1;
                                 let source = mv.source().to_string();
                                 if let Some(source_rows) = output_rows.get(&source) {
-                                    mv.process_block(block, source_rows);
+                                    mv.replay_block(block, source_rows);
                                 } else if let Some(raw_rows) = row_cache.get(&source) {
                                     let maps: Vec<RowMap> =
                                         raw_rows.iter().map(|r| r.to_map()).collect();
-                                    mv.process_block(block, &maps);
+                                    mv.replay_block(block, &maps);
                                 }
                             } else {
                                 let mv = self.mvs.get_mut(name).unwrap();
                                 let source = mv.source().to_string();
                                 if let Some(source_rows) = output_rows.get(&source) {
-                                    mv.process_block(block, source_rows);
+                                    mv.replay_block(block, source_rows);
                                 } else if let Some(raw_rows) = row_cache.get(&source) {
                                     let maps: Vec<RowMap> =
                                         raw_rows.iter().map(|r| r.to_map()).collect();
-                                    mv.process_block(block, &maps);
+                                    mv.replay_block(block, &maps);
                                 }
                             }
                         }

@@ -52,6 +52,9 @@ struct Touched {
     /// Offset of the group's values in `prev`; None if the group did not exist.
     groups: FxHashMap<GroupKey, Option<usize>>,
     prev: Vec<Value>,
+    /// Record only whether each group existed, for a caller with no use for
+    /// change records. A value reads all unfinalized blocks of its group.
+    existence_only: bool,
 }
 
 /// Manages a single materialized view: GROUP BY routing, aggregation, rollback, changes.
@@ -266,9 +269,29 @@ impl MVEngine {
     /// Process a batch of rows from a single block.
     /// Returns change records for new/updated groups.
     pub fn process_block(&mut self, block: BlockNumber, rows: &[RowMap]) -> Vec<ChangeRecord> {
+        let mut touched = Touched::default();
+        self.apply_block(block, rows, &mut touched);
+        self.emit_changes(touched)
+    }
+
+    /// `process_block` with no change records, for replay, which discards
+    /// them. Replay after a deferred tail leaves every replayed block
+    /// unfinalized, so reading the values of a group touched in each block
+    /// would cost quadratic time in the tail length.
+    pub fn replay_block(&mut self, block: BlockNumber, rows: &[RowMap]) {
+        let mut touched = Touched {
+            existence_only: true,
+            ..Touched::default()
+        };
+        self.apply_block(block, rows, &mut touched);
+        self.drop_empty_groups(touched);
+    }
+
+    #[inline]
+    fn apply_block(&mut self, block: BlockNumber, rows: &[RowMap], touched: &mut Touched) {
         // Sliding window replay protection: skip blocks already in restored state
         if self.sliding_window.is_some() && self.block_times.contains_key(&block) {
-            return Vec::new();
+            return;
         }
 
         // Track block timestamp for sliding windows
@@ -286,13 +309,11 @@ impl MVEngine {
             }
         }
 
-        let mut touched = Touched::default();
-
         for row in rows {
             let group_key = self.compute_group_key(row);
 
             // Snapshot prev output before first mutation of this group
-            self.snapshot(&mut touched, &group_key);
+            self.snapshot(touched, &group_key);
 
             // Ensure group exists
             if !self.groups.contains_key(&group_key) {
@@ -318,10 +339,8 @@ impl MVEngine {
 
         // Expire old blocks for sliding windows
         if self.sliding_window.is_some() {
-            self.expire_old_blocks(&mut touched);
+            self.expire_old_blocks(touched);
         }
-
-        self.emit_changes(touched)
     }
 
     /// Roll back all blocks after fork_point.
@@ -522,7 +541,9 @@ impl MVEngine {
 
         let at = self.groups.get(group_key).map(|aggs| {
             let at = touched.prev.len();
-            touched.prev.extend(aggs.iter().map(|a| a.current_value()));
+            if !touched.existence_only {
+                touched.prev.extend(aggs.iter().map(|a| a.current_value()));
+            }
             at
         });
         touched.groups.insert(group_key.clone(), at);
@@ -563,9 +584,11 @@ impl MVEngine {
     /// sliding-window group dirty for the next finalize. Output rows are
     /// built only for the groups whose values changed.
     fn emit_changes(&mut self, touched: Touched) -> Vec<ChangeRecord> {
+        debug_assert!(!touched.existence_only);
         let Touched {
             groups: touched,
             mut prev,
+            ..
         } = touched;
         let mut changes = Vec::with_capacity(touched.len());
         let mut current: Vec<Value> = Vec::with_capacity(self.agg_count);
@@ -630,6 +653,27 @@ impl MVEngine {
         }
 
         changes
+    }
+
+    /// The state changes of `emit_changes`, without its change records.
+    fn drop_empty_groups(&mut self, touched: Touched) {
+        for (key, at) in touched.groups {
+            let has_data = self
+                .groups
+                .get(&key)
+                .is_some_and(|aggs| aggs.iter().any(|a| a.has_data()));
+
+            if !has_data {
+                self.groups.remove(&key);
+                if at.is_some() {
+                    self.removed_groups.push(key.clone());
+                }
+            }
+
+            if self.sliding_window.is_some() {
+                self.dirty_groups.insert(key);
+            }
+        }
     }
 
     fn change_record(
