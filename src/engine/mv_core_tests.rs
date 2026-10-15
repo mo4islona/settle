@@ -255,7 +255,7 @@ fn mv_finalize_then_rollback() {
     );
 
     let mut batch = StorageWriteBatch::new();
-    mv.finalize(1001, &mut batch);
+    mv.finalize(1001, &mut batch, true);
 
     // Rollback block 1002
     let changes = mv.rollback(1001);
@@ -470,7 +470,7 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
             ])],
         );
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(1, &mut batch);
+        mv.finalize(1, &mut batch, true);
         storage.commit(&batch).unwrap();
     }
 
@@ -491,7 +491,7 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
         assert!(changes.iter().any(|d| d.operation == ChangeOp::Delete));
 
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(1, &mut batch);
+        mv.finalize(1, &mut batch, true);
         storage.commit(&batch).unwrap();
     }
 
@@ -529,9 +529,10 @@ fn finalize_and_commit(
     mv: &mut MVEngine,
     storage: &Arc<dyn StorageBackend>,
     block: BlockNumber,
+    persist: bool,
 ) -> StorageWriteBatch {
     let mut batch = StorageWriteBatch::new();
-    mv.finalize(block, &mut batch);
+    mv.finalize(block, &mut batch, persist);
     storage.commit(&batch).unwrap();
     batch
 }
@@ -546,8 +547,8 @@ fn finalize_persists_group_when_finality_catches_up() {
     {
         let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
         mv.process_block(1, &[pool_row("ETH/USDC", 10.0)]);
-        finalize_and_commit(&mut mv, &storage, 0);
-        finalize_and_commit(&mut mv, &storage, 1);
+        finalize_and_commit(&mut mv, &storage, 0, true);
+        finalize_and_commit(&mut mv, &storage, 1, true);
     }
 
     let mut mv = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types());
@@ -559,6 +560,35 @@ fn finalize_persists_group_when_finality_catches_up() {
         Some(&Value::Float64(20.0))
     );
     assert_eq!(changes[0].values.get("swap_count"), Some(&Value::UInt64(2)));
+}
+
+/// Same as above, but the finalize that reaches the block is deferred
+/// (backfill) and a later checkpoint must write the group.
+#[test]
+fn checkpoint_persists_group_finalized_by_deferred_finalize() {
+    let storage = test_storage();
+
+    {
+        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
+        mv.process_block(1, &[pool_row("ETH/USDC", 10.0)]);
+        finalize_and_commit(&mut mv, &storage, 0, true);
+
+        let deferred = finalize_and_commit(&mut mv, &storage, 1, false);
+        assert!(deferred.ops.is_empty(), "a deferred finalize writes nothing");
+
+        let checkpoint = finalize_and_commit(&mut mv, &storage, 1, true);
+        assert_eq!(
+            persisted_pools(&checkpoint),
+            vec![Value::String("ETH/USDC".into())]
+        );
+    }
+
+    let mut mv = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types());
+    let changes = mv.process_block(2, &[pool_row("ETH/USDC", 10.0)]);
+    assert_eq!(
+        changes[0].values.get("total_volume"),
+        Some(&Value::Float64(20.0))
+    );
 }
 
 /// A finalize writes exactly the groups of the blocks it finalizes: a group
@@ -576,16 +606,16 @@ fn finalize_persists_groups_of_finalized_blocks_only() {
         "non-sliding MVs do not track touched groups"
     );
 
-    let batch = finalize_and_commit(&mut mv, &storage, 1);
+    let batch = finalize_and_commit(&mut mv, &storage, 1, true);
     assert_eq!(persisted_pools(&batch), vec![Value::String("A".into())]);
 
-    let batch = finalize_and_commit(&mut mv, &storage, 2);
+    let batch = finalize_and_commit(&mut mv, &storage, 2, true);
     assert_eq!(persisted_pools(&batch), vec![Value::String("B".into())]);
 
-    let batch = finalize_and_commit(&mut mv, &storage, 2);
+    let batch = finalize_and_commit(&mut mv, &storage, 2, true);
     assert!(persisted_pools(&batch).is_empty(), "nothing new to finalize");
 
-    let batch = finalize_and_commit(&mut mv, &storage, 3);
+    let batch = finalize_and_commit(&mut mv, &storage, 3, true);
     assert_eq!(
         persisted_pools(&batch),
         vec![Value::String("A".into()), Value::String("C".into())]
