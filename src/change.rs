@@ -215,8 +215,7 @@ fn hash_change_key(table: &str, key: &HashMap<String, Value>) -> u64 {
     use core::hash::{Hash, Hasher};
     use rustc_hash::FxHasher;
     // FxHash, not SipHash: this runs per key-field per emit on the flush hot
-    // path (it was ~6.9% `Sip13::write` in the flamegraph). The hash only feeds
-    // an internal dedup index whose buckets re-check key equality in `flush()`,
+    // path. The hash only feeds an internal dedup index whose buckets re-check key equality in `flush()`,
     // so collision resistance is irrelevant here — speed is what matters.
     let mut hasher = FxHasher::default();
     table.hash(&mut hasher);

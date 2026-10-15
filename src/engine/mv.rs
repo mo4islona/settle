@@ -258,7 +258,8 @@ impl MVEngine {
 
     /// Whether this MV uses a sliding window. Sliding-window MVs are excluded
     /// from backfill persist-deferral (block_times + per-block agg data form an
-    /// atomic unit; deferring them would corrupt window replay — see design v2).
+    /// atomic unit; deferring them would corrupt window replay — see
+    /// docs/backfill-mode-design.md).
     pub fn is_sliding(&self) -> bool {
         self.sliding_window.is_some()
     }
@@ -723,14 +724,13 @@ fn resolve_output_name(item: &SelectItem) -> String {
     }
 }
 
-// MV group state binary layout (avoids the old `Vec<Vec<u8>>` + double-rmp
-// re-encode that dominated finalize serialization):
+// MV group state binary layout:
 //   num_aggs: u8 (hence MAX_MV_AGGREGATES)
 //   per agg: len: u32 LE, then `len` bytes (per-agg rmp blob)
 //   prev flag: u8, written as 0. Older builds could write 1, then
 //     len: u32 LE and an rmp map of the last output; the reader checks and drops it.
-// Per-agg blobs reuse the existing, test-covered rmp codecs (to_bytes /
-// write_finalized / from_bytes) — only the outer framing changed.
+// Per-agg blobs use the aggregates' rmp codecs (to_bytes / write_finalized /
+// from_bytes).
 
 fn write_mv_group(
     buf: &mut Vec<u8>,

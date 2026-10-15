@@ -16,7 +16,7 @@ use super::ReducerRuntime;
 /// - Emit metatable created once at init, fields cleared per row via pre-compiled fn
 /// - User script wrapped in a closure, called via pre-compiled wrapper
 /// - When state_fields are known, state is passed/returned as positional function
-///   args/returns — eliminates per-field C API table.set/table.get calls (~1.3us/row savings)
+///   args/returns — eliminates per-field C API table.set/table.get calls
 /// - Only row fields actually referenced in the Lua script are marshalled (skip unused columns)
 /// - Pre-computed column IDs enable direct Vec indexing into Row.values()
 pub struct LuaRuntime {
@@ -55,7 +55,7 @@ impl LuaRuntime {
 
     /// Create a LuaRuntime with known state field names, types, source columns, and modules.
     /// State values are passed as function arguments and returned as return values,
-    /// eliminating per-field C API calls (~1.3us/row savings for 6-field state).
+    /// eliminating per-field C API calls.
     /// Source columns enable selective row field marshalling — only fields referenced
     /// in the Lua script are set on the row table, skipping unused columns.
     /// Modules are loaded before the user script, each executed once with its return

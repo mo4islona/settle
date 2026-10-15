@@ -125,9 +125,9 @@ pub struct SettleEngine {
     finalized_block: BlockNumber,
     /// Highest block whose derived reducer/MV state is actually persisted to
     /// disk. Invariant `durable_block <= min(finalized_block, latest)`. Written
-    /// to disk as `META_FINALIZED_BLOCK` (Option A) so recovery replays from
+    /// to disk as `META_FINALIZED_BLOCK` so recovery replays from
     /// here. Equals `finalized_block` unless backfill deferral is active.
-    /// None until a persisting finalize covers data: `Some(0)` means block 0
+    /// None until a checkpoint covers data: `Some(0)` means block 0
     /// is durable, which an empty database must not claim.
     durable_block: Option<BlockNumber>,
     /// True when the pipeline contains no sliding-window MV and no external
@@ -897,7 +897,7 @@ impl SettleEngine {
         // recovery anchor and wedging the instance (durable > latest). Reject it
         // here at the single chokepoint all rollback paths funnel through. With
         // deferral off (`durable == finalized`) this can never fire for an
-        // in-range fork, so behavior is identical to before the feature.
+        // in-range fork.
         if fork_point < self.finalized_block {
             return Err(Error::InvalidOperation(format!(
                 "rollback target block {fork_point} is below finalized block {} — \
@@ -1247,7 +1247,7 @@ impl SettleEngine {
 /// Backfill persist-deferral is only safe when the pipeline has no
 /// sliding-window MV (block_times + per-block aggs must persist atomically) and
 /// no external reducer (replay skips them, so deferred state can't be rebuilt).
-/// See design v2 B4/B5.
+/// See docs/backfill-mode-design.md.
 fn compute_defer_allowed(
     branches: &[PipelineBranch],
     reducers: &HashMap<String, ReducerEngine>,
