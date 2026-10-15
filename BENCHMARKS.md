@@ -44,6 +44,71 @@ Last updated: 2026-03-30
 
 > ⚠️ Числа выше получены из других бенчей (вероятно `vs_postgres_stateful` или `profile_polymarket` с устаревшей конфигурацией). **Свежий `profile_polymarket` после rebuild с debug symbols даёт 9-15K rows/s** — см. секцию ниже. Не использовать таблицу выше как baseline для tier-by-tier сравнения; для этого — «Optimization Roadmap Baseline (2026-05-29)».
 
+## Instruction counts (`instructions`)
+
+`benches/instructions.rs` counts the instructions and heap allocations of
+`Settle::ingest` under Valgrind with [Gungraun](https://github.com/gungraun/gungraun):
+Callgrind for instructions, DHAT for bytes and blocks allocated. Between runs of
+one binary, allocation counts repeat exactly (Lua cases to a few blocks) and
+instruction counts move by less than 0.4%, so one run of each build compares two
+builds. Use it for engine changes smaller than the ±10–20% noise of the
+wall-clock benches.
+
+It runs on Linux and needs `valgrind` and the runner of the same version as the
+`gungraun` dev-dependency. DHAT cannot see allocations made through mimalloc, so
+the bench builds without the default features. A run against a baseline fails
+with exit code 3 when instructions, bytes or blocks allocated grow by more than 1%.
+
+```bash
+cargo install gungraun-runner --version 0.20.0
+F="--no-default-features --features lua,rayon"
+git switch master  && cargo bench --bench instructions $F -- --save-baseline=base --parallel=auto
+git switch my-work && cargo bench --bench instructions $F -- --baseline=base --parallel=auto
+```
+
+Each case is a workload ingested in one of two modes. Setup ingests as many
+batches again first, outside the count, so the counted batches see a steady
+state. The count includes `ack` and the drop of each `ChangeBatch`, as a
+consumer would do them.
+
+| Workload | Pipeline |
+|---|---|
+| `mv_sum` | `sum` MV on a virtual table |
+| `mv_sum_stored` | the same on a stored table, which also emits a change record per raw row |
+| `mv_minmax` | `min`/`max`/`last` MV |
+| `event_rules` | EventRules reducer → `last` MV |
+| `polymarket` | `tests/polymarket/schema.sql`: two Lua reducers and their MVs |
+
+| Mode | Ingest | Finality | Counted |
+|---|---|---|---|
+| `backfill` | 100 blocks × 50 rows | at the batch tip | 4 ingests, 20K rows |
+| `tip` | 1 block × 50 rows | 64 blocks behind | 200 ingests, 10K rows |
+
+Memory storage only: RocksDB flushes and compacts on its own threads, which
+neither tool counts. Rayon runs on the bench thread for the same reason. The
+counts use glibc malloc, which costs more instructions than mimalloc, so
+allocation weighs more here than in production.
+
+Numbers on 2026-10-15, after the MV allocation cuts. The first baseline of the
+same day had 9–20% more instructions and 19–43% more allocated blocks.
+
+| Case | Instructions | per row | Bytes | Blocks | per row |
+|---|---:|---:|---:|---:|---:|
+| `backfill mv_sum` | 452M | 22.6K | 87.0 MB | 415K | 20.7 |
+| `backfill mv_sum_stored` | 600M | 30.0K | 140.6 MB | 636K | 31.8 |
+| `backfill mv_minmax` | 459M | 23.0K | 79.8 MB | 400K | 20.0 |
+| `backfill event_rules` | 789M | 39.5K | 126.4 MB | 824K | 41.2 |
+| `backfill polymarket` | 2,456M | 122.8K | 255.8 MB | 1,661K | 83.1 |
+| `tip mv_sum` | 230M | 23.0K | 39.7 MB | 221K | 22.1 |
+| `tip mv_sum_stored` | 297M | 29.7K | 62.3 MB | 332K | 33.2 |
+| `tip mv_minmax` | 291M | 29.1K | 48.6 MB | 261K | 26.1 |
+| `tip event_rules` | 392M | 39.2K | 62.1 MB | 428K | 42.8 |
+| `tip polymarket` | 1,221M | 122.1K | 121.6 MB | 849K | 84.9 |
+
+Each case leaves its profiles under `target/gungraun/settle/instructions/ingest/<mode>.<workload>/`.
+`callgrind_annotate --inclusive=yes callgrind.<mode>.<workload>.out` shows where
+the instructions go; `dhat.<mode>.<workload>.out` opens in Valgrind's `dh_view.html`.
+
 ## Optimization Roadmap Baseline (2026-05-29)
 
 Точка отсчёта для tier-by-tier сравнения roadmap'а в `~/.claude/plans/optimized-coalescing-nova.md` (раздел «ИТОГОВЫЙ ROADMAP»).
@@ -305,23 +370,37 @@ No aggregation. Pure throughput of pushing rows.
 
 ### Workload 2 — simple aggregation (per-user balance, `vs_postgres_simple_agg`)
 
-10K users, `SUM(value)` per user.
+10K users, `SUM(value)` per user. Both sides write the same 200K rows: 100K raw
+rows with a multi-row INSERT and 100K balance upserts through `unnest`. Raw rows
+go to PG straight from the input, so Settle reads them as a `VIRTUAL TABLE`.
 
-| Variant | Wall time | rows/s | pg_writes | Notes |
-|---|---|---|---|---|
-| `pg_only_per_row` | ~40s | ~2.5K | 100,100 | Naive `INSERT ... ON CONFLICT DO UPDATE` per row — kills network |
-| `pg_only_batch` | 0.84s | 119K | 200 | `unnest+GROUP BY` UPSERT — idiomatic batch path |
-| `settle_fn[mem]` | 1.98s | 50K | 200 | FnReducer + last() MV |
-| `settle_er[mem]` | 2.01s | 50K | 200 | EventRules — ≈ FnReducer |
-| `settle_mv[mem]` | 2.15s | 47K | 200 | MV `sum()` direct from raw, no reducer |
-| `settle_fn[rocks]` | 2.99s | 33K | 200 | RocksDB backend, +50% vs mem |
-| `settle_mv[mem,fin]` | 1.95s | 51K | 200 | Pre-finalized → SumAgg O(1) `current_value` |
+Updated 2026-10-15 on an idle Linux x86-64 server, PG 16 in Docker; mean of two
+runs. Before this update, Settle kept a stored copy of the raw rows and sent the
+balances as a multi-row `VALUES` upsert, which cost it 15–17% of the total.
+
+| Variant | Total | settle | pg | rows/s | Notes |
+|---|---:|---:|---:|---:|---|
+| `pg_only_per_row` | 9.3s | — | 9.3s | 11K | `INSERT ... ON CONFLICT DO UPDATE` per row |
+| `pg_only_batch` | 0.736s | — | 0.736s | 136K | `unnest` + `GROUP BY` upsert |
+| `settle_mv[mem]` | 0.851s | 0.139s | 0.713s | 118K | MV `sum()` on the raw table, no reducer |
+| `settle_mv[rocks]` | 0.876s | 0.155s | 0.720s | 114K | |
+| `settle_fn[mem]` | 0.933s | 0.220s | 0.713s | 107K | FnReducer → `last()` MV |
+| `settle_fn[rocks]` | 0.989s | 0.253s | 0.736s | 101K | |
+| `settle_er[mem]` | 0.995s | 0.271s | 0.725s | 100K | EventRules → `last()` MV |
+| `settle_er[rocks]` | 1.007s | 0.270s | 0.737s | 99K | |
+| `settle_mv[rocks,fin]` | 0.934s | 0.224s | 0.710s | 107K | finality at each batch tip |
+| `settle_mv[rocks,backfill]` | 0.917s | 0.184s | 0.733s | 109K | `,fin` + persist deferral |
 
 **Findings**:
-- **PG batch is unbeatable for small-state commutative aggregations**: indexed B-tree + HashAggregate in tight C loops.
-- All 3 Settle variants (FnReducer / EventRules / MV-only) ≈ equal — main cost is `MVEngine` processing, not reducer dispatch.
-- Per-row UPSERT in PG is **60× slower than batched** — never write it like this.
-- `MV-only + pre-finalized` is best Settle variant — flushes blocks immediately so `SumAgg.current_value` stops being O(N_unfinalized_blocks).
+- The PG part of each Settle variant equals `pg_only_batch`, so the whole gap is
+  Settle's own time.
+- That time adds to the PG time: a consumer acks a batch before the next ingest,
+  so Settle and PG never overlap. Only more than one batch in flight can hide it.
+- Each batch touches each user once (5000 rows, 5000 keys), so Settle removes no
+  PG rows here. Parity is the ceiling for this workload.
+- The MV-only pipeline is the cheapest; a reducer costs about 2× its Settle time.
+- `,fin` costs more Settle time than the tip mode, which never finalizes in this run.
+- Per-row UPSERT is about 12× slower than the batched one.
 
 ### Workload 3 — stateful PnL with 3 projections (`vs_postgres_stateful`)
 
@@ -352,7 +431,7 @@ For each workload pair (PG vs best Settle [mem]):
 | Workload | Settle/PG ratio | Settle wins? |
 |---|---|---|
 | Raw passthrough | 1.3–1.7× slower | No — Settle adds overhead, removes nothing |
-| Simple aggregation | 2.3× slower (vs PG batch) | No — PG `unnest+GROUP BY` is unbeatable for commutative ops |
+| Simple aggregation | 1.16× slower (vs PG batch) | No — the same PG writes plus Settle's time; parity at best |
 | Stateful PnL (3 projections) | 1.6× slower | No on wall time, **yes on I/O** (0 reads, fewer writes) |
 
 **Settle does not beat well-written Postgres on these workloads.** Period.

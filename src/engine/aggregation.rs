@@ -167,9 +167,9 @@ pub trait AggregationFunc: Send + Sync {
     /// Serialize to bytes for persistence.
     fn to_bytes(&self) -> Vec<u8>;
 
-    /// Serialize only the finalized portion (no unfinalized block data).
+    /// Append only the finalized portion (no unfinalized block data) to `out`.
     /// Used for crash-safe MV persistence — unfinalized blocks are replayed on recovery.
-    fn to_finalized_bytes(&self) -> Vec<u8>;
+    fn write_finalized(&self, out: &mut Vec<u8>);
 
     /// Deserialize from bytes.
     fn from_bytes(bytes: &[u8]) -> Self
@@ -179,6 +179,17 @@ pub trait AggregationFunc: Send + Sync {
     /// Return the block numbers that have unfinalized contributions.
     /// Used for rebuilding block_groups from persisted sliding window state.
     fn block_numbers(&self) -> Vec<BlockNumber>;
+}
+
+/// Removes the blocks at or below `block` in ascending order and hands each
+/// value to `f`, with no temporary list of keys.
+fn drain_up_to<V>(blocks: &mut BTreeMap<BlockNumber, V>, block: BlockNumber, mut f: impl FnMut(V)) {
+    while let Some(entry) = blocks.first_entry() {
+        if *entry.key() > block {
+            break;
+        }
+        f(entry.remove());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,14 +247,10 @@ impl AggregationFunc for SumAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
-        if !to_finalize.is_empty() {
-            self.has_finalized = true;
-        }
-        for (b, v) in to_finalize {
+        drain_up_to(&mut self.blocks, block, |v| {
             self.finalized = self.finalized.add(v);
-            self.blocks.remove(&b);
-        }
+            self.has_finalized = true;
+        });
     }
 
     fn current_value(&self) -> Value {
@@ -263,10 +270,12 @@ impl AggregationFunc for SumAgg {
         rmp_serde::to_vec(self).unwrap()
     }
 
-    fn to_finalized_bytes(&self) -> Vec<u8> {
-        let mut copy = self.clone();
-        copy.blocks.clear();
-        rmp_serde::to_vec(&copy).unwrap()
+    fn write_finalized(&self, out: &mut Vec<u8>) {
+        let finalized = Self {
+            blocks: BTreeMap::new(),
+            ..*self
+        };
+        rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
@@ -312,11 +321,7 @@ impl AggregationFunc for CountAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
-        for (b, v) in to_finalize {
-            self.finalized += v;
-            self.blocks.remove(&b);
-        }
+        drain_up_to(&mut self.blocks, block, |v| self.finalized += v);
     }
 
     fn current_value(&self) -> Value {
@@ -332,10 +337,12 @@ impl AggregationFunc for CountAgg {
         rmp_serde::to_vec(self).unwrap()
     }
 
-    fn to_finalized_bytes(&self) -> Vec<u8> {
-        let mut copy = self.clone();
-        copy.blocks.clear();
-        rmp_serde::to_vec(&copy).unwrap()
+    fn write_finalized(&self, out: &mut Vec<u8>) {
+        let finalized = Self {
+            blocks: BTreeMap::new(),
+            ..*self
+        };
+        rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
@@ -389,14 +396,12 @@ impl AggregationFunc for MinAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
-        for (b, v) in to_finalize {
+        drain_up_to(&mut self.blocks, block, |v| {
             self.finalized = Some(match self.finalized {
                 Some(f) => f.min(v),
                 None => v,
             });
-            self.blocks.remove(&b);
-        }
+        });
     }
 
     fn current_value(&self) -> Value {
@@ -421,10 +426,12 @@ impl AggregationFunc for MinAgg {
         rmp_serde::to_vec(self).unwrap()
     }
 
-    fn to_finalized_bytes(&self) -> Vec<u8> {
-        let mut copy = self.clone();
-        copy.blocks.clear();
-        rmp_serde::to_vec(&copy).unwrap()
+    fn write_finalized(&self, out: &mut Vec<u8>) {
+        let finalized = Self {
+            blocks: BTreeMap::new(),
+            ..*self
+        };
+        rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
@@ -478,14 +485,12 @@ impl AggregationFunc for MaxAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
-        for (b, v) in to_finalize {
+        drain_up_to(&mut self.blocks, block, |v| {
             self.finalized = Some(match self.finalized {
                 Some(f) => f.max(v),
                 None => v,
             });
-            self.blocks.remove(&b);
-        }
+        });
     }
 
     fn current_value(&self) -> Value {
@@ -510,10 +515,12 @@ impl AggregationFunc for MaxAgg {
         rmp_serde::to_vec(self).unwrap()
     }
 
-    fn to_finalized_bytes(&self) -> Vec<u8> {
-        let mut copy = self.clone();
-        copy.blocks.clear();
-        rmp_serde::to_vec(&copy).unwrap()
+    fn write_finalized(&self, out: &mut Vec<u8>) {
+        let finalized = Self {
+            blocks: BTreeMap::new(),
+            ..*self
+        };
+        rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
@@ -578,12 +585,10 @@ impl AggregationFunc for AvgAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
-        for (b, (s, c)) in to_finalize {
+        drain_up_to(&mut self.blocks, block, |(s, c)| {
             self.finalized_sum = self.finalized_sum.add(s);
             self.finalized_count += c;
-            self.blocks.remove(&b);
-        }
+        });
     }
 
     fn current_value(&self) -> Value {
@@ -612,10 +617,12 @@ impl AggregationFunc for AvgAgg {
         rmp_serde::to_vec(self).unwrap()
     }
 
-    fn to_finalized_bytes(&self) -> Vec<u8> {
-        let mut copy = self.clone();
-        copy.blocks.clear();
-        rmp_serde::to_vec(&copy).unwrap()
+    fn write_finalized(&self, out: &mut Vec<u8>) {
+        let finalized = Self {
+            blocks: BTreeMap::new(),
+            ..*self
+        };
+        rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
@@ -667,16 +674,11 @@ impl AggregationFunc for FirstAgg {
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
         // Finalized first = earliest block's first value
-        if self.finalized.is_none() {
-            let earliest = self.blocks.range(..=block).next().map(|(_, v)| v.clone());
-            if let Some(v) = earliest {
+        drain_up_to(&mut self.blocks, block, |v| {
+            if self.finalized.is_none() {
                 self.finalized = Some(v);
             }
-        }
-        let to_remove: Vec<_> = self.blocks.range(..=block).map(|(&b, _)| b).collect();
-        for b in to_remove {
-            self.blocks.remove(&b);
-        }
+        });
     }
 
     fn current_value(&self) -> Value {
@@ -696,10 +698,12 @@ impl AggregationFunc for FirstAgg {
         rmp_serde::to_vec(self).unwrap()
     }
 
-    fn to_finalized_bytes(&self) -> Vec<u8> {
-        let mut copy = self.clone();
-        copy.blocks.clear();
-        rmp_serde::to_vec(&copy).unwrap()
+    fn write_finalized(&self, out: &mut Vec<u8>) {
+        let finalized = Self {
+            finalized: self.finalized.clone(),
+            blocks: BTreeMap::new(),
+        };
+        rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
@@ -749,18 +753,7 @@ impl AggregationFunc for LastAgg {
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
         // Finalized last = latest value from blocks being finalized
-        let latest = self
-            .blocks
-            .range(..=block)
-            .next_back()
-            .map(|(_, v)| v.clone());
-        if let Some(v) = latest {
-            self.finalized = Some(v);
-        }
-        let to_remove: Vec<_> = self.blocks.range(..=block).map(|(&b, _)| b).collect();
-        for b in to_remove {
-            self.blocks.remove(&b);
-        }
+        drain_up_to(&mut self.blocks, block, |v| self.finalized = Some(v));
     }
 
     fn current_value(&self) -> Value {
@@ -779,10 +772,12 @@ impl AggregationFunc for LastAgg {
         rmp_serde::to_vec(self).unwrap()
     }
 
-    fn to_finalized_bytes(&self) -> Vec<u8> {
-        let mut copy = self.clone();
-        copy.blocks.clear();
-        rmp_serde::to_vec(&copy).unwrap()
+    fn write_finalized(&self, out: &mut Vec<u8>) {
+        let finalized = Self {
+            finalized: self.finalized.clone(),
+            blocks: BTreeMap::new(),
+        };
+        rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
@@ -1234,6 +1229,46 @@ mod tests {
         let bytes = agg.to_bytes();
         let restored = LastAgg::from_bytes(&bytes);
         assert_eq!(restored.current_value(), Value::UInt64(99));
+    }
+
+    macro_rules! assert_finalized_bytes {
+        ($agg:expr, $value:expr) => {{
+            let mut agg = $agg;
+            for block in 100..103 {
+                agg.add_block(block, &[$value(block)]);
+            }
+            agg.finalize_up_to(101);
+
+            let mut cleared = agg.clone();
+            cleared.blocks.clear();
+            let expected = rmp_serde::to_vec(&cleared).unwrap();
+
+            // `write_finalized` appends: the byte in front must stay.
+            let mut out = vec![0xAA];
+            agg.write_finalized(&mut out);
+            assert_eq!(out[0], 0xAA);
+            assert_eq!(out[1..], expected[..]);
+        }};
+    }
+
+    /// Stored MV state holds a cleared clone of each aggregate, so
+    /// `write_finalized` must produce the same bytes.
+    #[test]
+    fn write_finalized_matches_cleared_clone() {
+        let float = |b: u64| Value::Float64(b as f64 * 1.5);
+        let int = |b: u64| Value::UInt64(b);
+        let big = |b: u64| u256_val(b as u128);
+        let string = |b: u64| Value::String(format!("v{b}"));
+
+        assert_finalized_bytes!(SumAgg::new(&ColumnType::Float64), float);
+        assert_finalized_bytes!(SumAgg::new(&ColumnType::UInt64), int);
+        assert_finalized_bytes!(SumAgg::new(&ColumnType::Uint256), big);
+        assert_finalized_bytes!(CountAgg::new(), int);
+        assert_finalized_bytes!(MinAgg::new(&ColumnType::Float64), float);
+        assert_finalized_bytes!(MaxAgg::new(&ColumnType::UInt64), int);
+        assert_finalized_bytes!(AvgAgg::new(&ColumnType::Float64), float);
+        assert_finalized_bytes!(FirstAgg::new(), string);
+        assert_finalized_bytes!(LastAgg::new(), string);
     }
 
     // --- OHLCV candle scenario from RFC Section 10 ---

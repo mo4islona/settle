@@ -19,7 +19,7 @@ smallvec = { version = "1", features = ["serde"] }
 rayon = { version = "1", optional = true }
 napi = { version = "2", features = ["napi9", "serde-json"], optional = true }
 napi-derive = { version = "2", optional = true }
-ethnum = "1.5.2"
+ethnum = "1.5.3"
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
@@ -46,6 +46,8 @@ tokio-postgres = "0.7"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 anyhow = "1"
+# Instruction and allocation counts under Valgrind; the runner binary must match this version.
+gungraun = "=0.20.0"
 
 [features]
 # Default features for native (Node.js) builds.
@@ -84,6 +86,10 @@ path = "tests/sliding/tests.rs"
 
 [[bench]]
 name = "throughput"
+harness = false
+
+[[bench]]
+name = "instructions"
 harness = false
 
 [[bench]]

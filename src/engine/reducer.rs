@@ -535,24 +535,33 @@ impl ReducerEngine {
         let mut to_persist = std::mem::take(&mut self.pending_durable);
         to_persist.extend(finalized_keys);
 
-        for group_key_bytes in &to_persist {
+        for group_key_bytes in to_persist {
             // Find the most recent state at or before the finalization block.
             // Snapshots are positional Vec<Value>, encoded with the fast binary
             // codec (no string keys, no msgpack). For deferred keys the snapshot
             // was retained; for this-batch keys it is freshly present.
-            if let Some(state) = self.find_snapshot_at_or_before(group_key_bytes, block) {
-                let state_bytes = storage::encode_values(&state);
-                batch.set_reducer_finalized(&self.def.name, group_key_bytes, &state_bytes);
-            }
+            let state_bytes = self
+                .find_snapshot_at_or_before(&group_key_bytes, block)
+                .map(storage::encode_values);
 
             // Remove in-memory snapshots for blocks <= finalization point now
             // that they are durable.
-            if let Some(snapshots) = self.block_snapshots.get_mut(group_key_bytes) {
-                let remaining = snapshots.split_off(&(block + 1));
-                *snapshots = remaining;
-                if snapshots.is_empty() {
-                    self.block_snapshots.remove(group_key_bytes);
+            if let Some(snapshots) = self.block_snapshots.get_mut(&group_key_bytes) {
+                // Not `split_off`: it allocates a new root even when no block is
+                // above `block`.
+                while let Some(entry) = snapshots.first_entry() {
+                    if *entry.key() > block {
+                        break;
+                    }
+                    entry.remove();
                 }
+                if snapshots.is_empty() {
+                    self.block_snapshots.remove(&group_key_bytes);
+                }
+            }
+
+            if let Some(state_bytes) = state_bytes {
+                batch.set_reducer_finalized(&self.def.name, group_key_bytes, state_bytes);
             }
         }
     }
@@ -561,7 +570,7 @@ impl ReducerEngine {
     /// falling back to storage (finalized state) or defaults.
     fn find_state_at_or_before(&self, group_key_bytes: &[u8], block: BlockNumber) -> Result<State> {
         if let Some(values) = self.find_snapshot_at_or_before(group_key_bytes, block) {
-            return Ok(values_to_state(&values, &self.state_field_names));
+            return Ok(values_to_state(values, &self.state_field_names));
         }
         // Fall back to finalized state in storage
         load_state_from(
@@ -579,14 +588,14 @@ impl ReducerEngine {
         &self,
         group_key_bytes: &[u8],
         block: BlockNumber,
-    ) -> Option<Vec<Value>> {
+    ) -> Option<&[Value]> {
         self.block_snapshots
             .get(group_key_bytes)
             .and_then(|snapshots| {
                 snapshots
                     .range(..=block)
                     .next_back()
-                    .map(|(_, values)| values.clone())
+                    .map(|(_, values)| values.as_slice())
             })
     }
 

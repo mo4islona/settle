@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::types::{BlockCursor, ChangeBatch, ChangeOp, ChangeRecord, PerfNode, Value};
 
@@ -78,10 +79,11 @@ impl ChangeBuffer {
 
         // Merge records by (table, key) identity in a single pass.
         // Hash is used for fast lookup; key equality is verified to prevent collisions.
-        // Vec<usize> handles the rare case of 3+ records with the same hash but different keys.
+        // A bucket holds several indexes only when distinct keys share a hash,
+        // so one fits inline and the common case allocates nothing.
         // FxHashMap: the key is our own already-mixed u64 (from `hash_change_key`),
         // so SipHash over it is pure overhead — FxHash on the flush hot path.
-        let mut index: FxHashMap<u64, Vec<usize>> =
+        let mut index: FxHashMap<u64, SmallVec<[usize; 1]>> =
             FxHashMap::with_capacity_and_hasher(self.pending.len(), Default::default());
         let mut merged: Vec<ChangeRecord> = Vec::with_capacity(self.pending.len());
 
@@ -102,7 +104,7 @@ impl ChangeBuffer {
                     merged[idx].prev_values = None;
                     merged[idx].values.clear();
                     if let Some(bucket) = index.get_mut(&key_hash) {
-                        bucket.retain(|&i| i != idx);
+                        bucket.retain(|i| *i != idx);
                         if bucket.is_empty() {
                             index.remove(&key_hash);
                         }
