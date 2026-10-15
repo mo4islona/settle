@@ -501,3 +501,103 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
         assert_eq!(mv.groups.len(), 1, "only ETH/USDC should survive");
     }
 }
+
+fn pool_row(pool: &str, amount: f64) -> RowMap {
+    make_row(&[
+        ("pool", Value::String(pool.into())),
+        ("amount", Value::Float64(amount)),
+    ])
+}
+
+/// The pools whose group state a finalize wrote into `batch`.
+fn persisted_pools(batch: &StorageWriteBatch) -> Vec<Value> {
+    let mut pools: Vec<Value> = batch
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            storage::BatchOp::PutMvState { group_key, .. } => {
+                Some(storage::decode_group_key(group_key)[0].clone())
+            }
+            _ => None,
+        })
+        .collect();
+    pools.sort_by_key(|v| format!("{v:?}"));
+    pools
+}
+
+fn finalize_and_commit(
+    mv: &mut MVEngine,
+    storage: &Arc<dyn StorageBackend>,
+    block: BlockNumber,
+) -> StorageWriteBatch {
+    let mut batch = StorageWriteBatch::new();
+    mv.finalize(block, &mut batch);
+    storage.commit(&batch).unwrap();
+    batch
+}
+
+/// Finality can reach a group's block in a later finalize that has no rows
+/// for the group. Its finalized state must still be persisted, because
+/// recovery replays only the blocks above finality.
+#[test]
+fn finalize_persists_group_when_finality_catches_up() {
+    let storage = test_storage();
+
+    {
+        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
+        mv.process_block(1, &[pool_row("ETH/USDC", 10.0)]);
+        finalize_and_commit(&mut mv, &storage, 0);
+        finalize_and_commit(&mut mv, &storage, 1);
+    }
+
+    let mut mv = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types());
+    let changes = mv.process_block(2, &[pool_row("ETH/USDC", 10.0)]);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].operation, ChangeOp::Update);
+    assert_eq!(
+        changes[0].values.get("total_volume"),
+        Some(&Value::Float64(20.0))
+    );
+    assert_eq!(changes[0].values.get("swap_count"), Some(&Value::UInt64(2)));
+}
+
+/// A finalize writes exactly the groups of the blocks it finalizes: a group
+/// touched only above finality has no new finalized state yet.
+#[test]
+fn finalize_persists_groups_of_finalized_blocks_only() {
+    let storage = test_storage();
+    let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
+
+    mv.process_block(1, &[pool_row("A", 1.0)]);
+    mv.process_block(2, &[pool_row("B", 2.0)]);
+    mv.process_block(3, &[pool_row("A", 3.0), pool_row("C", 3.0)]);
+    assert!(
+        mv.dirty_groups.is_empty(),
+        "non-sliding MVs do not track touched groups"
+    );
+
+    let batch = finalize_and_commit(&mut mv, &storage, 1);
+    assert_eq!(persisted_pools(&batch), vec![Value::String("A".into())]);
+
+    let batch = finalize_and_commit(&mut mv, &storage, 2);
+    assert_eq!(persisted_pools(&batch), vec![Value::String("B".into())]);
+
+    let batch = finalize_and_commit(&mut mv, &storage, 2);
+    assert!(persisted_pools(&batch).is_empty(), "nothing new to finalize");
+
+    let batch = finalize_and_commit(&mut mv, &storage, 3);
+    assert_eq!(
+        persisted_pools(&batch),
+        vec![Value::String("A".into()), Value::String("C".into())]
+    );
+
+    // Every group is on disk with all its finalized data.
+    let restored = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types());
+    let total = |pool: &str| {
+        let key: GroupKey = std::iter::once(Value::String(pool.into())).collect();
+        restored.groups[&key][0].current_value()
+    };
+    assert_eq!(total("A"), Value::Float64(4.0));
+    assert_eq!(total("B"), Value::Float64(2.0));
+    assert_eq!(total("C"), Value::Float64(3.0));
+}

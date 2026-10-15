@@ -87,6 +87,10 @@ harness = false
 name = "profile_breakdown"
 harness = false
 
+[[bench]]
+name = "profile_polymarket_realistic"
+harness = false
+
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"

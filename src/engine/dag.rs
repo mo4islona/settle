@@ -73,6 +73,11 @@ pub struct SettleEngine {
     latest_block: Option<BlockNumber>,
     /// Finalized block number (for finalization logic).
     finalized_block: BlockNumber,
+    /// True once `finalize()` has run at least once (or state restored from
+    /// disk). Lets `finalize(N)` skip work when N hasn't advanced past the
+    /// last finalized block — heartbeat ingests with stale `finalized_head`
+    /// otherwise re-serialize every MV group state on every call.
+    has_finalized: bool,
     /// Block number → hash for all known blocks.
     /// Populated by set_rollback_chain(). Used for fork resolution and cursors.
     block_hashes: BTreeMap<BlockNumber, String>,
@@ -224,6 +229,7 @@ impl SettleEngine {
             sequence: 0,
             latest_block: None,
             finalized_block: 0,
+            has_finalized: false,
             block_hashes: BTreeMap::new(),
         }
     }
@@ -957,6 +963,16 @@ impl SettleEngine {
     /// Finalize all state up to and including the given block.
     /// Reducer finalized state writes are collected into the provided batch.
     pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
+        // Idempotent skip: nothing to finalize when the requested block hasn't
+        // advanced. The first call after open (or after restore) still runs so
+        // initial state lands on disk. Without this, heartbeat ingests with a
+        // stale `finalized_head` re-serialize every MV group every batch.
+        // db.rs validation already rejects `block < current_finalized`, so
+        // `block == self.finalized_block` is the only case to short-circuit.
+        if block == self.finalized_block && self.has_finalized {
+            return;
+        }
+
         for node in &self.pipeline {
             match node {
                 PipelineNode::Reducer(name) => {
@@ -984,6 +1000,7 @@ impl SettleEngine {
         }
 
         self.finalized_block = block;
+        self.has_finalized = true;
 
         // Remove hashes for blocks below finalized (keep finalized itself as
         // anchor). On gappy chains (Solana-style) `latest_block` may be
@@ -1053,6 +1070,9 @@ impl SettleEngine {
 
     pub fn set_finalized_block(&mut self, block: BlockNumber) {
         self.finalized_block = block;
+        // Restored state is on disk already; treat as finalized so the next
+        // `finalize(same_block)` short-circuits like a normal idempotent call.
+        self.has_finalized = true;
     }
 
     pub fn restore_block_hashes(&mut self, hashes: BTreeMap<BlockNumber, String>) {

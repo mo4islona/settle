@@ -819,3 +819,70 @@ fn ingest_no_spurious_rollback_on_multi_batch_advance() {
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
     assert!(!mv_records.is_empty(), "batch 2 must produce MV updates");
 }
+
+fn record_for<'a>(batch: &'a ChangeBatch, table: &str, key: &str, value: &str) -> &'a ChangeRecord {
+    batch
+        .records_for(table)
+        .iter()
+        .find(|r| r.key.get(key) == Some(&Value::String(value.into())))
+        .unwrap()
+}
+
+/// Finality can reach an MV group's block in a later ingest that has no rows
+/// for the group. The group must be persisted then: recovery replays only the
+/// blocks above finality.
+#[test]
+fn finality_only_ingest_persists_mv_group() {
+    let storage = Arc::new(MemoryBackend::new());
+
+    {
+        let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
+        ingest_with_finalized(&mut db, vec![("swaps".into(), 1, vec![make_swap("ETH", 10.0)])], 0)
+            .unwrap();
+        ingest_with_finalized(&mut db, vec![], 1).unwrap();
+        assert_eq!(db.finalized_block(), 1);
+    }
+
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).storage(storage)).unwrap();
+    let batch = ingest_with_finalized(&mut db, vec![("swaps".into(), 2, vec![make_swap("ETH", 10.0)])], 1)
+        .unwrap()
+        .unwrap();
+    let eth = record_for(&batch, "pool_volume", "pool", "ETH");
+    assert_eq!(eth.values.get("total_volume"), Some(&Value::Float64(20.0)));
+    assert_eq!(eth.values.get("swap_count"), Some(&Value::UInt64(2)));
+}
+
+/// Same with a reducer in front of the MV.
+#[test]
+fn finality_only_ingest_persists_reducer_and_mv_state() {
+    let storage = Arc::new(MemoryBackend::new());
+
+    {
+        let mut db = Settle::open(Config::new(DEX_SCHEMA).storage(storage.clone())).unwrap();
+        ingest_with_finalized(
+            &mut db,
+            vec![("trades".into(), 1, vec![make_trade("alice", "buy", 10.0, 2000.0)])],
+            0,
+        )
+        .unwrap();
+        ingest_with_finalized(&mut db, vec![], 1).unwrap();
+    }
+
+    let mut db = Settle::open(Config::new(DEX_SCHEMA).storage(storage)).unwrap();
+    let batch = ingest_with_finalized(
+        &mut db,
+        vec![("trades".into(), 2, vec![make_trade("alice", "sell", 5.0, 2100.0)])],
+        1,
+    )
+    .unwrap()
+    .unwrap();
+    let alice = record_for(&batch, "position_summary", "user", "alice");
+    assert_eq!(alice.values.get("trade_count"), Some(&Value::UInt64(2)));
+    assert_eq!(
+        alice.values.get("current_position"),
+        Some(&Value::Float64(5.0))
+    );
+    // 5 * (2100 - 2000)
+    let pnl = alice.values.get("total_pnl").and_then(|v| v.as_f64()).unwrap();
+    assert!((pnl - 500.0).abs() < 1e-9, "total_pnl = {pnl}");
+}
