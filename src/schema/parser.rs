@@ -1827,6 +1827,18 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
             )));
         }
 
+        let agg_count = mv
+            .select
+            .iter()
+            .filter(|item| matches!(item.expr, SelectExpr::Agg(..)))
+            .count();
+        if agg_count > MAX_MV_AGGREGATES {
+            return Err(Error::Schema(format!(
+                "MV '{}': {agg_count} aggregate columns, at most {MAX_MV_AGGREGATES} are supported",
+                mv.name
+            )));
+        }
+
         // Validate sliding window time_column exists in source table with a numeric type
         if let Some(ref sw) = mv.sliding_window {
             if source_is_table {
@@ -2090,6 +2102,31 @@ mod tests {
         "#;
         let err = parse_schema(sql).unwrap_err();
         assert!(err.to_string().contains("nonexistent_table"));
+    }
+
+    #[test]
+    fn validation_rejects_mv_with_too_many_aggregates() {
+        // The persisted group state stores the aggregate count in one byte: a
+        // wider MV would lose its state at reopen.
+        let mv_sql = |aggregates: usize| {
+            let columns: Vec<String> = (0..aggregates)
+                .map(|i| format!("sum(price) AS s{i}"))
+                .collect();
+            format!(
+                "CREATE TABLE trades (block_number UInt64, pair String, price Float64);
+                 CREATE MATERIALIZED VIEW wide AS
+                   SELECT pair, {} FROM trades GROUP BY pair;",
+                columns.join(", ")
+            )
+        };
+
+        parse_schema(&mv_sql(MAX_MV_AGGREGATES)).expect("the limit itself is allowed");
+
+        let Err(err) = parse_schema(&mv_sql(MAX_MV_AGGREGATES + 1)) else {
+            panic!("an MV with more than {MAX_MV_AGGREGATES} aggregates must be rejected");
+        };
+        assert!(matches!(err, Error::Schema(_)), "{err}");
+        assert!(err.to_string().contains("wide"), "{err}");
     }
 
     #[test]
