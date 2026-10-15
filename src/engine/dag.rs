@@ -26,27 +26,37 @@ enum PipelineNode {
     MV(String),
 }
 
-/// A node whose finalized state can be persisted independently of all others.
-/// Reducers and MVs write disjoint storage keys, so finalize work fans out
-/// across the rayon pool (each into its own write batch, merged afterward).
-#[cfg(feature = "rayon")]
-trait FinalizeNode: Send {
-    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool);
+/// A reducer or MV. Each finalizes only its own state and writes disjoint
+/// storage keys, so the nodes run in parallel on the rayon pool.
+trait FinalizeNode {
+    fn advance_finality(&mut self, block: BlockNumber);
+    fn write_checkpoint(&mut self, finalized: BlockNumber, batch: &mut StorageWriteBatch);
 }
 
-#[cfg(feature = "rayon")]
 impl FinalizeNode for ReducerEngine {
-    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
-        self.finalize(block, batch, persist);
+    fn advance_finality(&mut self, block: BlockNumber) {
+        ReducerEngine::advance_finality(self, block);
+    }
+
+    fn write_checkpoint(&mut self, finalized: BlockNumber, batch: &mut StorageWriteBatch) {
+        ReducerEngine::write_checkpoint(self, finalized, batch);
+    }
+}
+
+impl FinalizeNode for MVEngine {
+    fn advance_finality(&mut self, block: BlockNumber) {
+        MVEngine::advance_finality(self, block);
+    }
+
+    fn write_checkpoint(&mut self, _finalized: BlockNumber, batch: &mut StorageWriteBatch) {
+        MVEngine::write_checkpoint(self, batch);
     }
 }
 
 #[cfg(feature = "rayon")]
-impl FinalizeNode for MVEngine {
-    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
-        self.finalize(block, batch, persist);
-    }
-}
+type NodeMut<'a> = &'a mut (dyn FinalizeNode + Send);
+#[cfg(not(feature = "rayon"))]
+type NodeMut<'a> = &'a mut dyn FinalizeNode;
 
 /// An independent reducer→MV chain that can be processed in parallel.
 /// Engines are stored inline to avoid HashMap extraction/reinsertion per batch.
@@ -122,13 +132,12 @@ pub struct SettleEngine {
     durable_block: Option<BlockNumber>,
     /// True when the pipeline contains no sliding-window MV and no external
     /// reducer, so backfill persist-deferral is safe. Computed at construction
-    /// (and after `add_reducer`). When false, every finalize persists
-    /// (durable == finalized), exactly as before this feature.
+    /// (and after `add_reducer`). When false, every ingest writes a
+    /// checkpoint (durable == finalized).
     defer_allowed: bool,
-    /// True once `finalize()` has run at least once (or state restored from
-    /// disk). Lets `finalize(N)` skip work when N hasn't advanced past the
-    /// last finalized block — heartbeat ingests with stale `finalized_head`
-    /// otherwise re-serialize every MV group state on every call.
+    /// True once finality advanced at least once (or state was restored from
+    /// disk). Lets `advance_finality(N)` skip work when N has not moved:
+    /// heartbeat ingests with a stale `finalized_head` are common at the tip.
     has_finalized: bool,
     /// Whether ingest builds the `PerfNode` timing tree.
     collect_perf: bool,
@@ -585,7 +594,7 @@ impl SettleEngine {
         // A durable watermark can sit on a block that held no data: ingest
         // admits block 0 while latest is 0, and older databases stored a
         // finality above their latest block. This block's state is not on
-        // disk, so the next finalize must persist it.
+        // disk, so the next checkpoint must write it.
         if self.durable_block.is_some_and(|d| block <= d) {
             self.durable_block = block.checked_sub(1);
         }
@@ -881,7 +890,7 @@ impl SettleEngine {
         }
 
         // Finality floor: a fork/rollback must never cross below the finalized
-        // watermark — finalized state is irreversible. `finalize` keeps the
+        // watermark — finalized state is irreversible. Pruning keeps the
         // hash of the durable block, which lags finality under backfill
         // deferral, so a fork signal could otherwise resolve below finality —
         // rolling derived state back past the durable watermark, corrupting the
@@ -975,123 +984,106 @@ impl SettleEngine {
         Ok(all_changes)
     }
 
-    /// Finalize all state up to and including the given block.
-    /// Reducer finalized state writes are collected into the provided batch.
-    ///
-    /// `persist`: when true (checkpoint / non-backfill), derived state is
-    /// serialized into the batch and `durable_block` advances. When false
-    /// (backfill deferral), the in-memory merge/prune still runs but disk
-    /// persistence is deferred to the next checkpoint. db.rs decides `persist`
-    /// (see backfill_checkpoint_interval) and must only pass false when
-    /// `defer_allowed()` and the ingest is no-lag. See design v2.
-    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
-        // Idempotent skip: nothing to do when finality hasn't advanced AND there
-        // is nothing deferred to flush. The first call after open (or restore)
-        // still runs so initial state lands on disk. A forced checkpoint
-        // (`persist` with `durable_block < block`) must NOT be skipped even when
-        // `block == finalized_block` — that is how deferred state catches up.
-        let nothing_to_flush = !persist || self.durable_block.is_some_and(|d| d >= block);
-        if block == self.finalized_block && self.has_finalized && nothing_to_flush {
+    /// Merge every node's blocks up to `block` into finalized state; rollback
+    /// stops at `block` from now on. Nothing reaches disk before
+    /// `write_checkpoint`.
+    pub fn advance_finality(&mut self, block: BlockNumber) {
+        // With the durable state at this finality, every block up to it is
+        // merged: new data lands above the latest block, which is at or above
+        // the durable one.
+        let merged = self.has_finalized
+            && block == self.finalized_block
+            && self.durable_block.is_some_and(|d| d >= block);
+        if merged {
             return;
         }
 
-        // Finalize is pure persistence: each reducer/MV serializes its own
-        // group state into the batch with disjoint storage keys. These tasks
-        // are independent, so fan them out across the rayon pool — each writes
-        // into its own sub-batch which is merged afterward. This was the single
-        // largest serial section on the main thread (~38% inclusive).
+        let mut nodes = self.finalize_nodes();
         #[cfg(feature = "rayon")]
-        {
-            let mut nodes: Vec<&mut dyn FinalizeNode> = Vec::new();
-            for branch in &mut self.branches {
-                nodes.push(&mut branch.reducer);
-                for (_, mv) in &mut branch.mv_entries {
-                    nodes.push(mv);
-                }
-            }
-            for reducer in self.reducers.values_mut() {
-                nodes.push(reducer);
-            }
-            for mv in self.mvs.values_mut() {
-                nodes.push(mv);
-            }
-
-            if nodes.len() == 1 {
-                nodes[0].finalize_into(block, batch, persist);
-            } else if nodes.len() > 1 {
-                // Force one rayon task per node (`with_max_len(1)`): the default
-                // range split would put the two heavy nodes (heavy reducer +
-                // its heavy MV, adjacent in `nodes`) in the same half and run
-                // them on one worker — no parallelism. One task per node lets
-                // work-stealing spread the heavy finalizes across workers.
-                let sub_batches: Vec<StorageWriteBatch> = nodes
-                    .par_iter_mut()
-                    .with_max_len(1)
-                    .map(|node| {
-                        let mut sub = StorageWriteBatch::new();
-                        node.finalize_into(block, &mut sub, persist);
-                        sub
-                    })
-                    .collect();
-                for sub in sub_batches {
-                    batch.ops.extend(sub.ops);
-                }
-            }
-        }
-
+        nodes
+            .par_iter_mut()
+            .with_max_len(1)
+            .for_each(|node| node.advance_finality(block));
         #[cfg(not(feature = "rayon"))]
-        for node in &self.pipeline {
-            match node {
-                PipelineNode::Reducer(name) => {
-                    if let Some(branch) =
-                        self.branch_index.get(name).map(|&i| &mut self.branches[i])
-                    {
-                        branch.reducer.finalize(block, batch, persist);
-                    } else {
-                        let reducer = self.reducers.get_mut(name).unwrap();
-                        reducer.finalize(block, batch, persist);
-                    }
-                }
-                PipelineNode::MV(name) => {
-                    if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
-                        self.branches[bi].mv_entries[mi].1.finalize(block, batch, persist);
-                    } else {
-                        let mv = self.mvs.get_mut(name).unwrap();
-                        mv.finalize(block, batch, persist);
-                    }
-                }
-                PipelineNode::RawTable(_) => {
-                    // Raw table finalization = eviction eligibility (not implemented yet)
-                }
-            }
+        for node in &mut nodes {
+            node.advance_finality(block);
         }
 
         self.finalized_block = block;
         self.has_finalized = true;
-        if persist {
-            // Durable watermark advances only when derived state was actually
-            // written into this batch. Clamp to latest so it never exceeds the
-            // highest block with persisted raw rows (gappy chains: F may exceed
-            // latest — design v2 B2). Without data nothing becomes durable.
-            if let Some(latest) = self.latest_block {
-                self.durable_block = Some(block.min(latest));
-            }
+        self.prune_block_hashes();
+    }
+
+    /// Write the derived state of every block up to finality into `batch`,
+    /// and move the durable watermark there. The caller commits `batch` with
+    /// the raw rows and metadata of the same ingest, so the state and the
+    /// watermark reach disk together or not at all.
+    pub fn write_checkpoint(&mut self, batch: &mut StorageWriteBatch) {
+        if self.durable_block.is_some_and(|d| d >= self.finalized_block) {
+            return;
         }
 
-        // Fork resolution stops at finality, so hashes below it only grow the
-        // metadata that every ingest writes. Two of them stay: a reopen
-        // restarts finality at the durable block and reads its hash, and on
-        // gappy chains `latest_cursor` reads the hash of a latest block below
-        // finality.
-        let anchors: Vec<(BlockNumber, String)> = [self.durable_block, self.latest_block]
-            .into_iter()
-            .flatten()
-            .filter(|&b| b < block)
-            .filter_map(|b| self.block_hashes.get(&b).map(|h| (b, h.clone())))
-            .collect();
+        let finalized = self.finalized_block;
+        let mut nodes = self.finalize_nodes();
+        #[cfg(feature = "rayon")]
+        if let [node] = nodes.as_mut_slice() {
+            node.write_checkpoint(finalized, batch);
+        } else {
+            // One task per node: the default split could put the two heaviest
+            // nodes, a reducer and its MV, in one task on one worker.
+            let sub_batches: Vec<StorageWriteBatch> = nodes
+                .par_iter_mut()
+                .with_max_len(1)
+                .map(|node| {
+                    let mut sub = StorageWriteBatch::new();
+                    node.write_checkpoint(finalized, &mut sub);
+                    sub
+                })
+                .collect();
+            for sub in sub_batches {
+                batch.ops.extend(sub.ops);
+            }
+        }
+        #[cfg(not(feature = "rayon"))]
+        for node in &mut nodes {
+            node.write_checkpoint(finalized, batch);
+        }
 
-        self.block_hashes = self.block_hashes.split_off(&block);
-        self.block_hashes.extend(anchors);
+        // On gappy chains finality can run ahead of the data. Without data
+        // nothing is durable.
+        if let Some(latest) = self.latest_block {
+            self.durable_block = Some(finalized.min(latest));
+        }
+        self.prune_block_hashes();
+    }
+
+    /// Every reducer and MV.
+    fn finalize_nodes(&mut self) -> Vec<NodeMut<'_>> {
+        let mut nodes: Vec<NodeMut<'_>> = Vec::new();
+        for branch in &mut self.branches {
+            nodes.push(&mut branch.reducer);
+            for (_, mv) in &mut branch.mv_entries {
+                nodes.push(mv);
+            }
+        }
+        for reducer in self.reducers.values_mut() {
+            nodes.push(reducer);
+        }
+        for mv in self.mvs.values_mut() {
+            nodes.push(mv);
+        }
+        nodes
+    }
+
+    /// Fork resolution stops at finality, so hashes below it only grow the
+    /// metadata that every ingest writes. Two of them stay: a reopen restarts
+    /// finality at the durable block and reads its hash, and on gappy chains
+    /// `latest_cursor` reads the hash of a latest block below finality.
+    fn prune_block_hashes(&mut self) {
+        let finalized = self.finalized_block;
+        let anchors = [self.durable_block, self.latest_block];
+        self.block_hashes
+            .retain(|&block, _| block >= finalized || anchors.contains(&Some(block)));
     }
 
     /// Create a ChangeBatch from a set of change records.
@@ -1152,7 +1144,7 @@ impl SettleEngine {
         self.defer_allowed
     }
 
-    /// True once finalize has run at least once (or state was restored).
+    /// True once finality advanced at least once (or state was restored).
     pub fn has_finalized(&self) -> bool {
         self.has_finalized
     }
@@ -1172,12 +1164,12 @@ impl SettleEngine {
 
     pub fn set_finalized_block(&mut self, block: BlockNumber) {
         self.finalized_block = block;
-        // On-disk `META_FINALIZED_BLOCK` is the DURABLE watermark (Option A),
-        // so restoring it sets durable == finalized: derived state on disk is
-        // exactly as-of-`block`, and recovery replays raw rows from block+1.
+        // On-disk `META_FINALIZED_BLOCK` is the DURABLE watermark, so restoring
+        // it sets durable == finalized: derived state on disk is exactly
+        // as-of-`block`, and recovery replays raw rows from block+1.
         self.durable_block = Some(block);
-        // Restored state is on disk already; treat as finalized so the next
-        // `finalize(same_block)` short-circuits like a normal idempotent call.
+        // Restored state is on disk already: advancing to the same block
+        // again has nothing to do.
         self.has_finalized = true;
     }
 
@@ -1733,7 +1725,8 @@ mod tests {
             .unwrap();
 
         let mut batch = StorageWriteBatch::new();
-        engine.finalize(1000, &mut batch, true);
+        engine.advance_finality(1000);
+        engine.write_checkpoint(&mut batch);
         assert_eq!(engine.finalized_block(), 1000);
 
         // Rollback to 1000 should only remove block 1001
@@ -1768,7 +1761,8 @@ mod tests {
                 .unwrap();
         }
         let mut batch = StorageWriteBatch::new();
-        engine.finalize(1001, &mut batch, true);
+        engine.advance_finality(1001);
+        engine.write_checkpoint(&mut batch);
         assert_eq!(engine.finalized_block(), 1001);
 
         // Below finalized → rejected, no mutation.
@@ -1799,7 +1793,8 @@ mod tests {
             .process_batch_deferred("swaps", 3, swap(100.0), &mut batch)
             .unwrap();
         engine.set_rollback_chain(&[(100, "0x64".to_string())]);
-        engine.finalize(100, &mut batch, true);
+        engine.advance_finality(100);
+        engine.write_checkpoint(&mut batch);
         storage.commit(&batch).unwrap();
 
         // The failed ingest's write batch is never committed.
