@@ -255,7 +255,8 @@ fn mv_finalize_then_rollback() {
     );
 
     let mut batch = StorageWriteBatch::new();
-    mv.finalize(1001, &mut batch, true);
+    mv.advance_finality(1001);
+    mv.write_checkpoint(&mut batch);
 
     // Rollback block 1002
     let changes = mv.rollback(1001);
@@ -470,7 +471,8 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
             ])],
         );
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(1, &mut batch, true);
+        mv.advance_finality(1);
+        mv.write_checkpoint(&mut batch);
         storage.commit(&batch).unwrap();
     }
 
@@ -491,7 +493,8 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
         assert!(changes.iter().any(|d| d.operation == ChangeOp::Delete));
 
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(1, &mut batch, true);
+        mv.advance_finality(1);
+        mv.write_checkpoint(&mut batch);
         storage.commit(&batch).unwrap();
     }
 
@@ -529,10 +532,13 @@ fn finalize_and_commit(
     mv: &mut MVEngine,
     storage: &Arc<dyn StorageBackend>,
     block: BlockNumber,
-    persist: bool,
+    checkpoint: bool,
 ) -> StorageWriteBatch {
     let mut batch = StorageWriteBatch::new();
-    mv.finalize(block, &mut batch, persist);
+    mv.advance_finality(block);
+    if checkpoint {
+        mv.write_checkpoint(&mut batch);
+    }
     storage.commit(&batch).unwrap();
     batch
 }

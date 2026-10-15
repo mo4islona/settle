@@ -45,10 +45,9 @@ pub struct ReducerEngine {
     /// inserted once per touched group per block (hot path) — matches the
     /// FxHash already used for `state_cache` / `block_snapshots`.
     block_groups: BTreeMap<BlockNumber, FxHashSet<Vec<u8>>>,
-    /// Group keys finalized since the last DURABLE checkpoint but not yet
-    /// persisted (backfill deferral). While a key sits here its newest
-    /// finalized snapshot is kept so the eventual checkpoint can read its
-    /// correct as-of-finalized value. Empty unless deferral is active.
+    /// Group keys finalized since the last checkpoint. Each keeps its newest
+    /// finalized snapshot, which `write_checkpoint` persists. Under backfill
+    /// deferral keys wait here for several finalizations.
     pending_durable: FxHashSet<Vec<u8>>,
     /// Pre-computed column IDs for group-by columns (resolved against source registry).
     /// Enables direct Vec indexing instead of HashMap lookups.
@@ -504,78 +503,54 @@ impl ReducerEngine {
         Ok(affected_keys.len())
     }
 
-    /// Finalize state up to the given block.
-    ///
-    /// `persist` controls durability. When true (the default / checkpoint),
-    /// finalized state is serialized into the batch and in-memory snapshots ≤
-    /// block are pruned, as before. When false (backfill deferral), the changed
-    /// group keys are accumulated into `pending_durable` and only their newest
-    /// finalized snapshot is kept, which the eventual checkpoint reads — no
-    /// disk writes happen. See design v2.
-    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
-        // Split off blocks > block, keeping blocks <= block for finalization.
-        // (Always prune block_groups — it only tracks block→key for rollback,
-        // and finalized blocks ≤ block are never rolled back.)
+    /// Merge the blocks up to `block` into finalized state: they can no longer
+    /// roll back. Their groups wait in `pending_durable` for `write_checkpoint`,
+    /// which reads each group's newest snapshot at or before finality, so the
+    /// older snapshots go now.
+    pub fn advance_finality(&mut self, block: BlockNumber) {
         let remaining = self.block_groups.split_off(&(block + 1));
-        let finalized_block_groups = std::mem::replace(&mut self.block_groups, remaining);
+        let finalized = std::mem::replace(&mut self.block_groups, remaining);
 
-        let mut finalized_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
-        for keys in finalized_block_groups.values() {
-            finalized_keys.extend(keys.iter().cloned());
-        }
-
-        if !persist {
-            // Defer: remember the keys. Keep each key's newest snapshot at or
-            // before `block`, which a later checkpoint reads when lag has moved
-            // state_cache ahead. Older ones are dead: rollback stops at `block`.
-            for key in &finalized_keys {
-                if let Some(snapshots) = self.block_snapshots.get_mut(key) {
-                    let newest = snapshots.range(..=block).next_back().map(|(b, _)| *b);
-                    if let Some(newest) = newest {
-                        while let Some(entry) = snapshots.first_entry() {
-                            if *entry.key() >= newest {
-                                break;
-                            }
-                            entry.remove();
+        for key in finalized.into_values().flatten() {
+            if let Some(snapshots) = self.block_snapshots.get_mut(&key) {
+                let newest = snapshots.range(..=block).next_back().map(|(b, _)| *b);
+                if let Some(newest) = newest {
+                    while let Some(entry) = snapshots.first_entry() {
+                        if *entry.key() >= newest {
+                            break;
                         }
+                        entry.remove();
                     }
                 }
             }
-            self.pending_durable.extend(finalized_keys);
-            return;
+            self.pending_durable.insert(key);
         }
+    }
 
-        // Checkpoint: persist accumulated deferred keys + this batch's keys.
-        let mut to_persist = std::mem::take(&mut self.pending_durable);
-        to_persist.extend(finalized_keys);
-
-        for group_key_bytes in to_persist {
-            // Find the most recent state at or before the finalization block.
-            // Snapshots are positional Vec<Value>, encoded with the fast binary
-            // codec (no string keys, no msgpack). For deferred keys the snapshot
-            // was retained; for this-batch keys it is freshly present.
+    /// Write the state as of `finalized` of every group in `pending_durable`.
+    /// Storage then holds that state, so the snapshots up to `finalized` go.
+    pub fn write_checkpoint(&mut self, finalized: BlockNumber, batch: &mut StorageWriteBatch) {
+        for key in std::mem::take(&mut self.pending_durable) {
             let state_bytes = self
-                .find_snapshot_at_or_before(&group_key_bytes, block)
+                .find_snapshot_at_or_before(&key, finalized)
                 .map(storage::encode_values);
 
-            // Remove in-memory snapshots for blocks <= finalization point now
-            // that they are durable.
-            if let Some(snapshots) = self.block_snapshots.get_mut(&group_key_bytes) {
+            if let Some(snapshots) = self.block_snapshots.get_mut(&key) {
                 // Not `split_off`: it allocates a new root even when no block is
-                // above `block`.
+                // above `finalized`.
                 while let Some(entry) = snapshots.first_entry() {
-                    if *entry.key() > block {
+                    if *entry.key() > finalized {
                         break;
                     }
                     entry.remove();
                 }
                 if snapshots.is_empty() {
-                    self.block_snapshots.remove(&group_key_bytes);
+                    self.block_snapshots.remove(&key);
                 }
             }
 
             if let Some(state_bytes) = state_bytes {
-                batch.set_reducer_finalized(&self.def.name, group_key_bytes, state_bytes);
+                batch.set_reducer_finalized(&self.def.name, key, state_bytes);
             }
         }
     }
@@ -652,7 +627,7 @@ fn compute_default_state(def: &ReducerDef) -> State {
 }
 
 /// Load reducer state from storage, avoiding borrowing the entire ReducerEngine.
-/// Finalized state is persisted positionally (see `finalize`), so decode the
+/// Finalized state is persisted positionally (see `write_checkpoint`), so decode the
 /// `Vec<Value>` and rebuild the hot `HashMap` state by schema field order.
 fn load_state_from(
     storage: &dyn StorageBackend,
@@ -963,7 +938,8 @@ mod tests {
 
         // Finalize up to 1000
         let mut batch = StorageWriteBatch::new();
-        engine.finalize(1000, &mut batch, true);
+        engine.advance_finality(1000);
+        engine.write_checkpoint(1000, &mut batch);
         storage.commit(&batch).unwrap();
 
         // Block 1002: buy 3 (will be rolled back)
@@ -996,7 +972,7 @@ mod tests {
                 .process_block(block, &[make_trade("alice", "buy", 1.0, 100.0)])
                 .unwrap();
             if block > 2 {
-                engine.finalize(block - 2, &mut StorageWriteBatch::new(), false);
+                engine.advance_finality(block - 2);
             }
         }
         let blocks: Vec<BlockNumber> = engine
@@ -1007,7 +983,8 @@ mod tests {
         assert_eq!(blocks, vec![8, 9, 10]);
 
         let mut batch = StorageWriteBatch::new();
-        engine.finalize(9, &mut batch, true);
+        engine.advance_finality(9);
+        engine.write_checkpoint(9, &mut batch);
         storage.commit(&batch).unwrap();
 
         // Block 10 rolls back onto the persisted state: 9 bought at 100.

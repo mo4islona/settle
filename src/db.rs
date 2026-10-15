@@ -206,9 +206,9 @@ pub struct Settle {
     ack_warning_threshold: Duration,
     /// Set when a non-recoverable commit (heartbeat immediate-commit) fails.
     /// In that case the engine's in-memory state has already mutated past
-    /// disk (e.g. `engine.finalize` pruned `block_snapshots`) and naively
-    /// retrying would re-run `finalize` against the pruned state, writing
-    /// an *empty* batch and silently leaving CF_REDUCER_FIN stale. Every
+    /// disk (e.g. `advance_finality` pruned `block_snapshots`) and naively
+    /// retrying would write a checkpoint from the pruned state, an *empty*
+    /// batch, silently leaving CF_REDUCER_FIN stale. Every
     /// public mutating method short-circuits with `Error::Poisoned` once
     /// this is set; the only recovery is `drop` + reopen, which rebuilds
     /// in-memory state from disk via `replay_unfinalized`.
@@ -907,24 +907,21 @@ impl Settle {
         ));
         self.engine.set_rollback_chain(&chain);
 
-        // 3. Finalize: populate write_batch with finalized state + meta.
-        //    Note: engine.finalize() destructively prunes in-memory snapshots
-        //    even though storage.commit() hasn't run yet. This is intentional:
-        //    on crash before ack, drop() loses in-memory state, and on reopen
-        //    `replay_unfinalized` rebuilds it from on-disk CF_REDUCER_FIN.
-        //    On commit success (in ack or heartbeat path), in-memory and disk
-        //    agree.
+        // 3. Finalize in memory, then write a checkpoint into write_batch.
+        //    advance_finality() prunes in-memory snapshots before
+        //    storage.commit() runs. On a crash before ack, reopen rebuilds that
+        //    state from disk and the replayed raw rows; on commit, in-memory and
+        //    disk agree.
         //
         //    Backfill deferral: when the ingest is no-lag (finalized head at the
         //    batch tip — historical backfill), the pipeline is deferral-safe,
-        //    and the checkpoint interval hasn't elapsed, we DEFER persisting
-        //    derived state (`persist = false`). The durable watermark
-        //    (META_FINALIZED_BLOCK) then stays put and recovery replays raw rows
-        //    from it. Any lag (tip operation), interval elapse, or a
-        //    deferral-unsafe pipeline forces a persisting checkpoint, catching
-        //    the durable watermark up to true finality. See design v2.
+        //    and the checkpoint interval hasn't elapsed, no checkpoint is
+        //    written. The durable watermark (META_FINALIZED_BLOCK) then stays
+        //    put and recovery replays raw rows from it. Any lag (tip
+        //    operation), interval elapse, or a deferral-unsafe pipeline writes
+        //    one, catching the durable watermark up to finality.
         let target_finalized = input.finalized_head.number;
-        let persist = {
+        let checkpoint = {
             let latest = self.engine.latest_block();
             let durable = self.engine.durable_block();
             let no_lag = target_finalized >= latest;
@@ -936,8 +933,10 @@ impl Settle {
             });
             !defer_active || reached_interval
         };
-        self.engine
-            .finalize(target_finalized, &mut write_batch, persist);
+        self.engine.advance_finality(target_finalized);
+        if checkpoint {
+            self.engine.write_checkpoint(&mut write_batch);
+        }
         self.append_meta_to_batch(&mut write_batch)?;
 
         // 4. Update buffer heads with correct cursors (hashes now stored)
@@ -956,12 +955,11 @@ impl Settle {
         match batch_opt {
             None => {
                 // Heartbeat: nothing to apply downstream, so nothing to ack.
-                // Commit immediately to avoid orphaning the finalize writes
-                // (engine.finalize() already pruned in-memory snapshots).
-                // On failure, poison the instance — `engine.finalize()`'s
-                // in-memory pruning is past disk and a naive retry would
-                // re-`finalize` against the pruned state and write an empty
-                // batch, silently leaving CF_REDUCER_FIN stale.
+                // Commit immediately to avoid orphaning the checkpoint writes
+                // (advance_finality() already pruned in-memory snapshots).
+                // On failure, poison the instance: the in-memory pruning is
+                // past disk, and a naive retry would write a checkpoint from
+                // the pruned state, silently leaving CF_REDUCER_FIN stale.
                 if let Err(e) = self.storage.commit(&write_batch) {
                     self.poisoned = Some(format!("heartbeat ingest commit failed: {e}"));
                     return Err(e);

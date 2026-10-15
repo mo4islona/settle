@@ -84,20 +84,17 @@ pub struct MVEngine {
     block_times: BTreeMap<BlockNumber, i64>,
     /// The maximum timestamp seen across all blocks (the "watermark").
     current_watermark: i64,
-    /// Group keys removed since last finalize (for storage cleanup).
+    /// Group keys removed since the last checkpoint (for storage cleanup).
     removed_groups: Vec<GroupKey>,
-    /// Sliding windows only: groups touched since the last `finalize`, whose
-    /// full per-block state must be re-persisted. Unchanged groups already
-    /// have their state on disk; re-persisting them is wasted work that
-    /// dominated the bench (see BENCHMARKS.md "Optimization Roadmap Baseline
-    /// 2026-05-29"). Non-sliding MVs persist only finalized state, which
-    /// changes when a group's blocks are finalized, not when it is touched:
-    /// see `finalize_blocks_up_to`.
+    /// Sliding windows only: groups touched since the last
+    /// `advance_finality`, whose full per-block state must be re-persisted.
+    /// Unchanged groups already have their state on disk. Non-sliding MVs
+    /// persist only finalized state, which changes when a group's blocks are
+    /// finalized, not when it is touched: see `finalize_blocks_up_to`.
     dirty_groups: FxHashSet<GroupKey>,
-    /// Group keys changed since the last DURABLE checkpoint but not yet
-    /// persisted (backfill deferral). Accumulated across non-checkpoint
-    /// finalizes; drained when a checkpoint persists. Empty unless deferral is
-    /// active. See docs/backfill-mode-design.md.
+    /// Group keys whose stored state changed since the last checkpoint, which
+    /// `write_checkpoint` persists. Under backfill deferral keys wait here for
+    /// several finalizations. See docs/backfill-mode-design.md.
     pending_durable: FxHashSet<GroupKey>,
 }
 
@@ -386,45 +383,30 @@ impl MVEngine {
         self.emit_changes(touched)
     }
 
-    /// Finalize all blocks up to and including the given block.
-    ///
-    /// `persist` controls durability: when true (the default / checkpoint),
-    /// finalized state is serialized into the batch as before. When false
-    /// (backfill deferral), the in-memory merge still happens — keeping the
-    /// cumulative finalized aggregate live and correct — but disk writes are
-    /// deferred: changed keys accumulate in `pending_durable` and are persisted
-    /// at the next checkpoint. The cumulative agg lives in `self.groups`, so a
-    /// later checkpoint serializes the correct as-of value. See design v2.
-    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
-        let is_sliding = self.sliding_window.is_some();
-
-        // Sliding windows keep per-block data (no finalize_up_to) and prune
-        // block_groups in expire_old_blocks. The merge runs regardless of
-        // `persist`: it keeps the in-memory cumulative aggregate correct.
-        let changed = if is_sliding {
+    /// Merge the blocks up to `block` into finalized state. The groups whose
+    /// stored state changed wait in `pending_durable` for `write_checkpoint`.
+    /// A sliding window stores its blocks final or not, so it queues the groups
+    /// touched since the last call instead.
+    pub fn advance_finality(&mut self, block: BlockNumber) {
+        let changed = if self.sliding_window.is_some() {
             std::mem::take(&mut self.dirty_groups)
         } else {
             self.finalize_blocks_up_to(block)
         };
+        self.pending_durable.extend(changed);
+    }
 
-        if !persist {
-            // Defer: remember the changed keys; the cumulative agg is already
-            // updated in memory. removed_groups is left to accumulate (drained
-            // only at a checkpoint). No disk writes.
-            self.pending_durable.extend(changed);
-            return;
-        }
+    /// Write the stored state of every group in `pending_durable`, and delete
+    /// the groups that emptied.
+    pub fn write_checkpoint(&mut self, batch: &mut StorageWriteBatch) {
+        let is_sliding = self.sliding_window.is_some();
 
-        // Checkpoint: persist accumulated deferred keys + this batch's keys.
-        let mut to_persist = std::mem::take(&mut self.pending_durable);
-        to_persist.extend(changed);
-
-        for group_key in &to_persist {
-            let aggs = match self.groups.get(group_key) {
+        for group_key in std::mem::take(&mut self.pending_durable) {
+            let aggs = match self.groups.get(&group_key) {
                 Some(a) => a,
                 None => continue, // removed meanwhile (handled below)
             };
-            let gk_bytes = storage::encode_group_key(group_key);
+            let gk_bytes = storage::encode_group_key(&group_key);
             let state_bytes = if is_sliding {
                 serialize_mv_group_full(aggs)
             } else {
@@ -441,9 +423,8 @@ impl MVEngine {
         }
 
         // Delete stale groups from storage. Membership-wins reconcile: only
-        // delete keys NOT currently present — a key removed then re-added within
-        // a deferral interval is present in `to_persist` (put above) and must
-        // NOT also be deleted (design v2 B3).
+        // delete keys NOT currently present — a key removed then re-added
+        // between checkpoints was written above and must NOT also be deleted.
         for key in std::mem::take(&mut self.removed_groups) {
             if !self.groups.contains_key(&key) {
                 let gk_bytes = storage::encode_group_key(&key);
@@ -581,7 +562,7 @@ impl MVEngine {
     }
 
     /// Emit one change per touched group against its snapshot, and mark a
-    /// sliding-window group dirty for the next finalize. Output rows are
+    /// sliding-window group dirty for the next checkpoint. Output rows are
     /// built only for the groups whose values changed.
     fn emit_changes(&mut self, touched: Touched) -> Vec<ChangeRecord> {
         debug_assert!(!touched.existence_only);
