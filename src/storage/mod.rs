@@ -57,19 +57,19 @@ impl StorageWriteBatch {
         });
     }
 
-    pub fn set_reducer_finalized(&mut self, reducer: &str, group_key: &[u8], state: &[u8]) {
+    pub fn set_reducer_finalized(&mut self, reducer: &str, group_key: Vec<u8>, state: Vec<u8>) {
         self.ops.push(BatchOp::SetReducerFinalized {
             reducer: reducer.to_string(),
-            group_key: group_key.to_vec(),
-            state: state.to_vec(),
+            group_key,
+            state,
         });
     }
 
-    pub fn put_mv_state(&mut self, view: &str, group_key: &[u8], state: &[u8]) {
+    pub fn put_mv_state(&mut self, view: &str, group_key: Vec<u8>, state: Vec<u8>) {
         self.ops.push(BatchOp::PutMvState {
             view: view.to_string(),
-            group_key: group_key.to_vec(),
-            state: state.to_vec(),
+            group_key,
+            state,
         });
     }
 
@@ -126,7 +126,8 @@ pub fn decode_state(bytes: &[u8]) -> RowMap {
 /// using the fast tag-based binary codec — no string keys, no msgpack overhead.
 /// Format: `count: u32 LE` then one `encode_value` per value.
 pub fn encode_values(values: &[Value]) -> StateBytes {
-    let mut buf = Vec::with_capacity(4 + values.len() * 9);
+    let capacity = 4 + values.iter().map(encoded_len_hint).sum::<usize>();
+    let mut buf = Vec::with_capacity(capacity);
     buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
     for v in values {
         encode_value(&mut buf, v);
@@ -172,6 +173,19 @@ const TAG_BYTES: u8 = 7;
 const TAG_UINT256: u8 = 8;
 const TAG_BASE58: u8 = 9;
 const TAG_JSON: u8 = 10;
+
+/// An upper bound of what `encode_value` writes for `val`, JSON aside.
+fn encoded_len_hint(val: &Value) -> usize {
+    // The tag and any fixed-size value but a U256; length-prefixed values
+    // need their payload on top.
+    let extra = match val {
+        Value::String(s) => s.len(),
+        Value::Bytes(b) | Value::Base58(b) => b.len(),
+        Value::Uint256(_) => 24,
+        _ => 0,
+    };
+    9 + extra
+}
 
 fn encode_value(buf: &mut Vec<u8>, val: &Value) {
     match val {

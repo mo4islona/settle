@@ -1,0 +1,333 @@
+//! Instructions and allocations of `Settle::ingest`, counted under Valgrind by
+//! Gungraun: Callgrind for instructions, DHAT for bytes and blocks allocated.
+//! Between runs of one binary, allocation counts repeat exactly (Lua cases to a
+//! few blocks) and instruction counts move by less than 0.4%, so one run of each
+//! build compares two builds. The wall-clock benches cannot resolve a change that
+//! small.
+//!
+//! Linux only. Needs `valgrind` and the runner of the same version as the
+//! `gungraun` dev-dependency. DHAT cannot see allocations made through
+//! mimalloc, so build without the default features:
+//!
+//!   cargo install gungraun-runner --version 0.20.0
+//!   git switch BASE && cargo bench --bench instructions --no-default-features \
+//!       --features lua,rayon -- --save-baseline=base
+//!   git switch NEW  && cargo bench --bench instructions --no-default-features \
+//!       --features lua,rayon -- --baseline=base
+//!
+//! Memory storage only: RocksDB flushes and compacts on its own threads, which
+//! neither tool counts. Rayon runs on the bench thread for the same reason.
+//! Each case ingests warm-up batches in setup, outside the count, so the counted
+//! batches see a steady state. Postgres comparisons stay in `vs_postgres_*`.
+
+use std::collections::HashMap;
+use std::hint::black_box;
+
+use gungraun::prelude::*;
+use gungraun::{Callgrind, Dhat, DhatMetric, EventKind};
+use settle::db::{Config, IngestInput, Settle};
+use settle::test_helpers::cursor;
+use settle::types::{RowMap, Value};
+
+const ROWS_PER_BLOCK: u64 = 50;
+/// Finality lag at the tip, in blocks: about two Ethereum epochs.
+const FINALITY_LAG: u64 = 64;
+
+#[derive(Clone, Copy)]
+enum Workload {
+    /// `sum` MV straight off a virtual table: the engine floor.
+    MvSum,
+    /// `MvSum` on a stored table, which also emits one change record per raw row.
+    MvSumStored,
+    /// `min`/`max`/`last` MV: aggregates with no reverse delta.
+    MvMinMax,
+    /// EventRules reducer feeding a `last` MV.
+    EventRules,
+    /// The Polymarket schema: two Lua reducers and their MVs.
+    Polymarket,
+}
+
+impl Workload {
+    fn table(self) -> &'static str {
+        match self {
+            Workload::MvSum | Workload::MvSumStored | Workload::EventRules => "transfers",
+            Workload::MvMinMax => "trades",
+            Workload::Polymarket => "orders",
+        }
+    }
+
+    fn schema(self) -> String {
+        let transfers = "transfers (
+            block_number UInt64,
+            from_addr    String,
+            to_addr      String,
+            value        Float64
+        );";
+
+        match self {
+            Workload::MvSum | Workload::MvSumStored => {
+                let create = match self {
+                    Workload::MvSum => "CREATE VIRTUAL TABLE",
+                    _ => "CREATE TABLE",
+                };
+                format!(
+                    "{create} {transfers}
+                    CREATE MATERIALIZED VIEW balances AS
+                    SELECT from_addr, sum(value) AS balance
+                    FROM transfers GROUP BY from_addr;"
+                )
+            }
+            Workload::MvMinMax => "CREATE VIRTUAL TABLE trades (
+                    block_number UInt64,
+                    asset_id     String,
+                    price        Float64
+                );
+                CREATE MATERIALIZED VIEW asset_price AS
+                SELECT asset_id, max(price) AS hi, min(price) AS lo, last(price) AS last_price
+                FROM trades GROUP BY asset_id;"
+                .to_string(),
+            Workload::EventRules => format!(
+                "CREATE VIRTUAL TABLE {transfers}
+                CREATE REDUCER user_balance
+                SOURCE transfers
+                GROUP BY from_addr
+                STATE (balance Float64 DEFAULT 0)
+                    WHEN 1 = 1 THEN
+                        SET state.balance = state.balance + row.value
+                        EMIT _dummy = 0
+                    ALWAYS EMIT
+                        row.from_addr AS from_addr,
+                        state.balance AS balance
+                END;
+                CREATE MATERIALIZED VIEW balances AS
+                SELECT from_addr, last(balance) AS balance
+                FROM user_balance GROUP BY from_addr;"
+            ),
+            Workload::Polymarket => include_str!("../tests/polymarket/schema.sql").to_string(),
+        }
+    }
+
+    fn row(self, i: u64) -> RowMap {
+        match self {
+            Workload::MvSum | Workload::MvSumStored | Workload::EventRules => HashMap::from([
+                (
+                    "from_addr".into(),
+                    Value::String(format!("0xfrom{:06x}", i % 10_000)),
+                ),
+                (
+                    "to_addr".into(),
+                    Value::String(format!("0xto{:06x}", (i + 1) % 10_000)),
+                ),
+                ("value".into(), Value::Float64(1.0 + i as f64 * 0.01)),
+            ]),
+            Workload::MvMinMax => HashMap::from([
+                (
+                    "asset_id".into(),
+                    Value::String(format!("asset_{:04}", i * 7 % 1000)),
+                ),
+                (
+                    "price".into(),
+                    Value::Float64(100.0 + (i * 13 % 997) as f64 * 0.1),
+                ),
+            ]),
+            Workload::Polymarket => polymarket_order(i),
+        }
+    }
+}
+
+/// Same distribution as `profile_polymarket`: 100K traders, the top 10% place
+/// 80% of the orders.
+fn polymarket_order(i: u64) -> RowMap {
+    let traders = 100_000;
+    let top = traders / 10;
+    let trader = if i % 5 < 4 {
+        i % top
+    } else {
+        top + i % (traders - top)
+    };
+
+    let price_bps = if i % 10 < 7 {
+        9600 + i % 400
+    } else {
+        3000 + i % 6000
+    };
+    let shares = 1_000_000_000u64;
+
+    HashMap::from([
+        (
+            "trader".into(),
+            Value::String(format!("0xtrader{trader:06x}")),
+        ),
+        (
+            "asset_id".into(),
+            Value::String(format!("token_{:04}", i % 10_000)),
+        ),
+        ("usdc".into(), Value::UInt64(shares * price_bps / 10_000)),
+        ("shares".into(), Value::UInt64(shares)),
+        ("side".into(), Value::UInt64(u64::from(i % 5 >= 3))),
+        ("timestamp".into(), Value::UInt64(1_000_000 + i / 500)),
+    ])
+}
+
+#[derive(Clone, Copy)]
+enum Mode {
+    /// 100 blocks per ingest, finality at the batch tip.
+    Backfill,
+    /// One block per ingest, finality `FINALITY_LAG` blocks behind.
+    Tip,
+}
+
+impl Mode {
+    fn blocks_per_ingest(self) -> u64 {
+        match self {
+            Mode::Backfill => 100,
+            Mode::Tip => 1,
+        }
+    }
+
+    /// Ingests in warm-up, and again in the counted run.
+    fn ingests(self) -> usize {
+        match self {
+            Mode::Backfill => 4,
+            Mode::Tip => 200,
+        }
+    }
+
+    fn inputs(self, workload: Workload) -> Vec<IngestInput> {
+        let per_ingest = self.blocks_per_ingest();
+        let mut row_index = 0;
+
+        (0..2 * self.ingests() as u64)
+            .map(|n| {
+                let first = 1 + n * per_ingest;
+                let last = first + per_ingest - 1;
+
+                let mut rows = Vec::with_capacity((per_ingest * ROWS_PER_BLOCK) as usize);
+                for block in first..=last {
+                    for _ in 0..ROWS_PER_BLOCK {
+                        let mut row = workload.row(row_index);
+                        row.insert("block_number".into(), Value::UInt64(block));
+                        rows.push(row);
+                        row_index += 1;
+                    }
+                }
+
+                let finalized = match self {
+                    Mode::Backfill => last,
+                    Mode::Tip => last.saturating_sub(FINALITY_LAG),
+                };
+
+                IngestInput {
+                    data: HashMap::from([(workload.table().to_string(), rows)]),
+                    rollback_chain: (first..=last)
+                        .filter(|b| *b > finalized)
+                        .map(cursor)
+                        .collect(),
+                    finalized_head: cursor(finalized),
+                }
+            })
+            .collect()
+    }
+}
+
+struct Prepared {
+    db: Settle,
+    inputs: Vec<IngestInput>,
+}
+
+/// Leaked, so that dropping the engine is not counted.
+fn prepare(workload: Workload, mode: Mode) -> &'static mut Prepared {
+    // A runtime check: a compile error would break `cargo build --all-targets`.
+    if cfg!(feature = "mimalloc") {
+        panic!(
+            "DHAT cannot see mimalloc allocations: build with --no-default-features --features lua,rayon"
+        );
+    }
+
+    #[cfg(feature = "rayon")]
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .use_current_thread()
+        .build_global()
+        .unwrap();
+
+    let mut db = Settle::open(Config::new(workload.schema())).unwrap();
+    let mut inputs = mode.inputs(workload);
+    let counted = inputs.split_off(mode.ingests());
+    for input in inputs {
+        ingest_and_ack(&mut db, input);
+    }
+
+    Box::leak(Box::new(Prepared {
+        db,
+        inputs: counted,
+    }))
+}
+
+fn ingest_and_ack(db: &mut Settle, input: IngestInput) -> usize {
+    let Some(batch) = db.ingest(input).unwrap() else {
+        return 0;
+    };
+    db.ack(batch.sequence).unwrap();
+    batch.record_count()
+}
+
+fn prepare_backfill(workload: Workload) -> &'static mut Prepared {
+    prepare(workload, Mode::Backfill)
+}
+
+fn prepare_tip(workload: Workload) -> &'static mut Prepared {
+    prepare(workload, Mode::Tip)
+}
+
+fn ingest_all(case: &'static mut Prepared) -> usize {
+    let inputs = std::mem::take(&mut case.inputs);
+    let records = inputs
+        .into_iter()
+        .map(|input| ingest_and_ack(&mut case.db, input))
+        .sum();
+    black_box(records)
+}
+
+#[library_benchmark]
+#[bench::mv_sum(args = (Workload::MvSum), setup = prepare_backfill)]
+#[bench::mv_sum_stored(args = (Workload::MvSumStored), setup = prepare_backfill)]
+#[bench::mv_minmax(args = (Workload::MvMinMax), setup = prepare_backfill)]
+#[bench::event_rules(args = (Workload::EventRules), setup = prepare_backfill)]
+#[bench::polymarket(args = (Workload::Polymarket), setup = prepare_backfill)]
+fn backfill(case: &'static mut Prepared) -> usize {
+    ingest_all(case)
+}
+
+#[library_benchmark]
+#[bench::mv_sum(args = (Workload::MvSum), setup = prepare_tip)]
+#[bench::mv_sum_stored(args = (Workload::MvSumStored), setup = prepare_tip)]
+#[bench::mv_minmax(args = (Workload::MvMinMax), setup = prepare_tip)]
+#[bench::event_rules(args = (Workload::EventRules), setup = prepare_tip)]
+#[bench::polymarket(args = (Workload::Polymarket), setup = prepare_tip)]
+fn tip(case: &'static mut Prepared) -> usize {
+    ingest_all(case)
+}
+
+library_benchmark_group!(name = ingest, benchmarks = [backfill, tip]);
+
+// No cache simulation: it doubles the run time, and the limits read instructions.
+main!(
+    config = LibraryBenchmarkConfig::default()
+        .tool(
+            Callgrind::with_args(["--cache-sim=no"])
+                .format([EventKind::Ir])
+                .soft_limits([(EventKind::Ir, 1.0)])
+        )
+        // Only allocations whose stack reaches the bench function are counted,
+        // and Valgrind keeps 12 frames by default: a deeper one would drop out.
+        .tool(
+            Dhat::with_args(["--num-callers=500"])
+                .format([DhatMetric::TotalBytes, DhatMetric::TotalBlocks])
+                .soft_limits([
+                    (DhatMetric::TotalBytes, 1.0),
+                    (DhatMetric::TotalBlocks, 1.0),
+                ])
+        ),
+    library_benchmark_groups = ingest
+);

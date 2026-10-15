@@ -44,6 +44,16 @@ enum GroupKeyExtractor {
     Window(String, u64),
 }
 
+/// The groups that one block (or rollback) touched, each with its aggregation
+/// values from before the change. The values of all groups share one Vec,
+/// `agg_count` per group in `agg_index` order, so a snapshot allocates nothing.
+#[derive(Default)]
+struct Touched {
+    /// Offset of the group's values in `prev`; None if the group did not exist.
+    groups: FxHashMap<GroupKey, Option<usize>>,
+    prev: Vec<Value>,
+}
+
 /// Manages a single materialized view: GROUP BY routing, aggregation, rollback, changes.
 pub struct MVEngine {
     def: MVDef,
@@ -62,8 +72,6 @@ pub struct MVEngine {
     /// Tracks which blocks have been ingested (for rollback).
     /// block -> set of group keys touched. BTreeMap for O(log N) range queries.
     block_groups: BTreeMap<BlockNumber, FxHashSet<GroupKey>>,
-    /// Snapshot of previous output values per group key, for change computation.
-    prev_output: FxHashMap<GroupKey, HashMap<String, Value>>,
     /// Storage backend for persisting finalized MV state.
     storage: Arc<dyn StorageBackend>,
     /// Sliding window configuration (None for tumbling/non-windowed MVs).
@@ -180,16 +188,12 @@ impl MVEngine {
 
         // Restore finalized MV state from storage
         let mut groups: FxHashMap<GroupKey, Vec<Box<dyn AggregationFunc>>> = FxHashMap::default();
-        let mut prev_output: FxHashMap<GroupKey, HashMap<String, Value>> = FxHashMap::default();
 
         if let Ok(group_keys) = storage.list_mv_group_keys(&def.name) {
             for gk_bytes in group_keys {
                 if let Ok(Some(state_bytes)) = storage.get_mv_state(&def.name, &gk_bytes) {
-                    if let Some((aggs, prev)) = deserialize_mv_group(&state_bytes, &agg_funcs) {
+                    if let Some(aggs) = deserialize_mv_group(&state_bytes, &agg_funcs) {
                         let group_key = storage::decode_group_key(&gk_bytes);
-                        if let Some(prev) = prev {
-                            prev_output.insert(group_key.clone(), prev);
-                        }
                         groups.insert(group_key, aggs);
                     }
                 }
@@ -234,7 +238,6 @@ impl MVEngine {
             group_key_extractors,
             groups,
             block_groups,
-            prev_output,
             storage,
             sliding_window,
             block_times,
@@ -283,20 +286,13 @@ impl MVEngine {
             }
         }
 
-        // Snapshot current output for touched groups before mutation
-        let mut touched_keys: FxHashSet<GroupKey> = FxHashSet::default();
+        let mut touched = Touched::default();
 
         for row in rows {
             let group_key = self.compute_group_key(row);
 
             // Snapshot prev output before first mutation of this group
-            if !touched_keys.contains(&group_key) {
-                let prev = self.compute_output(&group_key);
-                if let Some(prev) = prev {
-                    self.prev_output.insert(group_key.clone(), prev);
-                }
-                touched_keys.insert(group_key.clone());
-            }
+            self.snapshot(&mut touched, &group_key);
 
             // Ensure group exists
             if !self.groups.contains_key(&group_key) {
@@ -322,19 +318,10 @@ impl MVEngine {
 
         // Expire old blocks for sliding windows
         if self.sliding_window.is_some() {
-            let expired_keys = self.expire_old_blocks();
-            touched_keys.extend(expired_keys);
+            self.expire_old_blocks(&mut touched);
         }
 
-        // Emit changes for all touched groups
-        let changes = self.emit_changes(&touched_keys);
-        // Mark touched sliding-window groups as dirty so the next finalize
-        // knows what to persist. Consume `touched_keys` here — its only other
-        // use was the borrow passed to `emit_changes` above.
-        if self.sliding_window.is_some() {
-            self.dirty_groups.extend(touched_keys);
-        }
-        changes
+        self.emit_changes(touched)
     }
 
     /// Roll back all blocks after fork_point.
@@ -358,24 +345,17 @@ impl MVEngine {
             self.current_watermark = self.block_times.values().copied().max().unwrap_or(0);
         }
 
-        // Collect all group keys affected by rolled-back blocks (consume by value)
-        let mut touched_keys: FxHashSet<GroupKey> = FxHashSet::default();
+        // Collect all group keys affected by rolled-back blocks (consume by
+        // value), with their output before the rollback.
+        let mut touched = Touched::default();
         for (_block, keys) in rolled_back {
             for key in keys {
-                touched_keys.insert(key);
-            }
-        }
-
-        // Snapshot prev output before mutation
-        for key in &touched_keys {
-            let prev = self.compute_output(key);
-            if let Some(prev) = prev {
-                self.prev_output.insert(key.clone(), prev);
+                self.snapshot(&mut touched, &key);
             }
         }
 
         // Batch-remove blocks from aggregations: one split_off per group key
-        for key in &touched_keys {
+        for key in touched.groups.keys() {
             if let Some(aggs) = self.groups.get_mut(key) {
                 for agg in aggs.iter_mut() {
                     agg.remove_blocks_after(fork_point);
@@ -384,11 +364,7 @@ impl MVEngine {
         }
 
         // Emit changes (updates or deletes)
-        let changes = self.emit_changes(&touched_keys);
-        if self.sliding_window.is_some() {
-            self.dirty_groups.extend(touched_keys);
-        }
-        changes
+        self.emit_changes(touched)
     }
 
     /// Finalize all blocks up to and including the given block.
@@ -430,13 +406,12 @@ impl MVEngine {
                 None => continue, // removed meanwhile (handled below)
             };
             let gk_bytes = storage::encode_group_key(group_key);
-            let prev = self.prev_output.get(group_key);
             let state_bytes = if is_sliding {
-                serialize_mv_group_full(aggs, prev)
+                serialize_mv_group_full(aggs)
             } else {
-                serialize_mv_group(aggs, prev)
+                serialize_mv_group(aggs)
             };
-            batch.put_mv_state(&self.def.name, &gk_bytes, &state_bytes);
+            batch.put_mv_state(&self.def.name, gk_bytes, state_bytes);
         }
 
         // Persist block_times for sliding windows
@@ -482,9 +457,9 @@ impl MVEngine {
         changed
     }
 
-    /// Remove blocks whose timestamps have fallen outside the sliding window.
-    /// Returns the set of group keys affected by expiry.
-    fn expire_old_blocks(&mut self) -> FxHashSet<GroupKey> {
+    /// Remove blocks whose timestamps have fallen outside the sliding window,
+    /// and add the groups they held to `touched`.
+    fn expire_old_blocks(&mut self, touched: &mut Touched) {
         let sw = self.sliding_window.as_ref().unwrap();
         let window_ms = (sw.interval_seconds as i64).saturating_mul(1000);
         let cutoff = self.current_watermark - window_ms;
@@ -498,22 +473,12 @@ impl MVEngine {
             .map(|(block, _)| *block)
             .collect();
 
-        if expired_blocks.is_empty() {
-            return FxHashSet::default();
-        }
-
-        let mut expired_keys: FxHashSet<GroupKey> = FxHashSet::default();
-
         for &block in &expired_blocks {
             if let Some(keys) = self.block_groups.remove(&block) {
                 for key in keys {
                     // Snapshot prev output before first mutation of this group by expiry.
-                    // If already in prev_output (touched by row processing), skip.
-                    if !self.prev_output.contains_key(&key) {
-                        if let Some(prev) = self.compute_output(&key) {
-                            self.prev_output.insert(key.clone(), prev);
-                        }
-                    }
+                    // If already touched by row processing, keep that snapshot.
+                    self.snapshot(touched, &key);
 
                     // Remove block's contribution from all aggs for this group
                     if let Some(aggs) = self.groups.get_mut(&key) {
@@ -521,15 +486,11 @@ impl MVEngine {
                             agg.remove_block(block);
                         }
                     }
-
-                    expired_keys.insert(key);
                 }
             }
 
             self.block_times.remove(&block);
         }
-
-        expired_keys
     }
 
     fn compute_group_key(&self, row: &RowMap) -> GroupKey {
@@ -553,8 +514,27 @@ impl MVEngine {
         key
     }
 
-    fn compute_output(&self, group_key: &GroupKey) -> Option<HashMap<String, Value>> {
-        let aggs = self.groups.get(group_key)?;
+    /// Record the aggregation values of a group before its first change.
+    fn snapshot(&self, touched: &mut Touched, group_key: &GroupKey) {
+        if touched.groups.contains_key(group_key) {
+            return;
+        }
+
+        let at = self.groups.get(group_key).map(|aggs| {
+            let at = touched.prev.len();
+            touched.prev.extend(aggs.iter().map(|a| a.current_value()));
+            at
+        });
+        touched.groups.insert(group_key.clone(), at);
+    }
+
+    /// The output row of a group: its key columns plus `agg_values`, which
+    /// are moved out.
+    fn build_output(
+        &self,
+        group_key: &GroupKey,
+        agg_values: &mut [Value],
+    ) -> HashMap<String, Value> {
         let mut output = HashMap::with_capacity(self.output_columns.len());
 
         let mut key_idx = 0;
@@ -570,81 +550,106 @@ impl MVEngine {
                     output_name,
                     ..
                 } => {
-                    output.insert(output_name.clone(), aggs[*agg_index].current_value());
+                    let value = std::mem::replace(&mut agg_values[*agg_index], Value::Null);
+                    output.insert(output_name.clone(), value);
                 }
             }
         }
 
-        Some(output)
+        output
     }
 
-    fn emit_changes(&mut self, touched_keys: &FxHashSet<GroupKey>) -> Vec<ChangeRecord> {
-        let mut changes = Vec::new();
+    /// Emit one change per touched group against its snapshot, and mark a
+    /// sliding-window group dirty for the next finalize. Output rows are
+    /// built only for the groups whose values changed.
+    fn emit_changes(&mut self, touched: Touched) -> Vec<ChangeRecord> {
+        let Touched {
+            groups: touched,
+            mut prev,
+        } = touched;
+        let mut changes = Vec::with_capacity(touched.len());
+        let mut current: Vec<Value> = Vec::with_capacity(self.agg_count);
 
-        for key in touched_keys {
-            let prev = self.prev_output.remove(key);
-            let current = self.compute_output(key);
+        for (key, at) in touched {
+            current.clear();
+            // False once the group has no data left (all aggs empty) or is gone.
+            let has_data = match self.groups.get(&key) {
+                Some(aggs) if aggs.iter().any(|a| a.has_data()) => {
+                    current.extend(aggs.iter().map(|a| a.current_value()));
+                    true
+                }
+                _ => false,
+            };
+            let prev_values = at.map(|at| &mut prev[at..at + self.agg_count]);
 
-            // Check if group is now empty (all aggs have no data)
-            let is_empty = self
-                .groups
-                .get(key)
-                .map(|aggs| aggs.iter().all(|a| !a.has_data()))
-                .unwrap_or(true);
-
-            let change_key = self.build_change_key(key);
-
-            match (prev, is_empty) {
-                (None, false) => {
+            match (prev_values, has_data) {
+                (None, true) => {
                     // New group -> Insert
-                    if let Some(values) = current {
-                        changes.push(ChangeRecord {
-                            table: self.def.name.clone(),
-                            operation: ChangeOp::Insert,
-                            key: change_key,
-                            values,
-                            prev_values: None,
-                        });
-                    }
+                    let values = self.build_output(&key, &mut current);
+                    changes.push(self.change_record(ChangeOp::Insert, &key, values, None));
                 }
-                (Some(prev_vals), false) => {
+                (Some(prev_values), true) => {
                     // Existing group updated -> Update
-                    if let Some(values) = current {
-                        if values != prev_vals {
-                            changes.push(ChangeRecord {
-                                table: self.def.name.clone(),
-                                operation: ChangeOp::Update,
-                                key: change_key,
-                                values,
-                                prev_values: Some(prev_vals),
-                            });
-                        }
+                    if current[..] != prev_values[..] {
+                        let values = self.build_output(&key, &mut current);
+                        let prev_values = self.build_output(&key, prev_values);
+                        changes.push(self.change_record(
+                            ChangeOp::Update,
+                            &key,
+                            values,
+                            Some(prev_values),
+                        ));
                     }
                 }
-                (Some(prev_vals), true) => {
+                (Some(prev_values), false) => {
                     // Group became empty after rollback/expiry -> Delete
-                    changes.push(ChangeRecord {
-                        table: self.def.name.clone(),
-                        operation: ChangeOp::Delete,
-                        key: change_key,
-                        values: prev_vals.clone(),
-                        prev_values: Some(prev_vals),
-                    });
+                    let prev_values = self.build_output(&key, prev_values);
+                    changes.push(self.change_record(
+                        ChangeOp::Delete,
+                        &key,
+                        prev_values.clone(),
+                        Some(prev_values),
+                    ));
+
                     // Clean up empty group and track for storage deletion
-                    self.groups.remove(key);
+                    self.groups.remove(&key);
                     self.removed_groups.push(key.clone());
                 }
-                (None, true) => {
-                    // Was never emitted and is empty — no change needed
+                (None, false) => {
+                    // Never emitted and already empty, e.g. its rows expired on
+                    // arrival: nothing to emit, but a lingering empty group would
+                    // turn the next row's Insert into an Update and get persisted.
+                    // It was never stored, so there is nothing to delete.
+                    self.groups.remove(&key);
                 }
+            }
+
+            if self.sliding_window.is_some() {
+                self.dirty_groups.insert(key);
             }
         }
 
         changes
     }
 
+    fn change_record(
+        &self,
+        operation: ChangeOp,
+        group_key: &GroupKey,
+        values: HashMap<String, Value>,
+        prev_values: Option<HashMap<String, Value>>,
+    ) -> ChangeRecord {
+        ChangeRecord {
+            table: self.def.name.clone(),
+            operation,
+            key: self.build_change_key(group_key),
+            values,
+            prev_values,
+        }
+    }
+
     fn build_change_key(&self, group_key: &GroupKey) -> HashMap<String, Value> {
-        let mut change_key = HashMap::new();
+        let mut change_key = HashMap::with_capacity(group_key.len());
         let mut key_idx = 0;
         for col in &self.output_columns {
             match col {
@@ -697,47 +702,45 @@ fn resolve_output_name(item: &SelectItem) -> String {
 // re-encode that dominated finalize serialization):
 //   num_aggs: u8 (hence MAX_MV_AGGREGATES)
 //   per agg: len: u32 LE, then `len` bytes (per-agg rmp blob)
-//   prev flag: u8 (0 = None, 1 = Some)
-//   if Some: len: u32 LE, then rmp(prev_output map)
+//   prev flag: u8, written as 0. Older builds could write 1, then
+//     len: u32 LE and an rmp map of the last output; the reader checks and drops it.
 // Per-agg blobs reuse the existing, test-covered rmp codecs (to_bytes /
-// to_finalized_bytes / from_bytes) — only the outer framing changed.
+// write_finalized / from_bytes) — only the outer framing changed.
 
-fn write_mv_group(buf: &mut Vec<u8>, agg_blob: impl Fn(&dyn AggregationFunc) -> Vec<u8>, aggs: &[Box<dyn AggregationFunc>], prev_output: Option<&HashMap<String, Value>>) {
+fn write_mv_group(
+    buf: &mut Vec<u8>,
+    write_agg: impl Fn(&dyn AggregationFunc, &mut Vec<u8>),
+    aggs: &[Box<dyn AggregationFunc>],
+) {
     let count = u8::try_from(aggs.len()).expect("schema validation bounds the aggregate count");
     buf.push(count);
     for a in aggs {
-        let blob = agg_blob(a.as_ref());
-        buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&blob);
+        // The blob goes straight into `buf`; its length is patched in after.
+        let len_at = buf.len();
+        buf.extend_from_slice(&[0; 4]);
+        write_agg(a.as_ref(), buf);
+
+        let len = (buf.len() - len_at - 4) as u32;
+        buf[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
     }
-    match prev_output {
-        None => buf.push(0),
-        Some(map) => {
-            buf.push(1);
-            let pb = rmp_serde::to_vec(map).expect("prev_output serialization should not fail");
-            buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&pb);
-        }
-    }
+    buf.push(0);
 }
 
 /// Serialize an MV group's full state (finalized + per-block) for sliding window persistence.
-fn serialize_mv_group_full(
-    aggs: &[Box<dyn AggregationFunc>],
-    prev_output: Option<&HashMap<String, Value>>,
-) -> Vec<u8> {
+fn serialize_mv_group_full(aggs: &[Box<dyn AggregationFunc>]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(16 + aggs.len() * 24);
-    write_mv_group(&mut buf, |a| a.to_bytes(), aggs, prev_output);
+    write_mv_group(
+        &mut buf,
+        |a, out| out.extend_from_slice(&a.to_bytes()),
+        aggs,
+    );
     buf
 }
 
-/// Serialize an MV group's aggregation state + prev_output for persistence.
-fn serialize_mv_group(
-    aggs: &[Box<dyn AggregationFunc>],
-    prev_output: Option<&HashMap<String, Value>>,
-) -> Vec<u8> {
+/// Serialize an MV group's finalized aggregation state for persistence.
+fn serialize_mv_group(aggs: &[Box<dyn AggregationFunc>]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(16 + aggs.len() * 24);
-    write_mv_group(&mut buf, |a| a.to_finalized_bytes(), aggs, prev_output);
+    write_mv_group(&mut buf, |a, out| a.write_finalized(out), aggs);
     buf
 }
 
@@ -752,10 +755,7 @@ fn read_u32(bytes: &[u8], pos: &mut usize) -> Option<usize> {
 fn deserialize_mv_group(
     bytes: &[u8],
     agg_funcs: &[AggFunc],
-) -> Option<(
-    Vec<Box<dyn AggregationFunc>>,
-    Option<HashMap<String, Value>>,
-)> {
+) -> Option<Vec<Box<dyn AggregationFunc>>> {
     let mut pos = 0usize;
     let n = *bytes.get(pos)? as usize;
     pos += 1;
@@ -770,20 +770,18 @@ fn deserialize_mv_group(
         pos = end;
         aggs.push(restore_agg(func, blob));
     }
-    let prev_output = match *bytes.get(pos)? {
-        0 => {
-            None
-        }
+    match *bytes.get(pos)? {
+        0 => {}
         1 => {
             pos += 1;
             let len = read_u32(bytes, &mut pos)?;
             let end = pos.checked_add(len)?;
             let pb = bytes.get(pos..end)?;
-            rmp_serde::from_slice(pb).ok()?
+            rmp_serde::from_slice::<HashMap<String, Value>>(pb).ok()?;
         }
         _ => return None,
-    };
-    Some((aggs, prev_output))
+    }
+    Some(aggs)
 }
 
 #[cfg(test)]
