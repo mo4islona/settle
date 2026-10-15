@@ -631,3 +631,19 @@ fn finalize_persists_groups_of_finalized_blocks_only() {
     assert_eq!(total("B"), Value::Float64(2.0));
     assert_eq!(total("C"), Value::Float64(3.0));
 }
+
+/// Replay drops a group that holds no data, as `process_block` does: if it
+/// stayed, the group's next row would read as an Update.
+#[test]
+fn replay_block_drops_group_without_data() {
+    let mut def = simple_sum_mv_def();
+    def.select.truncate(2);
+    let mut mv = MVEngine::new(def, test_storage(), &test_column_types());
+
+    let pool = ("pool", Value::String("ETH/USDC".into()));
+    mv.replay_block(1000, &[make_row(&[pool.clone(), ("amount", Value::Null)])]);
+
+    let changes = mv.process_block(1001, &[make_row(&[pool, ("amount", Value::Float64(5.0))])]);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].operation, ChangeOp::Insert);
+}
