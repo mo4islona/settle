@@ -309,6 +309,17 @@ Original теперь меряет «всё кроме finalize» — meaningles
 
 ## History
 
+### Measurements behind hot-path choices
+
+Moved here from code comments, which keep only the reason.
+
+| Choice | Measured effect |
+|--------|-----------------|
+| mimalloc as the global allocator | +13-15% throughput on simple_agg and polymarket |
+| FxHash for the change-buffer dedup key | SipHash (`Sip13::write`) was ~6.9% of the flush profile |
+| Ingest rows moved into per-block buckets, not cloned | The deep `RowMap` clone was 12% inclusive in the flamegraph |
+| Lua state passed as function arguments and returns | ~1.3 µs/row saved for a 6-field state |
+
 ### Lua emit optimization (2026-03-30)
 
 Removed `emit.field = val` syntax, only `emit({...})` call.

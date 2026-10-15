@@ -23,9 +23,8 @@
 //!    asset (-Δvolume, -Δcount), and applies a delta-UPSERT — `O(forked rows)`,
 //!    ZERO full-history rescan. That is the SAME order of work settle does.
 //!    => On additive aggregates we EXPECT parity-to-slightly-slower for settle,
-//!       exactly matching project_vs_postgres_baseline.md (~25-35% slower on
-//!       trivial agg). We include `pg_summary_reversible` as this competent
-//!       opponent and we ASSERT settle does NOT spuriously "win" here — if it
+//!       matching the simple-aggregation result in BENCHMARKS.md. We include
+//!       `pg_summary_reversible` as this competent opponent and we ASSERT settle does NOT spuriously "win" here — if it
 //!       does, treat it as contamination, not a result.
 //!    => We ALSO include `pg_summary_naive`, the indexer that recomputes
 //!       affected groups with `GROUP BY` over surviving history. Its per-reorg
