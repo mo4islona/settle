@@ -36,7 +36,8 @@ pub struct ReducerEngine {
     /// Stored positionally (schema field order) so the per-block snapshot clone
     /// is a cheap `Vec<Value>` copy instead of a full `HashMap` clone with N
     /// string-key allocations (was the dominant cost in the finalize path).
-    /// Only contains unfinalized blocks. Used for rollback.
+    /// Holds unfinalized blocks for rollback, plus, for each key in
+    /// `pending_durable`, its newest finalized snapshot.
     block_snapshots: FxHashMap<Vec<u8>, BTreeMap<BlockNumber, Vec<Value>>>,
     /// Tracks which blocks have been processed and which group keys were touched.
     /// BTreeMap for O(log N) range queries during rollback/finalize. FxHash on
@@ -44,6 +45,11 @@ pub struct ReducerEngine {
     /// inserted once per touched group per block (hot path) — matches the
     /// FxHash already used for `state_cache` / `block_snapshots`.
     block_groups: BTreeMap<BlockNumber, FxHashSet<Vec<u8>>>,
+    /// Group keys finalized since the last DURABLE checkpoint but not yet
+    /// persisted (backfill deferral). While a key sits here its newest
+    /// finalized snapshot is kept so the eventual checkpoint can read its
+    /// correct as-of-finalized value. Empty unless deferral is active.
+    pending_durable: FxHashSet<Vec<u8>>,
     /// Pre-computed column IDs for group-by columns (resolved against source registry).
     /// Enables direct Vec indexing instead of HashMap lookups.
     group_by_ids: Vec<Option<ColumnId>>,
@@ -83,6 +89,7 @@ impl ReducerEngine {
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            pending_durable: FxHashSet::default(),
             group_by_ids,
             source_registry,
             chained: false,
@@ -157,6 +164,7 @@ impl ReducerEngine {
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            pending_durable: FxHashSet::default(),
             group_by_ids: vec![],
             source_registry: Arc::new(empty_registry),
             chained: true,
@@ -188,6 +196,7 @@ impl ReducerEngine {
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            pending_durable: FxHashSet::default(),
             group_by_ids,
             source_registry,
             chained: false,
@@ -496,10 +505,17 @@ impl ReducerEngine {
     }
 
     /// Finalize state up to the given block.
-    /// Collects finalized state writes into the provided batch for atomic commit.
-    /// Drops in-memory snapshots for finalized blocks.
-    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
-        // Split off blocks > block, keeping blocks <= block for finalization
+    ///
+    /// `persist` controls durability. When true (the default / checkpoint),
+    /// finalized state is serialized into the batch and in-memory snapshots ≤
+    /// block are pruned, as before. When false (backfill deferral), the changed
+    /// group keys are accumulated into `pending_durable` and only their newest
+    /// finalized snapshot is kept, which the eventual checkpoint reads — no
+    /// disk writes happen. See design v2.
+    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
+        // Split off blocks > block, keeping blocks <= block for finalization.
+        // (Always prune block_groups — it only tracks block→key for rollback,
+        // and finalized blocks ≤ block are never rolled back.)
         let remaining = self.block_groups.split_off(&(block + 1));
         let finalized_block_groups = std::mem::replace(&mut self.block_groups, remaining);
 
@@ -508,17 +524,43 @@ impl ReducerEngine {
             finalized_keys.extend(keys.iter().cloned());
         }
 
-        // For each group key, add finalized state to batch and drop old snapshots
-        for group_key_bytes in &finalized_keys {
+        if !persist {
+            // Defer: remember the keys. Keep each key's newest snapshot at or
+            // before `block`, which a later checkpoint reads when lag has moved
+            // state_cache ahead. Older ones are dead: rollback stops at `block`.
+            for key in &finalized_keys {
+                if let Some(snapshots) = self.block_snapshots.get_mut(key) {
+                    let newest = snapshots.range(..=block).next_back().map(|(b, _)| *b);
+                    if let Some(newest) = newest {
+                        while let Some(entry) = snapshots.first_entry() {
+                            if *entry.key() >= newest {
+                                break;
+                            }
+                            entry.remove();
+                        }
+                    }
+                }
+            }
+            self.pending_durable.extend(finalized_keys);
+            return;
+        }
+
+        // Checkpoint: persist accumulated deferred keys + this batch's keys.
+        let mut to_persist = std::mem::take(&mut self.pending_durable);
+        to_persist.extend(finalized_keys);
+
+        for group_key_bytes in &to_persist {
             // Find the most recent state at or before the finalization block.
             // Snapshots are positional Vec<Value>, encoded with the fast binary
-            // codec (no string keys, no msgpack).
+            // codec (no string keys, no msgpack). For deferred keys the snapshot
+            // was retained; for this-batch keys it is freshly present.
             if let Some(state) = self.find_snapshot_at_or_before(group_key_bytes, block) {
                 let state_bytes = storage::encode_values(&state);
                 batch.set_reducer_finalized(&self.def.name, group_key_bytes, &state_bytes);
             }
 
-            // Remove in-memory snapshots for blocks <= finalization point
+            // Remove in-memory snapshots for blocks <= finalization point now
+            // that they are durable.
             if let Some(snapshots) = self.block_snapshots.get_mut(group_key_bytes) {
                 let remaining = snapshots.split_off(&(block + 1));
                 *snapshots = remaining;
@@ -912,7 +954,7 @@ mod tests {
 
         // Finalize up to 1000
         let mut batch = StorageWriteBatch::new();
-        engine.finalize(1000, &mut batch);
+        engine.finalize(1000, &mut batch, true);
         storage.commit(&batch).unwrap();
 
         // Block 1002: buy 3 (will be rolled back)
@@ -930,6 +972,42 @@ mod tests {
         let pnl = output[0].get("trade_pnl").unwrap().as_f64().unwrap();
         // avg cost = 30500/15 = 2033.33, sell 15 @ 2100: pnl = 15 * (2100 - 2033.33) = 1000
         assert!((pnl - 1000.0).abs() < 0.01);
+    }
+
+    /// Under deferral a finalize keeps only the newest finalized snapshot of
+    /// a group, and the next checkpoint persists that state.
+    #[test]
+    fn deferred_finalize_keeps_newest_finalized_snapshot() {
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine =
+            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]);
+
+        for block in 1..=10 {
+            engine
+                .process_block(block, &[make_trade("alice", "buy", 1.0, 100.0)])
+                .unwrap();
+            if block > 2 {
+                engine.finalize(block - 2, &mut StorageWriteBatch::new(), false);
+            }
+        }
+        let blocks: Vec<BlockNumber> = engine
+            .block_snapshots
+            .values()
+            .flat_map(|snapshots| snapshots.keys().copied())
+            .collect();
+        assert_eq!(blocks, vec![8, 9, 10]);
+
+        let mut batch = StorageWriteBatch::new();
+        engine.finalize(9, &mut batch, true);
+        storage.commit(&batch).unwrap();
+
+        // Block 10 rolls back onto the persisted state: 9 bought at 100.
+        engine.rollback(9).unwrap();
+        let output = engine
+            .process_block(10, &[make_trade("alice", "sell", 9.0, 200.0)])
+            .unwrap();
+        let pnl = output[0].get("trade_pnl").unwrap().as_f64().unwrap();
+        assert!((pnl - 900.0).abs() < 0.01);
     }
 
     #[test]

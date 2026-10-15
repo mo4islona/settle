@@ -83,6 +83,11 @@ pub struct MVEngine {
     /// changes when a group's blocks are finalized, not when it is touched:
     /// see `finalize_blocks_up_to`.
     dirty_groups: FxHashSet<GroupKey>,
+    /// Group keys changed since the last DURABLE checkpoint but not yet
+    /// persisted (backfill deferral). Accumulated across non-checkpoint
+    /// finalizes; drained when a checkpoint persists. Empty unless deferral is
+    /// active. See docs/backfill-mode-design.md.
+    pending_durable: FxHashSet<GroupKey>,
 }
 
 impl MVEngine {
@@ -236,6 +241,7 @@ impl MVEngine {
             current_watermark,
             removed_groups: Vec::new(),
             dirty_groups: FxHashSet::default(),
+            pending_durable: FxHashSet::default(),
         }
     }
 
@@ -245,6 +251,13 @@ impl MVEngine {
 
     pub fn source(&self) -> &str {
         &self.def.source
+    }
+
+    /// Whether this MV uses a sliding window. Sliding-window MVs are excluded
+    /// from backfill persist-deferral (block_times + per-block agg data form an
+    /// atomic unit; deferring them would corrupt window replay — see design v2).
+    pub fn is_sliding(&self) -> bool {
+        self.sliding_window.is_some()
     }
 
     /// Process a batch of rows from a single block.
@@ -379,24 +392,42 @@ impl MVEngine {
     }
 
     /// Finalize all blocks up to and including the given block.
-    /// Persists finalized aggregation state to the batch for atomic commit.
-    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
+    ///
+    /// `persist` controls durability: when true (the default / checkpoint),
+    /// finalized state is serialized into the batch as before. When false
+    /// (backfill deferral), the in-memory merge still happens — keeping the
+    /// cumulative finalized aggregate live and correct — but disk writes are
+    /// deferred: changed keys accumulate in `pending_durable` and are persisted
+    /// at the next checkpoint. The cumulative agg lives in `self.groups`, so a
+    /// later checkpoint serializes the correct as-of value. See design v2.
+    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
         let is_sliding = self.sliding_window.is_some();
 
         // Sliding windows keep per-block data (no finalize_up_to) and prune
-        // block_groups in expire_old_blocks.
+        // block_groups in expire_old_blocks. The merge runs regardless of
+        // `persist`: it keeps the in-memory cumulative aggregate correct.
         let changed = if is_sliding {
             std::mem::take(&mut self.dirty_groups)
         } else {
             self.finalize_blocks_up_to(block)
         };
 
-        // Persist state only for changed groups. Unchanged group state is
-        // already on disk from the previous finalize.
-        for group_key in &changed {
+        if !persist {
+            // Defer: remember the changed keys; the cumulative agg is already
+            // updated in memory. removed_groups is left to accumulate (drained
+            // only at a checkpoint). No disk writes.
+            self.pending_durable.extend(changed);
+            return;
+        }
+
+        // Checkpoint: persist accumulated deferred keys + this batch's keys.
+        let mut to_persist = std::mem::take(&mut self.pending_durable);
+        to_persist.extend(changed);
+
+        for group_key in &to_persist {
             let aggs = match self.groups.get(group_key) {
                 Some(a) => a,
-                None => continue, // removed meanwhile
+                None => continue, // removed meanwhile (handled below)
             };
             let gk_bytes = storage::encode_group_key(group_key);
             let prev = self.prev_output.get(group_key);
@@ -415,10 +446,15 @@ impl MVEngine {
             batch.put_meta(&format!("mv_block_times:{}", self.def.name), &bt_bytes);
         }
 
-        // Delete stale groups from storage (expired/removed since last finalize)
-        for key in self.removed_groups.drain(..) {
-            let gk_bytes = storage::encode_group_key(&key);
-            batch.delete_mv_state(&self.def.name, &gk_bytes);
+        // Delete stale groups from storage. Membership-wins reconcile: only
+        // delete keys NOT currently present — a key removed then re-added within
+        // a deferral interval is present in `to_persist` (put above) and must
+        // NOT also be deleted (design v2 B3).
+        for key in std::mem::take(&mut self.removed_groups) {
+            if !self.groups.contains_key(&key) {
+                let gk_bytes = storage::encode_group_key(&key);
+                batch.delete_mv_state(&self.def.name, &gk_bytes);
+            }
         }
     }
 

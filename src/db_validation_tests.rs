@@ -1,6 +1,7 @@
 use super::test_helpers::*;
 use super::*;
 use crate::schema::ast::MAX_MV_AGGREGATES;
+use crate::test_helpers::cursor;
 use crate::types::{BlockCursor, Value};
 use std::collections::HashMap;
 
@@ -265,4 +266,62 @@ fn mv_at_aggregate_limit_survives_reopen() {
     let last = format!("s{}", MAX_MV_AGGREGATES - 1);
     assert_eq!(eth.values.get("s0"), Some(&Value::Float64(20.0)));
     assert_eq!(eth.values.get(&last), Some(&Value::Float64(20.0)));
+}
+
+/// On a gappy chain finality can be ahead of the latest data block. A failed
+/// ingest must still undo the blocks it processed: the undo is not a chain
+/// rollback, so the finality bound does not apply.
+#[test]
+fn failed_ingest_is_undone_when_finality_is_ahead_of_latest() {
+    let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
+    let buy = |amount: f64| vec![make_trade("alice", "buy", amount, 1.0)];
+
+    ingest_with_finalized(&mut db, vec![("trades".into(), 3, buy(10.0))], 100).unwrap();
+    assert_eq!(db.latest_block(), 3);
+    assert_eq!(db.finalized_block(), 100);
+
+    // "trades" sorts before "zz_unknown": blocks 4 and 5 are processed, then
+    // the unknown table fails the ingest.
+    let err = ingest_with_finalized(
+        &mut db,
+        vec![
+            ("trades".into(), 4, buy(5.0)),
+            ("trades".into(), 5, buy(5.0)),
+            ("zz_unknown".into(), 5, buy(1.0)),
+        ],
+        100,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidOperation(_)),
+        "expected the ingest error itself, not a failed recovery: {err}"
+    );
+    assert_eq!(db.latest_block(), 3, "the failed ingest is undone");
+    assert_eq!(
+        db.finalized_cursor(),
+        Some(cursor(100)),
+        "the undo keeps the finalized head hash"
+    );
+
+    // The retry is not a duplicate, and every trade counts once.
+    let batch = ingest_with_finalized(
+        &mut db,
+        vec![
+            ("trades".into(), 4, buy(5.0)),
+            ("trades".into(), 5, buy(5.0)),
+        ],
+        100,
+    )
+    .unwrap()
+    .unwrap();
+    let alice = batch
+        .records_for("position_summary")
+        .iter()
+        .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+        .unwrap();
+    assert_eq!(alice.values.get("trade_count"), Some(&Value::UInt64(3)));
+    assert_eq!(
+        alice.values.get("current_position"),
+        Some(&Value::Float64(20.0))
+    );
 }
