@@ -642,7 +642,8 @@ fn sliding_window_persistence_and_restore() {
         );
 
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(2, &mut batch, true);
+        mv.advance_finality(2);
+        mv.write_checkpoint(&mut batch);
         storage.commit(&batch).unwrap();
     }
 
@@ -689,7 +690,8 @@ fn sliding_window_replay_skip() {
             )],
         );
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(1, &mut batch, true);
+        mv.advance_finality(1);
+        mv.write_checkpoint(&mut batch);
         storage.commit(&batch).unwrap();
     }
 
@@ -852,7 +854,8 @@ fn sliding_window_empty_group_cleanup_on_finalize() {
 
     // Finalize
     let mut batch = StorageWriteBatch::new();
-    mv.finalize(2, &mut batch, true);
+    mv.advance_finality(2);
+    mv.write_checkpoint(&mut batch);
     storage.commit(&batch).unwrap();
 
     // Restore — group X should not exist
@@ -893,7 +896,8 @@ fn sliding_window_group_expired_on_arrival_is_removed() {
     );
 
     let mut batch = StorageWriteBatch::new();
-    mv.finalize(2, &mut batch, true);
+    mv.advance_finality(2);
+    mv.write_checkpoint(&mut batch);
     storage.commit(&batch).unwrap();
     let restored = MVEngine::new(
         sliding_sum_mv_def(10),
