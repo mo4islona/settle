@@ -91,6 +91,13 @@ harness = false
 name = "profile_polymarket_realistic"
 harness = false
 
+[[bench]]
+name = "profile_backfill"
+harness = false
+
+[profile.bench]
+debug = true
+
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"

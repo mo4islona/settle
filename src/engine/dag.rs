@@ -46,20 +46,20 @@ enum PipelineNode {
 /// across the rayon pool (each into its own write batch, merged afterward).
 #[cfg(feature = "rayon")]
 trait FinalizeNode: Send {
-    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch);
+    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool);
 }
 
 #[cfg(feature = "rayon")]
 impl FinalizeNode for ReducerEngine {
-    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
-        self.finalize(block, batch);
+    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
+        self.finalize(block, batch, persist);
     }
 }
 
 #[cfg(feature = "rayon")]
 impl FinalizeNode for MVEngine {
-    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
-        self.finalize(block, batch);
+    fn finalize_into(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
+        self.finalize(block, batch, persist);
     }
 }
 
@@ -93,8 +93,23 @@ pub struct SettleEngine {
     sequence: u64,
     /// Latest processed block number (for ordering/rollback logic).
     latest_block: Option<BlockNumber>,
-    /// Finalized block number (for finalization logic).
+    /// Finalized block number (for finalization logic). In-memory finality
+    /// watermark; bounds rollback. May run AHEAD of `durable_block` during
+    /// backfill deferral (derived state for `(durable_block, finalized_block]`
+    /// is then only in memory, rebuilt from raw rows on recovery).
     finalized_block: BlockNumber,
+    /// Highest block whose derived reducer/MV state is actually persisted to
+    /// disk. Invariant `durable_block <= min(finalized_block, latest)`. Written
+    /// to disk as `META_FINALIZED_BLOCK` (Option A) so recovery replays from
+    /// here. Equals `finalized_block` unless backfill deferral is active.
+    /// None until a persisting finalize covers data: `Some(0)` means block 0
+    /// is durable, which an empty database must not claim.
+    durable_block: Option<BlockNumber>,
+    /// True when the pipeline contains no sliding-window MV and no external
+    /// reducer, so backfill persist-deferral is safe. Computed at construction
+    /// (and after `add_reducer`). When false, every finalize persists
+    /// (durable == finalized), exactly as before this feature.
+    defer_allowed: bool,
     /// True once `finalize()` has run at least once (or state restored from
     /// disk). Lets `finalize(N)` skip work when N hasn't advanced past the
     /// last finalized block — heartbeat ingests with stale `finalized_head`
@@ -238,6 +253,8 @@ impl SettleEngine {
             }
         }
 
+        let defer_allowed = compute_defer_allowed(&branches, &reducers, &mvs);
+
         Self {
             raw_tables,
             reducers,
@@ -251,6 +268,8 @@ impl SettleEngine {
             sequence: 0,
             latest_block: None,
             finalized_block: 0,
+            durable_block: None,
+            defer_allowed,
             has_finalized: false,
             block_hashes: BTreeMap::new(),
         }
@@ -308,6 +327,9 @@ impl SettleEngine {
 
         // Add to pipeline
         self.pipeline.push(PipelineNode::Reducer(name));
+
+        // Recompute: an added external reducer disables backfill deferral.
+        self.defer_allowed = compute_defer_allowed(&self.branches, &self.reducers, &self.mvs);
 
         Ok(())
     }
@@ -657,6 +679,14 @@ impl SettleEngine {
             self.latest_block = Some(block);
         }
 
+        // A durable watermark can sit on a block that held no data: ingest
+        // admits block 0 while latest is 0, and older databases stored a
+        // finality above their latest block. This block's state is not on
+        // disk, so the next finalize must persist it.
+        if self.durable_block.is_some_and(|d| block <= d) {
+            self.durable_block = block.checked_sub(1);
+        }
+
         let perf_node = PerfNode {
             kind: PerfNodeKind::Pipeline,
             name: table.to_string(),
@@ -677,6 +707,23 @@ impl SettleEngine {
         to_block: BlockNumber,
     ) -> Result<()> {
         self.replay_unfinalized_inner(from_block, to_block, None)
+    }
+
+    /// Drop restored sliding-window data of blocks above `durable`. A window
+    /// is persisted with the blocks it holds, final or not, and a fork can
+    /// replace those blocks without another persist; replay rebuilds them
+    /// from the raw rows instead.
+    pub fn discard_unfinalized_window_state(&mut self, durable: BlockNumber) {
+        let branch_mvs = self
+            .branches
+            .iter_mut()
+            .flat_map(|b| b.mv_entries.iter_mut().map(|(_, mv)| mv));
+
+        for mv in branch_mvs.chain(self.mvs.values_mut()) {
+            if mv.is_sliding() {
+                mv.rollback(durable);
+            }
+        }
     }
 
     /// Replay only a specific reducer and its direct downstream MVs.
@@ -925,7 +972,7 @@ impl SettleEngine {
     fn rollback_inner(
         &mut self,
         fork_point: BlockNumber,
-        mut write_batch: Option<&mut StorageWriteBatch>,
+        write_batch: Option<&mut StorageWriteBatch>,
     ) -> Result<Vec<ChangeRecord>> {
         // Guard: fork_point cannot raise latest_block. If the caller passes
         // a fork point above current latest (e.g. via stale future hashes that
@@ -936,6 +983,58 @@ impl SettleEngine {
             return Ok(Vec::new());
         }
 
+        // Finality floor: a fork/rollback must never cross below the finalized
+        // watermark — finalized state is irreversible. `finalize` keeps the
+        // hash of the durable block, which lags finality under backfill
+        // deferral, so a fork signal could otherwise resolve below finality —
+        // rolling derived state back past the durable watermark, corrupting the
+        // recovery anchor and wedging the instance (durable > latest). Reject it
+        // here at the single chokepoint all rollback paths funnel through. With
+        // deferral off (`durable == finalized`) this can never fire for an
+        // in-range fork, so behavior is identical to before the feature.
+        if fork_point < self.finalized_block {
+            return Err(Error::InvalidOperation(format!(
+                "rollback target block {fork_point} is below finalized block {} — \
+                 finalized state is irreversible",
+                self.finalized_block
+            )));
+        }
+
+        let all_changes = self.unwind_to(fork_point, write_batch)?;
+
+        // Remove hashes for rolled-back blocks
+        let after = self.block_hashes.split_off(&(fork_point + 1));
+        drop(after);
+
+        Ok(all_changes)
+    }
+
+    /// Undo the in-memory effects of a failed ingest, back to `block`: the
+    /// latest block before the ingest processed anything.
+    ///
+    /// This is not a chain reorg, so the finality bound of `rollback` does
+    /// not apply: the undone blocks were never finalized, and on gappy chains
+    /// `finalized_block` can be above `block`. Block hashes stay as they are,
+    /// because a failed ingest stores none, and the hashes above `block` can
+    /// include the finalized head. Raw-row deletions go to a throwaway batch:
+    /// the ingest's raw rows were never committed.
+    pub fn undo_ingest(&mut self, block: BlockNumber) -> Result<()> {
+        if block > self.latest_block() {
+            return Ok(());
+        }
+
+        let mut throwaway = StorageWriteBatch::new();
+        self.unwind_to(block, Some(&mut throwaway))?;
+        Ok(())
+    }
+
+    /// Roll every pipeline node back to `fork_point` and make it the latest
+    /// block. The callers check that the target is valid.
+    fn unwind_to(
+        &mut self,
+        fork_point: BlockNumber,
+        mut write_batch: Option<&mut StorageWriteBatch>,
+    ) -> Result<Vec<ChangeRecord>> {
         let mut all_changes = Vec::new();
 
         // Roll back in reverse pipeline order
@@ -975,23 +1074,27 @@ impl SettleEngine {
         }
 
         self.latest_block = Some(fork_point);
-        // Remove hashes for rolled-back blocks
-        let after = self.block_hashes.split_off(&(fork_point + 1));
-        drop(after);
 
         Ok(all_changes)
     }
 
     /// Finalize all state up to and including the given block.
     /// Reducer finalized state writes are collected into the provided batch.
-    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch) {
-        // Idempotent skip: nothing to finalize when the requested block hasn't
-        // advanced. The first call after open (or after restore) still runs so
-        // initial state lands on disk. Without this, heartbeat ingests with a
-        // stale `finalized_head` re-serialize every MV group every batch.
-        // db.rs validation already rejects `block < current_finalized`, so
-        // `block == self.finalized_block` is the only case to short-circuit.
-        if block == self.finalized_block && self.has_finalized {
+    ///
+    /// `persist`: when true (checkpoint / non-backfill), derived state is
+    /// serialized into the batch and `durable_block` advances. When false
+    /// (backfill deferral), the in-memory merge/prune still runs but disk
+    /// persistence is deferred to the next checkpoint. db.rs decides `persist`
+    /// (see backfill_checkpoint_interval) and must only pass false when
+    /// `defer_allowed()` and the ingest is no-lag. See design v2.
+    pub fn finalize(&mut self, block: BlockNumber, batch: &mut StorageWriteBatch, persist: bool) {
+        // Idempotent skip: nothing to do when finality hasn't advanced AND there
+        // is nothing deferred to flush. The first call after open (or restore)
+        // still runs so initial state lands on disk. A forced checkpoint
+        // (`persist` with `durable_block < block`) must NOT be skipped even when
+        // `block == finalized_block` — that is how deferred state catches up.
+        let nothing_to_flush = !persist || self.durable_block.is_some_and(|d| d >= block);
+        if block == self.finalized_block && self.has_finalized && nothing_to_flush {
             return;
         }
 
@@ -1017,7 +1120,7 @@ impl SettleEngine {
             }
 
             if nodes.len() == 1 {
-                nodes[0].finalize_into(block, batch);
+                nodes[0].finalize_into(block, batch, persist);
             } else if nodes.len() > 1 {
                 // Force one rayon task per node (`with_max_len(1)`): the default
                 // range split would put the two heavy nodes (heavy reducer +
@@ -1029,7 +1132,7 @@ impl SettleEngine {
                     .with_max_len(1)
                     .map(|node| {
                         let mut sub = StorageWriteBatch::new();
-                        node.finalize_into(block, &mut sub);
+                        node.finalize_into(block, &mut sub, persist);
                         sub
                     })
                     .collect();
@@ -1046,18 +1149,18 @@ impl SettleEngine {
                     if let Some(branch) =
                         self.branch_index.get(name).map(|&i| &mut self.branches[i])
                     {
-                        branch.reducer.finalize(block, batch);
+                        branch.reducer.finalize(block, batch, persist);
                     } else {
                         let reducer = self.reducers.get_mut(name).unwrap();
-                        reducer.finalize(block, batch);
+                        reducer.finalize(block, batch, persist);
                     }
                 }
                 PipelineNode::MV(name) => {
                     if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
-                        self.branches[bi].mv_entries[mi].1.finalize(block, batch);
+                        self.branches[bi].mv_entries[mi].1.finalize(block, batch, persist);
                     } else {
                         let mv = self.mvs.get_mut(name).unwrap();
-                        mv.finalize(block, batch);
+                        mv.finalize(block, batch, persist);
                     }
                 }
                 PipelineNode::RawTable(_) => {
@@ -1068,24 +1171,30 @@ impl SettleEngine {
 
         self.finalized_block = block;
         self.has_finalized = true;
-
-        // Remove hashes for blocks below finalized (keep finalized itself as
-        // anchor). On gappy chains (Solana-style) `latest_block` may be
-        // BELOW `finalized` — the caller knows finality out-of-band for a
-        // block whose data they haven't ingested. In that case the plain
-        // split_off would drop `latest_block`'s hash too, leaving
-        // `latest_cursor()` returning an empty hash. Preserve it explicitly.
-        let preserve_latest = self
-            .latest_block
-            .filter(|&latest| latest < block)
-            .and_then(|latest| self.block_hashes.get(&latest).map(|h| (latest, h.clone())));
-
-        let old_hashes = self.block_hashes.split_off(&block);
-        self.block_hashes = old_hashes;
-
-        if let Some((latest, hash)) = preserve_latest {
-            self.block_hashes.insert(latest, hash);
+        if persist {
+            // Durable watermark advances only when derived state was actually
+            // written into this batch. Clamp to latest so it never exceeds the
+            // highest block with persisted raw rows (gappy chains: F may exceed
+            // latest — design v2 B2). Without data nothing becomes durable.
+            if let Some(latest) = self.latest_block {
+                self.durable_block = Some(block.min(latest));
+            }
         }
+
+        // Fork resolution stops at finality, so hashes below it only grow the
+        // metadata that every ingest writes. Two of them stay: a reopen
+        // restarts finality at the durable block and reads its hash, and on
+        // gappy chains `latest_cursor` reads the hash of a latest block below
+        // finality.
+        let anchors: Vec<(BlockNumber, String)> = [self.durable_block, self.latest_block]
+            .into_iter()
+            .flatten()
+            .filter(|&b| b < block)
+            .filter_map(|b| self.block_hashes.get(&b).map(|h| (b, h.clone())))
+            .collect();
+
+        self.block_hashes = self.block_hashes.split_off(&block);
+        self.block_hashes.extend(anchors);
     }
 
     /// Create a ChangeBatch from a set of change records.
@@ -1109,6 +1218,12 @@ impl SettleEngine {
         self.latest_block.unwrap_or(0)
     }
 
+    /// The latest block, or None before any block: `latest_block` reads
+    /// that as 0.
+    pub fn latest_block_if_any(&self) -> Option<BlockNumber> {
+        self.latest_block
+    }
+
     pub fn latest_cursor(&self) -> Option<BlockCursor> {
         let block = self.latest_block?;
         let hash = self.block_hashes.get(&block).cloned().unwrap_or_default();
@@ -1120,6 +1235,24 @@ impl SettleEngine {
 
     pub fn finalized_block(&self) -> BlockNumber {
         self.finalized_block
+    }
+
+    /// Highest block whose derived state is durably persisted, or None if no
+    /// data is. Written to disk as `META_FINALIZED_BLOCK` so recovery replays
+    /// raw rows from the block after it, or from block 0 without it.
+    pub fn durable_block(&self) -> Option<BlockNumber> {
+        self.durable_block
+    }
+
+    /// Whether backfill persist-deferral is structurally safe for this pipeline
+    /// (no sliding-window MV, no external reducer).
+    pub fn defer_allowed(&self) -> bool {
+        self.defer_allowed
+    }
+
+    /// True once finalize has run at least once (or state was restored).
+    pub fn has_finalized(&self) -> bool {
+        self.has_finalized
     }
 
     pub fn finalized_cursor(&self) -> Option<BlockCursor> {
@@ -1137,6 +1270,10 @@ impl SettleEngine {
 
     pub fn set_finalized_block(&mut self, block: BlockNumber) {
         self.finalized_block = block;
+        // On-disk `META_FINALIZED_BLOCK` is the DURABLE watermark (Option A),
+        // so restoring it sets durable == finalized: derived state on disk is
+        // exactly as-of-`block`, and recovery replays raw rows from block+1.
+        self.durable_block = Some(block);
         // Restored state is on disk already; treat as finalized so the next
         // `finalize(same_block)` short-circuits like a normal idempotent call.
         self.has_finalized = true;
@@ -1190,8 +1327,16 @@ impl SettleEngine {
         previous_blocks: &[(BlockNumber, &str)],
     ) -> Option<BlockCursor> {
         let latest = self.latest_block.unwrap_or(0);
+        let finalized = self.finalized_block;
         for &(number, hash) in previous_blocks {
-            if number > latest {
+            // Skip matches above latest (no data) and below finalized (finality
+            // is irreversible). Under backfill deferral `block_hashes` keeps
+            // the hash of the durable block below finality; resolving a fork
+            // onto it would roll state back below finality. Resolving
+            // *to* `finalized` itself stays allowed (it only matches when the
+            // hash agrees, i.e. finality is intact — it rolls back the
+            // unfinalized tail). See the finality floor in `rollback_inner`.
+            if number > latest || number < finalized {
                 continue;
             }
             if self.block_hashes.get(&number).map(|h| h.as_str()) == Some(hash) {
@@ -1203,6 +1348,24 @@ impl SettleEngine {
         }
         None
     }
+}
+
+/// Backfill persist-deferral is only safe when the pipeline has no
+/// sliding-window MV (block_times + per-block aggs must persist atomically) and
+/// no external reducer (replay skips them, so deferred state can't be rebuilt).
+/// See design v2 B4/B5.
+fn compute_defer_allowed(
+    branches: &[PipelineBranch],
+    reducers: &HashMap<String, ReducerEngine>,
+    mvs: &HashMap<String, MVEngine>,
+) -> bool {
+    let no_external = branches.iter().all(|b| !b.reducer.is_external())
+        && reducers.values().all(|r| !r.is_external());
+    let no_sliding = branches
+        .iter()
+        .all(|b| b.mv_entries.iter().all(|(_, mv)| !mv.is_sliding()))
+        && mvs.values().all(|mv| !mv.is_sliding());
+    no_external && no_sliding
 }
 
 /// Identify independent branches and direct MVs from the pipeline.
@@ -1668,7 +1831,7 @@ mod tests {
             .unwrap();
 
         let mut batch = StorageWriteBatch::new();
-        engine.finalize(1000, &mut batch);
+        engine.finalize(1000, &mut batch, true);
         assert_eq!(engine.finalized_block(), 1000);
 
         // Rollback to 1000 should only remove block 1001
@@ -1680,6 +1843,84 @@ mod tests {
             mv_changes[0].values.get("total"),
             Some(&Value::Float64(100.0))
         );
+    }
+
+    #[test]
+    fn rollback_below_finalized_is_rejected() {
+        // Finality floor (Cluster B): rollback_inner must refuse any fork point
+        // below finalized_block — finalized state is irreversible. Rolling back
+        // to == finalized is allowed (removes the unfinalized tail); below is an
+        // error, regardless of which blocks still have retained hashes.
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
+        for (b, amt) in [(1000u64, 100.0), (1001, 200.0), (1002, 300.0)] {
+            engine
+                .process_batch(
+                    "swaps",
+                    b,
+                    vec![HashMap::from([
+                        ("pool".to_string(), Value::String("ETH/USDC".into())),
+                        ("amount".to_string(), Value::Float64(amt)),
+                    ])],
+                )
+                .unwrap();
+        }
+        let mut batch = StorageWriteBatch::new();
+        engine.finalize(1001, &mut batch, true);
+        assert_eq!(engine.finalized_block(), 1001);
+
+        // Below finalized → rejected, no mutation.
+        assert!(engine.rollback(1000).is_err(), "rollback below finalized must error");
+        assert_eq!(engine.latest_block(), 1002, "rejected rollback must not move latest");
+
+        // At finalized → allowed (removes unfinalized block 1002 only).
+        engine.rollback(1001).expect("rollback to finalized is allowed");
+        assert_eq!(engine.latest_block(), 1001);
+    }
+
+    #[test]
+    fn undo_ingest_is_not_bounded_by_finality() {
+        // Gappy chain: finality (100) is ahead of the latest data block (3).
+        // A failed ingest that processed block 4 is undone back to 3, which is
+        // below finality, and the finalized head hash survives the undo.
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage.clone());
+        let swap = |amount: f64| {
+            vec![HashMap::from([
+                ("pool".to_string(), Value::String("ETH/USDC".into())),
+                ("amount".to_string(), Value::Float64(amount)),
+            ])]
+        };
+
+        let mut batch = StorageWriteBatch::new();
+        engine
+            .process_batch_deferred("swaps", 3, swap(100.0), &mut batch)
+            .unwrap();
+        engine.set_rollback_chain(&[(100, "0x64".to_string())]);
+        engine.finalize(100, &mut batch, true);
+        storage.commit(&batch).unwrap();
+
+        // The failed ingest's write batch is never committed.
+        engine
+            .process_batch_deferred("swaps", 4, swap(200.0), &mut StorageWriteBatch::new())
+            .unwrap();
+
+        assert!(
+            engine.rollback(3).is_err(),
+            "a chain rollback below finality stays rejected"
+        );
+        engine
+            .undo_ingest(3)
+            .expect("undoing a failed ingest is not bounded by finality");
+        assert_eq!(engine.latest_block(), 3);
+        assert_eq!(engine.finalized_cursor().map(|c| c.number), Some(100));
+
+        // Block 4 again counts once.
+        let (changes, _) = engine
+            .process_batch_deferred("swaps", 4, swap(200.0), &mut StorageWriteBatch::new())
+            .unwrap();
+        let mv = changes.iter().find(|c| c.table == "pool_volume").unwrap();
+        assert_eq!(mv.values.get("total"), Some(&Value::Float64(300.0)));
     }
 
     #[test]

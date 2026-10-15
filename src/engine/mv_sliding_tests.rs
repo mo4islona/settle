@@ -642,7 +642,7 @@ fn sliding_window_persistence_and_restore() {
         );
 
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(2, &mut batch);
+        mv.finalize(2, &mut batch, true);
         storage.commit(&batch).unwrap();
     }
 
@@ -689,7 +689,7 @@ fn sliding_window_replay_skip() {
             )],
         );
         let mut batch = StorageWriteBatch::new();
-        mv.finalize(1, &mut batch);
+        mv.finalize(1, &mut batch, true);
         storage.commit(&batch).unwrap();
     }
 
@@ -852,7 +852,7 @@ fn sliding_window_empty_group_cleanup_on_finalize() {
 
     // Finalize
     let mut batch = StorageWriteBatch::new();
-    mv.finalize(2, &mut batch);
+    mv.finalize(2, &mut batch, true);
     storage.commit(&batch).unwrap();
 
     // Restore — group X should not exist
