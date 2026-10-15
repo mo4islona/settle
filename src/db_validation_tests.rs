@@ -1,5 +1,6 @@
 use super::test_helpers::*;
 use super::*;
+use crate::schema::ast::MAX_MV_AGGREGATES;
 use crate::types::{BlockCursor, Value};
 use std::collections::HashMap;
 
@@ -225,4 +226,43 @@ fn failed_ingest_does_not_leak_changes_to_buffer() {
         "failed ingest should not leak changes: got {} raw records",
         raw_records.len()
     );
+}
+
+fn wide_mv_schema(aggregates: usize) -> String {
+    let columns: Vec<String> = (0..aggregates)
+        .map(|i| format!("sum(amount) AS s{i}"))
+        .collect();
+    format!(
+        r#"
+        CREATE TABLE swaps (pool String, amount Float64);
+
+        CREATE MATERIALIZED VIEW wide AS
+        SELECT pool, {}
+        FROM swaps
+        GROUP BY pool;
+        "#,
+        columns.join(", ")
+    )
+}
+
+/// The persisted MV group state stores the aggregate count in one byte.
+#[test]
+fn mv_at_aggregate_limit_survives_reopen() {
+    let schema = wide_mv_schema(MAX_MV_AGGREGATES);
+    let storage = Arc::new(MemoryBackend::new());
+
+    {
+        let mut db = Settle::open(Config::new(schema.clone()).storage(storage.clone())).unwrap();
+        ingest_with_finalized(&mut db, vec![("swaps".into(), 1, vec![make_swap("ETH", 10.0)])], 1)
+            .unwrap();
+    }
+
+    let mut db = Settle::open(Config::new(schema).storage(storage)).unwrap();
+    let batch = ingest_with_finalized(&mut db, vec![("swaps".into(), 2, vec![make_swap("ETH", 10.0)])], 2)
+        .unwrap()
+        .unwrap();
+    let eth = &batch.records_for("wide")[0];
+    let last = format!("s{}", MAX_MV_AGGREGATES - 1);
+    assert_eq!(eth.values.get("s0"), Some(&Value::Float64(20.0)));
+    assert_eq!(eth.values.get(&last), Some(&Value::Float64(20.0)));
 }
