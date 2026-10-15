@@ -7,15 +7,14 @@ use web_time::Instant;
 
 use crate::change::ChangeBuffer;
 use crate::engine::dag::SettleEngine;
+use crate::engine::perf;
 use crate::error::{Error, Result};
 use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
 #[cfg(feature = "rocksdb")]
 use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
 use crate::storage::{StorageBackend, StorageWriteBatch};
-use crate::types::{
-    BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, PerfNodeKind, RowMap, Value,
-};
+use crate::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, RowMap, Value};
 
 /// Configuration for opening a Settle instance.
 #[non_exhaustive]
@@ -49,6 +48,8 @@ pub struct Config {
     /// raw rows from the last durable checkpoint, so a crash mid-interval costs
     /// extra replay but never loses data. See docs/backfill-mode-design.md.
     pub backfill_checkpoint_interval: u64,
+    /// Build the `ChangeBatch::perf` timing tree on ingest. Default `true`.
+    pub collect_perf: bool,
 }
 
 impl Config {
@@ -65,6 +66,7 @@ impl Config {
             cache_size: None,
             ack_warning_threshold: Duration::from_secs(10),
             backfill_checkpoint_interval: 1,
+            collect_perf: true,
         }
     }
 
@@ -80,6 +82,7 @@ impl Config {
             cache_size: None,
             ack_warning_threshold: Duration::from_secs(10),
             backfill_checkpoint_interval: 1,
+            collect_perf: true,
         }
     }
 
@@ -137,6 +140,13 @@ impl Config {
     /// reducers (those always persist every finalize).
     pub fn backfill_checkpoint_interval(mut self, n: u64) -> Self {
         self.backfill_checkpoint_interval = n.max(1);
+        self
+    }
+
+    /// Build the per-ingest `ChangeBatch::perf` timing tree (default true).
+    /// Off, ingest reads no clock and `perf` stays empty.
+    pub fn collect_perf(mut self, on: bool) -> Self {
+        self.collect_perf = on;
         self
     }
 }
@@ -241,6 +251,7 @@ impl Settle {
         };
 
         let mut engine = SettleEngine::new(&schema, storage.clone());
+        engine.set_collect_perf(config.collect_perf);
 
         // Restore persisted state
         if let Some(bytes) = storage.get_meta(META_LATEST_BLOCK)? {
@@ -715,7 +726,8 @@ impl Settle {
 
         // Collect changes locally — only push to buffer on success to avoid
         // partial changes leaking into downstream output on failure.
-        let mut pending_changes: Vec<(Vec<ChangeRecord>, Vec<PerfNode>)> = Vec::new();
+        let mut pending_changes: Vec<ChangeRecord> = Vec::new();
+        let mut block_perf: Vec<PerfNode> = Vec::new();
 
         // 0. Detect fork: compare new chain against stored block_hashes and rollback
         //    if our latest block is no longer on the canonical chain.
@@ -764,7 +776,7 @@ impl Settle {
                         let changes = self
                             .engine
                             .rollback_to_batch(fork_point, &mut write_batch)?;
-                        pending_changes.push((changes, vec![]));
+                        pending_changes.extend(changes);
                     }
                     fork_point
                 } else {
@@ -843,7 +855,8 @@ impl Settle {
                         block_rows,
                         &mut write_batch,
                     )?;
-                    pending_changes.push((changes, vec![perf_node]));
+                    pending_changes.extend(changes);
+                    block_perf.extend(perf_node);
                 }
             }
             Ok(())
@@ -875,49 +888,11 @@ impl Settle {
             return Err(e);
         }
 
-        // Success — push all changes with aggregated perf.
-        // Sum per-block durations into one "ingest" node. Children are
-        // accumulated in-place using the first block's structure as template.
-        let mut all_changes = Vec::new();
-        let mut total_ms = 0.0f64;
-        let mut merged: Option<PerfNode> = None;
-        for (changes, perf) in pending_changes {
-            all_changes.extend(changes);
-            for node in perf {
-                total_ms += node.duration_ms;
-                match &mut merged {
-                    None => merged = Some(node),
-                    Some(m) => {
-                        m.duration_ms += node.duration_ms;
-                        // Sum children by index (same pipeline structure every block)
-                        for (i, child) in node.children.into_iter().enumerate() {
-                            if i < m.children.len() {
-                                m.children[i].duration_ms += child.duration_ms;
-                                for (j, gc) in child.children.into_iter().enumerate() {
-                                    if j < m.children[i].children.len() {
-                                        m.children[i].children[j].duration_ms += gc.duration_ms;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let batch_perf = match merged {
-            Some(m) => vec![PerfNode {
-                kind: PerfNodeKind::Pipeline,
-                name: "ingest".to_string(),
-                duration_ms: total_ms,
-                children: vec![m],
-            }],
-            None => vec![],
-        };
         self.buffer.push(
-            all_changes,
+            pending_changes,
             self.engine.finalized_cursor(),
             self.engine.latest_cursor(),
-            batch_perf,
+            perf::merge_blocks(block_perf).into_iter().collect(),
         );
 
         // 2. Store rollback chain hashes (including finalized head)
