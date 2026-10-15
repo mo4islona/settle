@@ -71,6 +71,45 @@ struct PipelineBranch {
     mv_entries: Vec<(String, MVEngine)>,
 }
 
+impl PipelineBranch {
+    /// Run the reducer on its source rows and feed its output to the branch's
+    /// MVs.
+    #[cfg(feature = "rayon")]
+    fn process_block(
+        &mut self,
+        block: BlockNumber,
+        output_rows: &HashMap<String, Vec<RowMap>>,
+    ) -> Result<(Vec<ChangeRecord>, PerfNode)> {
+        let r_start = start_timer();
+        let mut changes = Vec::new();
+        let mut mv_nodes = Vec::new();
+
+        if let Some(rows) = output_rows.get(self.reducer.source()) {
+            let enriched = self.reducer.process_block_maps(block, rows)?;
+            if !enriched.is_empty() {
+                for (mv_name, mv) in &mut self.mv_entries {
+                    let mv_start = start_timer();
+                    changes.extend(mv.process_block(block, &enriched));
+                    mv_nodes.push(PerfNode {
+                        kind: PerfNodeKind::MV,
+                        name: mv_name.clone(),
+                        duration_ms: elapsed_ms(mv_start),
+                        children: vec![],
+                    });
+                }
+            }
+        }
+
+        let node = PerfNode {
+            kind: PerfNodeKind::Reducer,
+            name: self.reducer_name.clone(),
+            duration_ms: elapsed_ms(r_start),
+            children: mv_nodes,
+        };
+        Ok((changes, node))
+    }
+}
+
 /// Top-level engine that wires the computation DAG:
 /// Raw Tables → Reducers → Materialized Views
 pub struct SettleEngine {
@@ -477,66 +516,8 @@ impl SettleEngine {
                     let branch_1 = &mut second[0];
 
                     let (result_0, result_1) = rayon::join(
-                        || -> Result<(Vec<ChangeRecord>, PerfNode)> {
-                            let r_start = start_timer();
-                            let source = branch_0.reducer.source();
-                            let mut changes = Vec::new();
-                            let mut mv_nodes = Vec::new();
-                            if let Some(rows) = output_rows.get(source) {
-                                let enriched = branch_0.reducer.process_block_maps(block, rows)?;
-                                if !enriched.is_empty() {
-                                    for (mv_name, mv) in branch_0.mv_entries.iter_mut() {
-                                        let mv_start = start_timer();
-                                        changes.extend(mv.process_block(block, &enriched));
-                                        mv_nodes.push(PerfNode {
-                                            kind: PerfNodeKind::MV,
-                                            name: mv_name.clone(),
-                                            duration_ms: elapsed_ms(mv_start),
-                                            children: vec![],
-                                        });
-                                    }
-                                }
-                            }
-                            Ok((
-                                changes,
-                                PerfNode {
-                                    kind: PerfNodeKind::Reducer,
-                                    name: branch_0.reducer_name.clone(),
-                                    duration_ms: elapsed_ms(r_start),
-                                    children: mv_nodes,
-                                },
-                            ))
-                        },
-                        || -> Result<(Vec<ChangeRecord>, PerfNode)> {
-                            let r_start = start_timer();
-                            let source = branch_1.reducer.source();
-                            let mut changes = Vec::new();
-                            let mut mv_nodes = Vec::new();
-                            if let Some(rows) = output_rows.get(source) {
-                                let enriched = branch_1.reducer.process_block_maps(block, rows)?;
-                                if !enriched.is_empty() {
-                                    for (mv_name, mv) in branch_1.mv_entries.iter_mut() {
-                                        let mv_start = start_timer();
-                                        changes.extend(mv.process_block(block, &enriched));
-                                        mv_nodes.push(PerfNode {
-                                            kind: PerfNodeKind::MV,
-                                            name: mv_name.clone(),
-                                            duration_ms: elapsed_ms(mv_start),
-                                            children: vec![],
-                                        });
-                                    }
-                                }
-                            }
-                            Ok((
-                                changes,
-                                PerfNode {
-                                    kind: PerfNodeKind::Reducer,
-                                    name: branch_1.reducer_name.clone(),
-                                    duration_ms: elapsed_ms(r_start),
-                                    children: mv_nodes,
-                                },
-                            ))
-                        },
+                        || branch_0.process_block(block, &output_rows),
+                        || branch_1.process_block(block, &output_rows),
                     );
 
                     let (d0, p0) = result_0?;
@@ -554,36 +535,7 @@ impl SettleEngine {
                     let results: Vec<Result<(Vec<ChangeRecord>, PerfNode)>> = self
                         .branches
                         .par_iter_mut()
-                        .map(|branch| {
-                            let r_start = start_timer();
-                            let source = branch.reducer.source();
-                            let mut changes = Vec::new();
-                            let mut mv_nodes = Vec::new();
-                            if let Some(rows) = output_rows.get(source) {
-                                let enriched = branch.reducer.process_block_maps(block, rows)?;
-                                if !enriched.is_empty() {
-                                    for (mv_name, mv) in branch.mv_entries.iter_mut() {
-                                        let mv_start = start_timer();
-                                        changes.extend(mv.process_block(block, &enriched));
-                                        mv_nodes.push(PerfNode {
-                                            kind: PerfNodeKind::MV,
-                                            name: mv_name.clone(),
-                                            duration_ms: elapsed_ms(mv_start),
-                                            children: vec![],
-                                        });
-                                    }
-                                }
-                            }
-                            Ok((
-                                changes,
-                                PerfNode {
-                                    kind: PerfNodeKind::Reducer,
-                                    name: branch.reducer_name.clone(),
-                                    duration_ms: elapsed_ms(r_start),
-                                    children: mv_nodes,
-                                },
-                            ))
-                        })
+                        .map(|branch| branch.process_block(block, &output_rows))
                         .collect();
 
                     let mut branch_nodes = Vec::new();
