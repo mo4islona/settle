@@ -5,7 +5,9 @@
 //!     MV emits absolute values; PG receives INSERT raw + UPSERT balances
 //!     (replace, not increment) from ChangeBatch records.
 //!
-//! Both pipelines leave PG with the same final state.
+//! Both pipelines leave PG with the same final state. Raw rows go to PG
+//! straight from the input, so Settle reads `transfers` as a VIRTUAL TABLE:
+//! a stored one would keep a second copy and emit change records nobody reads.
 //!
 //! Run with: `cargo bench --bench vs_postgres_simple_agg` (Docker required)
 
@@ -27,7 +29,7 @@ use common::{
 };
 
 const SETTLE_SCHEMA_FN: &str = r#"
-CREATE TABLE transfers (
+CREATE VIRTUAL TABLE transfers (
     block_number UInt64,
     from_addr    String,
     to_addr      String,
@@ -51,7 +53,7 @@ GROUP BY from_addr;
 "#;
 
 const SETTLE_SCHEMA_MV: &str = r#"
-CREATE TABLE transfers (
+CREATE VIRTUAL TABLE transfers (
     block_number UInt64,
     from_addr    String,
     to_addr      String,
@@ -67,7 +69,7 @@ GROUP BY from_addr;
 "#;
 
 const SETTLE_SCHEMA_ER: &str = r#"
-CREATE TABLE transfers (
+CREATE VIRTUAL TABLE transfers (
     block_number UInt64,
     from_addr    String,
     to_addr      String,
@@ -264,18 +266,16 @@ fn pg_upsert_balances_batch(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<(
     Ok(())
 }
 
+/// Same `unnest` shape as `pg_upsert_balances_batch`, so that both sides pay
+/// the same per-statement cost. A batch holds one record per key, so the
+/// `ON CONFLICT` needs no `GROUP BY`.
 fn pg_upsert_balances_from_changes(
     pg: &PgRuntime,
     records: &[ChangeRecord],
 ) -> anyhow::Result<()> {
-    let n = records.len();
-    if n == 0 {
+    if records.is_empty() {
         return Ok(());
     }
-    let sql = format!(
-        "{} ON CONFLICT (from_addr) DO UPDATE SET balance = EXCLUDED.balance",
-        build_multi_insert("balances", &["from_addr", "balance"], n),
-    );
     let from_buf: Vec<String> = records
         .iter()
         .map(|r| {
@@ -296,12 +296,10 @@ fn pg_upsert_balances_from_changes(
                 .unwrap_or(0.0)
         })
         .collect();
-    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(n * 2);
-    for i in 0..n {
-        params.push(&from_buf[i]);
-        params.push(&val_buf[i]);
-    }
-    pg.execute(&sql, &params)?;
+    let sql = "INSERT INTO balances (from_addr, balance) \
+               SELECT * FROM unnest($1::text[], $2::float8[]) \
+               ON CONFLICT (from_addr) DO UPDATE SET balance = EXCLUDED.balance";
+    pg.execute(sql, &[&from_buf, &val_buf])?;
     Ok(())
 }
 

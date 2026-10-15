@@ -860,6 +860,60 @@ fn sliding_window_empty_group_cleanup_on_finalize() {
     assert_eq!(mv2.groups.len(), 1); // only Y
 }
 
+/// A group whose rows expire in the block that creates it must not linger
+/// empty: the next live row for it is an Insert, and nothing is persisted.
+#[test]
+fn sliding_window_group_expired_on_arrival_is_removed() {
+    let storage = test_storage();
+    let mut mv = MVEngine::new(
+        sliding_sum_mv_def(10),
+        storage.clone(),
+        &test_column_types(),
+    );
+    let trade = |pair: &str, volume: f64, ts_ms: i64| {
+        make_ts_row(
+            &[
+                ("pair", Value::String(pair.into())),
+                ("volume", Value::Float64(volume)),
+            ],
+            ts_ms,
+        )
+    };
+
+    // Watermark at 20 s.
+    mv.process_block(1, &[trade("ETH", 10.0, 20_000)]);
+
+    // 1 s is 19 s behind the watermark: the block expires as it arrives.
+    let late = mv.process_block(2, &[trade("BTC", 5.0, 1_000)]);
+    assert!(late.is_empty());
+    assert!(
+        !mv.groups
+            .keys()
+            .any(|k| k[0] == Value::String("BTC".into()))
+    );
+
+    let mut batch = StorageWriteBatch::new();
+    mv.finalize(2, &mut batch, true);
+    storage.commit(&batch).unwrap();
+    let restored = MVEngine::new(
+        sliding_sum_mv_def(10),
+        storage.clone(),
+        &test_column_types(),
+    );
+    assert_eq!(restored.groups.len(), 1); // only ETH
+
+    // A zero volume leaves the sum unchanged: only an Insert carries the row.
+    let live = mv.process_block(3, &[trade("BTC", 0.0, 21_000)]);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].operation, ChangeOp::Insert);
+    assert_eq!(live[0].prev_values, None);
+    assert_eq!(
+        live[0].values.get("total_volume"),
+        Some(&Value::Float64(0.0))
+    );
+    assert_eq!(live[0].values.get("trade_count"), Some(&Value::UInt64(1)));
+}
+
 #[test]
 fn sliding_window_missing_timestamp_uses_watermark() {
     let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()); // 10s window

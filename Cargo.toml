@@ -19,12 +19,17 @@ smallvec = { version = "1", features = ["serde"] }
 rayon = { version = "1", optional = true }
 napi = { version = "2", features = ["napi9", "serde-json"], optional = true }
 napi-derive = { version = "2", optional = true }
-ethnum = "1.5.2"
+ethnum = "1.5.3"
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 tracing = "0.1"
 web-time = "1"
+# Faster allocator for the hot ingest path (small per-event map/Vec churn).
+# Default-on for native builds; gated off for wasm (its C core won't compile
+# on wasm32) via the #[global_allocator] cfg in lib.rs. A/B: +13-15% on the
+# simple_agg / polymarket pipelines vs the system allocator.
+mimalloc = { version = "0.1", optional = true }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }
@@ -41,14 +46,17 @@ tokio-postgres = "0.7"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 anyhow = "1"
+# Instruction and allocation counts under Valgrind; the runner binary must match this version.
+gungraun = "=0.20.0"
 
 [features]
 # Default features for native (Node.js) builds.
 # For WASM builds use: --no-default-features --features wasm
-default = ["lua", "rocksdb", "rayon"]
+default = ["lua", "rocksdb", "rayon", "mimalloc"]
 lua = ["dep:mlua"]
 rocksdb = ["dep:rocksdb"]
 rayon = ["dep:rayon"]
+mimalloc = ["dep:mimalloc"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen"]
 
@@ -78,6 +86,10 @@ path = "tests/sliding/tests.rs"
 
 [[bench]]
 name = "throughput"
+harness = false
+
+[[bench]]
+name = "instructions"
 harness = false
 
 [[bench]]
