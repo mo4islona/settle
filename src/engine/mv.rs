@@ -890,15 +890,7 @@ fn resolve_output_name(item: &SelectItem) -> String {
     match &item.expr {
         SelectExpr::Column(col) => col.clone(),
         SelectExpr::Agg(func, col) => {
-            let func_name = match func {
-                crate::schema::ast::AggFunc::Sum => "sum",
-                crate::schema::ast::AggFunc::Count => "count",
-                crate::schema::ast::AggFunc::Min => "min",
-                crate::schema::ast::AggFunc::Max => "max",
-                crate::schema::ast::AggFunc::Avg => "avg",
-                crate::schema::ast::AggFunc::First => "first",
-                crate::schema::ast::AggFunc::Last => "last",
-            };
+            let func_name = func.name();
             match col {
                 Some(c) => format!("{func_name}_{c}"),
                 None => func_name.to_string(),
