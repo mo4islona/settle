@@ -214,6 +214,83 @@ fn drain_up_to<V>(blocks: &mut BTreeMap<BlockNumber, V>, block: BlockNumber, mut
     }
 }
 
+/// `blocks.values()` folded onto `seed` in block order, kept current while
+/// writes land on the newest block, so that a read costs O(1) instead of
+/// O(unfinalized blocks).
+///
+/// It equals a fresh fold bit for bit: float addition is not associative, so
+/// it folds in the same order and never subtracts (saturating integer
+/// addition has no inverse either). A removal, or a write below the newest
+/// block, folds again. Finalization does not touch it: draining the oldest
+/// blocks into `seed` performs the same additions in the same order.
+/// The unfinalized blocks from which an aggregate keeps a `RunningFold`. With
+/// fewer, a read folds them directly: the fold is two to three times the size
+/// of the aggregate, and most groups hold only a few unfinalized blocks.
+const RUNNING_FOLD_MIN_BLOCKS: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct RunningFold<S, V> {
+    /// `seed` and every block below the newest one.
+    below_newest: S,
+    newest: Option<(BlockNumber, V)>,
+    total: S,
+}
+
+impl<S: Copy, V: Copy> RunningFold<S, V> {
+    fn new(seed: S, blocks: &BTreeMap<BlockNumber, V>, op: impl Fn(S, V) -> S) -> Self {
+        let mut below_newest = seed;
+        let mut newest = None;
+        for (&block, &value) in blocks {
+            if let Some((_, below)) = newest.replace((block, value)) {
+                below_newest = op(below_newest, below);
+            }
+        }
+
+        let total = newest.map_or(below_newest, |(_, value)| op(below_newest, value));
+        Self {
+            below_newest,
+            newest,
+            total,
+        }
+    }
+
+    /// Set `slot` to the fold of `blocks`, or clear it when the blocks are too
+    /// few to need one.
+    fn refold_into(
+        slot: &mut Option<Box<Self>>,
+        seed: S,
+        blocks: &BTreeMap<BlockNumber, V>,
+        op: impl Fn(S, V) -> S,
+    ) {
+        if blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
+            *slot = None;
+            return;
+        }
+
+        let fold = Self::new(seed, blocks, op);
+        match slot {
+            Some(running) => **running = fold,
+            None => *slot = Some(Box::new(fold)),
+        }
+    }
+
+    /// Account for `block` now holding `value`. False when the write landed
+    /// below the newest block: the caller must fold again.
+    fn wrote(&mut self, block: BlockNumber, value: V, op: impl Fn(S, V) -> S) -> bool {
+        match self.newest {
+            Some((newest, _)) if block < newest => return false,
+            Some((newest, below)) if block > newest => {
+                self.below_newest = op(self.below_newest, below);
+            }
+            _ => {}
+        }
+
+        self.newest = Some((block, value));
+        self.total = op(self.below_newest, value);
+        true
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sum
 // ---------------------------------------------------------------------------
@@ -224,6 +301,10 @@ pub struct SumAgg {
     finalized: NumAccum,
     blocks: BTreeMap<BlockNumber, NumAccum>,
     has_finalized: bool,
+    /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
+    /// or more.
+    #[serde(skip)]
+    running: Option<Box<RunningFold<NumAccum, NumAccum>>>,
 }
 
 impl SumAgg {
@@ -234,7 +315,24 @@ impl SumAgg {
             finalized: NumAccum::zero(mode),
             blocks: BTreeMap::new(),
             has_finalized: false,
+            running: None,
         }
+    }
+
+    fn fold_total(&self) -> NumAccum {
+        self.blocks
+            .values()
+            .copied()
+            .fold(self.finalized, NumAccum::add)
+    }
+
+    fn refold(&mut self) {
+        RunningFold::refold_into(
+            &mut self.running,
+            self.finalized,
+            &self.blocks,
+            NumAccum::add,
+        );
     }
 }
 
@@ -251,25 +349,41 @@ impl AggregationFunc for SumAgg {
                 n
             })
             .fold(NumAccum::zero(self.mode), NumAccum::add);
-        if has_values {
-            let entry = self
-                .blocks
-                .entry(block)
-                .or_insert(NumAccum::zero(self.mode));
-            *entry = entry.add(partial);
+        if !has_values {
+            return;
+        }
+
+        let entry = self
+            .blocks
+            .entry(block)
+            .or_insert(NumAccum::zero(self.mode));
+        *entry = entry.add(partial);
+        let value = *entry;
+
+        let current = self
+            .running
+            .as_mut()
+            .is_some_and(|r| r.wrote(block, value, NumAccum::add));
+        if !current {
+            self.refold();
         }
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
+        self.refold();
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+        self.refold();
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
-        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+        let into = same_kind::<Self>(into);
+        move_entry(&mut self.blocks, &mut into.blocks, block);
+        self.refold();
+        into.refold();
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -281,14 +395,16 @@ impl AggregationFunc for SumAgg {
             self.finalized = self.finalized.add(v);
             self.has_finalized = true;
         });
+        if self.blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
+            self.running = None;
+        }
     }
 
     fn current_value(&self) -> Value {
         let total = self
-            .blocks
-            .values()
-            .copied()
-            .fold(self.finalized, NumAccum::add);
+            .running
+            .as_ref()
+            .map_or_else(|| self.fold_total(), |r| r.total);
         total.to_value()
     }
 
@@ -303,13 +419,16 @@ impl AggregationFunc for SumAgg {
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
             blocks: BTreeMap::new(),
+            running: None,
             ..*self
         };
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        rmp_serde::from_slice(bytes).unwrap()
+        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+        agg.refold();
+        agg
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -325,6 +444,14 @@ impl AggregationFunc for SumAgg {
 pub struct CountAgg {
     finalized: u64,
     blocks: BTreeMap<BlockNumber, u64>,
+    /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
+    /// or more.
+    #[serde(skip)]
+    running: Option<Box<RunningFold<u64, u64>>>,
+}
+
+fn add_count(total: u64, count: u64) -> u64 {
+    total + count
 }
 
 impl CountAgg {
@@ -332,26 +459,54 @@ impl CountAgg {
         Self {
             finalized: 0,
             blocks: BTreeMap::new(),
+            running: None,
         }
+    }
+
+    fn fold_total(&self) -> u64 {
+        self.blocks
+            .values()
+            .copied()
+            .fold(self.finalized, add_count)
+    }
+
+    fn refold(&mut self) {
+        RunningFold::refold_into(&mut self.running, self.finalized, &self.blocks, add_count);
     }
 }
 
 impl AggregationFunc for CountAgg {
     fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
         let count = values.iter().filter(|v| !v.is_null()).count() as u64;
-        *self.blocks.entry(block).or_insert(0) += count;
+
+        let entry = self.blocks.entry(block).or_insert(0);
+        *entry += count;
+        let value = *entry;
+
+        let current = self
+            .running
+            .as_mut()
+            .is_some_and(|r| r.wrote(block, value, add_count));
+        if !current {
+            self.refold();
+        }
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
+        self.refold();
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+        self.refold();
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
-        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+        let into = same_kind::<Self>(into);
+        move_entry(&mut self.blocks, &mut into.blocks, block);
+        self.refold();
+        into.refold();
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -360,10 +515,16 @@ impl AggregationFunc for CountAgg {
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
         drain_up_to(&mut self.blocks, block, |v| self.finalized += v);
+        if self.blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
+            self.running = None;
+        }
     }
 
     fn current_value(&self) -> Value {
-        let total = self.finalized + self.blocks.values().sum::<u64>();
+        let total = self
+            .running
+            .as_ref()
+            .map_or_else(|| self.fold_total(), |r| r.total);
         Value::UInt64(total)
     }
 
@@ -378,13 +539,16 @@ impl AggregationFunc for CountAgg {
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
             blocks: BTreeMap::new(),
+            running: None,
             ..*self
         };
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        rmp_serde::from_slice(bytes).unwrap()
+        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+        agg.refold();
+        agg
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -401,6 +565,14 @@ pub struct MinAgg {
     mode: NumMode,
     finalized: Option<NumAccum>,
     blocks: BTreeMap<BlockNumber, NumAccum>,
+    /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
+    /// or more.
+    #[serde(skip)]
+    running: Option<Box<RunningFold<Option<NumAccum>, NumAccum>>>,
+}
+
+fn min_into(acc: Option<NumAccum>, value: NumAccum) -> Option<NumAccum> {
+    Some(acc.map_or(value, |a| a.min(value)))
 }
 
 impl MinAgg {
@@ -409,7 +581,16 @@ impl MinAgg {
             mode: NumMode::from_column_type(column_type),
             finalized: None,
             blocks: BTreeMap::new(),
+            running: None,
         }
+    }
+
+    fn fold_total(&self) -> Option<NumAccum> {
+        self.blocks.values().copied().fold(self.finalized, min_into)
+    }
+
+    fn refold(&mut self) {
+        RunningFold::refold_into(&mut self.running, self.finalized, &self.blocks, min_into);
     }
 }
 
@@ -419,22 +600,38 @@ impl AggregationFunc for MinAgg {
             .iter()
             .filter_map(|v| NumAccum::from_value(v, self.mode))
             .reduce(NumAccum::min);
-        if let Some(min_val) = block_min {
-            let entry = self.blocks.entry(block).or_insert(min_val);
-            *entry = (*entry).min(min_val);
+        let Some(min_val) = block_min else {
+            return;
+        };
+
+        let entry = self.blocks.entry(block).or_insert(min_val);
+        *entry = (*entry).min(min_val);
+        let value = *entry;
+
+        let current = self
+            .running
+            .as_mut()
+            .is_some_and(|r| r.wrote(block, value, min_into));
+        if !current {
+            self.refold();
         }
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
+        self.refold();
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+        self.refold();
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
-        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+        let into = same_kind::<Self>(into);
+        move_entry(&mut self.blocks, &mut into.blocks, block);
+        self.refold();
+        into.refold();
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -443,22 +640,19 @@ impl AggregationFunc for MinAgg {
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
         drain_up_to(&mut self.blocks, block, |v| {
-            self.finalized = Some(match self.finalized {
-                Some(f) => f.min(v),
-                None => v,
-            });
+            self.finalized = min_into(self.finalized, v);
         });
+        if self.blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
+            self.running = None;
+        }
     }
 
     fn current_value(&self) -> Value {
-        let unfinalized_min = self.blocks.values().copied().reduce(NumAccum::min);
-        let result = match (self.finalized, unfinalized_min) {
-            (Some(f), Some(u)) => Some(f.min(u)),
-            (Some(f), None) => Some(f),
-            (None, Some(u)) => Some(u),
-            (None, None) => None,
-        };
-        match result {
+        let total = self
+            .running
+            .as_ref()
+            .map_or_else(|| self.fold_total(), |r| r.total);
+        match total {
             Some(v) => v.to_value(),
             None => Value::Null,
         }
@@ -475,13 +669,16 @@ impl AggregationFunc for MinAgg {
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
             blocks: BTreeMap::new(),
+            running: None,
             ..*self
         };
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        rmp_serde::from_slice(bytes).unwrap()
+        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+        agg.refold();
+        agg
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -498,6 +695,14 @@ pub struct MaxAgg {
     mode: NumMode,
     finalized: Option<NumAccum>,
     blocks: BTreeMap<BlockNumber, NumAccum>,
+    /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
+    /// or more.
+    #[serde(skip)]
+    running: Option<Box<RunningFold<Option<NumAccum>, NumAccum>>>,
+}
+
+fn max_into(acc: Option<NumAccum>, value: NumAccum) -> Option<NumAccum> {
+    Some(acc.map_or(value, |a| a.max(value)))
 }
 
 impl MaxAgg {
@@ -506,7 +711,16 @@ impl MaxAgg {
             mode: NumMode::from_column_type(column_type),
             finalized: None,
             blocks: BTreeMap::new(),
+            running: None,
         }
+    }
+
+    fn fold_total(&self) -> Option<NumAccum> {
+        self.blocks.values().copied().fold(self.finalized, max_into)
+    }
+
+    fn refold(&mut self) {
+        RunningFold::refold_into(&mut self.running, self.finalized, &self.blocks, max_into);
     }
 }
 
@@ -516,22 +730,38 @@ impl AggregationFunc for MaxAgg {
             .iter()
             .filter_map(|v| NumAccum::from_value(v, self.mode))
             .reduce(NumAccum::max);
-        if let Some(max_val) = block_max {
-            let entry = self.blocks.entry(block).or_insert(max_val);
-            *entry = (*entry).max(max_val);
+        let Some(max_val) = block_max else {
+            return;
+        };
+
+        let entry = self.blocks.entry(block).or_insert(max_val);
+        *entry = (*entry).max(max_val);
+        let value = *entry;
+
+        let current = self
+            .running
+            .as_mut()
+            .is_some_and(|r| r.wrote(block, value, max_into));
+        if !current {
+            self.refold();
         }
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
+        self.refold();
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+        self.refold();
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
-        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+        let into = same_kind::<Self>(into);
+        move_entry(&mut self.blocks, &mut into.blocks, block);
+        self.refold();
+        into.refold();
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -540,22 +770,19 @@ impl AggregationFunc for MaxAgg {
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
         drain_up_to(&mut self.blocks, block, |v| {
-            self.finalized = Some(match self.finalized {
-                Some(f) => f.max(v),
-                None => v,
-            });
+            self.finalized = max_into(self.finalized, v);
         });
+        if self.blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
+            self.running = None;
+        }
     }
 
     fn current_value(&self) -> Value {
-        let unfinalized_max = self.blocks.values().copied().reduce(NumAccum::max);
-        let result = match (self.finalized, unfinalized_max) {
-            (Some(f), Some(u)) => Some(f.max(u)),
-            (Some(f), None) => Some(f),
-            (None, Some(u)) => Some(u),
-            (None, None) => None,
-        };
-        match result {
+        let total = self
+            .running
+            .as_ref()
+            .map_or_else(|| self.fold_total(), |r| r.total);
+        match total {
             Some(v) => v.to_value(),
             None => Value::Null,
         }
@@ -572,13 +799,16 @@ impl AggregationFunc for MaxAgg {
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
             blocks: BTreeMap::new(),
+            running: None,
             ..*self
         };
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        rmp_serde::from_slice(bytes).unwrap()
+        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+        agg.refold();
+        agg
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -596,6 +826,28 @@ pub struct AvgAgg {
     finalized_sum: NumAccum,
     finalized_count: u64,
     blocks: BTreeMap<BlockNumber, (NumAccum, u64)>,
+    /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
+    /// or more.
+    #[serde(skip)]
+    running: Option<Box<RunningFold<SumCount, SumCount>>>,
+}
+
+/// The sum and the count of an average.
+type SumCount = (NumAccum, u64);
+
+fn add_sum_count(total: SumCount, block: SumCount) -> SumCount {
+    (total.0.add(block.0), total.1 + block.1)
+}
+
+fn avg_value((sum, count): SumCount) -> Value {
+    if count == 0 {
+        Value::Null
+    } else if let NumAccum::BigInt(sum) = sum {
+        // Integer division for Uint256 — no f64 precision loss
+        Value::Uint256((sum / U256::from(count)).to_be_bytes())
+    } else {
+        Value::Float64(sum.to_f64() / count as f64)
+    }
 }
 
 impl AvgAgg {
@@ -606,7 +858,22 @@ impl AvgAgg {
             finalized_sum: NumAccum::zero(mode),
             finalized_count: 0,
             blocks: BTreeMap::new(),
+            running: None,
         }
+    }
+
+    fn fold_total(&self) -> SumCount {
+        let seed = (self.finalized_sum, self.finalized_count);
+        self.blocks.values().copied().fold(seed, add_sum_count)
+    }
+
+    fn refold(&mut self) {
+        RunningFold::refold_into(
+            &mut self.running,
+            (self.finalized_sum, self.finalized_count),
+            &self.blocks,
+            add_sum_count,
+        );
     }
 }
 
@@ -620,26 +887,41 @@ impl AggregationFunc for AvgAgg {
                 count += 1;
             }
         }
-        if count > 0 {
-            let entry = self
-                .blocks
-                .entry(block)
-                .or_insert((NumAccum::zero(self.mode), 0));
-            entry.0 = entry.0.add(sum);
-            entry.1 += count;
+        if count == 0 {
+            return;
+        }
+
+        let entry = self
+            .blocks
+            .entry(block)
+            .or_insert((NumAccum::zero(self.mode), 0));
+        *entry = add_sum_count(*entry, (sum, count));
+        let value = *entry;
+
+        let current = self
+            .running
+            .as_mut()
+            .is_some_and(|r| r.wrote(block, value, add_sum_count));
+        if !current {
+            self.refold();
         }
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
+        self.refold();
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+        self.refold();
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
-        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+        let into = same_kind::<Self>(into);
+        move_entry(&mut self.blocks, &mut into.blocks, block);
+        self.refold();
+        into.refold();
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -651,24 +933,17 @@ impl AggregationFunc for AvgAgg {
             self.finalized_sum = self.finalized_sum.add(s);
             self.finalized_count += c;
         });
+        if self.blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
+            self.running = None;
+        }
     }
 
     fn current_value(&self) -> Value {
-        let total_sum = self
-            .blocks
-            .values()
-            .map(|(s, _)| *s)
-            .fold(self.finalized_sum, NumAccum::add);
-        let total_count: u64 =
-            self.finalized_count + self.blocks.values().map(|(_, c)| c).sum::<u64>();
-        if total_count == 0 {
-            Value::Null
-        } else if let NumAccum::BigInt(sum) = total_sum {
-            // Integer division for Uint256 — no f64 precision loss
-            Value::Uint256((sum / U256::from(total_count)).to_be_bytes())
-        } else {
-            Value::Float64(total_sum.to_f64() / total_count as f64)
-        }
+        let total = self
+            .running
+            .as_ref()
+            .map_or_else(|| self.fold_total(), |r| r.total);
+        avg_value(total)
     }
 
     fn has_data(&self) -> bool {
@@ -682,13 +957,16 @@ impl AggregationFunc for AvgAgg {
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
             blocks: BTreeMap::new(),
+            running: None,
             ..*self
         };
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        rmp_serde::from_slice(bytes).unwrap()
+        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+        agg.refold();
+        agg
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -1562,5 +1840,191 @@ mod tests {
             u256_from_val(&agg.current_value()),
             ethnum::U256::from(100u64)
         );
+    }
+
+    // --- Running fold ---
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        }
+    }
+
+    /// Float64 by bits: a fold in another order can differ in the last bit.
+    fn assert_same(actual: &Value, expected: &Value, context: &str) {
+        let same = match (actual, expected) {
+            (Value::Float64(a), Value::Float64(b)) => a.to_bits() == b.to_bits(),
+            _ => actual == expected,
+        };
+        assert!(same, "{context}: {actual:?} != {expected:?}");
+    }
+
+    /// Random writes, finalizations, removals, moves and decodes, with the
+    /// order of a live engine: writes land above the finalized blocks, mostly
+    /// on the newest block or a new one. After each step the running fold must
+    /// equal `fresh`, a full fold of the same state. Finalizations and forks
+    /// are rare enough that the group often holds `RUNNING_FOLD_MIN_BLOCKS`
+    /// unfinalized blocks or more, so both read paths are checked.
+    fn check_running_fold<A: AggregationFunc + Clone + 'static>(
+        new: impl Fn() -> A,
+        value: impl Fn(&mut Rng) -> Value,
+        fresh: impl Fn(&A) -> Value,
+    ) {
+        let mut steps = 0;
+        let mut folded_steps = 0;
+
+        for seed in 0..300 {
+            let mut rng = Rng::new(seed);
+            let mut agg = new();
+            let mut side = new();
+            let mut finalized: BlockNumber = 0;
+
+            for step in 0..300 {
+                let blocks = agg.block_numbers();
+                let newest = blocks.last().copied().unwrap_or(finalized).max(finalized);
+                let unfinalized_block = |rng: &mut Rng| {
+                    (!blocks.is_empty()).then(|| blocks[rng.below(blocks.len() as u64) as usize])
+                };
+
+                let op = rng.below(100);
+                match op {
+                    0..=69 => {
+                        let block = newest + rng.below(3).max(u64::from(newest == finalized));
+                        let values: Vec<Value> =
+                            (0..1 + rng.below(3)).map(|_| value(&mut rng)).collect();
+                        agg.add_block(block, &values);
+                    }
+                    70..=75 => {
+                        let block = finalized + 1 + rng.below(newest - finalized + 1);
+                        agg.add_block(block, &[value(&mut rng)]);
+                    }
+                    76..=79 => {
+                        finalized += rng.below(newest - finalized + 1);
+                        agg.finalize_up_to(finalized);
+                    }
+                    80..=83 => {
+                        if let Some(block) = unfinalized_block(&mut rng) {
+                            agg.remove_block(block);
+                        }
+                    }
+                    84..=85 => {
+                        let fork_point = finalized + rng.below(newest - finalized + 1);
+                        agg.remove_blocks_after(fork_point);
+                    }
+                    86..=91 => {
+                        if let Some(block) = unfinalized_block(&mut rng) {
+                            agg.move_block(block, &mut side);
+                        }
+                    }
+                    92..=95 => {
+                        let moved = side.block_numbers();
+                        if let Some(&block) = moved.first()
+                            && block > finalized
+                        {
+                            side.move_block(block, &mut agg);
+                        }
+                    }
+                    _ => {
+                        agg = A::from_bytes(&agg.to_bytes());
+                    }
+                }
+
+                let context = format!("seed {seed} step {step} op {op}");
+                assert_same(&agg.current_value(), &fresh(&agg), &context);
+                assert_same(&side.current_value(), &fresh(&side), &context);
+
+                steps += 1;
+                if agg.block_numbers().len() >= RUNNING_FOLD_MIN_BLOCKS {
+                    folded_steps += 1;
+                }
+            }
+        }
+
+        assert!(
+            folded_steps * 4 > steps,
+            "only {folded_steps} of {steps} steps read a running fold"
+        );
+    }
+
+    fn float_value(rng: &mut Rng) -> Value {
+        let values = [1e16, -1e16, 1.0, 0.1, 3.0e-5, 2.5, -0.0, 0.0, -7.25];
+        Value::Float64(values[rng.below(values.len() as u64) as usize])
+    }
+
+    fn int_value(rng: &mut Rng) -> Value {
+        match rng.below(3) {
+            0 => Value::Int64(-(rng.below(1_000) as i64)),
+            _ => Value::UInt64(rng.below(1_000)),
+        }
+    }
+
+    /// Near `U256::MAX`, so that the saturating sum saturates.
+    fn big_value(rng: &mut Rng) -> Value {
+        let big = match rng.below(3) {
+            0 => ethnum::U256::MAX - ethnum::U256::from(rng.below(1_000)),
+            _ => ethnum::U256::from(rng.below(1_000)),
+        };
+        Value::Uint256(big.to_be_bytes())
+    }
+
+    fn fresh_sum(agg: &SumAgg) -> Value {
+        let total = agg
+            .blocks
+            .values()
+            .copied()
+            .fold(agg.finalized, NumAccum::add);
+        total.to_value()
+    }
+
+    fn fresh_avg(agg: &AvgAgg) -> Value {
+        let seed = (agg.finalized_sum, agg.finalized_count);
+        avg_value(agg.blocks.values().copied().fold(seed, add_sum_count))
+    }
+
+    fn fresh_min(agg: &MinAgg) -> Value {
+        let min = agg.blocks.values().copied().fold(agg.finalized, min_into);
+        min.map_or(Value::Null, NumAccum::to_value)
+    }
+
+    fn fresh_max(agg: &MaxAgg) -> Value {
+        let max = agg.blocks.values().copied().fold(agg.finalized, max_into);
+        max.map_or(Value::Null, NumAccum::to_value)
+    }
+
+    #[test]
+    fn running_fold_sum_matches_fresh_fold() {
+        check_running_fold(|| SumAgg::new(&ColumnType::Float64), float_value, fresh_sum);
+        check_running_fold(|| SumAgg::new(&ColumnType::Int64), int_value, fresh_sum);
+        check_running_fold(|| SumAgg::new(&ColumnType::Uint256), big_value, fresh_sum);
+    }
+
+    #[test]
+    fn running_fold_count_matches_fresh_fold() {
+        let fresh =
+            |agg: &CountAgg| Value::UInt64(agg.finalized + agg.blocks.values().sum::<u64>());
+        check_running_fold(CountAgg::new, float_value, fresh);
+    }
+
+    #[test]
+    fn running_fold_avg_matches_fresh_fold() {
+        check_running_fold(|| AvgAgg::new(&ColumnType::Float64), float_value, fresh_avg);
+        check_running_fold(|| AvgAgg::new(&ColumnType::Uint256), big_value, fresh_avg);
+    }
+
+    #[test]
+    fn running_fold_min_max_match_fresh_fold() {
+        check_running_fold(|| MinAgg::new(&ColumnType::Float64), float_value, fresh_min);
+        check_running_fold(|| MaxAgg::new(&ColumnType::Float64), float_value, fresh_max);
+        check_running_fold(|| MinAgg::new(&ColumnType::Uint256), big_value, fresh_min);
+        check_running_fold(|| MaxAgg::new(&ColumnType::Int64), int_value, fresh_max);
     }
 }
