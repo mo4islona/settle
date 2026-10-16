@@ -136,6 +136,10 @@ harness = false
 name = "profile_backfill"
 harness = false
 
+[[bench]]
+name = "tip_rocks"
+harness = false
+
 [profile.bench]
 debug = true
 

@@ -80,7 +80,8 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    let dir = tempfile::tempdir().unwrap();
+    // In target/, on the disk: /tmp can be tmpfs, where fsync costs nothing.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let cfg = Config::with_data_dir(SCHEMA, dir.path().to_str().unwrap())
         .backfill_checkpoint_interval(interval);
     let mut db = Settle::open(cfg).unwrap();

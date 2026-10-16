@@ -257,7 +257,8 @@ fn make_config(schema: &str, backend: Backend) -> (Config, Option<tempfile::Temp
     match backend {
         Backend::Memory => (Config::new(schema), None),
         Backend::RocksDb => {
-            let dir = tempfile::tempdir().unwrap();
+            // In target/, on the disk: /tmp can be tmpfs, where fsync costs nothing.
+            let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
             let cfg = Config::with_data_dir(schema, dir.path().to_str().unwrap());
             (cfg, Some(dir))
         }
