@@ -22,6 +22,7 @@ struct MemoryInner {
     mv_states: BTreeMap<(String, Vec<u8>), Vec<u8>>,
     /// meta:{key} -> value bytes
     meta: BTreeMap<String, Vec<u8>>,
+    block_hashes: BTreeMap<BlockNumber, String>,
 }
 
 impl MemoryBackend {
@@ -33,6 +34,7 @@ impl MemoryBackend {
                 reducer_finalized: BTreeMap::new(),
                 mv_states: BTreeMap::new(),
                 meta: BTreeMap::new(),
+                block_hashes: BTreeMap::new(),
             }),
         }
     }
@@ -275,6 +277,15 @@ impl StorageBackend for MemoryBackend {
         Ok(inner.meta.get(key).cloned())
     }
 
+    fn get_block_hashes(&self) -> Result<Vec<(BlockNumber, String)>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .block_hashes
+            .iter()
+            .map(|(&block, hash)| (block, hash.clone()))
+            .collect())
+    }
+
     // --- Atomic batch commit ---
 
     fn commit(&self, batch: &StorageWriteBatch) -> Result<()> {
@@ -318,6 +329,12 @@ impl StorageBackend for MemoryBackend {
                             inner.raw.remove(&k);
                         }
                     }
+                }
+                BatchOp::PutBlockHash { block, hash } => {
+                    inner.block_hashes.insert(*block, hash.clone());
+                }
+                BatchOp::DeleteBlockHash { block } => {
+                    inner.block_hashes.remove(block);
                 }
             }
         }

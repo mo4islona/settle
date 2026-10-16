@@ -37,6 +37,13 @@ pub enum BatchOp {
         table: String,
         after_block: BlockNumber,
     },
+    PutBlockHash {
+        block: BlockNumber,
+        hash: String,
+    },
+    DeleteBlockHash {
+        block: BlockNumber,
+    },
 }
 
 /// A collection of operations to be committed atomically.
@@ -94,6 +101,17 @@ impl StorageWriteBatch {
             table: table.to_string(),
             after_block,
         });
+    }
+
+    pub fn put_block_hash(&mut self, block: BlockNumber, hash: &str) {
+        self.ops.push(BatchOp::PutBlockHash {
+            block,
+            hash: hash.to_string(),
+        });
+    }
+
+    pub fn delete_block_hash(&mut self, block: BlockNumber) {
+        self.ops.push(BatchOp::DeleteBlockHash { block });
     }
 }
 
@@ -577,6 +595,11 @@ pub trait StorageBackend: Send + Sync {
 
     fn put_meta(&self, key: &str, value: &[u8]) -> Result<()>;
     fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>>;
+
+    // --- Block hashes (written only through `commit`) ---
+
+    /// Every stored block hash, in block order.
+    fn get_block_hashes(&self) -> Result<Vec<(BlockNumber, String)>>;
 
     // --- Bulk operations ---
 

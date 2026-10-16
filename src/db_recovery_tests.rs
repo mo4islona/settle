@@ -4,6 +4,7 @@
 
 use super::test_helpers::*;
 use super::*;
+use crate::storage::BatchOp;
 use crate::test_helpers::{cursor, ingest_with_finalized_no_ack};
 use crate::types::{ChangeOp, Value};
 use std::sync::atomic::Ordering;
@@ -521,9 +522,52 @@ fn legacy_watermark_above_latest_does_not_hide_new_blocks() {
     assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(30));
 }
 
-/// Every ingest writes the block hashes. Under deferral the hashes between
-/// the durable block and finality must not pile up there: only the durable
-/// block's hash, which a reopen needs, stays below finality.
+/// At the tip an ingest writes the hash of its block and deletes the hash
+/// that falls below finality; the hashes of the rollback chain that did not
+/// change are not written again.
+#[test]
+fn tip_ingest_writes_only_changed_block_hashes() {
+    let mut db = reopen(SUM_SCHEMA, &Arc::new(MemoryBackend::new()), 1);
+    let ingest = |db: &mut Settle, block: BlockNumber| {
+        let finalized = block.saturating_sub(10);
+        let mut row = swap(block, "ETH", 1);
+        row.insert("block_number".into(), Value::UInt64(block));
+        let input = IngestInput {
+            data: HashMap::from([("swaps".to_string(), vec![row])]),
+            rollback_chain: (finalized + 1..=block).map(cursor).collect(),
+            finalized_head: cursor(finalized),
+        };
+        db.ingest(input).unwrap().unwrap()
+    };
+
+    for block in 1..50 {
+        let batch = ingest(&mut db, block);
+        db.ack(batch.sequence).unwrap();
+    }
+    ingest(&mut db, 50);
+
+    let ops = &db.pending.back().unwrap().write_batch.ops;
+    let puts: Vec<BlockNumber> = ops
+        .iter()
+        .filter_map(|op| match op {
+            BatchOp::PutBlockHash { block, .. } => Some(*block),
+            _ => None,
+        })
+        .collect();
+    let deletes: Vec<BlockNumber> = ops
+        .iter()
+        .filter_map(|op| match op {
+            BatchOp::DeleteBlockHash { block } => Some(*block),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(puts, [50]);
+    assert_eq!(deletes, [39]);
+}
+
+/// Under deferral the hashes between the durable block and finality must not
+/// pile up: only the durable block's hash, which a reopen needs, stays below
+/// finality.
 #[test]
 fn deferral_keeps_only_the_durable_hash_below_finality() {
     let storage = Arc::new(MemoryBackend::new());
@@ -956,6 +1000,17 @@ fn check_history(schema: &str, interval: u64, forks: bool, seed: u64, steps: usi
         log.push(format!("{op:?}"));
 
         if let Op::Reopen = op {
+            // Every batch is acked: storage holds the hashes in memory.
+            if !reopened.is_poisoned() {
+                let stored: BTreeMap<_, _> = storage.get_block_hashes().unwrap().into_iter().collect();
+                assert_eq!(
+                    &stored,
+                    reopened.engine.block_hashes(),
+                    "seed {seed}, interval {interval}: stored hashes after\n{}",
+                    log.join("\n")
+                );
+            }
+
             drop(reopened);
             reopened = reopen(schema, &storage, interval);
             continue;
