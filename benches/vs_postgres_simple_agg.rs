@@ -9,14 +9,19 @@
 //! straight from the input, so Settle reads `transfers` as a VIRTUAL TABLE:
 //! a stored one would keep a second copy and emit change records nobody reads.
 //!
+//! The `,pipe` rows let two batches wait for their ack: Settle ingests batch
+//! N+1 while another thread applies batch N to PG, so the total is about the
+//! slower side instead of the sum of both.
+//!
 //! Run with: `cargo bench --bench vs_postgres_simple_agg` (Docker required)
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use settle::db::{Config, Settle};
 use settle::reducer_runtime::fn_reducer::FnReducerRuntime;
-use settle::test_helpers::{ingest_blocks, ingest_with_finalized};
+use settle::test_helpers::{ingest_blocks, ingest_with_finalized, ingest_with_finalized_no_ack};
 use settle::types::{ChangeBatch, ChangeRecord, RowMap, Value};
 use tokio_postgres::types::ToSql;
 
@@ -147,31 +152,33 @@ impl Storage {
 
 /// Build a config. `checkpoint_interval > 1` enables backfill persist-deferral
 /// (only effective on no-lag ingest with a deferral-safe pipeline — no external
-/// reducer, no sliding-window MV).
+/// reducer, no sliding-window MV). `depth` batches may wait for their ack.
 fn make_cfg(
     schema: &str,
     storage: Storage,
     checkpoint_interval: u64,
+    depth: usize,
 ) -> (Config, Option<tempfile::TempDir>) {
-    match storage {
-        Storage::Memory => (
-            Config::new(schema).backfill_checkpoint_interval(checkpoint_interval),
-            None,
-        ),
+    let (cfg, dir) = match storage {
+        Storage::Memory => (Config::new(schema), None),
         Storage::Rocks => {
             let dir = tempfile::tempdir().unwrap();
-            let cfg = Config::with_data_dir(schema, dir.path().to_str().unwrap())
-                .backfill_checkpoint_interval(checkpoint_interval);
+            let cfg = Config::with_data_dir(schema, dir.path().to_str().unwrap());
             (cfg, Some(dir))
         }
-    }
+    };
+    let cfg = cfg
+        .backfill_checkpoint_interval(checkpoint_interval)
+        .max_pending_batches(depth);
+    (cfg, dir)
 }
 
 fn open_settle_db_fn(
     storage: Storage,
     checkpoint_interval: u64,
+    depth: usize,
 ) -> anyhow::Result<(Settle, Option<tempfile::TempDir>)> {
-    let (cfg, dir) = make_cfg(SETTLE_SCHEMA_FN, storage, checkpoint_interval);
+    let (cfg, dir) = make_cfg(SETTLE_SCHEMA_FN, storage, checkpoint_interval, depth);
     let mut db = Settle::open(cfg)?;
     db.register_reducer_callback("user_balance", Box::new(balance_reducer()))?;
     Ok((db, dir))
@@ -180,8 +187,9 @@ fn open_settle_db_fn(
 fn open_settle_db_eventrules(
     storage: Storage,
     checkpoint_interval: u64,
+    depth: usize,
 ) -> anyhow::Result<(Settle, Option<tempfile::TempDir>)> {
-    let (cfg, dir) = make_cfg(SETTLE_SCHEMA_ER, storage, checkpoint_interval);
+    let (cfg, dir) = make_cfg(SETTLE_SCHEMA_ER, storage, checkpoint_interval, depth);
     let db = Settle::open(cfg)?;
     Ok((db, dir))
 }
@@ -189,8 +197,9 @@ fn open_settle_db_eventrules(
 fn open_settle_db_mv_only(
     storage: Storage,
     checkpoint_interval: u64,
+    depth: usize,
 ) -> anyhow::Result<(Settle, Option<tempfile::TempDir>)> {
-    let (cfg, dir) = make_cfg(SETTLE_SCHEMA_MV, storage, checkpoint_interval);
+    let (cfg, dir) = make_cfg(SETTLE_SCHEMA_MV, storage, checkpoint_interval, depth);
     let db = Settle::open(cfg)?;
     Ok((db, dir))
 }
@@ -409,6 +418,82 @@ fn run_settle_pg_timed(
     Ok(settle_total)
 }
 
+/// `run_settle_pg_timed` with the PG side on another thread: Settle ingests
+/// the next batch while PG applies the one before. Returns the time spent
+/// inside Settle (ingest and ack) and the time PG was busy.
+fn run_settle_pg_pipelined(
+    db: &mut Settle,
+    pg: &PgRuntime,
+    rows: &[RowMap],
+    no_lag: bool,
+    depth: usize,
+) -> anyhow::Result<(Duration, Duration)> {
+    let (batch_tx, batch_rx) = mpsc::channel::<(u64, &[RowMap], ChangeBatch)>();
+    let (applied_tx, applied_rx) = mpsc::channel::<anyhow::Result<u64>>();
+
+    std::thread::scope(|scope| {
+        let applier = scope.spawn(move || {
+            let mut busy = Duration::ZERO;
+            for (block_no, chunk, batch) in batch_rx {
+                let t = Instant::now();
+                let applied = pg_insert_transfers(pg, block_no, chunk)
+                    .and_then(|()| pg_upsert_balances_from_changes(pg, batch.records_for("balances")))
+                    .map(|()| batch.sequence);
+                busy += t.elapsed();
+                if applied_tx.send(applied).is_err() {
+                    break;
+                }
+            }
+            busy
+        });
+
+        let mut settle_total = Duration::ZERO;
+        let mut ack = |db: &mut Settle, applied: anyhow::Result<u64>| -> anyhow::Result<()> {
+            let sequence = applied?;
+            let t = Instant::now();
+            db.ack(sequence)?;
+            settle_total += t.elapsed();
+            Ok(())
+        };
+
+        let mut block_no = 1u64;
+        let mut ingest_time = Duration::ZERO;
+        for chunk in rows.chunks(BATCH_SIZE) {
+            while let Ok(applied) = applied_rx.try_recv() {
+                ack(db, applied)?;
+            }
+            while db.unacked_batches() >= depth {
+                ack(db, applied_rx.recv()?)?;
+            }
+
+            let items: Vec<(String, u64, Vec<RowMap>)> = split_blocks(chunk, block_no)
+                .into_iter()
+                .map(|(b, c)| ("transfers".to_string(), b, c.to_vec()))
+                .collect();
+            let batch_tip = items.iter().map(|(_, b, _)| *b).max().unwrap_or(block_no);
+            let finalized = if no_lag { batch_tip } else { db.finalized_block() };
+
+            let t = Instant::now();
+            let batch = ingest_with_finalized_no_ack(db, items, finalized)?.expect("non-empty batch");
+            ingest_time += t.elapsed();
+
+            batch_tx
+                .send((block_no, chunk, batch))
+                .map_err(|_| anyhow::anyhow!("PG applier stopped"))?;
+            block_no += BLOCKS_PER_BATCH as u64;
+        }
+
+        drop(batch_tx);
+        while db.is_awaiting_ack() {
+            ack(db, applied_rx.recv()?)?;
+        }
+        drop(ack);
+
+        let pg_busy = applier.join().expect("applier thread");
+        Ok((settle_total + ingest_time, pg_busy))
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     let rows: Vec<RowMap> = (0..TOTAL_ROWS)
         .map(|i| gen_transfer(i, NUM_USERS))
@@ -471,46 +556,38 @@ fn main() -> anyhow::Result<()> {
         (",fin", true, 1),
         (",backfill", true, 1000),
     ];
+    type Open = fn(Storage, u64, usize) -> anyhow::Result<(Settle, Option<tempfile::TempDir>)>;
+    let styles: [(&str, Open); 3] = [
+        ("fn", open_settle_db_fn),
+        ("er", open_settle_db_eventrules),
+        ("mv", open_settle_db_mv_only),
+    ];
+    // Depth 1 acks each batch before the next ingest; depth 2 overlaps the
+    // two sides.
     for (tag, pre_finalized, interval) in modes {
         for storage in [Storage::Memory, Storage::Rocks] {
-            // FnReducer
-            {
-                let (mut db, _dir) = open_settle_db_fn(storage, interval)?;
-                let pg = PgRuntime::start()?;
-                pg.batch_execute(PG_SCHEMA)?;
-                pg.take_stats();
-                let t = Instant::now();
-                let settle_t = run_settle_pg_timed(&mut db, &pg, &rows, pre_finalized)?;
-                let total = t.elapsed();
-                let label = format!("settle_fn[{}{tag}]_then_pg", storage.label());
-                print_result_split(&label, TOTAL_ROWS, total, settle_t, pg.take_stats());
-                check_pg_state(&pg, &label)?;
-            }
-            // EventRules
-            {
-                let (mut db, _dir) = open_settle_db_eventrules(storage, interval)?;
-                let pg = PgRuntime::start()?;
-                pg.batch_execute(PG_SCHEMA)?;
-                pg.take_stats();
-                let t = Instant::now();
-                let settle_t = run_settle_pg_timed(&mut db, &pg, &rows, pre_finalized)?;
-                let total = t.elapsed();
-                let label = format!("settle_er[{}{tag}]_then_pg", storage.label());
-                print_result_split(&label, TOTAL_ROWS, total, settle_t, pg.take_stats());
-                check_pg_state(&pg, &label)?;
-            }
-            // MV-only (no reducer)
-            {
-                let (mut db, _dir) = open_settle_db_mv_only(storage, interval)?;
-                let pg = PgRuntime::start()?;
-                pg.batch_execute(PG_SCHEMA)?;
-                pg.take_stats();
-                let t = Instant::now();
-                let settle_t = run_settle_pg_timed(&mut db, &pg, &rows, pre_finalized)?;
-                let total = t.elapsed();
-                let label = format!("settle_mv[{}{tag}]_then_pg", storage.label());
-                print_result_split(&label, TOTAL_ROWS, total, settle_t, pg.take_stats());
-                check_pg_state(&pg, &label)?;
+            for (style, open) in styles {
+                for depth in [1, 2] {
+                    let (mut db, _dir) = open(storage, interval, depth)?;
+                    let pg = PgRuntime::start()?;
+                    pg.batch_execute(PG_SCHEMA)?;
+                    pg.take_stats();
+
+                    let pipe = if depth > 1 { ",pipe" } else { "" };
+                    let label = format!("settle_{style}[{}{tag}{pipe}]_then_pg", storage.label());
+                    let t = Instant::now();
+                    let settle_t = if depth > 1 {
+                        let (settle_t, pg_busy) =
+                            run_settle_pg_pipelined(&mut db, &pg, &rows, pre_finalized, depth)?;
+                        eprintln!("  [pipe] {label:<28}  pg busy={:>6.3}s", pg_busy.as_secs_f64());
+                        settle_t
+                    } else {
+                        run_settle_pg_timed(&mut db, &pg, &rows, pre_finalized)?
+                    };
+                    let total = t.elapsed();
+                    print_result_split(&label, TOTAL_ROWS, total, settle_t, pg.take_stats());
+                    check_pg_state(&pg, &label)?;
+                }
             }
         }
     }

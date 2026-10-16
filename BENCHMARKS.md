@@ -402,11 +402,35 @@ balances as a multi-row `VALUES` upsert, which cost it 15–17% of the total.
 | `settle_mv[rocks,fin]` | 0.934s | 0.224s | 0.710s | 107K | finality at each batch tip |
 | `settle_mv[rocks,backfill]` | 0.917s | 0.184s | 0.733s | 109K | `,fin` + persist deferral |
 
+**Pipelined acks** (`,pipe` rows, 2026-10-16, same server, mean of two runs).
+With two unacked batches (`max_pending_batches`, default 2), Settle ingests
+batch N+1 while another thread applies batch N to PG and sends back its
+sequence for `ack`. The serial rows set it to 1. In this run `pg_only_batch`
+took 0.734s.
+
+| Variant | Serial total | Pipelined total | vs `pg_only_batch` | PG busy |
+|---|---:|---:|---:|---:|
+| `settle_mv[mem]` | 0.853s | 0.774s | 1.16× → 1.05× | 0.713s |
+| `settle_mv[rocks]` | 0.837s | 0.763s | 1.14× → 1.04× | 0.707s |
+| `settle_fn[mem]` | 0.904s | 0.784s | 1.23× → 1.07× | 0.714s |
+| `settle_fn[rocks]` | 0.943s | 0.796s | 1.28× → 1.08× | 0.731s |
+| `settle_er[mem]` | 0.932s | 0.790s | 1.27× → 1.07× | 0.722s |
+| `settle_er[rocks]` | 0.940s | 0.782s | 1.28× → 1.07× | 0.712s |
+| `settle_fn[rocks,fin]` | 1.190s | 0.808s | 1.62× → 1.10× | 0.732s |
+| `settle_er[rocks,fin]` | 1.196s | 0.808s | 1.63× → 1.10× | 0.730s |
+| `settle_mv[rocks,fin]` | 0.935s | 0.780s | 1.27× → 1.06× | 0.722s |
+| `settle_mv[rocks,backfill]` | 0.857s | 0.774s | 1.17× → 1.05× | 0.713s |
+
 **Findings**:
 - The PG part of each Settle variant equals `pg_only_batch`, so the whole gap is
   Settle's own time.
-- That time adds to the PG time: a consumer acks a batch before the next ingest,
-  so Settle and PG never overlap. Only more than one batch in flight can hide it.
+- With one batch in flight that time adds to the PG time: a consumer acks a
+  batch before the next ingest, so Settle and PG never overlap. With two, PG is
+  busy for as long as in `pg_only_batch` and hides Settle's time; what remains
+  is the first batch, which PG cannot overlap, and the last ack. Settle's own
+  time grows by up to 40% next to the PG thread, but stays hidden.
+- 3 and 5 unacked batches measure the same as 2 (±2%, `mv` and `fn`, tip and
+  `,fin`): with PG always busy, a longer queue has nothing to hide.
 - Each batch touches each user once (5000 rows, 5000 keys), so Settle removes no
   PG rows here. Parity is the ceiling for this workload.
 - The MV-only pipeline is the cheapest; a reducer costs about 2× its Settle time.
@@ -419,21 +443,57 @@ Moving-average cost basis. 1 reducer (`position`, GROUP BY user+token) feeds 3 M
 
 Settle uses `CREATE VIRTUAL TABLE` for `trades` (raw not persisted in Settle — see Engine TODOs).
 
-| Variant | Total | settle | pg | rows/s | pg_writes | pg_rows_w | pg_reads | pg_rows_r |
-|---|---|---|---|---|---|---|---|---|
-| `pg_only_smart` | 3.16s | — | 3.16s | 32K | 80 | 400,000 | 60 | 160,000 |
-| `settle_fn[mem]` | 5.11s | 2.71s | 2.40s | 20K | 66 | 330,000 | 0 | 0 |
-| `settle_fn[rocks]` | 5.73s | 3.41s | 2.33s | 17K | 66 | 330,000 | 0 | 0 |
-| `settle_fn[mem,fin]` | 5.11s | 2.72s | 2.39s | 20K | 66 | 330,000 | 0 | 0 |
-| `settle_fn[rocks,fin]` | 5.88s | 3.45s | 2.43s | 17K | 66 | 330,000 | 0 | 0 |
-
 PG-only uses the realistic scalable pattern: load **only the exact aggregate state for keys touched in this batch** (`WHERE (user, token) IN unnest(...)`, similarly for day), apply moving-avg math in Rust, UPSERT back.
 
+2026-10-16, same server, mean of three runs. PG-only and the serial Settle
+rows commit one transaction per batch of 5000 trades:
+
+| Variant | Total | PG busy | pg_rows_w | pg_rows_r |
+|---|---:|---:|---:|---:|
+| `pg_raw_only` (trades only, no MV) | 0.756s | 0.756s | 100,000 | 0 |
+| `pg_only_smart` | 3.022s | 3.022s | 400,000 | 160,000 |
+| `pg_only_smart[x4]` (4 batches per transaction) | 2.211s | 2.211s | 300,000 | 60,000 |
+
+Settle totals, and the factor against `pg_only_smart`:
+
+| Variant | Settle time | Serial | `,pipe` | `,pipe,q4` | `,pipe,x4` |
+|---|---:|---:|---:|---:|---:|
+| `settle_fn[mem]` | 0.58–0.63s | 2.842s (1.06×) | 2.293s (1.32×) | 2.047s (1.48×) | 2.083s (1.45×) |
+| `settle_fn[rocks]` | 0.59–0.65s | 2.900s (1.04×) | 2.345s (1.29×) | 2.061s (1.47×) | 2.110s (1.43×) |
+| `settle_fn[mem,fin]` | 0.89–1.01s | 3.282s (0.92×) | 2.362s (1.28×) | 2.260s (1.34×) | 2.197s (1.38×) |
+| `settle_fn[rocks,fin]` | 1.05–1.18s | 3.489s (0.87×) | 2.409s (1.25×) | 2.268s (1.33×) | 2.237s (1.35×) |
+| PG busy | | | 2.11–2.17s | 1.85–2.02s | 1.80–1.85s |
+| pg_rows_w | | 330,000 | 330,000 | 285,000–300,000 | 280,000 |
+
+- **Serial** acks each batch before the next ingest (`max_pending_batches = 1`).
+- **`,pipe`**: another thread applies each batch to PG in its own
+  transaction; two batches may wait for their ack (the default).
+- **`,pipe,q4`**: the PG thread takes up to 4 batches that already wait,
+  keeps the last record per key and acks the newest (acks are cumulative).
+  It does not wait for more batches, so it adds no delay while PG keeps up.
+- **`,pipe,x4`**: the same, but the PG thread waits for 4 batches. It commits
+  as often as `pg_only_smart[x4]`.
+
 **Findings**:
-- **Settle architecturally avoids 160K reads** (0 reads vs PG's 160K) and 17% fewer writes.
-- **PG wins on wall time by 1.6×** anyway: PG B-tree seek per row + state update is faster than Settle's per-row reducer + 3 MV pipeline dispatch.
-- Settle's bottleneck is **CPU on reducer + 3 MVs** (~2.7s of 5.1s), not I/O.
-- Adding more projections (1 → 3 MVs) made PG win **more**, not less: PG just runs 2 more cheap SELECTs+UPSERTs, Settle runs 2 more full MV pipelines.
+- The table that was here before (Settle 2.7s of 5.1s, PG-only 1.6× faster) is
+  out of date: Settle's own time is now 0.6s at the tip and up to 1.2s with
+  `rocks,fin`.
+- Serial, Settle's time adds to its PG time: 1.04–1.06× faster than PG-only at
+  the tip, 0.87–0.92× with `,fin`.
+- With `,pipe`, PG is busy for 2.1s of the 2.3–2.4s total and hides Settle's
+  time: 1.25–1.32× faster than PG-only. The Settle rows write 330K rows to PG
+  and read nothing; PG-only writes 400K rows and reads 160K.
+- PG time follows the rows written: 0.75s for the 100K trades, which every
+  variant writes, and about 6µs for each MV row. In a pipelined run, faster
+  Settle code does not make the total shorter; fewer PG rows do.
+- The merge removes 50K of the 230K MV rows: in this data each batch touches
+  each user once and each day is new, so only positions and totals repeat.
+  PG busy goes from 2.1s to 1.8s. The same 4-batch transactions with no merge
+  measured 2.2s, so the gain comes from the rows, not from fewer commits.
+- At the same transaction size PG-only gains as much: `pg_only_smart[x4]`
+  (2.21s) against `settle_fn[...,pipe,x4]` (2.08–2.24s) is 0.99–1.06×.
+- `,q4` merged less with `,fin` (7 transactions instead of 6, 300K rows): Settle
+  is slower there, so fewer batches wait.
 
 ### Honest summary across all workloads
 
@@ -442,12 +502,12 @@ For each workload pair (PG vs best Settle [mem]):
 | Workload | Settle/PG ratio | Settle wins? |
 |---|---|---|
 | Raw passthrough | 1.3–1.7× slower | No — Settle adds overhead, removes nothing |
-| Simple aggregation | 1.16× slower (vs PG batch) | No — the same PG writes plus Settle's time; parity at best |
-| Stateful PnL (3 projections) | 1.6× slower | No on wall time, **yes on I/O** (0 reads, fewer writes) |
+| Simple aggregation | 1.04–1.11× slower (vs PG batch) with pipelined acks, 1.14–1.63× without | No — the same PG writes; parity at best |
+| Stateful PnL (3 projections) | 1.25–1.32× faster with pipelined acks, 0.87–1.06× serial; 0.99–1.06× when both sides commit every 4 batches | Yes, by the PG work it removes: 0 reads, fewer rows written |
 
-**Settle does not beat well-written Postgres on these workloads.** Period.
+**Settle beats well-written Postgres only where it removes PG work.** In the stateful workload it reads nothing back and writes fewer rows; with the same work on both sides (raw passthrough, simple aggregation) it is at parity at best.
 
-PG's batched SQL (multi-row INSERT, `unnest+GROUP BY ON CONFLICT`, `WHERE (a,b) IN unnest(...)`) extracts most of the wins that an in-memory streaming reducer could give. Settle's per-row reducer abstractions (FnReducer dispatch, HashMap-keyed emits, MV `compute_output` × `prev+current` per touched group per batch, BTreeMap-per-block agg state) add CPU overhead larger than the I/O savings on small-state workloads.
+PG's batched SQL (multi-row INSERT, `unnest+GROUP BY ON CONFLICT`, `WHERE (a,b) IN unnest(...)`) extracts most of the wins that an in-memory streaming reducer could give. With pipelined acks Settle's CPU time hides behind the PG writes, so the total depends on the PG work each side does; serial, Settle's per-row reducer and MV overhead adds to it.
 
 ### Where Settle's value actually lies (not measured here)
 
