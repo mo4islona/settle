@@ -325,6 +325,9 @@ enum Scale {
     MinMax,
     /// A window wider than the batch, so no block expires.
     SlidingLast,
+    /// `sum` in a window wider than the batch, then one block whose timestamp
+    /// expires every other block of the group at once.
+    SlidingJump,
 }
 
 impl Scale {
@@ -333,9 +336,10 @@ impl Scale {
             Scale::Sum => "sum(value) AS total",
             Scale::MinMax => "min(value) AS lo, max(value) AS hi",
             Scale::SlidingLast => "last(value) AS latest",
+            Scale::SlidingJump => "sum(value) AS total",
         };
         let window = match self {
-            Scale::SlidingLast => "WINDOW SLIDING INTERVAL 1 DAY BY ts",
+            Scale::SlidingLast | Scale::SlidingJump => "WINDOW SLIDING INTERVAL 1 DAY BY ts",
             Scale::Sum | Scale::MinMax => "",
         };
 
@@ -357,24 +361,29 @@ impl Scale {
 fn prepare_scale(scale: Scale, blocks: u64) -> &'static mut Prepared {
     init_bench_process();
 
-    let rows = (1..=blocks)
-        .map(|block| {
-            HashMap::from([
-                ("block_number".into(), Value::UInt64(block)),
-                (
-                    "ts".into(),
-                    Value::DateTime(1_700_000_000_000 + block as i64 * 1000),
-                ),
-                ("pair".into(), Value::String("hot".into())),
-                ("value".into(), Value::Float64((block * 7919 % 1000) as f64)),
-            ])
-        })
-        .collect();
+    let row = |block: u64, seconds: u64| {
+        HashMap::from([
+            ("block_number".into(), Value::UInt64(block)),
+            (
+                "ts".into(),
+                Value::DateTime(1_700_000_000_000 + seconds as i64 * 1000),
+            ),
+            ("pair".into(), Value::String("hot".into())),
+            ("value".into(), Value::Float64((block * 7919 % 1000) as f64)),
+        ])
+    };
+
+    let mut rows: Vec<RowMap> = (1..=blocks).map(|block| row(block, block)).collect();
+    let mut last = blocks;
+    if let Scale::SlidingJump = scale {
+        last += 1;
+        rows.push(row(last, blocks + 2 * 86_400));
+    }
 
     let input = IngestInput {
         data: HashMap::from([("ticks".to_string(), rows)]),
         rollback_chain: Vec::new(),
-        finalized_head: cursor(blocks),
+        finalized_head: cursor(last),
     };
 
     Box::leak(Box::new(Prepared {
@@ -393,6 +402,9 @@ fn prepare_scale(scale: Scale, blocks: u64) -> &'static mut Prepared {
 #[bench::sliding_last_2k(args = (Scale::SlidingLast, 2_000), setup = prepare_scale)]
 #[bench::sliding_last_4k(args = (Scale::SlidingLast, 4_000), setup = prepare_scale)]
 #[bench::sliding_last_8k(args = (Scale::SlidingLast, 8_000), setup = prepare_scale)]
+#[bench::sliding_jump_2k(args = (Scale::SlidingJump, 2_000), setup = prepare_scale)]
+#[bench::sliding_jump_4k(args = (Scale::SlidingJump, 4_000), setup = prepare_scale)]
+#[bench::sliding_jump_8k(args = (Scale::SlidingJump, 8_000), setup = prepare_scale)]
 fn scale(case: &'static mut Prepared) -> usize {
     ingest_all(case)
 }
