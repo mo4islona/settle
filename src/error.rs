@@ -31,7 +31,7 @@ pub enum Error {
     #[error("wrong ack sequence: expected {expected}, got {got}")]
     WrongAckSequence { expected: u64, got: u64 },
 
-    #[error("instance poisoned by a previous failure ({0}); drop and reopen")]
+    #[error("instance poisoned by a previous failure ({0}); ack the applied batches, then drop and reopen")]
     Poisoned(String),
 }
 

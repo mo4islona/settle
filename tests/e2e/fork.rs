@@ -103,11 +103,10 @@ async fn fork_compensating_ops_roll_back_target() {
     );
 }
 
-/// Caller has an unacked batch in-flight and was already in the middle of
-/// applying it to Postgres when a fork notification arrives. The fork
-/// attempt must error with `PendingAck`; caller acks the pending batch
-/// first, then handles the fork on the just-committed state and applies
-/// the compensating batch.
+/// Caller has an unacked batch in-flight and already applied it to Postgres
+/// when a fork notification arrives. `handle_fork` rolls back from the state
+/// after that batch; the caller applies the compensating batch after it, and
+/// one ack commits both.
 #[tokio::test(flavor = "multi_thread")]
 async fn fork_during_pending_full_workflow() {
     let mut pg = start_pg().await;
@@ -135,23 +134,12 @@ async fn fork_during_pending_full_workflow() {
         cursor_with_hash(2, "0xfork_2"),
         cursor_with_hash(1, "0x0000000000000001"),
     ];
-    match db.handle_fork(fork_chain.clone()) {
-        Ok(_) => panic!("expected PendingAck, got Ok"),
-        Err(settle::error::Error::PendingAck { sequence, .. }) => {
-            assert_eq!(sequence, b2.sequence);
-        }
-        Err(e) => panic!("expected PendingAck, got {e:?}"),
-    }
-
-    // Caller acks first (PG already has block 2 applied — safe).
-    db.ack(b2.sequence).unwrap();
-
-    // Now handle_fork operates on the committed state — rolls block 2 back.
-    let fork = db.handle_fork(fork_chain).expect("handle_fork after ack");
+    let fork = db.handle_fork(fork_chain).expect("handle_fork with b2 unacked");
     assert_eq!(fork.cursor.number, 1);
     let comp = fork.batch.expect("rollback of block 2 produces compensation");
     apply_batch(&mut pg.client, &comp).await.expect("apply comp");
-    db.ack(comp.sequence).expect("ack fork");
+    db.ack(comp.sequence).expect("ack covers b2 and the fork");
+    assert!(!db.is_awaiting_ack());
 
     // PG reflects block-1-only state.
     assert_eq!(pg_row(&pg.client, ASSET_A).await, Some((10, 1)));

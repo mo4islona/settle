@@ -112,6 +112,31 @@ if (batch) {
 }
 ```
 
+## Acks and durability
+
+`ingest()` and `handle_fork()` return a change batch. Apply it to the target,
+then call `ack(batch.sequence)`: only then does its state reach disk. A reopen
+goes back to the last acked batch, so the target must apply batches
+idempotently.
+
+By default two batches may wait for their ack, so the next blocks can be
+ingested while the target still applies the batch before. That is enough to
+keep one target busy; `max_pending_batches` (`maxPendingBatches` in
+TypeScript) changes it, and 1 makes `ingest()` wait for every ack:
+
+- Apply every batch, in sequence order. A fork's compensating batch undoes
+  the state after all the batches before it, acked or not.
+- Acks are cumulative: `ack(n)` commits every batch up to `n`.
+- A call that returns no batch while batches wait takes a place too: its
+  writes commit with the newest batch. `unacked_batches()` counts these
+  places.
+- When `unacked_batches()` reaches `max_pending_batches`, `ingest()` and
+  `handle_fork()` return `PendingAck`. Reducer registration and replay need
+  every batch acked.
+- After an error that poisons the instance, `ack()` still works. Ack the
+  batches that the target applied, then drop and reopen: a reopen goes back
+  to the last acked batch, and a later fork cannot undo the others.
+
 ## Storage Backends
 
 - **Memory** — Default. No persistence, data lost on restart.
