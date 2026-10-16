@@ -208,11 +208,16 @@ pub fn decode_state(bytes: &[u8]) -> RowMap {
 pub fn encode_values(values: &[Value]) -> StateBytes {
     let capacity = 4 + values.iter().map(encoded_len_hint).sum::<usize>();
     let mut buf = Vec::with_capacity(capacity);
+    write_values(&mut buf, values);
+    buf
+}
+
+/// [`encode_values`] appended to `buf`.
+pub fn write_values(buf: &mut Vec<u8>, values: &[Value]) {
     buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
     for v in values {
-        encode_value(&mut buf, v);
+        encode_value(buf, v);
     }
-    buf
 }
 
 /// Decode a positional list of `Value`s encoded by [`encode_values`].

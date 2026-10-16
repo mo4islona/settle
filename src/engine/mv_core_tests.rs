@@ -607,10 +607,6 @@ fn finalize_persists_groups_of_finalized_blocks_only() {
     mv.process_block(1, &[pool_row("A", 1.0)]);
     mv.process_block(2, &[pool_row("B", 2.0)]);
     mv.process_block(3, &[pool_row("A", 3.0), pool_row("C", 3.0)]);
-    assert!(
-        mv.dirty_groups.is_empty(),
-        "non-sliding MVs do not track touched groups"
-    );
 
     let batch = finalize_and_commit(&mut mv, &storage, 1, true);
     assert_eq!(persisted_pools(&batch), vec![Value::String("A".into())]);

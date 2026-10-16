@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{BlockNumber, Value};
@@ -185,6 +186,34 @@ pub trait AggregationFunc: Send + Sync {
     /// Return the block numbers that have unfinalized contributions.
     /// Used for rebuilding block_groups from persisted sliding window state.
     fn block_numbers(&self) -> Vec<BlockNumber>;
+
+    /// Append the data of `block` to `out`: false, with nothing written, if
+    /// the aggregate holds none.
+    fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool;
+
+    /// Add the data of `block` that `write_block` wrote.
+    fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()>;
+}
+
+fn write_entry<V: Serialize>(
+    blocks: &BTreeMap<BlockNumber, V>,
+    block: BlockNumber,
+    out: &mut Vec<u8>,
+) -> bool {
+    let Some(value) = blocks.get(&block) else {
+        return false;
+    };
+    rmp_serde::encode::write(out, value).expect("block data serializes");
+    true
+}
+
+fn read_entry<V: DeserializeOwned>(
+    blocks: &mut BTreeMap<BlockNumber, V>,
+    block: BlockNumber,
+    bytes: &[u8],
+) -> Option<()> {
+    blocks.insert(block, rmp_serde::from_slice(bytes).ok()?);
+    Some(())
 }
 
 fn move_entry<V>(
@@ -436,6 +465,15 @@ impl AggregationFunc for SumAgg {
     fn block_numbers(&self) -> Vec<BlockNumber> {
         self.blocks.keys().copied().collect()
     }
+
+    fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
+        write_entry(&self.blocks, block, out)
+    }
+
+    fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()> {
+        self.running = None;
+        read_entry(&mut self.blocks, block, bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +593,15 @@ impl AggregationFunc for CountAgg {
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
         self.blocks.keys().copied().collect()
+    }
+
+    fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
+        write_entry(&self.blocks, block, out)
+    }
+
+    fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()> {
+        self.running = None;
+        read_entry(&mut self.blocks, block, bytes)
     }
 }
 
@@ -686,6 +733,15 @@ impl AggregationFunc for MinAgg {
     fn block_numbers(&self) -> Vec<BlockNumber> {
         self.blocks.keys().copied().collect()
     }
+
+    fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
+        write_entry(&self.blocks, block, out)
+    }
+
+    fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()> {
+        self.running = None;
+        read_entry(&mut self.blocks, block, bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +871,15 @@ impl AggregationFunc for MaxAgg {
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
         self.blocks.keys().copied().collect()
+    }
+
+    fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
+        write_entry(&self.blocks, block, out)
+    }
+
+    fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()> {
+        self.running = None;
+        read_entry(&mut self.blocks, block, bytes)
     }
 }
 
@@ -974,6 +1039,15 @@ impl AggregationFunc for AvgAgg {
     fn block_numbers(&self) -> Vec<BlockNumber> {
         self.blocks.keys().copied().collect()
     }
+
+    fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
+        write_entry(&self.blocks, block, out)
+    }
+
+    fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()> {
+        self.running = None;
+        read_entry(&mut self.blocks, block, bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,6 +1137,14 @@ impl AggregationFunc for FirstAgg {
     fn block_numbers(&self) -> Vec<BlockNumber> {
         self.blocks.keys().copied().collect()
     }
+
+    fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
+        write_entry(&self.blocks, block, out)
+    }
+
+    fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()> {
+        read_entry(&mut self.blocks, block, bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,6 +1226,14 @@ impl AggregationFunc for LastAgg {
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
         self.blocks.keys().copied().collect()
+    }
+
+    fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
+        write_entry(&self.blocks, block, out)
+    }
+
+    fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()> {
+        read_entry(&mut self.blocks, block, bytes)
     }
 }
 

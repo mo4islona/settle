@@ -330,10 +330,6 @@ impl Settle {
         // Replay the blocks above the durable checkpoint to rebuild
         // reducer/MV in-memory state; without a checkpoint, every block.
         let durable = engine.durable_block();
-        if let Some(durable) = durable {
-            engine.discard_unfinalized_window_state(durable);
-        }
-
         let replay_from = durable.map_or(0, |d| d + 1);
         let latest = engine.latest_block();
         if latest >= replay_from {

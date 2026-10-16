@@ -118,13 +118,6 @@ impl BlockTimes {
     }
 }
 
-impl From<BTreeMap<BlockNumber, i64>> for BlockTimes {
-    fn from(by_block: BTreeMap<BlockNumber, i64>) -> Self {
-        let by_ts = by_block.iter().map(|(&block, &ts)| (ts, block)).collect();
-        Self { by_block, by_ts }
-    }
-}
-
 impl Deref for BlockTimes {
     type Target = BTreeMap<BlockNumber, i64>;
 
@@ -163,14 +156,15 @@ pub struct MVEngine {
     /// Sliding windows only: the expired blocks, by the block that expired
     /// them.
     expired: BTreeMap<BlockNumber, Vec<ExpiredBlock>>,
+    /// Sliding windows only: the blocks that storage lacks. Storage holds
+    /// the window as of the last finality advance, so these are the blocks
+    /// applied since, mostly above it.
+    unstored: BTreeSet<BlockNumber>,
+    /// Sliding windows only: the storage writes of the finality advances
+    /// since the last checkpoint, in order.
+    window_writes: Vec<WindowWrite>,
     /// Group keys removed since the last checkpoint (for storage cleanup).
     removed_groups: Vec<GroupKey>,
-    /// Sliding windows only: groups touched since the last
-    /// `advance_finality`, whose full per-block state must be re-persisted.
-    /// Unchanged groups already have their state on disk. Non-sliding MVs
-    /// persist only finalized state, which changes when a group's blocks are
-    /// finalized, not when it is touched: see `finalize_blocks_up_to`.
-    dirty_groups: FxHashSet<GroupKey>,
     /// Group keys whose stored state changed since the last checkpoint, which
     /// `write_checkpoint` persists. Under backfill deferral keys wait here for
     /// several finalizations. See docs/backfill-mode-design.md.
@@ -273,74 +267,91 @@ impl MVEngine {
             })
             .collect();
 
-        // Restore finalized MV state from storage
-        let mut groups: FxHashMap<GroupKey, Vec<Box<dyn AggregationFunc>>> = FxHashMap::default();
-
-        if let Ok(group_keys) = storage.list_mv_group_keys(&def.name) {
-            for gk_bytes in group_keys {
-                if let Ok(Some(state_bytes)) = storage.get_mv_state(&def.name, &gk_bytes) {
-                    if let Some(aggs) = deserialize_mv_group(&state_bytes, &agg_funcs) {
-                        let group_key = storage::decode_group_key(&gk_bytes);
-                        groups.insert(group_key, aggs);
-                    }
-                }
-            }
-        }
-
-        let sliding_window = def.sliding_window.clone();
-        let mut block_times = BlockTimes::default();
-        let mut block_groups: BTreeMap<BlockNumber, FxHashSet<GroupKey>> = BTreeMap::new();
-        let mut expired = BTreeMap::new();
-
-        // Restore sliding window metadata from storage
-        if sliding_window.is_some() {
-            let meta_key = format!("mv_block_times:{}", def.name);
-            if let Ok(Some(bt_bytes)) = storage.get_meta(&meta_key) {
-                if let Ok(bt) = rmp_serde::from_slice::<BTreeMap<BlockNumber, i64>>(&bt_bytes) {
-                    block_times = BlockTimes::from(bt);
-                }
-            }
-
-            if let Ok(Some(bytes)) = storage.get_meta(&expired_meta_key(&def.name)) {
-                expired = decode_expired(&bytes, &agg_funcs).unwrap_or_default();
-            }
-
-            // Rebuild block_groups from restored agg state (union of all aggs'
-            // block numbers, since different agg types may track different blocks)
-            for (group_key, aggs) in &groups {
-                for agg in aggs {
-                    for block in agg.block_numbers() {
-                        block_groups
-                            .entry(block)
-                            .or_default()
-                            .insert(group_key.clone());
-                    }
-                }
-            }
-        }
-
-        let current_watermark = block_times.max_ts().unwrap_or(0);
-
-        MVEngine {
+        let mut mv = MVEngine {
+            sliding_window: def.sliding_window.clone(),
             def,
             output_columns,
             agg_funcs,
             agg_count,
             agg_feeds,
             group_key_extractors,
-            groups,
-            block_groups,
+            groups: FxHashMap::default(),
+            block_groups: BTreeMap::new(),
             storage,
-            sliding_window,
-            block_times,
-            current_watermark,
-            expired,
+            block_times: BlockTimes::default(),
+            current_watermark: 0,
+            expired: BTreeMap::new(),
+            unstored: BTreeSet::new(),
+            window_writes: Vec::new(),
             removed_groups: Vec::new(),
-            dirty_groups: FxHashSet::default(),
             pending_durable: FxHashSet::default(),
             ingest_touched: Touched::default(),
             emit_order: Vec::new(),
+        };
+        if mv.sliding_window.is_some() {
+            mv.restore_window();
+        } else {
+            mv.restore_groups();
         }
+        mv
+    }
+
+    /// Load the finalized state of each group.
+    fn restore_groups(&mut self) {
+        let Ok(group_keys) = self.storage.list_mv_group_keys(&self.def.name) else {
+            return;
+        };
+        for gk_bytes in group_keys {
+            if let Ok(Some(state_bytes)) = self.storage.get_mv_state(&self.def.name, &gk_bytes)
+                && let Some(aggs) = deserialize_mv_group(&state_bytes, &self.agg_funcs)
+            {
+                self.groups.insert(storage::decode_group_key(&gk_bytes), aggs);
+            }
+        }
+    }
+
+    /// Load the window as of the durable block, which `write_checkpoint`
+    /// stores block by block.
+    fn restore_window(&mut self) {
+        let Ok(keys) = self.storage.list_mv_group_keys(&self.def.name) else {
+            return;
+        };
+        for key in keys {
+            let Ok(Some(record)) = self.storage.get_mv_state(&self.def.name, &key) else {
+                continue;
+            };
+            let Some(block) = key.try_into().ok().map(BlockNumber::from_be_bytes) else {
+                continue;
+            };
+            self.read_window_record(block, &record);
+        }
+        self.current_watermark = self.block_times.max_ts().unwrap_or(0);
+    }
+
+    /// Add the block of a record that `window_record` wrote.
+    fn read_window_record(&mut self, block: BlockNumber, record: &[u8]) -> Option<()> {
+        let mut pos = 0;
+        let ts = read_u64(record, &mut pos)? as i64;
+        let group_count = read_u32(record, &mut pos)?;
+        self.block_times.insert(block, ts);
+
+        for _ in 0..group_count {
+            let group_key = storage::decode_group_key(read_slice(record, &mut pos)?);
+            if !self.groups.contains_key(&group_key) {
+                let aggs = self.create_agg_vec();
+                self.groups.insert(group_key.clone(), aggs);
+            }
+
+            let aggs = self.groups.get_mut(&group_key).unwrap();
+            for agg in aggs {
+                let data = read_slice(record, &mut pos)?;
+                if !data.is_empty() {
+                    agg.read_block(block, data)?;
+                }
+            }
+            self.block_groups.entry(block).or_default().insert(group_key);
+        }
+        Some(())
     }
 
     pub fn name(&self) -> &str {
@@ -352,9 +363,7 @@ impl MVEngine {
     }
 
     /// Whether this MV uses a sliding window. Sliding-window MVs are excluded
-    /// from backfill persist-deferral (block_times + per-block agg data form an
-    /// atomic unit; deferring them would corrupt window replay — see
-    /// docs/backfill-mode-design.md).
+    /// from backfill persist-deferral: see docs/backfill-mode-design.md.
     pub fn is_sliding(&self) -> bool {
         self.sliding_window.is_some()
     }
@@ -418,6 +427,7 @@ impl MVEngine {
                 // so the block still participates in expiry rather than leaking.
                 .unwrap_or(self.current_watermark);
             self.block_times.insert(block, block_max_ts);
+            self.unstored.insert(block);
             if block_max_ts > self.current_watermark {
                 self.current_watermark = block_max_ts;
             }
@@ -478,6 +488,7 @@ impl MVEngine {
         // block from the aggregates, so a block that fed no aggregate has a
         // time and no groups.
         let rolled_back_times = self.block_times.split_off(fork_point + 1);
+        self.unstored.split_off(&(fork_point + 1));
 
         if rolled_back.is_empty() && unexpired.is_empty() && rolled_back_times.is_empty() {
             return Vec::new();
@@ -549,31 +560,89 @@ impl MVEngine {
 
     /// Merge the blocks up to `block` into finalized state. The groups whose
     /// stored state changed wait in `pending_durable` for `write_checkpoint`.
-    /// A sliding window stores its blocks final or not, so it queues the groups
-    /// touched since the last call instead.
+    /// A sliding window keeps its blocks apart until they expire, final or
+    /// not; it queues the storage writes that move the stored window to
+    /// `block` instead.
     pub fn advance_finality(&mut self, block: BlockNumber) {
         debug_assert!(
             self.ingest_touched.groups.is_empty(),
             "finality advanced with the changes of an ingest not taken"
         );
 
-        let changed = if self.sliding_window.is_some() {
-            // No fork can go below `block` now, so these blocks stay expired.
-            self.expired = match block.checked_add(1) {
-                Some(after) => self.expired.split_off(&after),
-                None => BTreeMap::new(),
-            };
-            std::mem::take(&mut self.dirty_groups)
+        if self.sliding_window.is_some() {
+            self.advance_window(block);
         } else {
-            self.finalize_blocks_up_to(block)
+            let changed = self.finalize_blocks_up_to(block);
+            self.pending_durable.extend(changed);
+        }
+    }
+
+    /// Queue the writes that turn the stored window as of the previous
+    /// advance into the window as of `block`: the blocks that became final,
+    /// unless a final block expired them, and the deletion of the stored
+    /// blocks that a block now final expired. A block expired by a block
+    /// above `block` stays stored: a fork can bring it back.
+    fn advance_window(&mut self, block: BlockNumber) {
+        let (newly_final, expired_final) = match block.checked_add(1) {
+            Some(after) => {
+                let unstored = self.unstored.split_off(&after);
+                let expired = self.expired.split_off(&after);
+                (
+                    std::mem::replace(&mut self.unstored, unstored),
+                    std::mem::replace(&mut self.expired, expired),
+                )
+            }
+            None => (
+                std::mem::take(&mut self.unstored),
+                std::mem::take(&mut self.expired),
+            ),
         };
-        self.pending_durable.extend(changed);
+
+        for &b in &newly_final {
+            let Some(&ts) = self.block_times.get(&b) else {
+                continue; // Expired: in `self.expired` or `expired_final`.
+            };
+            let keys = self.block_groups.get(&b).into_iter().flatten();
+            let groups = keys.filter_map(|key| Some((key, self.groups.get(key)?.as_slice())));
+            let record = window_record(b, ts, groups);
+            self.window_writes.push(WindowWrite::Put(b, record));
+        }
+
+        // The window as of `block` still holds these.
+        for expired in self.expired.values().flatten() {
+            if newly_final.contains(&expired.block) {
+                let groups = expired.groups.iter().map(|(key, aggs)| (key, aggs.as_slice()));
+                let record = window_record(expired.block, expired.ts, groups);
+                self.window_writes.push(WindowWrite::Put(expired.block, record));
+            }
+        }
+
+        // No fork can go below `block` now, so these blocks stay expired.
+        for expired in expired_final.into_values().flatten() {
+            if !newly_final.contains(&expired.block) {
+                self.window_writes.push(WindowWrite::Delete(expired.block));
+            }
+        }
     }
 
     /// Write the stored state of every group in `pending_durable`, and delete
     /// the groups that emptied.
     pub fn write_checkpoint(&mut self, batch: &mut StorageWriteBatch) {
-        let is_sliding = self.sliding_window.is_some();
+        if self.sliding_window.is_some() {
+            for write in self.window_writes.drain(..) {
+                match write {
+                    WindowWrite::Put(block, record) => {
+                        batch.put_mv_state(&self.def.name, block.to_be_bytes().to_vec(), record);
+                    }
+                    WindowWrite::Delete(block) => {
+                        batch.delete_mv_state(&self.def.name, &block.to_be_bytes());
+                    }
+                }
+            }
+            // A window stores blocks, not groups.
+            self.removed_groups.clear();
+            return;
+        }
 
         for group_key in std::mem::take(&mut self.pending_durable) {
             let aggs = match self.groups.get(&group_key) {
@@ -581,23 +650,7 @@ impl MVEngine {
                 None => continue, // removed meanwhile (handled below)
             };
             let gk_bytes = storage::encode_group_key(&group_key);
-            let state_bytes = if is_sliding {
-                serialize_mv_group_full(aggs)
-            } else {
-                serialize_mv_group(aggs)
-            };
-            batch.put_mv_state(&self.def.name, gk_bytes, state_bytes);
-        }
-
-        // Persist block_times for sliding windows
-        if is_sliding {
-            let bt_bytes = rmp_serde::to_vec(&*self.block_times)
-                .expect("block_times serialization should not fail");
-            batch.put_meta(&format!("mv_block_times:{}", self.def.name), &bt_bytes);
-
-            // Reopen rolls the window back to the durable block, which must
-            // bring back the blocks that later blocks expired.
-            batch.put_meta(&expired_meta_key(&self.def.name), &encode_expired(&self.expired));
+            batch.put_mv_state(&self.def.name, gk_bytes, serialize_mv_group(aggs));
         }
 
         // Delete stale groups from storage. Membership-wins reconcile: only
@@ -738,9 +791,8 @@ impl MVEngine {
         output
     }
 
-    /// Emit one change per touched group against its snapshot, and mark a
-    /// sliding-window group dirty for the next checkpoint. Output rows are
-    /// built only for the groups whose values changed.
+    /// Emit one change per touched group against its snapshot. Output rows
+    /// are built only for the groups whose values changed.
     fn emit_changes(&mut self, touched: Touched) -> Vec<ChangeRecord> {
         debug_assert!(!touched.existence_only);
         let Touched {
@@ -809,10 +861,6 @@ impl MVEngine {
                     self.groups.remove(&key);
                 }
             }
-
-            if self.sliding_window.is_some() {
-                self.dirty_groups.insert(key);
-            }
         }
 
         if touched.capacity() <= EMIT_ORDER_KEEP {
@@ -834,10 +882,6 @@ impl MVEngine {
                 if at.is_some() {
                     self.removed_groups.push(key.clone());
                 }
-            }
-
-            if self.sliding_window.is_some() {
-                self.dirty_groups.insert(key);
             }
         }
     }
@@ -927,17 +971,6 @@ fn write_mv_group(
     buf.push(0);
 }
 
-/// Serialize an MV group's full state (finalized + per-block) for sliding window persistence.
-fn serialize_mv_group_full(aggs: &[Box<dyn AggregationFunc>]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(16 + aggs.len() * 24);
-    write_mv_group(
-        &mut buf,
-        |a, out| out.extend_from_slice(&a.to_bytes()),
-        aggs,
-    );
-    buf
-}
-
 /// Serialize an MV group's finalized aggregation state for persistence.
 fn serialize_mv_group(aggs: &[Box<dyn AggregationFunc>]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(16 + aggs.len() * 24);
@@ -985,66 +1018,64 @@ fn deserialize_mv_group(
     Some(aggs)
 }
 
-fn expired_meta_key(mv_name: &str) -> String {
-    format!("mv_expired_blocks:{mv_name}")
+// A sliding window is stored as of the last finality advance, one record per
+// block under the view's name. All groups of a block expire together, and a
+// final block changes only by expiry, so a record is written once and
+// deleted once.
+//   key:    block: u64 BE
+//   record: ts: i64 LE, groups: u32 LE, per group: len: u32 LE +
+//           `encode_group_key`, per agg: len: u32 LE + `write_block` bytes
+//           (len 0: no data)
+
+enum WindowWrite {
+    Put(BlockNumber, Vec<u8>),
+    Delete(BlockNumber),
 }
 
-// Expired blocks layout:
-//   count: u32 LE
-//   per block: expired_by: u64 LE, block: u64 LE, ts: i64 LE, groups: u32 LE
-//   per group: len: u32 LE + `encode_group_key`, len: u32 LE + `write_mv_group` layout
+/// The record of `block`: its time and the data that each group holds of it.
+fn window_record<'a>(
+    block: BlockNumber,
+    ts: i64,
+    groups: impl Iterator<Item = (&'a GroupKey, &'a [Box<dyn AggregationFunc>])>,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&ts.to_le_bytes());
+    let count_at = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());
 
-fn encode_expired(expired: &BTreeMap<BlockNumber, Vec<ExpiredBlock>>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let count = expired.values().map(Vec::len).sum::<usize>() as u32;
-    buf.extend_from_slice(&count.to_le_bytes());
+    // A group with no data in the block, e.g. one fed only NULLs, is left
+    // out: a reopen would restore it as a group with no data, which a group
+    // in memory never is, and its next row would update instead of insert.
+    let mut count = 0u32;
+    for (key, aggs) in groups {
+        let group_at = buf.len();
+        write_len_prefixed(&mut buf, |buf| storage::write_values(buf, key));
 
-    for (expired_by, blocks) in expired {
-        for expired in blocks {
-            buf.extend_from_slice(&expired_by.to_le_bytes());
-            buf.extend_from_slice(&expired.block.to_le_bytes());
-            buf.extend_from_slice(&expired.ts.to_le_bytes());
-            buf.extend_from_slice(&(expired.groups.len() as u32).to_le_bytes());
+        let mut has_data = false;
+        for agg in aggs {
+            write_len_prefixed(&mut buf, |buf| {
+                has_data |= agg.write_block(block, buf);
+            });
+        }
 
-            for (key, aggs) in &expired.groups {
-                write_slice(&mut buf, &storage::encode_group_key(key));
-                write_slice(&mut buf, &serialize_mv_group_full(aggs));
-            }
+        if has_data {
+            count += 1;
+        } else {
+            buf.truncate(group_at);
         }
     }
+
+    buf[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
     buf
 }
 
-fn decode_expired(
-    bytes: &[u8],
-    agg_funcs: &[AggFunc],
-) -> Option<BTreeMap<BlockNumber, Vec<ExpiredBlock>>> {
-    let mut pos = 0usize;
-    let mut expired: BTreeMap<BlockNumber, Vec<ExpiredBlock>> = BTreeMap::new();
-
-    for _ in 0..read_u32(bytes, &mut pos)? {
-        let expired_by = read_u64(bytes, &mut pos)?;
-        let block = read_u64(bytes, &mut pos)?;
-        let ts = read_u64(bytes, &mut pos)? as i64;
-
-        let mut groups = Vec::new();
-        for _ in 0..read_u32(bytes, &mut pos)? {
-            let key = storage::decode_group_key(read_slice(bytes, &mut pos)?);
-            let aggs = deserialize_mv_group(read_slice(bytes, &mut pos)?, agg_funcs)?;
-            groups.push((key, aggs));
-        }
-
-        expired
-            .entry(expired_by)
-            .or_default()
-            .push(ExpiredBlock { block, ts, groups });
-    }
-    Some(expired)
-}
-
-fn write_slice(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(bytes);
+/// Append a u32 LE length, then what `write` appends.
+fn write_len_prefixed(buf: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>)) {
+    let len_at = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    write(buf);
+    let len = (buf.len() - len_at - 4) as u32;
+    buf[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
 }
 
 fn read_slice<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {

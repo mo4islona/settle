@@ -182,7 +182,7 @@ construction) when it contains either:
 | Pipeline feature | Defer? | Why |
 |---|:---:|---|
 | reducer (Lua/EventRules) + tumbling MV | ✅ on | running aggregate is replayable from raw rows |
-| **sliding-window MV** | ❌ off | `block_times` meta + per-block agg data form one atomic unit; splitting their persist watermark corrupts window replay |
+| **sliding-window MV** | ❌ off | not tested with deferral. The window is stored as of each finality advance, one record per block, and each checkpoint writes only the blocks that changed, so deferral would save little |
 | **external reducer** (`LANGUAGE EXTERNAL`) | ❌ off | recovery replay *skips* external reducers (no host callback at `open()`), so deferred state could never be rebuilt |
 
 Confirmed live in `vs_postgres_simple_agg`: the `settle_fn` (external) rows do
