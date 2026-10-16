@@ -114,8 +114,8 @@ The `scaling` group ingests one batch of N blocks with one row each, all in one
 group, with finality at the batch tip. A linear engine doubles the count when N
 doubles. Before the running fold, `sum` and `min`/`max` read every unfinalized
 block of the group on each block. `sliding_last` keeps a window wider than the
-batch, so no block expires, and each block scans all the block times of the
-window.
+batch, so no block expires; before the timestamp index of the window, each
+block scanned all the block times of the window.
 
 | Case | 2K blocks | 4K | 8K | Per doubling |
 |---|---:|---:|---:|---:|
@@ -123,7 +123,8 @@ window.
 | `sum` | 52M | 105M | 210M | ×2.0 |
 | `minmax`, before the running fold | 406M | 1,550M | 6,058M | ×3.8–3.9 |
 | `minmax` | 36M | 74M | 151M | ×2.0 |
-| `sliding_last` | 137M | 444M | 1,566M | ×3.2–3.5 |
+| `sliding_last`, before the timestamp index | 137M | 445M | 1,568M | ×3.2–3.5 |
+| `sliding_last` | 53M | 109M | 218M | ×2.0 |
 
 Each case leaves its profiles under `target/gungraun/settle/instructions/ingest/<mode>.<workload>/`.
 `callgrind_annotate --inclusive=yes callgrind.<mode>.<workload>.out` shows where

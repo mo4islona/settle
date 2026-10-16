@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Deref;
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -66,6 +67,68 @@ struct ExpiredBlock {
     groups: Vec<(GroupKey, Vec<Box<dyn AggregationFunc>>)>,
 }
 
+/// The max timestamp (ms) of each block in a sliding window, indexed by block
+/// and by timestamp, so that expiry finds the blocks below the cutoff without
+/// a scan of the window. Block timestamps need not grow with the block number.
+#[derive(Default)]
+struct BlockTimes {
+    by_block: BTreeMap<BlockNumber, i64>,
+    by_ts: BTreeSet<(i64, BlockNumber)>,
+}
+
+impl BlockTimes {
+    fn insert(&mut self, block: BlockNumber, ts: i64) {
+        if let Some(old) = self.by_block.insert(block, ts) {
+            self.by_ts.remove(&(old, block));
+        }
+        self.by_ts.insert((ts, block));
+    }
+
+    /// Remove and return the blocks from `block` up.
+    fn split_off(&mut self, block: BlockNumber) -> BTreeMap<BlockNumber, i64> {
+        let removed = self.by_block.split_off(&block);
+        for (&block, &ts) in &removed {
+            self.by_ts.remove(&(ts, block));
+        }
+        removed
+    }
+
+    /// Remove and return the blocks with a timestamp below `cutoff`, in block
+    /// order.
+    fn take_older_than(&mut self, cutoff: i64) -> Vec<(BlockNumber, i64)> {
+        let mut taken = Vec::new();
+        while let Some(&(ts, block)) = self.by_ts.first()
+            && ts < cutoff
+        {
+            self.by_ts.pop_first();
+            self.by_block.remove(&block);
+            taken.push((block, ts));
+        }
+
+        taken.sort_unstable();
+        taken
+    }
+
+    fn max_ts(&self) -> Option<i64> {
+        self.by_ts.last().map(|&(ts, _)| ts)
+    }
+}
+
+impl From<BTreeMap<BlockNumber, i64>> for BlockTimes {
+    fn from(by_block: BTreeMap<BlockNumber, i64>) -> Self {
+        let by_ts = by_block.iter().map(|(&block, &ts)| (ts, block)).collect();
+        Self { by_block, by_ts }
+    }
+}
+
+impl Deref for BlockTimes {
+    type Target = BTreeMap<BlockNumber, i64>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_block
+    }
+}
+
 /// Manages a single materialized view: GROUP BY routing, aggregation, rollback, changes.
 pub struct MVEngine {
     def: MVDef,
@@ -90,7 +153,7 @@ pub struct MVEngine {
     sliding_window: Option<SlidingWindowDef>,
     /// Block number → max timestamp (ms) seen in that block.
     /// Only populated when sliding_window is Some.
-    block_times: BTreeMap<BlockNumber, i64>,
+    block_times: BlockTimes,
     /// The maximum timestamp seen across all blocks (the "watermark").
     current_watermark: i64,
     /// Sliding windows only: the expired blocks, by the block that expired
@@ -213,7 +276,7 @@ impl MVEngine {
         }
 
         let sliding_window = def.sliding_window.clone();
-        let mut block_times: BTreeMap<BlockNumber, i64> = BTreeMap::new();
+        let mut block_times = BlockTimes::default();
         let mut block_groups: BTreeMap<BlockNumber, FxHashSet<GroupKey>> = BTreeMap::new();
         let mut expired = BTreeMap::new();
 
@@ -222,7 +285,7 @@ impl MVEngine {
             let meta_key = format!("mv_block_times:{}", def.name);
             if let Ok(Some(bt_bytes)) = storage.get_meta(&meta_key) {
                 if let Ok(bt) = rmp_serde::from_slice::<BTreeMap<BlockNumber, i64>>(&bt_bytes) {
-                    block_times = bt;
+                    block_times = BlockTimes::from(bt);
                 }
             }
 
@@ -244,7 +307,7 @@ impl MVEngine {
             }
         }
 
-        let current_watermark = block_times.values().copied().max().unwrap_or(0);
+        let current_watermark = block_times.max_ts().unwrap_or(0);
 
         MVEngine {
             def,
@@ -374,7 +437,7 @@ impl MVEngine {
         // Not covered by `rolled_back`: a reopen rebuilds the groups of a
         // block from the aggregates, so a block that fed no aggregate has a
         // time and no groups.
-        let rolled_back_times = self.block_times.split_off(&(fork_point + 1));
+        let rolled_back_times = self.block_times.split_off(fork_point + 1);
 
         if rolled_back.is_empty() && unexpired.is_empty() && rolled_back_times.is_empty() {
             return Vec::new();
@@ -400,7 +463,7 @@ impl MVEngine {
 
         if self.sliding_window.is_some() {
             self.restore_expired(unexpired, fork_point, &mut touched);
-            self.current_watermark = self.block_times.values().copied().max().unwrap_or(0);
+            self.current_watermark = self.block_times.max_ts().unwrap_or(0);
         }
 
         // Emit changes (updates or deletes)
@@ -483,7 +546,7 @@ impl MVEngine {
 
         // Persist block_times for sliding windows
         if is_sliding {
-            let bt_bytes = rmp_serde::to_vec(&self.block_times)
+            let bt_bytes = rmp_serde::to_vec(&*self.block_times)
                 .expect("block_times serialization should not fail");
             batch.put_meta(&format!("mv_block_times:{}", self.def.name), &bt_bytes);
 
@@ -534,17 +597,8 @@ impl MVEngine {
         let window_ms = (sw.interval_seconds as i64).saturating_mul(1000);
         let cutoff = self.current_watermark - window_ms;
 
-        // Find all blocks with timestamp < cutoff (strict less-than: boundary is inclusive).
-        // Scan is bounded by window size since expired blocks are removed each round.
-        let expired_blocks: Vec<(BlockNumber, i64)> = self
-            .block_times
-            .iter()
-            .filter(|(_, ts)| **ts < cutoff)
-            .map(|(block, ts)| (*block, *ts))
-            .collect();
-
-        for (block, ts) in expired_blocks {
-            self.block_times.remove(&block);
+        // Strict less-than: a block at the cutoff stays in the window.
+        for (block, ts) in self.block_times.take_older_than(cutoff) {
             let keys = self.block_groups.remove(&block).unwrap_or_default();
 
             let mut groups = Vec::with_capacity(keys.len());
