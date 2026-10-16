@@ -45,13 +45,17 @@ enum GroupKeyExtractor {
     Window(String, u64),
 }
 
-/// The groups that one block (or rollback) touched, each with its aggregation
-/// values from before the change. The values of all groups share one Vec,
-/// `agg_count` per group in `agg_index` order, so a snapshot allocates nothing.
+const EMIT_ORDER_KEEP: usize = 8192;
+
+/// The groups that the blocks of an ingest (or a rollback) touched, each with
+/// its aggregation values from before the change. The values of all groups
+/// share one Vec, `agg_count` per group in `agg_index` order, so a snapshot
+/// allocates nothing.
 #[derive(Default)]
 struct Touched {
-    /// Offset of the group's values in `prev`; None if the group did not exist.
-    groups: FxHashMap<GroupKey, Option<usize>>,
+    /// Per group: the order of its first touch, and the offset of its values
+    /// in `prev` (None if the group did not exist).
+    groups: FxHashMap<GroupKey, (usize, Option<usize>)>,
     prev: Vec<Value>,
     /// Record only whether each group existed, for a caller with no use for
     /// change records. A value reads all unfinalized blocks of its group.
@@ -175,6 +179,10 @@ pub struct MVEngine {
     /// values from before it. `take_changes` emits one record per group: the
     /// change buffer would merge the records of each block into that anyway.
     ingest_touched: Touched,
+    /// The touched groups of an emit in first-touch order, kept between
+    /// emits up to `EMIT_ORDER_KEEP` entries so that a usual emit allocates
+    /// nothing for its sort; a larger buffer would hold its memory.
+    emit_order: Vec<(GroupKey, (usize, Option<usize>))>,
 }
 
 impl MVEngine {
@@ -331,6 +339,7 @@ impl MVEngine {
             dirty_groups: FxHashSet::default(),
             pending_durable: FxHashSet::default(),
             ingest_touched: Touched::default(),
+            emit_order: Vec::new(),
         }
     }
 
@@ -694,7 +703,8 @@ impl MVEngine {
             }
             at
         });
-        touched.groups.insert(group_key.clone(), at);
+        let order = touched.groups.len();
+        touched.groups.insert(group_key.clone(), (order, at));
     }
 
     /// The output row of a group: its key columns plus `agg_values`, which
@@ -734,14 +744,19 @@ impl MVEngine {
     fn emit_changes(&mut self, touched: Touched) -> Vec<ChangeRecord> {
         debug_assert!(!touched.existence_only);
         let Touched {
-            groups: touched,
-            mut prev,
-            ..
+            groups, mut prev, ..
         } = touched;
+
+        // In first-touch order, not hash order: keys that arrive together stay
+        // together, and a target's index applies them faster that way.
+        let mut touched = std::mem::take(&mut self.emit_order);
+        touched.extend(groups);
+        touched.sort_unstable_by_key(|(_, (order, _))| *order);
+
         let mut changes = Vec::with_capacity(touched.len());
         let mut current: Vec<Value> = Vec::with_capacity(self.agg_count);
 
-        for (key, at) in touched {
+        for (key, (_, at)) in touched.drain(..) {
             current.clear();
             // False once the group has no data left (all aggs empty) or is gone.
             let has_data = match self.groups.get(&key) {
@@ -800,12 +815,15 @@ impl MVEngine {
             }
         }
 
+        if touched.capacity() <= EMIT_ORDER_KEEP {
+            self.emit_order = touched;
+        }
         changes
     }
 
     /// The state changes of `emit_changes`, without its change records.
     fn drop_empty_groups(&mut self, touched: Touched) {
-        for (key, at) in touched.groups {
+        for (key, (_, at)) in touched.groups {
             let has_data = self
                 .groups
                 .get(&key)
