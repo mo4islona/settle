@@ -198,7 +198,7 @@ const META_BLOCK_HASHES: &str = "block_hashes";
 const META_NEXT_SEQUENCE: &str = "next_sequence";
 
 /// Whether the database holds data: every commit of an ingest or a fork
-/// writes one of these keys.
+/// writes one of these keys. Versions before format 2 wrote `block_hashes`.
 fn has_data(storage: &dyn StorageBackend) -> Result<bool> {
     for key in [
         META_LATEST_BLOCK,
@@ -321,11 +321,7 @@ impl Settle {
             );
             engine.set_finalized_block(block);
         }
-        if let Some(bytes) = storage.get_meta(META_BLOCK_HASHES)? {
-            let hashes: BTreeMap<BlockNumber, String> = serde_json::from_slice(&bytes)
-                .map_err(|e| Error::Storage(format!("corrupt block_hashes metadata: {e}")))?;
-            engine.restore_block_hashes(hashes);
-        }
+        engine.restore_block_hashes(storage.get_block_hashes()?.into_iter().collect());
 
         // Replay the blocks above the durable checkpoint to rebuild
         // reducer/MV in-memory state; without a checkpoint, every block.
@@ -699,7 +695,7 @@ impl Settle {
             .collect();
         self.engine.set_rollback_chain(&chain);
 
-        self.append_meta_to_batch(&mut write_batch)?;
+        self.append_meta_to_batch(&mut write_batch);
 
         self.buffer.push(
             changes,
@@ -906,7 +902,7 @@ impl Settle {
         if checkpoint {
             self.engine.write_checkpoint(&mut write_batch);
         }
-        self.append_meta_to_batch(&mut write_batch)?;
+        self.append_meta_to_batch(&mut write_batch);
 
         // 4. Update buffer heads with correct cursors (hashes now stored)
         self.buffer
@@ -1124,8 +1120,8 @@ impl Settle {
         self.guard_no_pending()
     }
 
-    /// Append engine metadata (latest_block, durable watermark, block_hashes)
-    /// and the stamp to a write batch for atomic commit.
+    /// Append engine metadata (latest_block, durable watermark, the block
+    /// hashes that changed) and the stamp to a write batch for atomic commit.
     ///
     /// `META_FINALIZED_BLOCK` stores the engine's DURABLE watermark, not the
     /// in-memory finality watermark. Under backfill deferral the two diverge:
@@ -1138,18 +1134,20 @@ impl Settle {
     /// stays absent until data is durable, and recovery then replays from 0.
     /// `META_LATEST_BLOCK` stays absent until a block exists: a stored 0 reads
     /// back as block 0.
-    fn append_meta_to_batch(&self, batch: &mut StorageWriteBatch) -> Result<()> {
+    fn append_meta_to_batch(&mut self, batch: &mut StorageWriteBatch) {
         if let Some(latest) = self.engine.latest_block_if_any() {
             batch.put_meta(META_LATEST_BLOCK, &latest.to_be_bytes());
         }
         if let Some(durable) = self.engine.durable_block() {
             batch.put_meta(META_FINALIZED_BLOCK, &durable.to_be_bytes());
         }
-        let hashes_json = serde_json::to_vec(self.engine.block_hashes())
-            .map_err(|e| Error::Storage(format!("failed to serialize block_hashes: {e}")))?;
-        batch.put_meta(META_BLOCK_HASHES, &hashes_json);
+        for (block, hash) in self.engine.take_hash_changes() {
+            match hash {
+                Some(hash) => batch.put_block_hash(block, hash),
+                None => batch.delete_block_hash(block),
+            }
+        }
         format::write_stamp(&self.stamp, batch);
-        Ok(())
     }
 }
 

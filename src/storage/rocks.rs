@@ -16,6 +16,7 @@ const CF_REDUCER_SNAP: &str = "reducer_snap";
 const CF_REDUCER_FIN: &str = "reducer_fin";
 const CF_MV: &str = "mv";
 const CF_META: &str = "meta";
+const CF_BLOCK_HASH: &str = "block_hash";
 
 fn to_err(e: rocksdb::Error) -> Error {
     Error::Storage(e.to_string())
@@ -32,6 +33,7 @@ fn to_err(e: rocksdb::Error) -> Error {
 // CF_REDUCER_FIN:   {reducer}\0{group_key}
 // CF_MV:            {view}\0{group_key}
 // CF_META:          {key}
+// CF_BLOCK_HASH:    {block_be8}
 // ---------------------------------------------------------------------------
 
 fn raw_key(table: &str, block: BlockNumber) -> Vec<u8> {
@@ -178,7 +180,7 @@ impl RocksDbBackend {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
 
-        let cfs = [CF_RAW, CF_REDUCER_SNAP, CF_REDUCER_FIN, CF_MV, CF_META]
+        let cfs = [CF_RAW, CF_REDUCER_SNAP, CF_REDUCER_FIN, CF_MV, CF_META, CF_BLOCK_HASH]
             .into_iter()
             .map(|name| ColumnFamilyDescriptor::new(name, make_opts()))
             .collect::<Vec<_>>();
@@ -519,6 +521,23 @@ impl StorageBackend for RocksDbBackend {
         self.db.get_cf(cf, key.as_bytes()).map_err(to_err)
     }
 
+    fn get_block_hashes(&self) -> Result<Vec<(BlockNumber, String)>> {
+        let cf = self.db.cf_handle(CF_BLOCK_HASH).expect("block_hash CF");
+        let mut hashes = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (key, value) = item.map_err(to_err)?;
+            let block = key
+                .as_ref()
+                .try_into()
+                .map(BlockNumber::from_be_bytes)
+                .map_err(|_| Error::Storage("corrupt block hash key".into()))?;
+            let hash = String::from_utf8(value.into_vec())
+                .map_err(|_| Error::Storage(format!("corrupt hash of block {block}")))?;
+            hashes.push((block, hash));
+        }
+        Ok(hashes)
+    }
+
     // --- Atomic batch commit ---
 
     fn commit(&self, batch: &StorageWriteBatch) -> Result<()> {
@@ -569,6 +588,14 @@ impl StorageBackend for RocksDbBackend {
                         let end = upper_bound(&raw_table_prefix(table));
                         wb.delete_range_cf(cf, &start, &end);
                     }
+                }
+                BatchOp::PutBlockHash { block, hash } => {
+                    let cf = self.db.cf_handle(CF_BLOCK_HASH).expect("block_hash CF");
+                    wb.put_cf(cf, block.to_be_bytes(), hash.as_bytes());
+                }
+                BatchOp::DeleteBlockHash { block } => {
+                    let cf = self.db.cf_handle(CF_BLOCK_HASH).expect("block_hash CF");
+                    wb.delete_cf(cf, block.to_be_bytes());
                 }
             }
         }

@@ -278,8 +278,9 @@ fn rollback_persists_metadata_atomically() {
     assert_eq!(latest, 1, "latest_block should be persisted after rollback");
 
     // Verify block_hashes only has block 1
-    let hashes_bytes = storage.get_meta("block_hashes").unwrap().unwrap();
-    let hashes: BTreeMap<BlockNumber, String> = serde_json::from_slice(&hashes_bytes).unwrap();
+    let hashes: BTreeMap<BlockNumber, String> =
+        storage.get_block_hashes().unwrap().into_iter().collect();
+    assert!(hashes.contains_key(&1), "block 1 hash should stay");
     assert!(!hashes.contains_key(&2), "block 2 hash should be removed");
     assert!(!hashes.contains_key(&3), "block 3 hash should be removed");
 

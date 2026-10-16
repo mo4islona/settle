@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 #[cfg(feature = "rayon")]
@@ -188,6 +188,8 @@ pub struct SettleEngine {
     /// Block number → hash for all known blocks.
     /// Populated by set_rollback_chain(). Used for fork resolution and cursors.
     block_hashes: BTreeMap<BlockNumber, String>,
+    /// Blocks whose hash changed since the last `take_hash_changes`.
+    hash_changes: BTreeSet<BlockNumber>,
 }
 
 impl SettleEngine {
@@ -343,6 +345,7 @@ impl SettleEngine {
             has_finalized: false,
             collect_perf: true,
             block_hashes: BTreeMap::new(),
+            hash_changes: BTreeSet::new(),
         }
     }
 
@@ -999,7 +1002,7 @@ impl SettleEngine {
 
         // Remove hashes for rolled-back blocks
         let after = self.block_hashes.split_off(&(fork_point + 1));
-        drop(after);
+        self.hash_changes.extend(after.into_keys());
 
         Ok(all_changes)
     }
@@ -1168,15 +1171,23 @@ impl SettleEngine {
         nodes
     }
 
-    /// Fork resolution stops at finality, so hashes below it only grow the
-    /// metadata that every ingest writes. Two of them stay: a reopen restarts
+    /// Fork resolution stops at finality, so hashes below it only take
+    /// memory and storage. Two of them stay: a reopen restarts
     /// finality at the durable block and reads its hash, and on gappy chains
     /// `latest_cursor` reads the hash of a latest block below finality.
     fn prune_block_hashes(&mut self) {
         let finalized = self.finalized_block;
         let anchors = [self.durable_block, self.latest_block];
-        self.block_hashes
-            .retain(|&block, _| block >= finalized || anchors.contains(&Some(block)));
+
+        let kept = self.block_hashes.split_off(&finalized);
+        let below = std::mem::replace(&mut self.block_hashes, kept);
+        for (block, hash) in below {
+            if anchors.contains(&Some(block)) {
+                self.block_hashes.insert(block, hash);
+            } else {
+                self.hash_changes.insert(block);
+            }
+        }
     }
 
     /// Create a ChangeBatch from a set of change records.
@@ -1278,8 +1289,21 @@ impl SettleEngine {
     /// and the finalized head. Used for fork resolution.
     pub fn set_rollback_chain(&mut self, chain: &[(BlockNumber, String)]) {
         for (number, hash) in chain {
-            self.block_hashes.insert(*number, hash.clone());
+            if self.block_hashes.get(number) != Some(hash) {
+                self.block_hashes.insert(*number, hash.clone());
+                self.hash_changes.insert(*number);
+            }
         }
+    }
+
+    /// The blocks whose hash changed since the last call, each with its hash
+    /// now: None if it was removed.
+    pub fn take_hash_changes(&mut self) -> Vec<(BlockNumber, Option<&str>)> {
+        let changes = std::mem::take(&mut self.hash_changes);
+        changes
+            .into_iter()
+            .map(|block| (block, self.block_hashes.get(&block).map(String::as_str)))
+            .collect()
     }
 
     /// Find the highest block in `previous_blocks` whose hash matches
