@@ -106,7 +106,10 @@ same day had 9–20% more instructions and 19–43% more allocated blocks.
 | `tip polymarket` | 1,221M | 122.1K | 121.6 MB | 849K | 84.9 |
 
 The running fold of the aggregates (2026-10-16) moved these cases by −0.2% to
-+0.4%, within the spread between two builds; allocations did not change.
++0.4%, within the spread between two builds. One MV emit per ingest (the same
+day) then cut them by 0.2–1.6%, and `backfill mv_minmax` by 52% of instructions
+and 70% of allocated blocks: its 1,000 assets get about five rows per ingest, and
+each row used to build a change record that the change buffer merged away.
 
 ### Scale cases
 
@@ -115,16 +118,20 @@ group, with finality at the batch tip. A linear engine doubles the count when N
 doubles. Before the running fold, `sum` and `min`/`max` read every unfinalized
 block of the group on each block. `sliding_last` keeps a window wider than the
 batch, so no block expires; before the timestamp index of the window, each
-block scanned all the block times of the window.
+block scanned all the block times of the window. The last row of each case has
+one MV emit per ingest, instead of one change record per block.
 
 | Case | 2K blocks | 4K | 8K | Per doubling |
 |---|---:|---:|---:|---:|
 | `sum`, before the running fold | 169M | 571M | 2,076M | ×3.4–3.6 |
-| `sum` | 52M | 105M | 210M | ×2.0 |
+| `sum`, running fold | 52M | 105M | 210M | ×2.0 |
+| `sum` | 30M | 58M | 121M | ×2.0 |
 | `minmax`, before the running fold | 406M | 1,550M | 6,058M | ×3.8–3.9 |
-| `minmax` | 36M | 74M | 151M | ×2.0 |
+| `minmax`, running fold | 36M | 74M | 151M | ×2.0 |
+| `minmax` | 32M | 65M | 133M | ×2.0 |
 | `sliding_last`, before the timestamp index | 137M | 445M | 1,568M | ×3.2–3.5 |
-| `sliding_last` | 53M | 109M | 218M | ×2.0 |
+| `sliding_last`, timestamp index | 53M | 109M | 218M | ×2.0 |
+| `sliding_last` | 30M | 63M | 127M | ×2.0 |
 
 ### Reopen
 
