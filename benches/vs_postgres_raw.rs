@@ -43,7 +43,8 @@ CREATE TABLE transfers (
 const TOTAL_ROWS: usize = 100_000;
 
 fn open_settle_db() -> anyhow::Result<(Settle, tempfile::TempDir)> {
-    let dir = tempfile::tempdir()?;
+    // In target/, on the disk: /tmp can be tmpfs, where fsync costs nothing.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
     let cfg = Config::with_data_dir(SETTLE_SCHEMA, dir.path().to_str().unwrap());
     let db = Settle::open(cfg)?;
     Ok((db, dir))
