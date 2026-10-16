@@ -421,14 +421,15 @@ fn reopen_of_empty_database_keeps_block_zero() {
     assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(20));
 }
 
-/// Databases written before the durable watermark existed store latest 0
-/// when empty, and their finality even when it is above the latest block. A
-/// block at or below that watermark must still be persisted.
+/// Versions before the durable watermark stored latest 0 for an empty
+/// database, and their finality even when it is above the latest block. A
+/// block at or below such a watermark must still be persisted.
 #[test]
 fn legacy_watermark_without_data_does_not_hide_new_blocks() {
     for (stored_finalized, first) in [(0u64, 0), (100, 0), (100, 7)] {
         let storage = Arc::new(MemoryBackend::new());
         let mut legacy = StorageWriteBatch::new();
+        legacy.put_meta("format_version", &crate::storage::format::FORMAT_VERSION.to_be_bytes());
         legacy.put_meta(META_LATEST_BLOCK, &0u64.to_be_bytes());
         legacy.put_meta(META_FINALIZED_BLOCK, &stored_finalized.to_be_bytes());
         storage.commit(&legacy).unwrap();

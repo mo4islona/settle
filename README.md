@@ -142,6 +142,19 @@ TypeScript) changes it, and 1 makes `ingest()` wait for every ack:
 - **Memory** — Default. No persistence, data lost on restart.
 - **RocksDB** — Set `dataDir` for crash-safe persistence with WAL-based atomic commits.
 
+### Schema changes
+
+Stored rows and state are encoded by position, so a database remembers the
+layout of each table, reducer and view: column names and types in order, a
+reducer's source, `GROUP BY` and state fields, a view's source, select list,
+`GROUP BY` and window. `open` refuses a schema that changes a stored layout.
+Reducer logic, defaults, output aliases and new objects may change. A new
+reducer or view does not see the finalized blocks from before it. To change a
+layout, give the object a new name or rebuild the database.
+
+`open` also refuses a database of another format version, and one without a
+format version (written before format versions existed).
+
 ## Performance
 
 Benchmarked on Apple M-series (`cargo bench`). Independent reducer branches execute in parallel via `rayon`.
