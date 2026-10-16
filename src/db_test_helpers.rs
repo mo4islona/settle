@@ -112,14 +112,17 @@ pub fn make_swap(pool: &str, amount: f64) -> RowMap {
 }
 
 /// `MemoryBackend` with injected failures: raw-row reads fail while
-/// `fail_reads` is set, and commits fail once `commits_before_failure`
-/// commits have passed. It keeps the default bounded raw-row read, and
-/// `blocks_read` counts the blocks of raw rows that it returned.
+/// `fail_reads` is set, syncs while `fail_syncs` is set, and commits fail once
+/// `commits_before_failure` commits have passed. It keeps the default bounded
+/// raw-row read; `blocks_read` counts the blocks of raw rows that it returned,
+/// and `syncs` the syncs that succeeded.
 pub struct FailingStorage {
     inner: MemoryBackend,
     pub fail_reads: AtomicBool,
+    pub fail_syncs: AtomicBool,
     pub commits_before_failure: AtomicU64,
     pub blocks_read: AtomicU64,
+    pub syncs: AtomicU64,
 }
 
 impl Default for FailingStorage {
@@ -127,8 +130,10 @@ impl Default for FailingStorage {
         Self {
             inner: MemoryBackend::new(),
             fail_reads: AtomicBool::new(false),
+            fail_syncs: AtomicBool::new(false),
             commits_before_failure: AtomicU64::new(u64::MAX),
             blocks_read: AtomicU64::new(0),
+            syncs: AtomicU64::new(0),
         }
     }
 }
@@ -169,5 +174,12 @@ impl StorageBackend for FailingStorage {
             self.commits_before_failure.store(left - 1, Ordering::SeqCst);
         }
         self.inner.commit(batch)
+    }
+    fn sync(&self) -> Result<()> {
+        if self.fail_syncs.load(Ordering::SeqCst) {
+            return Err(Error::Storage("injected sync failure".into()));
+        }
+        self.syncs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }

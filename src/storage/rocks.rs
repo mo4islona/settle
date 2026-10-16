@@ -602,6 +602,12 @@ impl StorageBackend for RocksDbBackend {
         self.db.write(wb).map_err(to_err)
     }
 
+    /// A commit is in the OS page cache on return; this syncs the WAL, which
+    /// holds every commit before it.
+    fn sync(&self) -> Result<()> {
+        self.db.flush_wal(true).map_err(to_err)
+    }
+
     // --- Bulk operations ---
 
     fn list_reducer_group_keys(&self, reducer: &str) -> Result<Vec<Vec<u8>>> {

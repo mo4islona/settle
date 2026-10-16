@@ -141,6 +141,52 @@ fn failed_ack_commit_keeps_that_batch_and_later_ones() {
     assert_eq!(reopened.latest_block(), 3);
 }
 
+/// An ack syncs storage once, after all the batches it commits: the sync
+/// covers every commit before it. A heartbeat commits at once and syncs
+/// nothing, as no target waits for it.
+#[test]
+fn ack_syncs_once_per_cumulative_ack() {
+    let storage = Arc::new(FailingStorage::default());
+    let mut db = open(SIMPLE_SCHEMA, storage.clone(), 3);
+    swap_block(&mut db, 1, 0).unwrap();
+    let b2 = swap_block(&mut db, 2, 0).unwrap();
+
+    db.ack(b2.sequence).unwrap();
+    assert_eq!(storage.syncs.load(Ordering::SeqCst), 1);
+
+    db.ack(b2.sequence).unwrap();
+    assert!(ingest_with_finalized_no_ack(&mut db, vec![], 2).unwrap().is_none());
+    assert_eq!(storage.syncs.load(Ordering::SeqCst), 1);
+}
+
+/// The batches are committed but maybe not on disk: a second sync could
+/// report them synced after a failure lost them. So the instance poisons, and
+/// no later ack succeeds: not a retry, which has nothing to commit, nor the
+/// ack of a later batch, whose sync cannot vouch for the earlier commits.
+#[test]
+fn failed_sync_refuses_every_later_ack() {
+    let storage = Arc::new(FailingStorage::default());
+    let mut db = open(SIMPLE_SCHEMA, storage.clone(), 3);
+    let b1 = swap_block(&mut db, 1, 0).unwrap();
+    let b2 = swap_block(&mut db, 2, 0).unwrap();
+
+    storage.fail_syncs.store(true, Ordering::SeqCst);
+    assert!(matches!(db.ack(b1.sequence), Err(Error::SyncFailed(_))));
+    assert!(db.is_poisoned());
+    assert_eq!(db.unacked_batches(), 1);
+
+    storage.fail_syncs.store(false, Ordering::SeqCst);
+    assert!(matches!(db.ack(b1.sequence), Err(Error::SyncFailed(_))));
+    assert!(matches!(db.ack(b2.sequence), Err(Error::SyncFailed(_))));
+    assert!(matches!(swap_block(&mut db, 3, 0), Err(Error::SyncFailed(_))));
+    assert_eq!(db.unacked_batches(), 1);
+    assert_eq!(storage.syncs.load(Ordering::SeqCst), 0);
+
+    // Block 1 was committed before the failed sync; block 2 never was.
+    let reopened = open(SIMPLE_SCHEMA, storage, 3);
+    assert_eq!(reopened.latest_block(), 1);
+}
+
 /// The fork rolls back batches that wait for their ack: the raw row of
 /// block 3 is only in an unacked batch, and so is the reducer checkpoint of
 /// blocks 1 and 2.
