@@ -115,9 +115,10 @@ if (batch) {
 ## Acks and durability
 
 `ingest()` and `handle_fork()` return a change batch. Apply it to the target,
-then call `ack(batch.sequence)`: only then does its state reach disk. A reopen
-goes back to the last acked batch, so the target must apply batches
-idempotently.
+then call `ack(batch.sequence)`: only then does its state reach disk. With
+RocksDB, `ack()` syncs the write-ahead log, so an acked batch also survives a
+power loss; that is one fsync per `ack()` call. A reopen goes back to the last
+acked batch, so the target must apply batches idempotently.
 
 By default two batches may wait for their ack, so the next blocks can be
 ingested while the target still applies the batch before. That is enough to
@@ -135,7 +136,8 @@ TypeScript) changes it, and 1 makes `ingest()` wait for every ack:
   every batch acked.
 - After an error that poisons the instance, `ack()` still works. Ack the
   batches that the target applied, then drop and reopen: a reopen goes back
-  to the last acked batch, and a later fork cannot undo the others.
+  to the last acked batch, and a later fork cannot undo the others. After a
+  failed sync, `ack()` returns `SyncFailed` too: drop and reopen.
 
 ## Storage Backends
 

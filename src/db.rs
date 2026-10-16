@@ -258,6 +258,10 @@ pub struct Settle {
     /// batches were all returned before the failure, so `ack` may still
     /// commit them.
     poisoned: Option<String>,
+    /// Set with `poisoned` when a sync after an ack fails. The commits it
+    /// should have covered may be lost, and a later sync cannot vouch for
+    /// them, so `ack` refuses too.
+    sync_failed: Option<String>,
     /// Names of reducers whose runtime has been explicitly installed via
     /// `register_reducer_callback`. Enforces the strict "one callback per
     /// name, drop+reopen to change" contract.
@@ -351,6 +355,7 @@ impl Settle {
             max_pending_batches: config.max_pending_batches.max(1),
             ack_warning_threshold: config.ack_warning_threshold,
             poisoned: None,
+            sync_failed: None,
             runtimes_attached: std::collections::HashSet::new(),
             backfill_checkpoint_interval: config.backfill_checkpoint_interval,
             stamp,
@@ -377,7 +382,8 @@ impl Settle {
     /// True if a previous failure has poisoned this instance. Every call but
     /// `ack()` then returns `Poisoned`. Ack the batches that the target
     /// applied, then drop and reopen: the reopened instance can undo only
-    /// what is on disk.
+    /// what is on disk. After a failed sync every call, `ack()` too, returns
+    /// `SyncFailed`.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.is_some()
     }
@@ -386,8 +392,16 @@ impl Settle {
     /// failure mutated in-memory state past disk, refuse further work
     /// instead of silently producing stale writes.
     fn guard_not_poisoned(&self) -> Result<()> {
+        self.guard_synced()?;
         if let Some(reason) = &self.poisoned {
             return Err(Error::Poisoned(reason.clone()));
+        }
+        Ok(())
+    }
+
+    fn guard_synced(&self) -> Result<()> {
+        if let Some(reason) = &self.sync_failed {
+            return Err(Error::SyncFailed(reason.clone()));
         }
         Ok(())
     }
@@ -542,12 +556,18 @@ impl Settle {
     ///   that batch and all later ones stay unacked — caller MUST retry by
     ///   calling `ack(sequence)` again (NOT `ingest()`, which can return
     ///   `Err(PendingAck)`).
+    /// - Then one sync makes the commits survive a power loss. A failed sync
+    ///   returns `SyncFailed` and poisons the instance: the commits may be
+    ///   lost, and a second sync could report them synced. From then on
+    ///   `ack` returns `SyncFailed` too; drop and reopen.
     ///
-    /// Also works on a poisoned instance: a failure leaves the unacked write
-    /// batches as they were, and each holds the state after a batch that was
-    /// returned before it. A target that applied such a batch must ack it
-    /// before the reopen, else a later fork cannot undo it in the target.
+    /// Also works on a poisoned instance, except after a failed sync: a
+    /// failure leaves the unacked write batches as they were, and each holds
+    /// the state after a batch that was returned before it. A target that
+    /// applied such a batch must ack it before the reopen, else a later fork
+    /// cannot undo it in the target.
     pub fn ack(&mut self, sequence: u64) -> Result<()> {
+        self.guard_synced()?;
         let Some(newest) = self.pending.back().map(|p| p.sequence) else {
             return Ok(());
         };
@@ -561,15 +581,31 @@ impl Settle {
         // CRITICAL: pop only after a successful commit. Otherwise a commit
         // failure would silently drop the write_batch and leave engine state
         // ahead of disk with no path to recover.
+        let mut result = Ok(());
+        let mut committed = false;
         while let Some(oldest) = self.pending.front() {
             if oldest.sequence > sequence {
                 break;
             }
-            self.storage.commit(&oldest.write_batch)?;
+            if let Err(e) = self.storage.commit(&oldest.write_batch) {
+                result = Err(e);
+                break;
+            }
             self.pending.pop_front();
             self.stamp.clear();
+            committed = true;
         }
-        Ok(())
+
+        // One sync covers every commit before it. The batches have left the
+        // queue, so a retried ack would not sync them; and a failed fsync
+        // can lose writes that a second one then reports as synced.
+        if committed && let Err(e) = self.storage.sync() {
+            let reason = e.to_string();
+            self.poisoned = Some(format!("sync after ack failed: {reason}"));
+            self.sync_failed = Some(reason.clone());
+            return Err(Error::SyncFailed(reason));
+        }
+        result
     }
 
     /// Number of pending (unflushed) change records inside the buffer.

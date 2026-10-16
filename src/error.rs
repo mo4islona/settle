@@ -38,6 +38,9 @@ pub enum Error {
 
     #[error("instance poisoned by a previous failure ({0}); ack the applied batches, then drop and reopen")]
     Poisoned(String),
+
+    #[error("storage sync failed ({0}); acked writes may not survive a power loss, so no ack is taken: drop and reopen")]
+    SyncFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
