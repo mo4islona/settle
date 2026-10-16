@@ -110,6 +110,10 @@ The running fold of the aggregates (2026-10-16) moved these cases by −0.2% to
 day) then cut them by 0.2–1.6%, and `backfill mv_minmax` by 52% of instructions
 and 70% of allocated blocks: its 1,000 assets get about five rows per ingest, and
 each row used to build a change record that the change buffer merged away.
+Emitting those changes in first-touch order rather than hash order costs up to
+1.3% of instructions (`backfill mv_sum`, a sort of 5,000 groups per ingest)
+and saves 3–5% of Postgres time in the pipelined `vs_postgres_simple_agg` runs:
+keys that arrive together reach the target's index together.
 
 ### Scale cases
 
