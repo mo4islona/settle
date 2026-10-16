@@ -105,6 +105,26 @@ same day had 9–20% more instructions and 19–43% more allocated blocks.
 | `tip event_rules` | 392M | 39.2K | 62.1 MB | 428K | 42.8 |
 | `tip polymarket` | 1,221M | 122.1K | 121.6 MB | 849K | 84.9 |
 
+The running fold of the aggregates (2026-10-16) moved these cases by −0.2% to
++0.4%, within the spread between two builds; allocations did not change.
+
+### Scale cases
+
+The `scaling` group ingests one batch of N blocks with one row each, all in one
+group, with finality at the batch tip. A linear engine doubles the count when N
+doubles. Before the running fold, `sum` and `min`/`max` read every unfinalized
+block of the group on each block. `sliding_last` keeps a window wider than the
+batch, so no block expires, and each block scans all the block times of the
+window.
+
+| Case | 2K blocks | 4K | 8K | Per doubling |
+|---|---:|---:|---:|---:|
+| `sum`, before the running fold | 169M | 571M | 2,076M | ×3.4–3.6 |
+| `sum` | 52M | 105M | 210M | ×2.0 |
+| `minmax`, before the running fold | 406M | 1,550M | 6,058M | ×3.8–3.9 |
+| `minmax` | 36M | 74M | 151M | ×2.0 |
+| `sliding_last` | 137M | 444M | 1,566M | ×3.2–3.5 |
+
 Each case leaves its profiles under `target/gungraun/settle/instructions/ingest/<mode>.<workload>/`.
 `callgrind_annotate --inclusive=yes callgrind.<mode>.<workload>.out` shows where
 the instructions go; `dhat.<mode>.<workload>.out` opens in Valgrind's `dh_view.html`.
