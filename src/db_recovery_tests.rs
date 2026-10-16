@@ -391,6 +391,166 @@ fn deferral_keeps_only_the_durable_hash_below_finality() {
     assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(51));
 }
 
+/// The reducer fails on an amount of 13.
+#[cfg(feature = "lua")]
+const FAILING_REDUCER_SCHEMA: &str = r#"
+    CREATE TABLE swaps (
+        block_number UInt64,
+        pool String,
+        amount UInt64,
+        ts DateTime
+    );
+
+    CREATE REDUCER running
+    SOURCE swaps
+    GROUP BY pool
+    STATE (
+        total UInt64 DEFAULT 0
+    )
+    LANGUAGE lua
+    PROCESS $$
+        if row.amount == 13 then error("unlucky amount") end
+        state.total = state.total + row.amount
+        emit({ pool = row.pool, total = state.total })
+    $$;
+
+    CREATE MATERIALIZED VIEW pool_total AS
+    SELECT pool, last(total) AS total, count() AS events
+    FROM running
+    GROUP BY pool;
+"#;
+
+/// One block of a new chain that forks off after block 1.
+fn new_chain_block(block: BlockNumber, amount: u64) -> IngestInput {
+    let mut row = swap(block, "A", amount);
+    row.insert("block_number".into(), Value::UInt64(block));
+    IngestInput {
+        data: HashMap::from([("swaps".to_string(), vec![row])]),
+        rollback_chain: vec![
+            cursor(1),
+            BlockCursor {
+                number: block,
+                hash: format!("0xnew{block}"),
+            },
+        ],
+        finalized_head: cursor(0),
+    }
+}
+
+fn apply_and_ack(db: &mut Settle, target: &mut Target, batch: Option<ChangeBatch>) {
+    if let Some(batch) = batch {
+        target.apply(&batch);
+        db.ack(batch.sequence).unwrap();
+    }
+}
+
+/// Blocks 1..=3 and then an ingest that detects a fork to block 1 and fails.
+/// A caller that goes on, or reopens a poisoned instance, and sends the new
+/// chain again must get the same downstream rows as a run without the
+/// failure.
+fn check_failed_fork_ingest(schema: &str, failing: IngestInput) {
+    let storage = Arc::new(MemoryBackend::new());
+    let mut db = reopen(schema, &storage, 1);
+    let mut target = Target::default();
+
+    let blocks = (1..=3).map(|b| ("swaps".into(), b, vec![swap(b, "A", b)])).collect();
+    let batch = ingest_with_finalized(&mut db, blocks, 0).unwrap();
+    target.apply(&batch.unwrap());
+
+    assert!(db.ingest(failing).is_err());
+
+    let batch = match db.ingest(new_chain_block(2, 5)) {
+        Err(Error::Poisoned(_)) => {
+            drop(db);
+            db = reopen(schema, &storage, 1);
+            db.ingest(new_chain_block(2, 5)).unwrap()
+        }
+        other => other.unwrap(),
+    };
+    apply_and_ack(&mut db, &mut target, batch);
+
+    let mut reference_db = reopen(schema, &Arc::new(MemoryBackend::new()), 1);
+    let mut reference = Target::default();
+    let block_1 = vec![("swaps".into(), 1, vec![swap(1, "A", 1)])];
+    reference.apply(&ingest_with_finalized(&mut reference_db, block_1, 0).unwrap().unwrap());
+    let batch = reference_db.ingest(new_chain_block(2, 5)).unwrap();
+    apply_and_ack(&mut reference_db, &mut reference, batch);
+
+    let diff = target.diff(&reference);
+    assert!(diff.is_empty(), "{}", diff.join("\n"));
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn reducer_error_after_ingest_fork_loses_no_compensation() {
+    check_failed_fork_ingest(FAILING_REDUCER_SCHEMA, new_chain_block(2, 13));
+}
+
+/// The input error is found before the fork rollback, so the instance
+/// stays as it was.
+#[test]
+fn input_error_after_ingest_fork_loses_no_compensation() {
+    let mut at_fork_point = new_chain_block(2, 5);
+    let rows = at_fork_point.data.get_mut("swaps").unwrap();
+    rows[0].insert("block_number".into(), Value::UInt64(1));
+    check_failed_fork_ingest(SUM_SCHEMA, at_fork_point);
+
+    let mut bad_type = new_chain_block(2, 5);
+    let rows = bad_type.data.get_mut("swaps").unwrap();
+    rows[0].insert("block_number".into(), Value::String("2".into()));
+    check_failed_fork_ingest(SUM_SCHEMA, bad_type);
+}
+
+/// `MemoryBackend` whose raw-row reads fail while `fail_reads` is set.
+#[derive(Default)]
+struct FailingReads {
+    inner: MemoryBackend,
+    fail_reads: std::sync::atomic::AtomicBool,
+}
+
+impl StorageBackend for FailingReads {
+    fn put_raw_rows(&self, t: &str, b: BlockNumber, d: &[u8]) -> Result<()> { self.inner.put_raw_rows(t, b, d) }
+    fn get_raw_rows(&self, t: &str, f: BlockNumber, u: BlockNumber) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
+        if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Storage("injected read failure".into()));
+        }
+        self.inner.get_raw_rows(t, f, u)
+    }
+    fn delete_raw_rows_after(&self, t: &str, a: BlockNumber) -> Result<()> { self.inner.delete_raw_rows_after(t, a) }
+    fn take_raw_rows_after(&self, t: &str, a: BlockNumber) -> Result<Vec<(BlockNumber, Vec<u8>)>> { self.inner.take_raw_rows_after(t, a) }
+    fn put_reducer_state(&self, r: &str, k: &[u8], b: BlockNumber, s: &[u8]) -> Result<()> { self.inner.put_reducer_state(r, k, b, s) }
+    fn get_reducer_state(&self, r: &str, k: &[u8], b: BlockNumber) -> Result<Option<Vec<u8>>> { self.inner.get_reducer_state(r, k, b) }
+    fn get_reducer_state_at_or_before(&self, r: &str, k: &[u8], b: BlockNumber) -> Result<Option<(BlockNumber, Vec<u8>)>> { self.inner.get_reducer_state_at_or_before(r, k, b) }
+    fn delete_reducer_states_after(&self, r: &str, k: &[u8], a: BlockNumber) -> Result<()> { self.inner.delete_reducer_states_after(r, k, a) }
+    fn get_reducer_finalized(&self, r: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_reducer_finalized(r, k) }
+    fn set_reducer_finalized(&self, r: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.set_reducer_finalized(r, k, s) }
+    fn delete_reducer_states_up_to(&self, r: &str, k: &[u8], u: BlockNumber) -> Result<()> { self.inner.delete_reducer_states_up_to(r, k, u) }
+    fn put_mv_state(&self, v: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.put_mv_state(v, k, s) }
+    fn get_mv_state(&self, v: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_mv_state(v, k) }
+    fn delete_mv_state(&self, v: &str, k: &[u8]) -> Result<()> { self.inner.delete_mv_state(v, k) }
+    fn list_mv_group_keys(&self, v: &str) -> Result<Vec<Vec<u8>>> { self.inner.list_mv_group_keys(v) }
+    fn put_meta(&self, k: &str, v: &[u8]) -> Result<()> { self.inner.put_meta(k, v) }
+    fn get_meta(&self, k: &str) -> Result<Option<Vec<u8>>> { self.inner.get_meta(k) }
+    fn list_reducer_group_keys(&self, r: &str) -> Result<Vec<Vec<u8>>> { self.inner.list_reducer_group_keys(r) }
+    fn commit(&self, batch: &StorageWriteBatch) -> Result<()> { self.inner.commit(batch) }
+}
+
+/// The raw tables roll back last, after the reducers and MVs. A read
+/// failure there leaves the engine half rolled back.
+#[test]
+fn rollback_failure_poisons_instance() {
+    let storage = Arc::new(FailingReads::default());
+    let config = Config::new(REDUCER_SCHEMA).storage(storage.clone());
+    let mut db = Settle::open(config).unwrap();
+
+    let blocks = (1..=3).map(|b| ("swaps".into(), b, vec![swap(b, "A", b)])).collect();
+    ingest_with_finalized(&mut db, blocks, 0).unwrap();
+
+    storage.fail_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(db.handle_fork(vec![cursor(1)]).is_err());
+    assert!(db.is_poisoned());
+}
+
 // ---------------------------------------------------------------------------
 // Differential test: random histories, one instance reopened at random points,
 // one never reopened. A downstream target fed by each must stay identical.
