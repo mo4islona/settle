@@ -361,6 +361,10 @@ impl SettleEngine {
         Ok(())
     }
 
+    pub fn has_table(&self, name: &str) -> bool {
+        self.raw_tables.contains_key(name)
+    }
+
     /// Check if a reducer with the given name exists in the engine.
     pub fn has_reducer(&self, name: &str) -> bool {
         self.reducers.contains_key(name) || self.branch_index.contains_key(name)
@@ -875,18 +879,14 @@ impl SettleEngine {
         self.rollback_inner(fork_point, Some(batch))
     }
 
-    fn rollback_inner(
-        &mut self,
-        fork_point: BlockNumber,
-        write_batch: Option<&mut StorageWriteBatch>,
-    ) -> Result<Vec<ChangeRecord>> {
-        // Guard: fork_point cannot raise latest_block. If the caller passes
-        // a fork point above current latest (e.g. via stale future hashes that
-        // somehow leaked into block_hashes), do nothing — no rollback work to
-        // perform and latest_block must not advance without underlying data.
+    /// Err if a rollback to `fork_point` is not allowed. Changes nothing, so
+    /// callers can tell a rejected target from a rollback that failed part
+    /// way.
+    pub fn check_rollback_target(&self, fork_point: BlockNumber) -> Result<()> {
+        // Above latest the rollback is a no-op, see `rollback_inner`.
         let current_latest = self.latest_block.unwrap_or(0);
         if fork_point > current_latest {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         // Finality floor: a fork/rollback must never cross below the finalized
@@ -894,16 +894,34 @@ impl SettleEngine {
         // hash of the durable block, which lags finality under backfill
         // deferral, so a fork signal could otherwise resolve below finality —
         // rolling derived state back past the durable watermark, corrupting the
-        // recovery anchor and wedging the instance (durable > latest). Reject it
-        // here at the single chokepoint all rollback paths funnel through. With
-        // deferral off (`durable == finalized`) this can never fire for an
-        // in-range fork.
+        // recovery anchor and wedging the instance (durable > latest). Every
+        // rollback path funnels through `rollback_inner`, which checks this.
+        // With deferral off (`durable == finalized`) this can never fire for
+        // an in-range fork.
         if fork_point < self.finalized_block {
             return Err(Error::InvalidOperation(format!(
                 "rollback target block {fork_point} is below finalized block {} — \
                  finalized state is irreversible",
                 self.finalized_block
             )));
+        }
+        Ok(())
+    }
+
+    fn rollback_inner(
+        &mut self,
+        fork_point: BlockNumber,
+        write_batch: Option<&mut StorageWriteBatch>,
+    ) -> Result<Vec<ChangeRecord>> {
+        self.check_rollback_target(fork_point)?;
+
+        // Guard: fork_point cannot raise latest_block. If the caller passes
+        // a fork point above current latest (e.g. via stale future hashes that
+        // somehow leaked into block_hashes), do nothing — no rollback work to
+        // perform and latest_block must not advance without underlying data.
+        let current_latest = self.latest_block.unwrap_or(0);
+        if fork_point > current_latest {
+            return Ok(Vec::new());
         }
 
         let all_changes = self.unwind_to(fork_point, write_batch)?;

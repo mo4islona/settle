@@ -207,7 +207,9 @@ pub struct Settle {
     /// In that case the engine's in-memory state has already mutated past
     /// disk (e.g. `advance_finality` pruned `block_snapshots`) and naively
     /// retrying would write a checkpoint from the pruned state, an *empty*
-    /// batch, silently leaving CF_REDUCER_FIN stale. Every
+    /// batch, silently leaving CF_REDUCER_FIN stale. Also set when a rollback
+    /// fails part way, or an ingest fails after its fork rollback: memory then
+    /// holds a state that no returned batch describes. Every
     /// public mutating method short-circuits with `Error::Poisoned` once
     /// this is set; the only recovery is `drop` + reopen, which rebuilds
     /// in-memory state from disk via `replay_unfinalized`.
@@ -610,9 +612,7 @@ impl Settle {
             })?;
 
         let mut write_batch = StorageWriteBatch::new();
-        let changes = self
-            .engine
-            .rollback_to_batch(cursor.number, &mut write_batch)?;
+        let changes = self.rollback_engine(cursor.number, &mut write_batch)?;
 
         // Store the new rollback chain and persist atomically
         let chain: Vec<(BlockNumber, String)> = rollback_chain
@@ -683,6 +683,11 @@ impl Settle {
     /// currently committed finalized block (finality is monotonic; going
     /// above `latest_block` is allowed for gappy chains like Solana).
     ///
+    /// If the rollback chain shows a fork, the ingest rolls it back first and
+    /// the batch carries the compensating changes. An input error is found
+    /// before that rollback. A reducer error after it poisons the instance:
+    /// drop and reopen, and the next ingest detects the fork again.
+    ///
     /// Each row in `data` must contain a `block_number` field (UInt64).
     pub fn ingest(&mut self, mut input: IngestInput) -> Result<Option<ChangeBatch>> {
         // 0. Poison gate. Any prior immediate-commit failure made in-memory
@@ -728,124 +733,20 @@ impl Settle {
         let mut pending_changes: Vec<ChangeRecord> = Vec::new();
         let mut block_perf: Vec<PerfNode> = Vec::new();
 
-        // 0. Detect fork: compare new chain against stored block_hashes and rollback
-        //    if our latest block is no longer on the canonical chain.
-        //    Sort rollback_chain DESC (newest first) so resolve_fork_cursor returns
-        //    the HIGHEST common ancestor — preventing catastrophic deep rollbacks
-        //    when the caller sends blocks in ascending order.
-        //
-        //    IMPORTANT: skip fork detection when the chain is advancing (rollbackChain
-        //    or finalizedHead contains blocks above current_latest). In that case, the
-        //    caller is providing new unseen blocks, not a rollback signal. External
-        //    fork handling (e.g. 409 in pipes-sdk) runs before ingest() is called.
-        let recovery_block = {
-            let current_latest = self.engine.latest_block();
-            if current_latest > 0 {
-                let mut sorted_chain: Vec<_> = input.rollback_chain.iter().collect();
-                sorted_chain.sort_unstable_by_key(|c| std::cmp::Reverse(c.number));
+        let fork_point = self.detect_fork(&input);
+        let recovery_block = fork_point.unwrap_or_else(|| self.engine.latest_block());
 
-                // If any block in rollbackChain or finalizedHead is ABOVE current_latest,
-                // the caller is advancing (normal progress). Resolve-fork-cursor would
-                // fall through to an old finalized anchor and trigger a spurious rollback.
-                let advancing = sorted_chain
-                    .first()
-                    .map(|c| c.number > current_latest)
-                    .unwrap_or(false)
-                    || input.finalized_head.number > current_latest;
+        // Checked before the fork rollback, which cannot be undone: a bad
+        // input then leaves the instance as it was.
+        let tables = self.group_input_rows(std::mem::take(&mut input.data), recovery_block)?;
 
-                if !advancing {
-                    let new_chain: Vec<(BlockNumber, &str)> = sorted_chain
-                        .iter()
-                        .map(|c| (c.number, c.hash.as_str()))
-                        .chain(std::iter::once((
-                            input.finalized_head.number,
-                            input.finalized_head.hash.as_str(),
-                        )))
-                        .collect();
+        if let Some(fork_point) = fork_point {
+            let changes = self.rollback_engine(fork_point, &mut write_batch)?;
+            pending_changes.extend(changes);
+        }
 
-                    // Use `_bounded` so a stale future hash can't push the
-                    // resolved fork point above latest and cause silent skips.
-                    let fork_point = match self.engine.resolve_fork_cursor_bounded(&new_chain) {
-                        Some(ref c) if c.number < current_latest => c.number,
-                        Some(_) => current_latest, // no divergence
-                        None => 0,                 // no common ancestor: full rollback
-                    };
-
-                    if fork_point < current_latest {
-                        let changes = self
-                            .engine
-                            .rollback_to_batch(fork_point, &mut write_batch)?;
-                        pending_changes.extend(changes);
-                    }
-                    fork_point
-                } else {
-                    current_latest // advancing — no fork detection needed
-                }
-            } else {
-                0
-            }
-        };
-
-        // 1. For each table, group rows by block_number and process in order.
-        //    Tables are sorted by name for deterministic processing order across
-        //    multiple tables (HashMap iteration order is non-deterministic).
         let result = (|| -> Result<()> {
-            // Dedup guard: reject any block at or below the current
-            // (post-fork-detection) latest. Re-ingesting an already-processed
-            // block would double reducer/MV aggregates.
-            // For real chain reorgs the caller must use handle_fork() to roll
-            // state back BEFORE feeding new-chain data — relying on ingest()'s
-            // in-line fork detection to also delete duplicate content at the
-            // fork point is not supported.
-            let post_fork_latest = self.engine.latest_block();
-            if post_fork_latest > 0 {
-                let min_input = input
-                    .data
-                    .values()
-                    .flat_map(|rows| {
-                        rows.iter().filter_map(|r| match r.get("block_number") {
-                            Some(Value::UInt64(n)) => Some(*n),
-                            _ => None,
-                        })
-                    })
-                    .min();
-                if let Some(min) = min_input
-                    && min <= post_fork_latest
-                {
-                    return Err(Error::InvalidOperation(format!(
-                        "duplicate ingest: block {min} is at or below latest_block {post_fork_latest} — \
-                         use handle_fork() for chain reorgs"
-                    )));
-                }
-            }
-
-            // Consume input.data by value: rows move into per-block buckets
-            // instead of a deep RowMap clone. The earlier min_input dedup
-            // check already read input.data, so taking it now is safe.
-            let mut tables: Vec<(String, Vec<RowMap>)> =
-                std::mem::take(&mut input.data).into_iter().collect();
-            tables.sort_by(|a, b| a.0.cmp(&b.0));
-
-            for (table, rows) in tables {
-                let mut by_block: BTreeMap<BlockNumber, Vec<RowMap>> = BTreeMap::new();
-                for row in rows {
-                    let block = match row.get("block_number") {
-                        Some(Value::UInt64(n)) => *n,
-                        Some(other) => {
-                            return Err(Error::InvalidOperation(format!(
-                                "row in table '{table}' has invalid block_number type: expected UInt64, got {}",
-                                other.type_name()
-                            )));
-                        }
-                        None => {
-                            return Err(Error::InvalidOperation(format!(
-                                "row in table '{table}' missing block_number"
-                            )));
-                        }
-                    };
-                    by_block.entry(block).or_default().push(row);
-                }
-
+            for (table, by_block) in tables {
                 for (block, block_rows) in by_block {
                     let (changes, perf_node) = self.engine.process_batch_deferred(
                         &table,
@@ -861,23 +762,28 @@ impl Settle {
         })();
 
         if let Err(e) = result {
-            // Undo in-memory state to recovery_block (fork point, or 0 for
-            // fresh DB). The undo stays in-memory only: raw rows from this
-            // ingest were never committed (they live in `write_batch`, dropped
-            // below), so storage has no `> recovery_block` rows to delete on
-            // disk, and no separate commit can fail half-way. Not a chain
-            // rollback: on gappy chains recovery_block can be below finality.
-            //
-            // Propagate the original error after attempting in-memory rollback;
-            // if the in-memory rollback itself errors (extremely rare — it
-            // mutates Rust collections), surface that as a separate
-            // `Error::Rollback` so the caller knows the instance is in a
-            // questionable state and should be dropped + reopened.
+            // The fork rollback is done and its compensating changes would be
+            // lost with this error, so the caller must drop and reopen. The
+            // reopened instance has the pre-fork state and detects the fork
+            // again.
+            if fork_point.is_some() {
+                self.poisoned = Some(format!("ingest failed after a fork rollback: {e}"));
+                return Err(e);
+            }
+
+            // Undo in-memory state to recovery_block (0 for a fresh DB). The
+            // undo stays in-memory only: raw rows from this ingest were never
+            // committed (they live in `write_batch`, dropped below), so
+            // storage has no `> recovery_block` rows to delete on disk, and no
+            // separate commit can fail half-way. Not a chain rollback: on
+            // gappy chains recovery_block can be below finality.
             if let Err(rollback_err) = self.engine.undo_ingest(recovery_block) {
-                return Err(Error::Rollback(format!(
+                let reason = format!(
                     "ingest failed ({e}) and recovery rollback also failed ({rollback_err}); \
                      instance state is inconsistent — drop and reopen",
-                )));
+                );
+                self.poisoned = Some(reason.clone());
+                return Err(Error::Rollback(reason));
             }
             return Err(e);
         }
@@ -970,6 +876,139 @@ impl Settle {
                 Ok(Some(batch))
             }
         }
+    }
+
+    /// The fork point if the input's rollback chain shows that blocks above
+    /// it are no longer canonical, else None.
+    ///
+    /// The chain is sorted DESC (newest first) so the HIGHEST common ancestor
+    /// wins — preventing catastrophic deep rollbacks when the caller sends
+    /// blocks in ascending order.
+    ///
+    /// IMPORTANT: no fork when the chain is advancing (rollbackChain or
+    /// finalizedHead contains blocks above current_latest). In that case, the
+    /// caller is providing new unseen blocks, not a rollback signal. External
+    /// fork handling (e.g. 409 in pipes-sdk) runs before ingest() is called.
+    fn detect_fork(&self, input: &IngestInput) -> Option<BlockNumber> {
+        let current_latest = self.engine.latest_block();
+        if current_latest == 0 {
+            return None;
+        }
+
+        let mut sorted_chain: Vec<_> = input.rollback_chain.iter().collect();
+        sorted_chain.sort_unstable_by_key(|c| std::cmp::Reverse(c.number));
+
+        // Resolve-fork-cursor would fall through to an old finalized anchor
+        // and trigger a spurious rollback.
+        let advancing = sorted_chain
+            .first()
+            .is_some_and(|c| c.number > current_latest)
+            || input.finalized_head.number > current_latest;
+        if advancing {
+            return None;
+        }
+
+        let new_chain: Vec<(BlockNumber, &str)> = sorted_chain
+            .iter()
+            .map(|c| (c.number, c.hash.as_str()))
+            .chain(std::iter::once((
+                input.finalized_head.number,
+                input.finalized_head.hash.as_str(),
+            )))
+            .collect();
+
+        // Use `_bounded` so a stale future hash can't push the resolved fork
+        // point above latest and cause silent skips. No common ancestor means
+        // a full rollback.
+        let fork_point = self
+            .engine
+            .resolve_fork_cursor_bounded(&new_chain)
+            .map_or(0, |c| c.number);
+        (fork_point < current_latest).then_some(fork_point)
+    }
+
+    /// Check the input rows and group them by table (in name order, for a
+    /// deterministic processing order) and by block. `latest` is the latest
+    /// block once a detected fork is rolled back.
+    fn group_input_rows(
+        &self,
+        data: std::collections::HashMap<String, Vec<RowMap>>,
+        latest: BlockNumber,
+    ) -> Result<Vec<(String, BTreeMap<BlockNumber, Vec<RowMap>>)>> {
+        // Dedup guard: reject any block at or below the current
+        // (post-fork-detection) latest. Re-ingesting an already-processed
+        // block would double reducer/MV aggregates.
+        // For real chain reorgs the caller must use handle_fork() to roll
+        // state back BEFORE feeding new-chain data — relying on ingest()'s
+        // in-line fork detection to also delete duplicate content at the
+        // fork point is not supported.
+        if latest > 0 {
+            let min_input = data
+                .values()
+                .flat_map(|rows| {
+                    rows.iter().filter_map(|r| match r.get("block_number") {
+                        Some(Value::UInt64(n)) => Some(*n),
+                        _ => None,
+                    })
+                })
+                .min();
+            if let Some(min) = min_input
+                && min <= latest
+            {
+                return Err(Error::InvalidOperation(format!(
+                    "duplicate ingest: block {min} is at or below latest_block {latest} — \
+                     use handle_fork() for chain reorgs"
+                )));
+            }
+        }
+
+        // Rows move into per-block buckets by value, without a RowMap clone.
+        let mut tables: Vec<(String, Vec<RowMap>)> = data.into_iter().collect();
+        tables.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut grouped = Vec::with_capacity(tables.len());
+        for (table, rows) in tables {
+            let mut by_block: BTreeMap<BlockNumber, Vec<RowMap>> = BTreeMap::new();
+            for row in rows {
+                let block = match row.get("block_number") {
+                    Some(Value::UInt64(n)) => *n,
+                    Some(other) => {
+                        return Err(Error::InvalidOperation(format!(
+                            "row in table '{table}' has invalid block_number type: expected UInt64, got {}",
+                            other.type_name()
+                        )));
+                    }
+                    None => {
+                        return Err(Error::InvalidOperation(format!(
+                            "row in table '{table}' missing block_number"
+                        )));
+                    }
+                };
+                by_block.entry(block).or_default().push(row);
+            }
+
+            if !by_block.is_empty() && !self.engine.has_table(&table) {
+                return Err(Error::InvalidOperation(format!("unknown table: {table}")));
+            }
+            grouped.push((table, by_block));
+        }
+        Ok(grouped)
+    }
+
+    /// Roll the engine back to `fork_point`. A failure part way leaves some
+    /// nodes rolled back and others not, so it poisons the instance.
+    fn rollback_engine(
+        &mut self,
+        fork_point: BlockNumber,
+        write_batch: &mut StorageWriteBatch,
+    ) -> Result<Vec<ChangeRecord>> {
+        self.engine.check_rollback_target(fork_point)?;
+
+        self.engine
+            .rollback_to_batch(fork_point, write_batch)
+            .inspect_err(|e| {
+                self.poisoned = Some(format!("rollback to block {fork_point} failed: {e}"));
+            })
     }
 
     /// Returns `Err(PendingAck)` when an unacked batch is in flight, with the
