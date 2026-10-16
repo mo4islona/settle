@@ -28,6 +28,7 @@ const SUM_SCHEMA: &str = r#"
     GROUP BY pool;
 "#;
 
+/// Every aggregate: each stores the blocks of a window in its own way.
 const SLIDING_SCHEMA: &str = r#"
     CREATE TABLE swaps (
         block_number UInt64,
@@ -40,7 +41,12 @@ const SLIDING_SCHEMA: &str = r#"
     SELECT
         pool,
         sum(amount) AS total,
-        count() AS swaps
+        count() AS swaps,
+        min(amount) AS low,
+        max(amount) AS high,
+        avg(amount) AS mean,
+        first(amount) AS opening,
+        last(amount) AS closing
     FROM swaps
     GROUP BY pool
     WINDOW SLIDING INTERVAL 1 HOUR BY ts;
@@ -253,6 +259,39 @@ fn total(batch: &ChangeBatch, view: &str, pool: &str) -> Value {
         .find(|r| r.key.get("pool") == Some(&Value::String(pool.into())))
         .and_then(|r| r.values.get("total").cloned())
         .unwrap()
+}
+
+/// Block 1 feeds the group only a NULL. After a fork drops block 2 and with
+/// it the group, a reopen must not restore the group from block 1: the next
+/// row of the group is an Insert, also when its value changes nothing.
+#[test]
+fn reopen_does_not_restore_a_group_without_data() {
+    for amount in [0, 5] {
+        let storage = Arc::new(MemoryBackend::new());
+        {
+            let mut db = reopen(SLIDING_SUM_SCHEMA, &storage, 1);
+            let mut null_row = swap(1, "ETH", 0);
+            null_row.insert("amount".into(), Value::Null);
+            let rows = vec![
+                ("swaps".into(), 1, vec![null_row]),
+                ("swaps".into(), 2, vec![swap(2, "ETH", 10)]),
+            ];
+            ingest_with_finalized(&mut db, rows, 1).unwrap();
+
+            let fork = rollback_to(&mut db, 1).unwrap().batch.unwrap();
+            let ops: Vec<ChangeOp> =
+                fork.records_for("pool_1h").iter().map(|r| r.operation.clone()).collect();
+            assert_eq!(ops, [ChangeOp::Delete]);
+        }
+
+        let mut db = reopen(SLIDING_SUM_SCHEMA, &storage, 1);
+        let rows = vec![("swaps".into(), 2, vec![swap(2, "ETH", amount)])];
+        let batch = ingest_with_finalized(&mut db, rows, 1).unwrap().unwrap();
+        let records = batch.records_for("pool_1h");
+        assert_eq!(records.len(), 1, "amount {amount}");
+        assert_eq!(records[0].operation, ChangeOp::Insert, "amount {amount}");
+        assert_eq!(records[0].values["total"], Value::UInt64(amount), "amount {amount}");
+    }
 }
 
 /// A fork replaces a block of a sliding window while finality stays put, so

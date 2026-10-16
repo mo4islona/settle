@@ -12,7 +12,7 @@ use super::{StorageBackend, StorageWriteBatch};
 
 /// The version of what is stored and how. Bump it on any change to either:
 /// open refuses a database of another version.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 const META_FORMAT_VERSION: &str = "format_version";
 

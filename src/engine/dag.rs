@@ -688,23 +688,6 @@ impl SettleEngine {
         self.replay_unfinalized_inner(from_block, to_block, None)
     }
 
-    /// Drop restored sliding-window data of blocks above `durable`. A window
-    /// is persisted with the blocks it holds, final or not, and a fork can
-    /// replace those blocks without another persist; replay rebuilds them
-    /// from the raw rows instead.
-    pub fn discard_unfinalized_window_state(&mut self, durable: BlockNumber) {
-        let branch_mvs = self
-            .branches
-            .iter_mut()
-            .flat_map(|b| b.mv_entries.iter_mut().map(|(_, mv)| mv));
-
-        for mv in branch_mvs.chain(self.mvs.values_mut()) {
-            if mv.is_sliding() {
-                mv.rollback(durable);
-            }
-        }
-    }
-
     /// Replay only a specific reducer and its direct downstream MVs.
     /// Note: only 1 level of MV depth (MV→MV chaining is not supported).
     /// Reset the named reducer and its downstream MVs to their in-memory
@@ -1354,9 +1337,9 @@ impl SettleEngine {
     }
 }
 
-/// Backfill persist-deferral is only safe when the pipeline has no
-/// sliding-window MV (block_times + per-block aggs must persist atomically) and
-/// no external reducer (replay skips them, so deferred state can't be rebuilt).
+/// Backfill persist-deferral is only allowed when the pipeline has no
+/// sliding-window MV (not tested with deferral) and no external reducer
+/// (replay skips them, so deferred state can't be rebuilt).
 /// See docs/backfill-mode-design.md.
 fn compute_defer_allowed(
     branches: &[PipelineBranch],
