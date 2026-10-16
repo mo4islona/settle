@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::ast::{AggFunc, MVDef, SelectExpr, SelectItem, SlidingWindowDef};
+use crate::storage::BatchOp;
 use crate::storage::memory::MemoryBackend;
 
 fn test_storage() -> Arc<dyn StorageBackend> {
@@ -548,8 +549,9 @@ fn sliding_window_rollback_drops_block_expired_on_arrival() {
     assert!(!mv.block_times.contains_key(&2));
 }
 
-/// Block 1 is final, but block 3 that expired it is not: the checkpoint keeps
-/// block 1, so a rollback after a reopen still brings it back.
+/// Block 1 is final, but block 3 that expired it is not: storage holds the
+/// window as of block 2, which keeps block 1, and replay of block 3 expires
+/// it again.
 #[test]
 fn sliding_window_expired_block_survives_reopen() {
     let storage = test_storage();
@@ -566,11 +568,43 @@ fn sliding_window_expired_block_survives_reopen() {
     }
 
     let mut mv = MVEngine::new(sliding_sum_mv_def(3600), storage.clone(), &test_column_types());
-    let rb = mv.rollback(2);
-    assert_eq!(
-        rb[0].values.get("total_volume"),
-        Some(&Value::Float64(300.0))
-    );
+    assert_eq!(mv.block_times.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+
+    let changes = mv.process_block(3, &[trade("ETH", 300.0, 3_601_000)]);
+    let total = |values: &HashMap<String, Value>| values["total_volume"].clone();
+    assert_eq!(total(changes[0].prev_values.as_ref().unwrap()), Value::Float64(300.0));
+    assert_eq!(total(&changes[0].values), Value::Float64(500.0));
+}
+
+/// A checkpoint stores the block that became final and deletes the stored
+/// block that a final block expired, whatever the size of the window.
+#[test]
+fn sliding_checkpoint_does_not_grow_with_the_window() {
+    for window in [10u64, 1_000] {
+        let storage = test_storage();
+        let mut mv = MVEngine::new(sliding_sum_mv_def(window), storage.clone(), &test_column_types());
+
+        // One block per second; finality 5 blocks behind.
+        let mut last = StorageWriteBatch::new();
+        for block in 1..=2 * window {
+            mv.process_block(block, &[trade("ETH", 1.0, block as i64 * 1000)]);
+            last = StorageWriteBatch::new();
+            mv.advance_finality(block - 5.min(block));
+            mv.write_checkpoint(&mut last);
+            storage.commit(&last).unwrap();
+        }
+
+        let ops: Vec<&str> = last
+            .ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::PutMvState { .. } => "put",
+                BatchOp::DeleteMvState { .. } => "delete",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(ops, ["put", "delete"], "window of {window} s");
+    }
 }
 
 /// Once the block that expired a block is final, the expired data goes.
