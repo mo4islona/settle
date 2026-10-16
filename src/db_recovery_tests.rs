@@ -77,6 +77,24 @@ const REDUCER_SCHEMA: &str = r#"
     GROUP BY pool;
 "#;
 
+/// No count(): a row with a NULL amount feeds no aggregate.
+const SLIDING_SUM_SCHEMA: &str = r#"
+    CREATE TABLE swaps (
+        block_number UInt64,
+        pool String,
+        amount UInt64,
+        ts DateTime
+    );
+
+    CREATE MATERIALIZED VIEW pool_1h AS
+    SELECT
+        pool,
+        sum(amount) AS total
+    FROM swaps
+    GROUP BY pool
+    WINDOW SLIDING INTERVAL 1 HOUR BY ts;
+"#;
+
 /// A window that nothing in a test history outlives: forks without expiry.
 const SLIDING_NO_EXPIRY_SCHEMA: &str = r#"
     CREATE TABLE swaps (
@@ -149,6 +167,54 @@ fn reopen_after_fork_does_not_restore_replaced_sliding_block() {
         .unwrap()
         .unwrap();
     assert_eq!(total(&batch, "pool_1h", "ETH"), Value::UInt64(50));
+}
+
+/// Block 8 expires block 1 of the one-hour window. Block 1 is final and
+/// block 8 is not, so after a reopen a fork to block 7 must still bring
+/// block 1 back.
+#[test]
+fn fork_after_reopen_restores_block_expired_by_rolled_back_block() {
+    let storage = Arc::new(MemoryBackend::new());
+    {
+        let mut db = reopen(SLIDING_SCHEMA, &storage, 1);
+        let blocks = (1..=8)
+            .map(|b| ("swaps".into(), b, vec![swap(b, "ETH", b)]))
+            .collect();
+        ingest_with_finalized(&mut db, blocks, 2).unwrap();
+    }
+
+    let mut db = reopen(SLIDING_SCHEMA, &storage, 1);
+    let batch = handle_fork(&mut db, vec![cursor(7)]).unwrap().batch.unwrap();
+    assert_eq!(total(&batch, "pool_1h", "ETH"), Value::UInt64(28));
+}
+
+/// Block 2 feeds no aggregate, so after a reopen it has a window time and no
+/// groups. A fork to block 1 must still remove that time, or the new block 2
+/// counts as replayed and is skipped.
+#[test]
+fn fork_after_reopen_replaces_block_without_aggregate_values() {
+    let storage = Arc::new(MemoryBackend::new());
+    {
+        let mut db = reopen(SLIDING_SUM_SCHEMA, &storage, 1);
+        let mut no_amount = swap(2, "ETH", 0);
+        no_amount.insert("amount".into(), Value::Null);
+        ingest_with_finalized(
+            &mut db,
+            vec![
+                ("swaps".into(), 1, vec![swap(1, "ETH", 10)]),
+                ("swaps".into(), 2, vec![no_amount]),
+            ],
+            1,
+        )
+        .unwrap();
+    }
+
+    let mut db = reopen(SLIDING_SUM_SCHEMA, &storage, 1);
+    handle_fork(&mut db, vec![cursor(1)]).unwrap();
+    let batch = ingest_with_finalized(&mut db, vec![("swaps".into(), 2, vec![swap(2, "ETH", 30)])], 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(total(&batch, "pool_1h", "ETH"), Value::UInt64(40));
 }
 
 /// A heartbeat on an empty database reports finality far ahead. No data is
@@ -647,12 +713,16 @@ fn random_histories_survive_reopen_sliding_forks() {
     }
 }
 
-/// No forks here: in memory a block that expired stays out of the window
-/// even when a fork removes the block that expired it, while replay after a
-/// reopen rebuilds the window from the raw rows and brings it back.
 #[test]
 fn random_histories_survive_reopen_sliding_expiry() {
     for seed in 0..300 {
-        check_history(SLIDING_SCHEMA, 1, false, seed, 40);
+        check_history(SLIDING_SCHEMA, 1, true, seed, 40);
+    }
+}
+
+#[test]
+fn random_short_histories_survive_reopen_sliding() {
+    for seed in 0..5000 {
+        check_history(SLIDING_SCHEMA, 1, true, seed, 8);
     }
 }

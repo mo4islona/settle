@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -154,6 +155,11 @@ pub trait AggregationFunc: Send + Sync {
     /// can use split_off for O(log N) performance.
     fn remove_blocks_after(&mut self, fork_point: BlockNumber);
 
+    /// Move the data of `block` into `into`, an aggregate of the same kind.
+    fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc);
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
     /// Finalize all blocks up to and including the given block.
     /// Merges their contributions into the finalized state and discards per-block data.
     fn finalize_up_to(&mut self, block: BlockNumber);
@@ -179,6 +185,22 @@ pub trait AggregationFunc: Send + Sync {
     /// Return the block numbers that have unfinalized contributions.
     /// Used for rebuilding block_groups from persisted sliding window state.
     fn block_numbers(&self) -> Vec<BlockNumber>;
+}
+
+fn move_entry<V>(
+    from: &mut BTreeMap<BlockNumber, V>,
+    into: &mut BTreeMap<BlockNumber, V>,
+    block: BlockNumber,
+) {
+    if let Some(v) = from.remove(&block) {
+        into.insert(block, v);
+    }
+}
+
+fn same_kind<T: 'static>(agg: &mut dyn AggregationFunc) -> &mut T {
+    agg.as_any_mut()
+        .downcast_mut()
+        .expect("the aggregates of one column are of one kind")
 }
 
 /// Removes the blocks at or below `block` in ascending order and hands each
@@ -244,6 +266,14 @@ impl AggregationFunc for SumAgg {
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
+        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
@@ -320,6 +350,14 @@ impl AggregationFunc for CountAgg {
         let _ = self.blocks.split_off(&(fork_point + 1));
     }
 
+    fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
+        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn finalize_up_to(&mut self, block: BlockNumber) {
         drain_up_to(&mut self.blocks, block, |v| self.finalized += v);
     }
@@ -393,6 +431,14 @@ impl AggregationFunc for MinAgg {
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
+        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
@@ -482,6 +528,14 @@ impl AggregationFunc for MaxAgg {
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
+        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
@@ -584,6 +638,14 @@ impl AggregationFunc for AvgAgg {
         let _ = self.blocks.split_off(&(fork_point + 1));
     }
 
+    fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
+        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn finalize_up_to(&mut self, block: BlockNumber) {
         drain_up_to(&mut self.blocks, block, |(s, c)| {
             self.finalized_sum = self.finalized_sum.add(s);
@@ -672,6 +734,14 @@ impl AggregationFunc for FirstAgg {
         let _ = self.blocks.split_off(&(fork_point + 1));
     }
 
+    fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
+        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn finalize_up_to(&mut self, block: BlockNumber) {
         // Finalized first = earliest block's first value
         drain_up_to(&mut self.blocks, block, |v| {
@@ -749,6 +819,14 @@ impl AggregationFunc for LastAgg {
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
+        move_entry(&mut self.blocks, &mut same_kind::<Self>(into).blocks, block);
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
