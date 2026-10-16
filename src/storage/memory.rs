@@ -60,11 +60,21 @@ impl StorageBackend for MemoryBackend {
         from_block: BlockNumber,
         to_block: BlockNumber,
     ) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
+        self.get_raw_rows_limited(table, from_block, to_block, usize::MAX)
+    }
+
+    fn get_raw_rows_limited(
+        &self,
+        table: &str,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+        max_blocks: usize,
+    ) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
         let inner = self.inner.lock().unwrap();
         let start = (table.to_string(), from_block);
         let end = (table.to_string(), to_block);
         let mut result = Vec::new();
-        for (key, data) in inner.raw.range(start..=end) {
+        for (key, data) in inner.raw.range(start..=end).take(max_blocks) {
             if key.0 == table {
                 result.push((key.1, data.clone()));
             }

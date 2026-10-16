@@ -196,6 +196,39 @@ fn attach_runtimes(db: &mut Settle, schema: &str) {
 }
 
 /// Ten minutes per block, so a one-hour window holds six blocks.
+/// A backend with no bounded raw-row read of its own returns the whole replay
+/// range at once; replay must not read the rest of it again for each part.
+#[test]
+fn replay_reads_each_block_once_without_bounded_reads() {
+    let storage = Arc::new(FailingStorage::default());
+    let open = || {
+        let config = Config::new(SUM_SCHEMA)
+            .storage(storage.clone())
+            .backfill_checkpoint_interval(u64::MAX);
+        Settle::open(config).unwrap()
+    };
+
+    let mut db = open();
+    for block in 1..=40 {
+        let mut row = swap(block, "A", 1);
+        row.insert("block_number".to_string(), Value::UInt64(block));
+        let input = IngestInput {
+            data: HashMap::from([("swaps".to_string(), vec![row])]),
+            rollback_chain: Vec::new(),
+            finalized_head: cursor(block),
+        };
+        let batch = db.ingest(input).unwrap().unwrap();
+        db.ack(batch.sequence).unwrap();
+    }
+    drop(db);
+
+    storage.blocks_read.store(0, Ordering::SeqCst);
+    drop(open());
+
+    // Block 1 is durable; the replay reads the 39 blocks after it.
+    assert_eq!(storage.blocks_read.load(Ordering::SeqCst), 39);
+}
+
 fn swap(block: BlockNumber, pool: &str, amount: u64) -> RowMap {
     HashMap::from([
         ("pool".to_string(), Value::String(pool.to_string())),

@@ -174,15 +174,17 @@ impl RawTableEngine {
         Ok(changes)
     }
 
-    /// Get all rows for a block range (inclusive). Used for reducer replay.
+    /// The rows of the first `max_blocks` blocks with data in a block range
+    /// (inclusive). Used for replay.
     pub fn get_rows(
         &self,
         from_block: BlockNumber,
         to_block: BlockNumber,
+        max_blocks: usize,
     ) -> Result<Vec<(BlockNumber, Vec<Row>)>> {
-        let raw = self
-            .storage
-            .get_raw_rows(&self.def.name, from_block, to_block)?;
+        let raw =
+            self.storage
+                .get_raw_rows_limited(&self.def.name, from_block, to_block, max_blocks)?;
         raw.into_iter()
             .map(|(block, data)| {
                 let rows = storage::decode_rows(&data, &self.registry)?;
@@ -272,7 +274,7 @@ mod tests {
         engine.ingest(1000, &[make_row_map("alice", 10.0)]).unwrap();
         engine.ingest(1001, &[make_row_map("bob", 20.0)]).unwrap();
 
-        let rows = engine.get_rows(1000, 1001).unwrap();
+        let rows = engine.get_rows(1000, 1001, usize::MAX).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 1000);
         assert_eq!(rows[1].0, 1001);
@@ -310,7 +312,7 @@ mod tests {
         );
 
         // Verify storage only has block 1000
-        let remaining = engine.get_rows(1000, 1010).unwrap();
+        let remaining = engine.get_rows(1000, 1010, usize::MAX).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, 1000);
     }
@@ -325,7 +327,7 @@ mod tests {
         let changes = engine.rollback(1000).unwrap();
         assert!(changes.is_empty());
 
-        let remaining = engine.get_rows(1000, 1000).unwrap();
+        let remaining = engine.get_rows(1000, 1000, usize::MAX).unwrap();
         assert_eq!(remaining.len(), 1);
     }
 
@@ -356,7 +358,7 @@ mod tests {
         );
 
         // Verify final state
-        let all_rows = engine.get_rows(1000, 1010).unwrap();
+        let all_rows = engine.get_rows(1000, 1010, usize::MAX).unwrap();
         assert_eq!(all_rows.len(), 3);
         assert_eq!(all_rows[2].0, 1002);
         assert_eq!(
