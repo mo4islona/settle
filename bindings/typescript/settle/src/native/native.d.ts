@@ -14,6 +14,13 @@ export interface SettleConfig {
   dataDir?: string
   /** Maximum buffer size before backpressure (default: 10000). */
   maxBufferSize?: number
+  /**
+   * Most change batches that may wait for `ack()` at a time (default: 2,
+   * so `ingest()` can run while the target applies the batch before; 1
+   * makes it wait for that ack). The target must apply every batch in
+   * sequence order.
+   */
+  maxPendingBatches?: number
   /** Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4". */
   compression?: string
   /** Disable RocksDB automatic background compactions. */
@@ -114,8 +121,8 @@ export declare class Settle {
    */
   handleFork(previousBlocks: Array<SettleCursor>): ForkResultJs
   /**
-   * Acknowledge the pending batch by sequence number and durably commit
-   * its writes. `sequence` is passed as `i64` — the JS-side accepts a
+   * Acknowledge every batch up to `sequence` and durably commit their
+   * writes, oldest first. `sequence` is passed as `i64` — the JS-side accepts a
    * non-negative integer up to `Number.MAX_SAFE_INTEGER` (2^53), well
    * below `i64::MAX`; the TS wrapper rejects fractional / out-of-range
    * values before they reach this boundary.
@@ -127,22 +134,27 @@ export declare class Settle {
   ack(sequence: number): void
   /**
    * Number of pending (unflushed) change records in the buffer. Does NOT
-   * reflect the pending-ack slot — see `isAwaitingAck` for that.
+   * reflect the unacked batches — see `unackedBatches` for that.
    */
   get pendingCount(): number
   /** Whether backpressure should be applied. */
   get isBackpressured(): boolean
   /**
    * Whether a previously-returned `ChangeBatch` is still awaiting `ack()`.
-   * While true, mutating APIs (`ingest`, `handleFork`, `registerReducer`)
-   * throw `SettlePendingAckError`.
+   * While true, `registerReducer` and `registerReducerCallback` throw
+   * `SettlePendingAckError`; `ingest` and `handleFork` throw it when
+   * `maxPendingBatches` batches wait.
    */
   get isAwaitingAck(): boolean
   /**
-   * Whether an unrecoverable commit failure has poisoned this instance.
-   * Once true the only recovery is to drop the instance and reopen — all
-   * mutating calls reject with `Error("instance poisoned ...")` so the
-   * caller does not silently produce stale writes.
+   * Places in use in the ack queue: each change batch that waits for
+   * `ack()`, and each call without a batch whose writes wait with one.
+   */
+  get unackedBatches(): number
+  /**
+   * Whether a previous failure has poisoned this instance. Once true,
+   * every call but `ack()` rejects with `Error("instance poisoned ...")`.
+   * Ack the batches that the target applied, then drop and reopen.
    */
   get isPoisoned(): boolean
   /** Current cursor: latest processed block + hash. Null if no blocks processed. */
