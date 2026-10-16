@@ -22,10 +22,12 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::sync::Arc;
 
 use gungraun::prelude::*;
 use gungraun::{Callgrind, Dhat, DhatMetric, EventKind};
 use settle::db::{Config, IngestInput, Settle};
+use settle::storage::memory::MemoryBackend;
 use settle::test_helpers::cursor;
 use settle::types::{RowMap, Value};
 
@@ -193,40 +195,40 @@ impl Mode {
         }
     }
 
-    fn inputs(self, workload: Workload) -> Vec<IngestInput> {
+    /// Built one at a time, so that a setup that ingests them as they come
+    /// never holds them all.
+    fn inputs(self, workload: Workload) -> impl Iterator<Item = IngestInput> {
         let per_ingest = self.blocks_per_ingest();
         let mut row_index = 0;
 
-        (0..2 * self.ingests() as u64)
-            .map(|n| {
-                let first = 1 + n * per_ingest;
-                let last = first + per_ingest - 1;
+        (0..2 * self.ingests() as u64).map(move |n| {
+            let first = 1 + n * per_ingest;
+            let last = first + per_ingest - 1;
 
-                let mut rows = Vec::with_capacity((per_ingest * ROWS_PER_BLOCK) as usize);
-                for block in first..=last {
-                    for _ in 0..ROWS_PER_BLOCK {
-                        let mut row = workload.row(row_index);
-                        row.insert("block_number".into(), Value::UInt64(block));
-                        rows.push(row);
-                        row_index += 1;
-                    }
+            let mut rows = Vec::with_capacity((per_ingest * ROWS_PER_BLOCK) as usize);
+            for block in first..=last {
+                for _ in 0..ROWS_PER_BLOCK {
+                    let mut row = workload.row(row_index);
+                    row.insert("block_number".into(), Value::UInt64(block));
+                    rows.push(row);
+                    row_index += 1;
                 }
+            }
 
-                let finalized = match self {
-                    Mode::Backfill => last,
-                    Mode::Tip => last.saturating_sub(FINALITY_LAG),
-                };
+            let finalized = match self {
+                Mode::Backfill => last,
+                Mode::Tip => last.saturating_sub(FINALITY_LAG),
+            };
 
-                IngestInput {
-                    data: HashMap::from([(workload.table().to_string(), rows)]),
-                    rollback_chain: (first..=last)
-                        .filter(|b| *b > finalized)
-                        .map(cursor)
-                        .collect(),
-                    finalized_head: cursor(finalized),
-                }
-            })
-            .collect()
+            IngestInput {
+                data: HashMap::from([(workload.table().to_string(), rows)]),
+                rollback_chain: (first..=last)
+                    .filter(|b| *b > finalized)
+                    .map(cursor)
+                    .collect(),
+                finalized_head: cursor(finalized),
+            }
+        })
     }
 }
 
@@ -256,7 +258,7 @@ fn prepare(workload: Workload, mode: Mode) -> &'static mut Prepared {
     init_bench_process();
 
     let mut db = Settle::open(Config::new(workload.schema())).unwrap();
-    let mut inputs = mode.inputs(workload);
+    let mut inputs: Vec<IngestInput> = mode.inputs(workload).collect();
     let counted = inputs.split_off(mode.ingests());
     for input in inputs {
         ingest_and_ack(&mut db, input);
@@ -395,8 +397,39 @@ fn scale(case: &'static mut Prepared) -> usize {
     ingest_all(case)
 }
 
+/// A config that reopens a database whose derived state is durable only up to
+/// its first ingest: setup ingests the `backfill` inputs of `mv_sum_stored`
+/// with persist deferral, so reopen replays a tail of 700 blocks, 35K rows.
+fn prepare_reopen() -> Config {
+    init_bench_process();
+
+    let workload = Workload::MvSumStored;
+    let storage = Arc::new(MemoryBackend::new());
+    let config = || {
+        Config::new(workload.schema())
+            .storage(storage.clone())
+            .backfill_checkpoint_interval(u64::MAX)
+    };
+
+    let mut db = Settle::open(config()).unwrap();
+    for input in Mode::Backfill.inputs(workload) {
+        ingest_and_ack(&mut db, input);
+    }
+    drop(db);
+
+    config()
+}
+
+#[library_benchmark]
+#[bench::mv_sum_stored(setup = prepare_reopen)]
+fn reopen(config: Config) {
+    // Leaked, so that dropping the engine is not counted.
+    std::mem::forget(black_box(Settle::open(config).unwrap()));
+}
+
 library_benchmark_group!(name = ingest, benchmarks = [backfill, tip]);
 library_benchmark_group!(name = scaling, benchmarks = [scale]);
+library_benchmark_group!(name = recovery, benchmarks = [reopen]);
 
 // No cache simulation: it doubles the run time, and the limits read instructions.
 main!(
@@ -416,5 +449,5 @@ main!(
                     (DhatMetric::TotalBlocks, 1.0),
                 ])
         ),
-    library_benchmark_groups = [ingest, scaling]
+    library_benchmark_groups = [ingest, scaling, recovery]
 );
