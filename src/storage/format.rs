@@ -3,6 +3,8 @@
 //! position, so a schema whose layout differs from the one that wrote them
 //! would read them wrong without an error.
 
+use serde::Serialize;
+
 use crate::error::{Error, Result};
 use crate::schema::ast::{MVDef, ReducerDef, Schema, SelectExpr, TableDef};
 
@@ -115,74 +117,195 @@ impl Layout {
     }
 }
 
+/// Layouts are stored as JSON of these structs: identifiers are escaped and
+/// each select expression is tagged, so two different layouts never share a
+/// text. Field order is the declaration order.
+#[derive(Serialize)]
+struct TableLayout<'a> {
+    columns: Vec<TypedName<'a>>,
+}
+
+#[derive(Serialize)]
+struct ReducerLayout<'a> {
+    source: &'a str,
+    group_by: &'a [String],
+    state: Vec<TypedName<'a>>,
+}
+
+#[derive(Serialize)]
+struct MvLayout<'a> {
+    source: &'a str,
+    select: Vec<SelectLayout<'a>>,
+    group_by: &'a [String],
+    sliding_window: Option<SlidingLayout<'a>>,
+}
+
+#[derive(Serialize)]
+struct TypedName<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    column_type: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SelectLayout<'a> {
+    Column(&'a str),
+    Agg {
+        func: &'static str,
+        column: Option<&'a str>,
+    },
+    Window {
+        column: &'a str,
+        seconds: u64,
+    },
+}
+
+#[derive(Serialize)]
+struct SlidingLayout<'a> {
+    seconds: u64,
+    time_column: &'a str,
+}
+
+fn to_text(layout: &impl Serialize) -> String {
+    serde_json::to_string(layout).expect("a layout serializes")
+}
+
 fn table_layout(def: &TableDef) -> Layout {
-    let columns: Vec<String> = def
-        .columns
-        .iter()
-        .map(|c| format!("{} {}", c.name, c.column_type))
-        .collect();
+    let layout = TableLayout {
+        columns: def
+            .columns
+            .iter()
+            .map(|c| TypedName {
+                name: &c.name,
+                column_type: c.column_type.to_string(),
+            })
+            .collect(),
+    };
 
     Layout {
         key_space: "table",
         kind: "table",
         name: def.name.clone(),
-        text: format!("columns ({})", columns.join(", ")),
+        text: to_text(&layout),
     }
 }
 
 fn reducer_layout(def: &ReducerDef) -> Layout {
-    let state: Vec<String> = def
-        .state
-        .iter()
-        .map(|f| format!("{} {}", f.name, f.column_type))
-        .collect();
+    let layout = ReducerLayout {
+        source: &def.source,
+        group_by: &def.group_by,
+        state: def
+            .state
+            .iter()
+            .map(|f| TypedName {
+                name: &f.name,
+                column_type: f.column_type.to_string(),
+            })
+            .collect(),
+    };
 
     Layout {
         key_space: "reducer",
         kind: "reducer",
         name: def.name.clone(),
-        text: format!(
-            "source {}; group by ({}); state ({})",
-            def.source,
-            def.group_by.join(", "),
-            state.join(", ")
-        ),
+        text: to_text(&layout),
     }
 }
 
 fn mv_layout(def: &MVDef) -> Layout {
-    let select: Vec<String> = def.select.iter().map(|item| select_layout(&item.expr)).collect();
-
-    let mut text = format!(
-        "source {}; select ({}); group by ({})",
-        def.source,
-        select.join(", "),
-        def.group_by.join(", ")
-    );
-    if let Some(window) = &def.sliding_window {
-        text.push_str(&format!(
-            "; sliding window {} s on {}",
-            window.interval_seconds, window.time_column
-        ));
-    }
+    let layout = MvLayout {
+        source: &def.source,
+        select: def.select.iter().map(|item| select_layout(&item.expr)).collect(),
+        group_by: &def.group_by,
+        sliding_window: def.sliding_window.as_ref().map(|w| SlidingLayout {
+            seconds: w.interval_seconds,
+            time_column: &w.time_column,
+        }),
+    };
 
     Layout {
         key_space: "mv",
         kind: "materialized view",
         name: def.name.clone(),
-        text,
+        text: to_text(&layout),
     }
 }
 
-fn select_layout(expr: &SelectExpr) -> String {
+fn select_layout(expr: &SelectExpr) -> SelectLayout<'_> {
     match expr {
-        SelectExpr::Column(column) => column.clone(),
-        SelectExpr::Agg(func, column) => {
-            format!("{}({})", func.name(), column.as_deref().unwrap_or(""))
-        }
+        SelectExpr::Column(column) => SelectLayout::Column(column),
+        SelectExpr::Agg(func, column) => SelectLayout::Agg {
+            func: func.name(),
+            column: column.as_deref(),
+        },
         SelectExpr::WindowFunc {
             column,
             interval_seconds,
-        } => format!("window({column}, {interval_seconds} s)"),
+        } => SelectLayout::Window {
+            column,
+            seconds: *interval_seconds,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::ast::{AggFunc, ColumnDef, SelectItem};
+    use crate::types::ColumnType;
+
+    fn mv(select: Vec<SelectExpr>) -> MVDef {
+        MVDef {
+            name: "v".into(),
+            source: "t".into(),
+            select: select
+                .into_iter()
+                .map(|expr| SelectItem { expr, alias: None })
+                .collect(),
+            group_by: vec![],
+            sliding_window: None,
+        }
+    }
+
+    fn table(columns: &[(&str, ColumnType)]) -> TableDef {
+        TableDef {
+            name: "t".into(),
+            columns: columns
+                .iter()
+                .map(|(name, column_type)| ColumnDef {
+                    name: name.to_string(),
+                    column_type: column_type.clone(),
+                })
+                .collect(),
+            virtual_table: false,
+        }
+    }
+
+    /// A quoted column may be named like an aggregate.
+    #[test]
+    fn column_named_like_an_aggregate_has_its_own_layout() {
+        let column = mv(vec![SelectExpr::Column("sum(a)".into())]);
+        let agg = mv(vec![SelectExpr::Agg(AggFunc::Sum, Some("a".into()))]);
+        assert_ne!(mv_layout(&column).text, mv_layout(&agg).text);
+
+        let window = mv(vec![SelectExpr::WindowFunc {
+            column: "a".into(),
+            interval_seconds: 60,
+        }]);
+        let count = mv(vec![SelectExpr::Agg(AggFunc::Count, None)]);
+        let column = mv(vec![SelectExpr::Column("count()".into())]);
+        assert_ne!(mv_layout(&window).text, mv_layout(&column).text);
+        assert_ne!(mv_layout(&count).text, mv_layout(&column).text);
+    }
+
+    #[test]
+    fn column_names_with_separators_have_their_own_layout() {
+        let one = table(&[("a UInt64, b", ColumnType::String)]);
+        let two = table(&[("a", ColumnType::UInt64), ("b", ColumnType::String)]);
+        assert_ne!(table_layout(&one).text, table_layout(&two).text);
+
+        let quoted = table(&[(r#"a","type":"UInt64"},{"name":"b"#, ColumnType::String)]);
+        assert_ne!(table_layout(&quoted).text, table_layout(&two).text);
     }
 }

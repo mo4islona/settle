@@ -92,7 +92,8 @@ fn swapped_table_columns_are_refused() {
 
     let msg = open_err(&swapped, &storage);
     assert!(msg.contains("table 'transfers'"), "{msg}");
-    assert!(msg.contains("columns (block_number UInt64, user String, a UInt64, b UInt64)"), "{msg}");
+    let stored = r#"{"name":"a","type":"UInt64"},{"name":"b","type":"UInt64"}"#;
+    assert!(msg.contains(stored), "{msg}");
 }
 
 #[test]
