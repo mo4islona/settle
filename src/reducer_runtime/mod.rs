@@ -46,6 +46,12 @@ pub trait ReducerRuntime: Send {
         false
     }
 
+    /// Whether `process_grouped` calls into a host (JS) context that must be
+    /// installed on the calling thread.
+    fn needs_host_context(&self) -> bool {
+        false
+    }
+
     /// Process a batch of groups. Each group has its state and ordered rows.
     ///
     /// Only called when `use_batched_processing()` returns true.

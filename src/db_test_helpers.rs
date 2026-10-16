@@ -6,8 +6,12 @@ pub use crate::test_helpers::{
     handle_fork, ingest_blocks, ingest_input, ingest_one, ingest_with_finalized, rollback_to,
 };
 
-use crate::types::{RowMap, Value};
+use crate::error::{Error, Result};
+use crate::storage::memory::MemoryBackend;
+use crate::storage::{StorageBackend, StorageWriteBatch};
+use crate::types::{BlockNumber, RowMap, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const DEX_SCHEMA: &str = r#"
     CREATE TABLE trades (
@@ -105,4 +109,59 @@ pub fn make_swap(pool: &str, amount: f64) -> RowMap {
         ("pool".to_string(), Value::String(pool.to_string())),
         ("amount".to_string(), Value::Float64(amount)),
     ])
+}
+
+/// `MemoryBackend` with injected failures: raw-row reads fail while
+/// `fail_reads` is set, and commits fail once `commits_before_failure`
+/// commits have passed.
+pub struct FailingStorage {
+    inner: MemoryBackend,
+    pub fail_reads: AtomicBool,
+    pub commits_before_failure: AtomicU64,
+}
+
+impl Default for FailingStorage {
+    fn default() -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            fail_reads: AtomicBool::new(false),
+            commits_before_failure: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+impl StorageBackend for FailingStorage {
+    fn put_raw_rows(&self, t: &str, b: BlockNumber, d: &[u8]) -> Result<()> { self.inner.put_raw_rows(t, b, d) }
+    fn get_raw_rows(&self, t: &str, f: BlockNumber, u: BlockNumber) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
+        if self.fail_reads.load(Ordering::SeqCst) {
+            return Err(Error::Storage("injected read failure".into()));
+        }
+        self.inner.get_raw_rows(t, f, u)
+    }
+    fn delete_raw_rows_after(&self, t: &str, a: BlockNumber) -> Result<()> { self.inner.delete_raw_rows_after(t, a) }
+    fn take_raw_rows_after(&self, t: &str, a: BlockNumber) -> Result<Vec<(BlockNumber, Vec<u8>)>> { self.inner.take_raw_rows_after(t, a) }
+    fn put_reducer_state(&self, r: &str, k: &[u8], b: BlockNumber, s: &[u8]) -> Result<()> { self.inner.put_reducer_state(r, k, b, s) }
+    fn get_reducer_state(&self, r: &str, k: &[u8], b: BlockNumber) -> Result<Option<Vec<u8>>> { self.inner.get_reducer_state(r, k, b) }
+    fn get_reducer_state_at_or_before(&self, r: &str, k: &[u8], b: BlockNumber) -> Result<Option<(BlockNumber, Vec<u8>)>> { self.inner.get_reducer_state_at_or_before(r, k, b) }
+    fn delete_reducer_states_after(&self, r: &str, k: &[u8], a: BlockNumber) -> Result<()> { self.inner.delete_reducer_states_after(r, k, a) }
+    fn get_reducer_finalized(&self, r: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_reducer_finalized(r, k) }
+    fn set_reducer_finalized(&self, r: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.set_reducer_finalized(r, k, s) }
+    fn delete_reducer_states_up_to(&self, r: &str, k: &[u8], u: BlockNumber) -> Result<()> { self.inner.delete_reducer_states_up_to(r, k, u) }
+    fn put_mv_state(&self, v: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.put_mv_state(v, k, s) }
+    fn get_mv_state(&self, v: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_mv_state(v, k) }
+    fn delete_mv_state(&self, v: &str, k: &[u8]) -> Result<()> { self.inner.delete_mv_state(v, k) }
+    fn list_mv_group_keys(&self, v: &str) -> Result<Vec<Vec<u8>>> { self.inner.list_mv_group_keys(v) }
+    fn put_meta(&self, k: &str, v: &[u8]) -> Result<()> { self.inner.put_meta(k, v) }
+    fn get_meta(&self, k: &str) -> Result<Option<Vec<u8>>> { self.inner.get_meta(k) }
+    fn list_reducer_group_keys(&self, r: &str) -> Result<Vec<Vec<u8>>> { self.inner.list_reducer_group_keys(r) }
+    fn commit(&self, batch: &StorageWriteBatch) -> Result<()> {
+        let left = self.commits_before_failure.load(Ordering::SeqCst);
+        if left == 0 {
+            return Err(Error::Storage("injected commit failure".into()));
+        }
+        if left != u64::MAX {
+            self.commits_before_failure.store(left - 1, Ordering::SeqCst);
+        }
+        self.inner.commit(batch)
+    }
 }

@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use crate::error::{Error, Result};
 use crate::schema::ast::Schema;
 use crate::storage::StorageBackend;
-use crate::storage::StorageWriteBatch;
+use crate::storage::{PendingWrites, StorageWriteBatch};
 use crate::types::{
     BlockCursor, BlockNumber, ColumnType, ChangeBatch, ChangeRecord, PerfNode, PerfNodeKind, Row,
     RowMap,
@@ -656,10 +656,11 @@ impl SettleEngine {
         fork_point: BlockNumber,
     ) -> Result<()> {
         // Reset the reducer itself (covers both branch-hosted and HashMap-hosted).
+        let none_pending = PendingWrites::default();
         if let Some(idx) = self.branch_index.get(reducer_name).copied() {
-            self.branches[idx].reducer.rollback(fork_point)?;
+            self.branches[idx].reducer.rollback(fork_point, &none_pending)?;
         } else if let Some(reducer) = self.reducers.get_mut(reducer_name) {
-            reducer.rollback(fork_point)?;
+            reducer.rollback(fork_point, &none_pending)?;
         } else {
             return Err(Error::InvalidOperation(format!(
                 "reset_reducer_branch_for_replay: unknown reducer '{reducer_name}'"
@@ -866,17 +867,19 @@ impl SettleEngine {
 
     /// Roll back all state after fork_point.
     pub fn rollback(&mut self, fork_point: BlockNumber) -> Result<Vec<ChangeRecord>> {
-        self.rollback_inner(fork_point, None)
+        self.rollback_inner(fork_point, None, &PendingWrites::default())
     }
 
     /// Roll back all state after fork_point, deferring raw-row deletions
-    /// to the provided write batch for atomic commit with metadata.
+    /// to the provided write batch for atomic commit with metadata. Storage
+    /// is read through `pending`, the write batches not committed yet.
     pub fn rollback_to_batch(
         &mut self,
         fork_point: BlockNumber,
         batch: &mut StorageWriteBatch,
+        pending: &PendingWrites,
     ) -> Result<Vec<ChangeRecord>> {
-        self.rollback_inner(fork_point, Some(batch))
+        self.rollback_inner(fork_point, Some(batch), pending)
     }
 
     /// Err if a rollback to `fork_point` is not allowed. Changes nothing, so
@@ -912,6 +915,7 @@ impl SettleEngine {
         &mut self,
         fork_point: BlockNumber,
         write_batch: Option<&mut StorageWriteBatch>,
+        pending: &PendingWrites,
     ) -> Result<Vec<ChangeRecord>> {
         self.check_rollback_target(fork_point)?;
 
@@ -924,7 +928,7 @@ impl SettleEngine {
             return Ok(Vec::new());
         }
 
-        let all_changes = self.unwind_to(fork_point, write_batch)?;
+        let all_changes = self.unwind_to(fork_point, write_batch, pending)?;
 
         // Remove hashes for rolled-back blocks
         let after = self.block_hashes.split_off(&(fork_point + 1));
@@ -941,14 +945,15 @@ impl SettleEngine {
     /// `finalized_block` can be above `block`. Block hashes stay as they are,
     /// because a failed ingest stores none, and the hashes above `block` can
     /// include the finalized head. Raw-row deletions go to a throwaway batch:
-    /// the ingest's raw rows were never committed.
-    pub fn undo_ingest(&mut self, block: BlockNumber) -> Result<()> {
+    /// the ingest's raw rows were never committed. `pending` holds the write
+    /// batches of earlier ingests that are not committed yet.
+    pub fn undo_ingest(&mut self, block: BlockNumber, pending: &PendingWrites) -> Result<()> {
         if block > self.latest_block() {
             return Ok(());
         }
 
         let mut throwaway = StorageWriteBatch::new();
-        self.unwind_to(block, Some(&mut throwaway))?;
+        self.unwind_to(block, Some(&mut throwaway), pending)?;
         Ok(())
     }
 
@@ -958,6 +963,7 @@ impl SettleEngine {
         &mut self,
         fork_point: BlockNumber,
         mut write_batch: Option<&mut StorageWriteBatch>,
+        pending: &PendingWrites,
     ) -> Result<Vec<ChangeRecord>> {
         let mut all_changes = Vec::new();
 
@@ -977,16 +983,16 @@ impl SettleEngine {
                     if let Some(branch) =
                         self.branch_index.get(name).map(|&i| &mut self.branches[i])
                     {
-                        branch.reducer.rollback(fork_point)?;
+                        branch.reducer.rollback(fork_point, pending)?;
                     } else {
                         let reducer = self.reducers.get_mut(name).unwrap();
-                        reducer.rollback(fork_point)?;
+                        reducer.rollback(fork_point, pending)?;
                     }
                 }
                 PipelineNode::RawTable(name) => {
                     let raw_engine = self.raw_tables.get(name).unwrap();
                     let changes = if let Some(ref mut batch) = write_batch {
-                        raw_engine.rollback_to_batch(fork_point, batch)?
+                        raw_engine.rollback_to_batch(fork_point, batch, pending)?
                     } else {
                         raw_engine.rollback(fork_point)?
                     };
@@ -1825,7 +1831,7 @@ mod tests {
             "a chain rollback below finality stays rejected"
         );
         engine
-            .undo_ingest(3)
+            .undo_ingest(3, &PendingWrites::default())
             .expect("undoing a failed ingest is not bounded by finality");
         assert_eq!(engine.latest_block(), 3);
         assert_eq!(engine.finalized_cursor().map(|c| c.number), Some(100));

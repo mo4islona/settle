@@ -2,9 +2,10 @@
 //!
 //! Pins the contract that `Settle::ingest` and `Settle::handle_fork` defer
 //! `storage.commit` until `ack(sequence)` succeeds. Until ack:
-//!   - Engine in-memory state is ahead of disk by one batch.
+//!   - Engine in-memory state is ahead of disk by the unacked batches.
 //!   - Disk reflects the last successfully-committed (acked or heartbeat) state.
-//!   - Mutating APIs return `Err(PendingAck)`.
+//!   - Once `max_pending_batches` (default 2) batches wait, `ingest` and
+//!     `handle_fork` return `Err(PendingAck)`.
 //!   - Drop+reopen rolls back to disk; re-ingest deterministically rebuilds.
 
 use std::collections::HashMap;
@@ -85,7 +86,7 @@ fn ack_commits_state_durably() {
 }
 
 #[test]
-fn second_ingest_returns_pending_ack_error() {
+fn ingest_past_full_queue_returns_pending_ack_error() {
     let tmp = TempDir::new().unwrap();
     let mut db = open_rocks(tmp.path());
 
@@ -93,9 +94,11 @@ fn second_ingest_returns_pending_ack_error() {
         .ingest(ingest_block(1, 0))
         .unwrap()
         .expect("block 1 produces a batch");
+    db.ingest(ingest_block(2, 0)).unwrap().expect("block 2 produces a batch");
 
-    // Without ack, the next ingest must report PendingAck — not partially process.
-    let err = db.ingest(ingest_block(2, 0)).unwrap_err();
+    // Without ack, the third ingest must report PendingAck with the oldest
+    // batch — not partially process.
+    let err = db.ingest(ingest_block(3, 0)).unwrap_err();
     match err {
         Error::PendingAck { sequence, .. } => {
             assert_eq!(sequence, b1.sequence);
@@ -272,23 +275,24 @@ fn handle_fork_empty_chain_rejected() {
 }
 
 #[test]
-fn ingest_validation_with_pending_uses_committed_not_engine_state() {
+fn full_queue_reports_pending_ack_before_validation() {
     let tmp = TempDir::new().unwrap();
     let mut db = open_rocks(tmp.path());
     // Acked ingest brings finalized to 3.
     let b1 = db.ingest(ingest_block(5, 3)).unwrap().unwrap();
     db.ack(b1.sequence).unwrap();
 
-    // Second ingest creates pending; engine.finalized advances to 4.
+    // Two unacked ingests fill the queue; engine.finalized advances to 4.
     let _ = db.ingest(ingest_block(6, 4)).unwrap();
+    let _ = db.ingest(ingest_block(7, 4)).unwrap();
     assert!(db.is_awaiting_ack());
 
-    // Third ingest with finalized_head=3 (committed view) should report
-    // PendingAck — NOT InvalidOperation against the uncommitted engine.finalized=4.
+    // A retry of an earlier input (finalized_head=3) should report
+    // PendingAck — NOT InvalidOperation against engine.finalized=4.
     let err = db
         .ingest(IngestInput {
-            data: HashMap::from([("orders".into(), vec![order_row(ASSET, 100, 7)])]),
-            rollback_chain: vec![cursor(7)],
+            data: HashMap::from([("orders".into(), vec![order_row(ASSET, 100, 8)])]),
+            rollback_chain: vec![cursor(8)],
             finalized_head: cursor(3),
         })
         .unwrap_err();
@@ -301,18 +305,19 @@ fn ingest_validation_with_pending_uses_committed_not_engine_state() {
 // ─── Fork pending semantics ──────────────────────────────────────
 
 #[test]
-fn fork_during_pending_returns_pending_ack_error() {
+fn fork_with_full_queue_returns_pending_ack_error() {
     let tmp = TempDir::new().unwrap();
     let mut db = open_rocks(tmp.path());
     let b1 = db.ingest(ingest_block(1, 0)).unwrap().unwrap();
     db.ack(b1.sequence).unwrap();
 
-    // Ingest block 2 without acking.
+    // Ingest blocks 2 and 3 without acking: the queue is full.
     let _ = db.ingest(ingest_block(2, 0)).unwrap();
+    let _ = db.ingest(ingest_block(3, 0)).unwrap();
     assert!(db.is_awaiting_ack());
 
-    // handle_fork while pending must report PendingAck — caller has to ack
-    // (or drop+reopen) first, then refork on the resulting committed state.
+    // handle_fork with a full queue must report PendingAck — caller has to
+    // ack (or drop+reopen) first.
     let err = match db.handle_fork(vec![cursor(1)]) {
         Ok(_) => panic!("expected PendingAck"),
         Err(e) => e,
@@ -648,8 +653,8 @@ impl StorageBackend for AlwaysFailCommit {
 /// CF_REDUCER_FIN stuck at the old finalized block.
 ///
 /// The chosen recovery is to **poison** the instance: subsequent mutating
-/// calls return `Err(Poisoned)` forcing the caller to drop+reopen, which
-/// rebuilds in-memory state from disk via `replay_unfinalized`.
+/// calls but `ack` return `Err(Poisoned)` forcing the caller to drop+reopen,
+/// which rebuilds in-memory state from disk via `replay_unfinalized`.
 #[test]
 fn heartbeat_commit_failure_poisons_instance() {
     let backend = Arc::new(FailFirstCommitBackend::new(1));
@@ -682,7 +687,7 @@ fn heartbeat_commit_failure_poisons_instance() {
         "poisoned instance must reject further mutating work, got {err:?}",
     );
 
-    // handle_fork, replay_reducer, ack — all rejected too.
+    // handle_fork and replay_reducer are rejected too.
     let fork_err = match db.handle_fork(vec![cursor(1)]) {
         Ok(_) => panic!("poisoned handle_fork must error"),
         Err(e) => e,
@@ -692,7 +697,8 @@ fn heartbeat_commit_failure_poisons_instance() {
         db.replay_reducer("market_stats").unwrap_err(),
         Error::Poisoned(_),
     ));
-    assert!(matches!(db.ack(0).unwrap_err(), Error::Poisoned(_)));
+    // ack is not: the batches returned before the failure stay valid.
+    db.ack(0).unwrap();
 }
 
 // ─── replay_reducer must NOT double-count ────────────────────────

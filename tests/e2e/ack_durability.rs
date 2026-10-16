@@ -101,8 +101,8 @@ async fn crash_before_ack_target_replay_is_idempotent() {
 }
 
 /// Apply fails (target table dropped). Caller does NOT call ack → pending
-/// stays. Subsequent ingest hits `Err(PendingAck)`. After fixing target +
-/// retry apply+ack, pipeline proceeds.
+/// stays. Once the default two batches wait, ingest hits `Err(PendingAck)`
+/// with the oldest. After fixing target + retry apply+ack, pipeline proceeds.
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_throws_then_pending_stays_with_pg() {
     let mut pg = start_pg().await;
@@ -116,8 +116,9 @@ async fn apply_throws_then_pending_stays_with_pg() {
     assert!(apply_err.is_err(), "apply must fail without table");
 
     assert!(db.is_awaiting_ack());
-    match db.ingest(ingest_block(2, 50, 0)) {
-        Err(Error::PendingAck { .. }) => {}
+    let b2 = db.ingest(ingest_block(2, 50, 0)).unwrap().expect("b2");
+    match db.ingest(ingest_block(3, 25, 0)) {
+        Err(Error::PendingAck { sequence, .. }) => assert_eq!(sequence, b1.sequence),
         other => panic!("expected PendingAck, got {other:?}"),
     }
 
@@ -132,11 +133,9 @@ async fn apply_throws_then_pending_stays_with_pg() {
         .await
         .unwrap();
     apply_batch(&mut pg.client, &b1).await.expect("retry apply");
-    db.ack(b1.sequence).expect("ack after retry");
-
-    let b2 = db.ingest(ingest_block(2, 50, 0)).unwrap().expect("b2");
     apply_batch(&mut pg.client, &b2).await.expect("apply b2");
-    db.ack(b2.sequence).expect("ack b2");
+    db.ack(b2.sequence).expect("ack covers b1 and b2");
+    assert!(!db.is_awaiting_ack());
 
     let (total, count) = pg_row(&pg.client, ASSET).await.unwrap();
     assert_eq!(count, 2);

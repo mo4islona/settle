@@ -7,3 +7,4 @@ mod common;
 
 mod ack_durability;
 mod fork;
+mod pipelined;
