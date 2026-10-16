@@ -57,6 +57,15 @@ struct Touched {
     existence_only: bool,
 }
 
+/// A block that left a sliding window. Its data stays until the block that
+/// expired it is final: a fork below that block brings it back.
+struct ExpiredBlock {
+    block: BlockNumber,
+    ts: i64,
+    /// Per group, aggregates that hold only this block.
+    groups: Vec<(GroupKey, Vec<Box<dyn AggregationFunc>>)>,
+}
+
 /// Manages a single materialized view: GROUP BY routing, aggregation, rollback, changes.
 pub struct MVEngine {
     def: MVDef,
@@ -84,6 +93,9 @@ pub struct MVEngine {
     block_times: BTreeMap<BlockNumber, i64>,
     /// The maximum timestamp seen across all blocks (the "watermark").
     current_watermark: i64,
+    /// Sliding windows only: the expired blocks, by the block that expired
+    /// them.
+    expired: BTreeMap<BlockNumber, Vec<ExpiredBlock>>,
     /// Group keys removed since the last checkpoint (for storage cleanup).
     removed_groups: Vec<GroupKey>,
     /// Sliding windows only: groups touched since the last
@@ -203,6 +215,7 @@ impl MVEngine {
         let sliding_window = def.sliding_window.clone();
         let mut block_times: BTreeMap<BlockNumber, i64> = BTreeMap::new();
         let mut block_groups: BTreeMap<BlockNumber, FxHashSet<GroupKey>> = BTreeMap::new();
+        let mut expired = BTreeMap::new();
 
         // Restore sliding window metadata from storage
         if sliding_window.is_some() {
@@ -211,6 +224,10 @@ impl MVEngine {
                 if let Ok(bt) = rmp_serde::from_slice::<BTreeMap<BlockNumber, i64>>(&bt_bytes) {
                     block_times = bt;
                 }
+            }
+
+            if let Ok(Some(bytes)) = storage.get_meta(&expired_meta_key(&def.name)) {
+                expired = decode_expired(&bytes, &agg_funcs).unwrap_or_default();
             }
 
             // Rebuild block_groups from restored agg state (union of all aggs'
@@ -242,6 +259,7 @@ impl MVEngine {
             sliding_window,
             block_times,
             current_watermark,
+            expired,
             removed_groups: Vec::new(),
             dirty_groups: FxHashSet::default(),
             pending_durable: FxHashSet::default(),
@@ -337,7 +355,7 @@ impl MVEngine {
 
         // Expire old blocks for sliding windows
         if self.sliding_window.is_some() {
-            self.expire_old_blocks(touched);
+            self.expire_old_blocks(block, touched);
         }
     }
 
@@ -351,15 +369,15 @@ impl MVEngine {
         }
         // Use BTreeMap range to efficiently find blocks > fork_point
         let rolled_back = self.block_groups.split_off(&(fork_point + 1));
+        // The blocks that the rolled-back blocks expired.
+        let unexpired = self.expired.split_off(&(fork_point + 1));
+        // Not covered by `rolled_back`: a reopen rebuilds the groups of a
+        // block from the aggregates, so a block that fed no aggregate has a
+        // time and no groups.
+        let rolled_back_times = self.block_times.split_off(&(fork_point + 1));
 
-        if rolled_back.is_empty() {
+        if rolled_back.is_empty() && unexpired.is_empty() && rolled_back_times.is_empty() {
             return Vec::new();
-        }
-
-        // Clean up sliding window state for rolled-back blocks
-        if self.sliding_window.is_some() {
-            drop(self.block_times.split_off(&(fork_point + 1)));
-            self.current_watermark = self.block_times.values().copied().max().unwrap_or(0);
         }
 
         // Collect all group keys affected by rolled-back blocks (consume by
@@ -380,8 +398,50 @@ impl MVEngine {
             }
         }
 
+        if self.sliding_window.is_some() {
+            self.restore_expired(unexpired, fork_point, &mut touched);
+            self.current_watermark = self.block_times.values().copied().max().unwrap_or(0);
+        }
+
         // Emit changes (updates or deletes)
         self.emit_changes(touched)
+    }
+
+    /// Put back the blocks of `unexpired` at or below `fork_point`.
+    fn restore_expired(
+        &mut self,
+        unexpired: BTreeMap<BlockNumber, Vec<ExpiredBlock>>,
+        fork_point: BlockNumber,
+        touched: &mut Touched,
+    ) {
+        for expired in unexpired.into_values().flatten() {
+            // Rolled back itself: it expired on arrival.
+            if expired.block > fork_point {
+                continue;
+            }
+
+            self.block_times.insert(expired.block, expired.ts);
+            for (key, mut data) in expired.groups {
+                self.snapshot(touched, &key);
+
+                match self.groups.get_mut(&key) {
+                    Some(aggs) => {
+                        for (from, agg) in data.iter_mut().zip(aggs.iter_mut()) {
+                            from.move_block(expired.block, agg.as_mut());
+                        }
+                    }
+                    // Expiry emptied the group and removed it.
+                    None => {
+                        self.groups.insert(key.clone(), data);
+                    }
+                }
+
+                self.block_groups
+                    .entry(expired.block)
+                    .or_default()
+                    .insert(key);
+            }
+        }
     }
 
     /// Merge the blocks up to `block` into finalized state. The groups whose
@@ -390,6 +450,11 @@ impl MVEngine {
     /// touched since the last call instead.
     pub fn advance_finality(&mut self, block: BlockNumber) {
         let changed = if self.sliding_window.is_some() {
+            // No fork can go below `block` now, so these blocks stay expired.
+            self.expired = match block.checked_add(1) {
+                Some(after) => self.expired.split_off(&after),
+                None => BTreeMap::new(),
+            };
             std::mem::take(&mut self.dirty_groups)
         } else {
             self.finalize_blocks_up_to(block)
@@ -421,6 +486,10 @@ impl MVEngine {
             let bt_bytes = rmp_serde::to_vec(&self.block_times)
                 .expect("block_times serialization should not fail");
             batch.put_meta(&format!("mv_block_times:{}", self.def.name), &bt_bytes);
+
+            // Reopen rolls the window back to the durable block, which must
+            // bring back the blocks that later blocks expired.
+            batch.put_meta(&expired_meta_key(&self.def.name), &encode_expired(&self.expired));
         }
 
         // Delete stale groups from storage. Membership-wins reconcile: only
@@ -458,39 +527,46 @@ impl MVEngine {
         changed
     }
 
-    /// Remove blocks whose timestamps have fallen outside the sliding window,
-    /// and add the groups they held to `touched`.
-    fn expire_old_blocks(&mut self, touched: &mut Touched) {
+    /// Move the blocks whose timestamps have fallen outside the sliding window
+    /// to `expired`, and add the groups they held to `touched`.
+    fn expire_old_blocks(&mut self, expired_by: BlockNumber, touched: &mut Touched) {
         let sw = self.sliding_window.as_ref().unwrap();
         let window_ms = (sw.interval_seconds as i64).saturating_mul(1000);
         let cutoff = self.current_watermark - window_ms;
 
         // Find all blocks with timestamp < cutoff (strict less-than: boundary is inclusive).
         // Scan is bounded by window size since expired blocks are removed each round.
-        let expired_blocks: Vec<BlockNumber> = self
+        let expired_blocks: Vec<(BlockNumber, i64)> = self
             .block_times
             .iter()
             .filter(|(_, ts)| **ts < cutoff)
-            .map(|(block, _)| *block)
+            .map(|(block, ts)| (*block, *ts))
             .collect();
 
-        for &block in &expired_blocks {
-            if let Some(keys) = self.block_groups.remove(&block) {
-                for key in keys {
-                    // Snapshot prev output before first mutation of this group by expiry.
-                    // If already touched by row processing, keep that snapshot.
-                    self.snapshot(touched, &key);
+        for (block, ts) in expired_blocks {
+            self.block_times.remove(&block);
+            let keys = self.block_groups.remove(&block).unwrap_or_default();
 
-                    // Remove block's contribution from all aggs for this group
-                    if let Some(aggs) = self.groups.get_mut(&key) {
-                        for agg in aggs.iter_mut() {
-                            agg.remove_block(block);
-                        }
-                    }
+            let mut groups = Vec::with_capacity(keys.len());
+            for key in keys {
+                // Snapshot prev output before first mutation of this group by expiry.
+                // If already touched by row processing, keep that snapshot.
+                self.snapshot(touched, &key);
+
+                let mut data = self.create_agg_vec();
+                let Some(aggs) = self.groups.get_mut(&key) else {
+                    continue;
+                };
+                for (agg, into) in aggs.iter_mut().zip(data.iter_mut()) {
+                    agg.move_block(block, into.as_mut());
                 }
+                groups.push((key, data));
             }
 
-            self.block_times.remove(&block);
+            self.expired
+                .entry(expired_by)
+                .or_default()
+                .push(ExpiredBlock { block, ts, groups });
         }
     }
 
@@ -807,6 +883,83 @@ fn deserialize_mv_group(
         _ => return None,
     }
     Some(aggs)
+}
+
+fn expired_meta_key(mv_name: &str) -> String {
+    format!("mv_expired_blocks:{mv_name}")
+}
+
+// Expired blocks layout:
+//   count: u32 LE
+//   per block: expired_by: u64 LE, block: u64 LE, ts: i64 LE, groups: u32 LE
+//   per group: len: u32 LE + `encode_group_key`, len: u32 LE + `write_mv_group` layout
+
+fn encode_expired(expired: &BTreeMap<BlockNumber, Vec<ExpiredBlock>>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let count = expired.values().map(Vec::len).sum::<usize>() as u32;
+    buf.extend_from_slice(&count.to_le_bytes());
+
+    for (expired_by, blocks) in expired {
+        for expired in blocks {
+            buf.extend_from_slice(&expired_by.to_le_bytes());
+            buf.extend_from_slice(&expired.block.to_le_bytes());
+            buf.extend_from_slice(&expired.ts.to_le_bytes());
+            buf.extend_from_slice(&(expired.groups.len() as u32).to_le_bytes());
+
+            for (key, aggs) in &expired.groups {
+                write_slice(&mut buf, &storage::encode_group_key(key));
+                write_slice(&mut buf, &serialize_mv_group_full(aggs));
+            }
+        }
+    }
+    buf
+}
+
+fn decode_expired(
+    bytes: &[u8],
+    agg_funcs: &[AggFunc],
+) -> Option<BTreeMap<BlockNumber, Vec<ExpiredBlock>>> {
+    let mut pos = 0usize;
+    let mut expired: BTreeMap<BlockNumber, Vec<ExpiredBlock>> = BTreeMap::new();
+
+    for _ in 0..read_u32(bytes, &mut pos)? {
+        let expired_by = read_u64(bytes, &mut pos)?;
+        let block = read_u64(bytes, &mut pos)?;
+        let ts = read_u64(bytes, &mut pos)? as i64;
+
+        let mut groups = Vec::new();
+        for _ in 0..read_u32(bytes, &mut pos)? {
+            let key = storage::decode_group_key(read_slice(bytes, &mut pos)?);
+            let aggs = deserialize_mv_group(read_slice(bytes, &mut pos)?, agg_funcs)?;
+            groups.push((key, aggs));
+        }
+
+        expired
+            .entry(expired_by)
+            .or_default()
+            .push(ExpiredBlock { block, ts, groups });
+    }
+    Some(expired)
+}
+
+fn write_slice(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_slice<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let len = read_u32(bytes, pos)?;
+    let end = pos.checked_add(len)?;
+    let slice = bytes.get(*pos..end)?;
+    *pos = end;
+    Some(slice)
+}
+
+fn read_u64(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let end = pos.checked_add(8)?;
+    let v = u64::from_le_bytes(bytes.get(*pos..end)?.try_into().ok()?);
+    *pos = end;
+    Some(v)
 }
 
 #[cfg(test)]

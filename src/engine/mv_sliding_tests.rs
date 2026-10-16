@@ -483,15 +483,108 @@ fn sliding_window_rollback_plus_expiry() {
         )],
     );
 
-    // Now rollback to block 2. Block 3 is removed. Block 1 was already expired.
+    // Rollback to block 2 removes block 3, so block 1 is in the window again:
+    // the watermark goes back to 1_800_000.
     let rb = mv.rollback(2);
     assert_eq!(rb.len(), 1);
-    // After rollback: only block 2 remains (block 1 expired, block 3 rolled back)
-    // Watermark recalculated to 1_800_000
     assert_eq!(
         rb[0].values.get("total_volume"),
-        Some(&Value::Float64(200.0))
+        Some(&Value::Float64(300.0))
     );
+}
+
+fn trade(pair: &str, volume: f64, ts_ms: i64) -> RowMap {
+    make_ts_row(
+        &[
+            ("pair", Value::String(pair.into())),
+            ("volume", Value::Float64(volume)),
+        ],
+        ts_ms,
+    )
+}
+
+/// Expiry removes the BTC group; a fork below the block that expired it
+/// brings the group back as an Insert.
+#[test]
+fn sliding_window_rollback_restores_group_removed_by_expiry() {
+    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types());
+
+    mv.process_block(1, &[trade("BTC", 5.0, 0)]);
+    mv.process_block(2, &[trade("ETH", 10.0, 5_000)]);
+    let expiry = mv.process_block(3, &[trade("ETH", 20.0, 11_000)]);
+    assert!(
+        expiry
+            .iter()
+            .any(|c| c.operation == ChangeOp::Delete && c.key["pair"] == Value::String("BTC".into()))
+    );
+
+    let rb = mv.rollback(2);
+    let btc = rb
+        .iter()
+        .find(|c| c.key["pair"] == Value::String("BTC".into()))
+        .unwrap();
+    assert_eq!(btc.operation, ChangeOp::Insert);
+    assert_eq!(btc.values.get("total_volume"), Some(&Value::Float64(5.0)));
+
+    // Block 1 is a live block again: the next expiry removes it once more.
+    let again = mv.process_block(3, &[trade("ETH", 20.0, 11_000)]);
+    assert!(
+        again
+            .iter()
+            .any(|c| c.operation == ChangeOp::Delete && c.key["pair"] == Value::String("BTC".into()))
+    );
+}
+
+/// A block that expires on arrival is rolled back with itself, not restored.
+#[test]
+fn sliding_window_rollback_drops_block_expired_on_arrival() {
+    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types());
+
+    mv.process_block(1, &[trade("ETH", 10.0, 20_000)]);
+    mv.process_block(2, &[trade("BTC", 5.0, 1_000)]);
+
+    assert!(mv.rollback(1).is_empty());
+    assert!(mv.groups.keys().all(|k| k[0] != Value::String("BTC".into())));
+    assert!(!mv.block_times.contains_key(&2));
+}
+
+/// Block 1 is final, but block 3 that expired it is not: the checkpoint keeps
+/// block 1, so a rollback after a reopen still brings it back.
+#[test]
+fn sliding_window_expired_block_survives_reopen() {
+    let storage = test_storage();
+    {
+        let mut mv = MVEngine::new(sliding_sum_mv_def(3600), storage.clone(), &test_column_types());
+        mv.process_block(1, &[trade("ETH", 100.0, 0)]);
+        mv.process_block(2, &[trade("ETH", 200.0, 1_800_000)]);
+        mv.process_block(3, &[trade("ETH", 300.0, 3_601_000)]);
+
+        let mut batch = StorageWriteBatch::new();
+        mv.advance_finality(2);
+        mv.write_checkpoint(&mut batch);
+        storage.commit(&batch).unwrap();
+    }
+
+    let mut mv = MVEngine::new(sliding_sum_mv_def(3600), storage.clone(), &test_column_types());
+    let rb = mv.rollback(2);
+    assert_eq!(
+        rb[0].values.get("total_volume"),
+        Some(&Value::Float64(300.0))
+    );
+}
+
+/// Once the block that expired a block is final, the expired data goes.
+#[test]
+fn sliding_window_final_expiry_drops_expired_data() {
+    let mut mv = MVEngine::new(sliding_sum_mv_def(3600), test_storage(), &test_column_types());
+    mv.process_block(1, &[trade("ETH", 100.0, 0)]);
+    mv.process_block(2, &[trade("ETH", 200.0, 3_601_000)]);
+
+    mv.advance_finality(1);
+    assert_eq!(mv.expired.len(), 1);
+
+    mv.advance_finality(2);
+    assert!(mv.expired.is_empty());
 }
 
 #[test]
@@ -948,4 +1041,146 @@ fn sliding_window_missing_timestamp_uses_watermark() {
     assert!(mv.block_times.contains_key(&2));
     // Block 2 should use watermark (5000) as fallback
     assert_eq!(mv.block_times[&2], 5_000);
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+    }
+}
+
+/// The rows a consumer of the change records holds, by group.
+type View = BTreeMap<String, HashMap<String, Value>>;
+
+fn apply_changes(view: &mut View, changes: Vec<ChangeRecord>) {
+    for change in changes {
+        let key = format!("{:?}", change.key.get("grp"));
+        match change.operation {
+            ChangeOp::Delete => {
+                view.remove(&key);
+            }
+            _ => {
+                view.insert(key, change.values);
+            }
+        }
+    }
+}
+
+/// Without count(), a block whose values are all NULL feeds no aggregate.
+fn sliding_sum_only_mv_def(window_secs: u64) -> MVDef {
+    let mut def = sliding_all_aggs_mv_def(window_secs);
+    def.select.truncate(2);
+    def
+}
+
+fn random_forks_mv(def: fn(u64) -> MVDef, storage: &Arc<dyn StorageBackend>) -> MVEngine {
+    MVEngine::new(def(10), storage.clone(), &test_column_types())
+}
+
+/// The view of a fresh MV fed only `chain`.
+fn replay_view(def: fn(u64) -> MVDef, chain: &[(BlockNumber, Vec<RowMap>)]) -> View {
+    let mut mv = random_forks_mv(def, &test_storage());
+    let mut view = View::new();
+    for (block, rows) in chain {
+        apply_changes(&mut view, mv.process_block(*block, rows));
+    }
+    view
+}
+
+/// Random blocks, forks, finalizations and reopens. After each step the view
+/// must equal the view of a fresh MV fed only the blocks that remain.
+fn check_random_forks(def: fn(u64) -> MVDef, seed: u64, steps: usize) {
+    let storage = test_storage();
+    let mut mv = random_forks_mv(def, &storage);
+    let mut view = View::new();
+    let mut rng = Rng::new(seed);
+    let mut chain: Vec<(BlockNumber, Vec<RowMap>)> = Vec::new();
+    let mut finalized: BlockNumber = 0;
+    let mut durable: Option<BlockNumber> = None;
+    let mut clock: i64 = 0;
+    let mut log = Vec::new();
+
+    for _ in 0..steps {
+        let top = chain.last().map_or(0, |(b, _)| *b).max(finalized);
+
+        match rng.below(100) {
+            0..55 => {
+                let block = top + 1 + rng.below(2);
+                clock += rng.below(4_000) as i64;
+                // Sometimes far behind the watermark: it expires on arrival.
+                let ts = match rng.below(10) {
+                    0 => clock - rng.below(20_000) as i64,
+                    _ => clock,
+                };
+                let rows: Vec<RowMap> = (0..1 + rng.below(3))
+                    .map(|_| {
+                        let grp = Value::String(["A", "B", "C", "D"][rng.below(4) as usize].into());
+                        let val = match rng.below(5) {
+                            0 => Value::Null,
+                            n => Value::Float64(n as f64),
+                        };
+                        match rng.below(20) {
+                            0 => make_row(&[("grp", grp), ("val", val)]),
+                            _ => make_ts_row(&[("grp", grp), ("val", val)], ts),
+                        }
+                    })
+                    .collect();
+
+                log.push(format!("block {block}: {rows:?}"));
+                apply_changes(&mut view, mv.process_block(block, &rows));
+                chain.push((block, rows));
+            }
+            55..75 => {
+                let at = finalized + rng.below(top - finalized + 1);
+                log.push(format!("fork {at}"));
+                apply_changes(&mut view, mv.rollback(at));
+                chain.retain(|(b, _)| *b <= at);
+            }
+            75..90 => {
+                let to = finalized + rng.below(top - finalized + 1);
+                log.push(format!("finalize {to}"));
+                let mut batch = StorageWriteBatch::new();
+                mv.advance_finality(to);
+                mv.write_checkpoint(&mut batch);
+                storage.commit(&batch).unwrap();
+                finalized = to;
+                durable = Some(to);
+            }
+            _ => {
+                // What Settle::open does: roll the stored window back to the
+                // durable block, then replay the raw rows above it.
+                let Some(durable) = durable else { continue };
+                log.push("reopen".into());
+                mv = random_forks_mv(def, &storage);
+                mv.rollback(durable);
+                for (block, rows) in chain.iter().filter(|(b, _)| *b > durable) {
+                    mv.replay_block(*block, rows);
+                }
+            }
+        }
+
+        assert_eq!(
+            view,
+            replay_view(def, &chain),
+            "seed {seed}, after\n{}",
+            log.join("\n")
+        );
+    }
+}
+
+#[test]
+fn sliding_window_random_forks_match_replay() {
+    for seed in 0..1000 {
+        check_random_forks(sliding_all_aggs_mv_def, seed, 60);
+        check_random_forks(sliding_sum_only_mv_def, seed, 60);
+    }
 }
