@@ -13,11 +13,12 @@
 //! Run with: `cargo bench --bench vs_postgres_stateful` (Docker required)
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use settle::db::{Config, Settle};
 use settle::reducer_runtime::fn_reducer::FnReducerRuntime;
-use settle::test_helpers::{ingest_blocks, ingest_with_finalized};
+use settle::test_helpers::{ingest_blocks, ingest_with_finalized, ingest_with_finalized_no_ack};
 use settle::types::{ChangeBatch, ChangeRecord, RowMap, Value};
 use tokio_postgres::types::ToSql;
 
@@ -118,6 +119,8 @@ CREATE TABLE user_total_pnl (
 
 const TOTAL_ROWS: usize = 100_000;
 const NUM_USERS: usize = 10_000;
+/// 8 columns × 5000 rows stays under the 65535 parameters of one statement.
+const ROWS_PER_STATEMENT: usize = BATCH_SIZE;
 
 // ─── FnReducer: per-(user, token) moving-avg cost basis ────────────────────
 
@@ -176,19 +179,23 @@ impl Storage {
     }
 }
 
-fn make_cfg(schema: &str, storage: Storage) -> (Config, Option<tempfile::TempDir>) {
-    match storage {
+fn make_cfg(schema: &str, storage: Storage, depth: usize) -> (Config, Option<tempfile::TempDir>) {
+    let (cfg, dir) = match storage {
         Storage::Memory => (Config::new(schema), None),
         Storage::Rocks => {
             let dir = tempfile::tempdir().unwrap();
             let cfg = Config::with_data_dir(schema, dir.path().to_str().unwrap());
             (cfg, Some(dir))
         }
-    }
+    };
+    (cfg.max_pending_batches(depth), dir)
 }
 
-fn open_settle_db(storage: Storage) -> anyhow::Result<(Settle, Option<tempfile::TempDir>)> {
-    let (cfg, dir) = make_cfg(SETTLE_SCHEMA, storage);
+fn open_settle_db(
+    storage: Storage,
+    depth: usize,
+) -> anyhow::Result<(Settle, Option<tempfile::TempDir>)> {
+    let (cfg, dir) = make_cfg(SETTLE_SCHEMA, storage, depth);
     let mut db = Settle::open(cfg)?;
     db.register_reducer_callback("position", Box::new(position_reducer()))?;
     Ok((db, dir))
@@ -197,10 +204,14 @@ fn open_settle_db(storage: Storage) -> anyhow::Result<(Settle, Option<tempfile::
 // ─── PG INSERT helpers ─────────────────────────────────────────────────────
 
 fn pg_insert_trades(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<()> {
-    let n = rows.len();
-    if n == 0 {
-        return Ok(());
+    for part in rows.chunks(ROWS_PER_STATEMENT) {
+        pg_insert_trades_statement(pg, part)?;
     }
+    Ok(())
+}
+
+fn pg_insert_trades_statement(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<()> {
+    let n = rows.len();
     let sql = build_multi_insert(
         "trades",
         &[
@@ -366,8 +377,8 @@ fn pg_smart_step(pg: &PgRuntime, batch_rows: &[RowMap]) -> anyhow::Result<()> {
     }
 
     // UPSERT touched positions.
-    if !touched_pos.is_empty() {
-        let keys: Vec<&(String, String)> = touched_pos.iter().collect();
+    let pos_keys: Vec<&(String, String)> = touched_pos.iter().collect();
+    for keys in pos_keys.chunks(ROWS_PER_STATEMENT) {
         let n = keys.len();
         let sql = format!(
             "{} ON CONFLICT (user_addr, token) DO UPDATE SET \
@@ -397,8 +408,8 @@ fn pg_smart_step(pg: &PgRuntime, batch_rows: &[RowMap]) -> anyhow::Result<()> {
     }
 
     // UPSERT touched daily PnL.
-    if !touched_daily.is_empty() {
-        let keys: Vec<&(String, i64)> = touched_daily.iter().collect();
+    let daily_keys: Vec<&(String, i64)> = touched_daily.iter().collect();
+    for keys in daily_keys.chunks(ROWS_PER_STATEMENT) {
         let n = keys.len();
         let sql = format!(
             "{} ON CONFLICT (user_addr, day) DO UPDATE SET daily_pnl = EXCLUDED.daily_pnl",
@@ -418,8 +429,8 @@ fn pg_smart_step(pg: &PgRuntime, batch_rows: &[RowMap]) -> anyhow::Result<()> {
     }
 
     // UPSERT touched total PnL.
-    if !touched_total.is_empty() {
-        let keys: Vec<&String> = touched_total.iter().collect();
+    let total_keys: Vec<&String> = touched_total.iter().collect();
+    for keys in total_keys.chunks(ROWS_PER_STATEMENT) {
         let n = keys.len();
         let sql = format!(
             "{} ON CONFLICT (user_addr) DO UPDATE SET total_pnl = EXCLUDED.total_pnl",
@@ -439,11 +450,15 @@ fn pg_smart_step(pg: &PgRuntime, batch_rows: &[RowMap]) -> anyhow::Result<()> {
 
 // ─── PG UPSERTs from Settle ChangeBatch records ────────────────────────────
 
-fn pg_upsert_positions_from_changes(pg: &PgRuntime, records: &[ChangeRecord]) -> anyhow::Result<()> {
-    let n = records.len();
-    if n == 0 {
-        return Ok(());
+fn pg_upsert_positions_from_changes(pg: &PgRuntime, records: &[&ChangeRecord]) -> anyhow::Result<()> {
+    for part in records.chunks(ROWS_PER_STATEMENT) {
+        pg_upsert_positions_statement(pg, part)?;
     }
+    Ok(())
+}
+
+fn pg_upsert_positions_statement(pg: &PgRuntime, records: &[&ChangeRecord]) -> anyhow::Result<()> {
+    let n = records.len();
     let sql = format!(
         "{} ON CONFLICT (user_addr, token) DO UPDATE SET \
             quantity = EXCLUDED.quantity, \
@@ -469,11 +484,15 @@ fn pg_upsert_positions_from_changes(pg: &PgRuntime, records: &[ChangeRecord]) ->
     Ok(())
 }
 
-fn pg_upsert_daily_from_changes(pg: &PgRuntime, records: &[ChangeRecord]) -> anyhow::Result<()> {
-    let n = records.len();
-    if n == 0 {
-        return Ok(());
+fn pg_upsert_daily_from_changes(pg: &PgRuntime, records: &[&ChangeRecord]) -> anyhow::Result<()> {
+    for part in records.chunks(ROWS_PER_STATEMENT) {
+        pg_upsert_daily_statement(pg, part)?;
     }
+    Ok(())
+}
+
+fn pg_upsert_daily_statement(pg: &PgRuntime, records: &[&ChangeRecord]) -> anyhow::Result<()> {
+    let n = records.len();
     let sql = format!(
         "{} ON CONFLICT (user_addr, day) DO UPDATE SET daily_pnl = EXCLUDED.daily_pnl",
         build_multi_insert("user_daily_pnl", &["user_addr", "day", "daily_pnl"], n),
@@ -491,11 +510,15 @@ fn pg_upsert_daily_from_changes(pg: &PgRuntime, records: &[ChangeRecord]) -> any
     Ok(())
 }
 
-fn pg_upsert_total_from_changes(pg: &PgRuntime, records: &[ChangeRecord]) -> anyhow::Result<()> {
-    let n = records.len();
-    if n == 0 {
-        return Ok(());
+fn pg_upsert_total_from_changes(pg: &PgRuntime, records: &[&ChangeRecord]) -> anyhow::Result<()> {
+    for part in records.chunks(ROWS_PER_STATEMENT) {
+        pg_upsert_total_statement(pg, part)?;
     }
+    Ok(())
+}
+
+fn pg_upsert_total_statement(pg: &PgRuntime, records: &[&ChangeRecord]) -> anyhow::Result<()> {
+    let n = records.len();
     let sql = format!(
         "{} ON CONFLICT (user_addr) DO UPDATE SET total_pnl = EXCLUDED.total_pnl",
         build_multi_insert("user_total_pnl", &["user_addr", "total_pnl"], n),
@@ -530,6 +553,58 @@ fn key_i64(r: &ChangeRecord, col: &str) -> i64 {
 
 fn val_f64(r: &ChangeRecord, col: &str) -> f64 {
     r.values.get(col).and_then(|v| v.as_f64()).unwrap_or(0.0)
+}
+
+/// The records of `table` over `batches`, one per key: the last one. Each
+/// record carries the whole row and this workload deletes nothing, so the
+/// UPSERT of the last record gives the state after all the batches. One
+/// batch has one record per key already.
+fn last_per_key<'a>(
+    batches: &[&'a ChangeBatch],
+    table: &str,
+    key_cols: &[&str],
+) -> Vec<&'a ChangeRecord> {
+    if let [batch] = batches {
+        return batch.records_for(table).iter().collect();
+    }
+
+    let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
+    let mut merged: Vec<&ChangeRecord> = Vec::new();
+    for record in batches.iter().flat_map(|b| b.records_for(table)) {
+        let key: Vec<Value> = key_cols
+            .iter()
+            .map(|col| record.key.get(*col).cloned().unwrap_or(Value::Null))
+            .collect();
+        match index.get(&key) {
+            Some(&i) => merged[i] = record,
+            None => {
+                index.insert(key, merged.len());
+                merged.push(record);
+            }
+        }
+    }
+    merged
+}
+
+/// A batch of trades with the change batch Settle made from them.
+type Applied = (Vec<RowMap>, ChangeBatch);
+
+/// Apply one or more batches in one transaction.
+fn pg_apply(pg: &PgRuntime, group: &[Applied]) -> anyhow::Result<()> {
+    let batches: Vec<&ChangeBatch> = group.iter().map(|(_, batch)| batch).collect();
+    let positions = last_per_key(&batches, "user_token_position", &["user_addr", "token"]);
+    let daily = last_per_key(&batches, "user_daily_pnl", &["user_addr", "day"]);
+    let total = last_per_key(&batches, "user_total_pnl", &["user_addr"]);
+
+    pg.begin()?;
+    for (trades, _) in group {
+        pg_insert_trades(pg, trades)?;
+    }
+    pg_upsert_positions_from_changes(pg, &positions)?;
+    pg_upsert_daily_from_changes(pg, &daily)?;
+    pg_upsert_total_from_changes(pg, &total)?;
+    pg.commit()?;
+    Ok(())
 }
 
 // ─── Correctness check (3 tables) ──────────────────────────────────────────
@@ -631,15 +706,29 @@ fn attach_block_numbers(rows: &mut [RowMap], first_block: u64) {
     }
 }
 
-fn run_pg_only(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<()> {
+/// `batch_size` rows go into each transaction.
+fn run_pg_only(pg: &PgRuntime, rows: &[RowMap], batch_size: usize) -> anyhow::Result<()> {
     let mut block_no = 1u64;
-    for chunk in rows.chunks(BATCH_SIZE) {
+    for chunk in rows.chunks(batch_size) {
         let mut owned = chunk.to_vec();
         attach_block_numbers(&mut owned, block_no);
         // Per-batch transaction: 1 fsync for INSERT raw + 3 UPSERTs vs 4 fsyncs.
         pg.begin()?;
         pg_insert_trades(pg, &owned)?;
         pg_smart_step(pg, &owned)?;
+        pg.commit()?;
+        block_no += (chunk.len() / ROWS_PER_BLOCK) as u64;
+    }
+    Ok(())
+}
+
+fn run_pg_raw_only(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<()> {
+    let mut block_no = 1u64;
+    for chunk in rows.chunks(BATCH_SIZE) {
+        let mut owned = chunk.to_vec();
+        attach_block_numbers(&mut owned, block_no);
+        pg.begin()?;
+        pg_insert_trades(pg, &owned)?;
         pg.commit()?;
         block_no += BLOCKS_PER_BATCH as u64;
     }
@@ -648,22 +737,26 @@ fn run_pg_only(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<()> {
 
 const FINALIZED_AHEAD: u64 = 1_000_000_000;
 
+fn ingest_items(rows: &[RowMap], block_no: u64) -> Vec<(String, u64, Vec<RowMap>)> {
+    split_blocks(rows, block_no)
+        .into_iter()
+        .map(|(b, c)| ("trades".to_string(), b, c.to_vec()))
+        .collect()
+}
+
 fn run_settle_pg_timed(
     db: &mut Settle,
     pg: &PgRuntime,
     rows: &[RowMap],
     pre_finalized: bool,
-) -> anyhow::Result<std::time::Duration> {
+) -> anyhow::Result<Duration> {
     let mut block_no = 1u64;
-    let mut settle_total = std::time::Duration::ZERO;
+    let mut settle_total = Duration::ZERO;
     for chunk in rows.chunks(BATCH_SIZE) {
         let mut owned = chunk.to_vec();
         attach_block_numbers(&mut owned, block_no);
 
-        let items: Vec<(String, u64, Vec<RowMap>)> = split_blocks(&owned, block_no)
-            .into_iter()
-            .map(|(b, c)| ("trades".to_string(), b, c.to_vec()))
-            .collect();
+        let items = ingest_items(&owned, block_no);
         let t = Instant::now();
         let batch: ChangeBatch = if pre_finalized {
             ingest_with_finalized(db, items, FINALIZED_AHEAD)?
@@ -673,15 +766,135 @@ fn run_settle_pg_timed(
         .expect("non-empty batch");
         settle_total += t.elapsed();
 
-        pg.begin()?;
-        pg_insert_trades(pg, &owned)?;
-        pg_upsert_positions_from_changes(pg, batch.records_for("user_token_position"))?;
-        pg_upsert_daily_from_changes(pg, batch.records_for("user_daily_pnl"))?;
-        pg_upsert_total_from_changes(pg, batch.records_for("user_total_pnl"))?;
-        pg.commit()?;
+        pg_apply(pg, &[(owned, batch)])?;
         block_no += BLOCKS_PER_BATCH as u64;
     }
     Ok(settle_total)
+}
+
+/// How the PG applier takes batches from the queue into one transaction.
+#[derive(Clone, Copy)]
+enum Group {
+    /// Up to `n` batches that wait in the queue; no wait for more.
+    Queued(usize),
+    /// `n` batches; the applier waits until they are ingested.
+    Fixed(usize),
+}
+
+impl Group {
+    fn size(self) -> usize {
+        match self {
+            Group::Queued(n) | Group::Fixed(n) => n,
+        }
+    }
+
+    /// Room for the group PG applies and the next group Settle ingests.
+    fn depth(self) -> usize {
+        2 * self.size()
+    }
+
+    fn label(self) -> String {
+        match self {
+            Group::Queued(1) => ",pipe".to_string(),
+            Group::Queued(n) => format!(",pipe,q{n}"),
+            Group::Fixed(n) => format!(",pipe,x{n}"),
+        }
+    }
+}
+
+struct PipelinedRun {
+    settle: Duration,
+    pg_busy: Duration,
+    transactions: usize,
+}
+
+/// `run_settle_pg_timed` with the PG side on another thread: Settle ingests
+/// the next batches while PG applies the ones before. One ack commits a
+/// whole group.
+fn run_settle_pg_pipelined(
+    db: &mut Settle,
+    pg: &PgRuntime,
+    rows: &[RowMap],
+    pre_finalized: bool,
+    group: Group,
+) -> anyhow::Result<PipelinedRun> {
+    let (batch_tx, batch_rx) = mpsc::channel::<Applied>();
+    let (applied_tx, applied_rx) = mpsc::channel::<anyhow::Result<u64>>();
+
+    std::thread::scope(|scope| {
+        let applier = scope.spawn(move || {
+            let mut busy = Duration::ZERO;
+            let mut transactions = 0;
+            while let Ok(first) = batch_rx.recv() {
+                let mut taken = vec![first];
+                while taken.len() < group.size() {
+                    let next = match group {
+                        Group::Queued(_) => batch_rx.try_recv().ok(),
+                        Group::Fixed(_) => batch_rx.recv().ok(),
+                    };
+                    let Some(next) = next else { break };
+                    taken.push(next);
+                }
+
+                let newest = taken.last().expect("one batch at least").1.sequence;
+                let t = Instant::now();
+                let applied = pg_apply(pg, &taken).map(|()| newest);
+                busy += t.elapsed();
+                transactions += 1;
+                if applied_tx.send(applied).is_err() {
+                    break;
+                }
+            }
+            (busy, transactions)
+        });
+
+        let mut settle_total = Duration::ZERO;
+        let mut ack = |db: &mut Settle, applied: anyhow::Result<u64>| -> anyhow::Result<()> {
+            let sequence = applied?;
+            let t = Instant::now();
+            db.ack(sequence)?;
+            settle_total += t.elapsed();
+            Ok(())
+        };
+
+        let mut block_no = 1u64;
+        let mut ingest_time = Duration::ZERO;
+        for chunk in rows.chunks(BATCH_SIZE) {
+            while let Ok(applied) = applied_rx.try_recv() {
+                ack(db, applied)?;
+            }
+            while db.unacked_batches() >= group.depth() {
+                ack(db, applied_rx.recv()?)?;
+            }
+
+            let mut owned = chunk.to_vec();
+            attach_block_numbers(&mut owned, block_no);
+            let items = ingest_items(&owned, block_no);
+            let finalized = if pre_finalized { FINALIZED_AHEAD } else { db.finalized_block() };
+
+            let t = Instant::now();
+            let batch = ingest_with_finalized_no_ack(db, items, finalized)?.expect("non-empty batch");
+            ingest_time += t.elapsed();
+
+            batch_tx
+                .send((owned, batch))
+                .map_err(|_| anyhow::anyhow!("PG applier stopped"))?;
+            block_no += BLOCKS_PER_BATCH as u64;
+        }
+
+        drop(batch_tx);
+        while db.is_awaiting_ack() {
+            ack(db, applied_rx.recv()?)?;
+        }
+        drop(ack);
+
+        let (pg_busy, transactions) = applier.join().expect("applier thread");
+        Ok(PipelinedRun {
+            settle: settle_total + ingest_time,
+            pg_busy,
+            transactions,
+        })
+    })
 }
 
 // ─── Driver ────────────────────────────────────────────────────────────────
@@ -698,36 +911,70 @@ fn main() -> anyhow::Result<()> {
 
     let mut baseline: Option<PgState> = None;
 
+    // The floor: every variant writes these trades, with no MV in PG.
     {
         let pg = PgRuntime::start()?;
         pg.batch_execute(PG_SCHEMA)?;
         pg.take_stats();
         let t = Instant::now();
-        run_pg_only(&pg, &rows)?;
+        run_pg_raw_only(&pg, &rows)?;
         let elapsed = t.elapsed();
-        print_result_split(
-            "pg_only_smart",
-            TOTAL_ROWS,
-            elapsed,
-            std::time::Duration::ZERO,
-            pg.take_stats(),
-        );
-        check_pg_state(&pg, "pg_only_smart", &mut baseline)?;
+        print_result_split("pg_raw_only", TOTAL_ROWS, elapsed, Duration::ZERO, pg.take_stats());
     }
 
+    // x4 commits as often as the Settle `x4` rows below.
+    for batches_per_tx in [1, 4] {
+        let pg = PgRuntime::start()?;
+        pg.batch_execute(PG_SCHEMA)?;
+        pg.take_stats();
+        let t = Instant::now();
+        run_pg_only(&pg, &rows, batches_per_tx * BATCH_SIZE)?;
+        let elapsed = t.elapsed();
+
+        let label = match batches_per_tx {
+            1 => "pg_only_smart".to_string(),
+            n => format!("pg_only_smart[x{n}]"),
+        };
+        print_result_split(&label, TOTAL_ROWS, elapsed, Duration::ZERO, pg.take_stats());
+        check_pg_state(&pg, &label, &mut baseline)?;
+    }
+
+    // None: ack each batch before the next ingest.
+    let consumers = [
+        None,
+        Some(Group::Queued(1)),
+        Some(Group::Queued(4)),
+        Some(Group::Fixed(4)),
+    ];
     for pre_fin in [false, true] {
         let fin_tag = if pre_fin { ",fin" } else { "" };
         for storage in [Storage::Memory, Storage::Rocks] {
-            let (mut db, _dir) = open_settle_db(storage)?;
-            let pg = PgRuntime::start()?;
-            pg.batch_execute(PG_SCHEMA)?;
-            pg.take_stats();
-            let t = Instant::now();
-            let settle_t = run_settle_pg_timed(&mut db, &pg, &rows, pre_fin)?;
-            let total = t.elapsed();
-            let label = format!("settle_fn[{}{fin_tag}]_then_pg", storage.label());
-            print_result_split(&label, TOTAL_ROWS, total, settle_t, pg.take_stats());
-            check_pg_state(&pg, &label, &mut baseline)?;
+            for consumer in consumers {
+                let depth = consumer.map_or(1, Group::depth);
+                let (mut db, _dir) = open_settle_db(storage, depth)?;
+                let pg = PgRuntime::start()?;
+                pg.batch_execute(PG_SCHEMA)?;
+                pg.take_stats();
+
+                let pipe = consumer.map_or(String::new(), Group::label);
+                let label = format!("settle_fn[{}{fin_tag}{pipe}]_then_pg", storage.label());
+                let t = Instant::now();
+                let settle_t = match consumer {
+                    None => run_settle_pg_timed(&mut db, &pg, &rows, pre_fin)?,
+                    Some(group) => {
+                        let run = run_settle_pg_pipelined(&mut db, &pg, &rows, pre_fin, group)?;
+                        eprintln!(
+                            "  [pipe] {label:<36}  pg busy={:>6.3}s  txs={}",
+                            run.pg_busy.as_secs_f64(),
+                            run.transactions,
+                        );
+                        run.settle
+                    }
+                };
+                let total = t.elapsed();
+                print_result_split(&label, TOTAL_ROWS, total, settle_t, pg.take_stats());
+                check_pg_state(&pg, &label, &mut baseline)?;
+            }
         }
     }
 
