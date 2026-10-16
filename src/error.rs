@@ -10,6 +10,11 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// The stored data has another format version, or a schema object's
+    /// layout differs from the one that wrote its data.
+    #[error("incompatible storage: {0}")]
+    IncompatibleStorage(String),
+
     #[error("reducer error: {0}")]
     Reducer(String),
 

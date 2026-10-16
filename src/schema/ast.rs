@@ -27,6 +27,20 @@ pub enum AggFunc {
     Last,
 }
 
+impl AggFunc {
+    pub fn name(&self) -> &'static str {
+        match self {
+            AggFunc::Sum => "sum",
+            AggFunc::Count => "count",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+            AggFunc::Avg => "avg",
+            AggFunc::First => "first",
+            AggFunc::Last => "last",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SelectExpr {
     Column(String),

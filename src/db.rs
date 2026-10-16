@@ -13,7 +13,7 @@ use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
 #[cfg(feature = "rocksdb")]
 use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
-use crate::storage::{PendingWrites, StorageBackend, StorageWriteBatch};
+use crate::storage::{PendingWrites, StorageBackend, StorageWriteBatch, format};
 use crate::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, RowMap, Value};
 
 /// Configuration for opening a Settle instance.
@@ -197,6 +197,22 @@ const META_FINALIZED_BLOCK: &str = "finalized_block";
 const META_BLOCK_HASHES: &str = "block_hashes";
 const META_NEXT_SEQUENCE: &str = "next_sequence";
 
+/// Whether the database holds data: every commit of an ingest or a fork
+/// writes one of these keys.
+fn has_data(storage: &dyn StorageBackend) -> Result<bool> {
+    for key in [
+        META_LATEST_BLOCK,
+        META_FINALIZED_BLOCK,
+        META_BLOCK_HASHES,
+        META_NEXT_SEQUENCE,
+    ] {
+        if storage.get_meta(key)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// State stashed between a successful `ingest()` / `handle_fork()` and the
 /// caller's `ack()`: the write batch that advances disk to the state after
 /// this change batch.
@@ -249,6 +265,10 @@ pub struct Settle {
     /// Backfill durability checkpoint interval (blocks). 1 = persist every
     /// finalize. See `Config::backfill_checkpoint_interval`.
     backfill_checkpoint_interval: u64,
+    /// The format version and layouts that storage lacks. Every write batch
+    /// carries them until one commits; each unacked batch holds all of them,
+    /// as they grow only while no batch waits.
+    stamp: format::Stamp,
 }
 
 impl Settle {
@@ -278,6 +298,8 @@ impl Settle {
         } else {
             Arc::new(MemoryBackend::new())
         };
+
+        let stamp = format::check(storage.as_ref(), &schema, has_data(storage.as_ref())?)?;
 
         let mut engine = SettleEngine::new(&schema, storage.clone());
         engine.set_collect_perf(config.collect_perf);
@@ -339,6 +361,7 @@ impl Settle {
             poisoned: None,
             runtimes_attached: std::collections::HashSet::new(),
             backfill_checkpoint_interval: config.backfill_checkpoint_interval,
+            stamp,
         })
     }
 
@@ -461,7 +484,9 @@ impl Settle {
                  use `replay_reducer` or `register_reducer_callback` to re-attach"
             )));
         }
+        let stamp = format::check_reducer(self.storage.as_ref(), &def)?;
         self.engine.add_reducer(def, self.storage.clone())?;
+        self.stamp.extend(stamp);
 
         // Newly-added reducer starts with empty state — replay rebuilds it
         // from the unfinalized range without any double-counting risk.
@@ -550,6 +575,7 @@ impl Settle {
             }
             self.storage.commit(&oldest.write_batch)?;
             self.pending.pop_front();
+            self.stamp.clear();
         }
         Ok(())
     }
@@ -1075,7 +1101,9 @@ impl Settle {
 
         self.storage.commit(&write_batch).inspect_err(|e| {
             self.poisoned = Some(format!("{call} commit failed: {e}"));
-        })
+        })?;
+        self.stamp.clear();
+        Ok(())
     }
 
     /// Returns `Err(PendingAck)` when an unacked batch is in flight, with the
@@ -1101,7 +1129,7 @@ impl Settle {
     }
 
     /// Append engine metadata (latest_block, durable watermark, block_hashes)
-    /// to a write batch for atomic commit.
+    /// and the stamp to a write batch for atomic commit.
     ///
     /// `META_FINALIZED_BLOCK` stores the engine's DURABLE watermark, not the
     /// in-memory finality watermark. Under backfill deferral the two diverge:
@@ -1124,6 +1152,7 @@ impl Settle {
         let hashes_json = serde_json::to_vec(self.engine.block_hashes())
             .map_err(|e| Error::Storage(format!("failed to serialize block_hashes: {e}")))?;
         batch.put_meta(META_BLOCK_HASHES, &hashes_json);
+        format::write_stamp(&self.stamp, batch);
         Ok(())
     }
 }
@@ -1155,6 +1184,10 @@ mod recovery_tests;
 #[cfg(test)]
 #[path = "db_pipeline_tests.rs"]
 mod pipeline_tests;
+
+#[cfg(test)]
+#[path = "db_format_tests.rs"]
+mod format_tests;
 
 #[cfg(all(test, feature = "rocksdb"))]
 #[path = "backfill_tests.rs"]

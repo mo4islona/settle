@@ -1,3 +1,4 @@
+pub mod format;
 pub mod memory;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
