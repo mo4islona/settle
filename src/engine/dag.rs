@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 #[cfg(feature = "rayon")]
@@ -57,6 +57,52 @@ impl FinalizeNode for MVEngine {
 type NodeMut<'a> = &'a mut (dyn FinalizeNode + Send);
 #[cfg(not(feature = "rayon"))]
 type NodeMut<'a> = &'a mut dyn FinalizeNode;
+
+/// Replay reads the raw rows of each table this many blocks at a time, so that
+/// a long unfinalized tail is not held in memory at once. Tests read two at a
+/// time, so that every replay in them crosses the boundaries of a read.
+const REPLAY_READ_BLOCKS: usize = if cfg!(test) { 2 } else { 64 };
+
+/// The raw rows of one table during replay, read a part at a time.
+struct ReplayCursor {
+    table: String,
+    /// The first block of the next read; None once the range is read.
+    next_from: Option<BlockNumber>,
+    rows: VecDeque<(BlockNumber, Vec<Row>)>,
+}
+
+impl ReplayCursor {
+    fn new(table: String, from_block: BlockNumber) -> Self {
+        Self {
+            table,
+            next_from: Some(from_block),
+            rows: VecDeque::new(),
+        }
+    }
+
+    /// Read the next part when the rows of the last one are used up.
+    fn refill(&mut self, raw: &RawTableEngine, to_block: BlockNumber) -> Result<()> {
+        let Some(from) = self.next_from.filter(|_| self.rows.is_empty()) else {
+            return Ok(());
+        };
+
+        // More blocks than asked for are the whole range: the backend reads no
+        // less (see `get_raw_rows_limited`).
+        let part = raw.get_rows(from, to_block, REPLAY_READ_BLOCKS)?;
+        self.next_from = match part.last() {
+            Some(&(last, _)) if part.len() == REPLAY_READ_BLOCKS && last < to_block => {
+                Some(last + 1)
+            }
+            _ => None,
+        };
+        self.rows.extend(part);
+        Ok(())
+    }
+
+    fn front_block(&self) -> Option<BlockNumber> {
+        self.rows.front().map(|(block, _)| *block)
+    }
+}
 
 /// An independent reducer→MV chain that can be processed in parallel.
 /// Engines are stored inline to avoid HashMap extraction/reinsertion per batch.
@@ -750,112 +796,127 @@ impl SettleEngine {
             return Ok(());
         }
 
-        // Collect all (table_name, block, rows) across all raw tables.
-        // Rows are stored as Vec<Row> — no to_map() conversion needed!
-        let mut all_blocks: BTreeMap<BlockNumber, HashMap<String, Vec<Row>>> = BTreeMap::new();
+        let mut cursors: Vec<ReplayCursor> = self
+            .raw_tables
+            .keys()
+            .map(|table| ReplayCursor::new(table.clone(), from_block))
+            .collect();
 
-        for (table_name, raw_eng) in &self.raw_tables {
-            let rows_by_block = raw_eng.get_rows(from_block, to_block)?;
-            for (block, rows) in rows_by_block {
-                all_blocks
-                    .entry(block)
-                    .or_default()
-                    .insert(table_name.clone(), rows);
+        // Each block in order, with the rows of every table that has data in it.
+        loop {
+            for cursor in &mut cursors {
+                cursor.refill(&self.raw_tables[&cursor.table], to_block)?;
+            }
+
+            let Some(block) = cursors.iter().filter_map(ReplayCursor::front_block).min() else {
+                break;
+            };
+
+            for cursor in &mut cursors {
+                if cursor.front_block() == Some(block) {
+                    let (_, rows) = cursor.rows.pop_front().expect("front block");
+                    self.replay_table_block(block, cursor.table.clone(), rows, only_nodes)?;
+                }
             }
         }
 
-        // Replay each block in order through reducers and MVs only
-        for (block, tables) in all_blocks {
-            for (table_name, rows) in tables {
-                // Row cache for reducer input (indexed access)
-                let mut row_cache: HashMap<String, Vec<Row>> = HashMap::new();
-                row_cache.insert(table_name, rows);
+        Ok(())
+    }
 
-                // Output from reducers (RowMaps for MV consumption)
-                let mut output_rows: HashMap<String, Vec<RowMap>> = HashMap::new();
+    /// Feed the rows of one table at `block` through the reducers and MVs,
+    /// with no raw-table ingest and no change records.
+    fn replay_table_block(
+        &mut self,
+        block: BlockNumber,
+        table_name: String,
+        rows: Vec<Row>,
+        only_nodes: Option<&HashSet<String>>,
+    ) -> Result<()> {
+        // Row cache for reducer input (indexed access)
+        let mut row_cache: HashMap<String, Vec<Row>> = HashMap::new();
+        row_cache.insert(table_name, rows);
 
-                for node in &self.pipeline {
-                    match node {
-                        PipelineNode::RawTable(_) => {
-                            // Skip — rows already in storage
+        // Output from reducers (RowMaps for MV consumption)
+        let mut output_rows: HashMap<String, Vec<RowMap>> = HashMap::new();
+
+        for node in &self.pipeline {
+            match node {
+                PipelineNode::RawTable(_) => {
+                    // Skip — rows already in storage
+                }
+                PipelineNode::Reducer(name) => {
+                    // Skip if filtered out
+                    if let Some(filter) = &only_nodes {
+                        if !filter.contains(name.as_str()) {
+                            continue;
                         }
-                        PipelineNode::Reducer(name) => {
-                            // Skip if filtered out
-                            if let Some(filter) = &only_nodes {
-                                if !filter.contains(name.as_str()) {
-                                    continue;
-                                }
-                            }
+                    }
 
-                            // Skip external reducers when no JS context is installed
-                            let is_ext = self
-                                .branch_index
+                    // Skip external reducers when no JS context is installed
+                    let is_ext = self
+                        .branch_index
+                        .get(name)
+                        .map(|&i| self.branches[i].reducer.needs_host_callback())
+                        .unwrap_or_else(|| {
+                            self.reducers
                                 .get(name)
-                                .map(|&i| self.branches[i].reducer.needs_host_callback())
-                                .unwrap_or_else(|| {
-                                    self.reducers
-                                        .get(name)
-                                        .map(|r| r.needs_host_callback())
-                                        .unwrap_or(false)
-                                });
+                                .map(|r| r.needs_host_callback())
+                                .unwrap_or(false)
+                        });
 
-                            let enriched = if is_ext {
-                                Vec::new()
-                            } else if let Some(branch) =
-                                self.branch_index.get(name).map(|&i| &mut self.branches[i])
-                            {
-                                let source = branch.reducer.source().to_string();
-                                if let Some(source_rows) = row_cache.get(&source) {
-                                    branch.reducer.process_block(block, source_rows)?
-                                } else if let Some(source_maps) = output_rows.get(&source) {
-                                    branch.reducer.process_block_maps(block, source_maps)?
-                                } else {
-                                    Vec::new()
-                                }
-                            } else {
-                                let reducer = self.reducers.get_mut(name).unwrap();
-                                let source = reducer.source().to_string();
-                                if let Some(source_rows) = row_cache.get(&source) {
-                                    reducer.process_block(block, source_rows)?
-                                } else if let Some(source_maps) = output_rows.get(&source) {
-                                    reducer.process_block_maps(block, source_maps)?
-                                } else {
-                                    Vec::new()
-                                }
-                            };
-                            if !enriched.is_empty() {
-                                output_rows.insert(name.clone(), enriched);
-                            }
+                    let enriched = if is_ext {
+                        Vec::new()
+                    } else if let Some(branch) =
+                        self.branch_index.get(name).map(|&i| &mut self.branches[i])
+                    {
+                        let source = branch.reducer.source().to_string();
+                        if let Some(source_rows) = row_cache.get(&source) {
+                            branch.reducer.process_block(block, source_rows)?
+                        } else if let Some(source_maps) = output_rows.get(&source) {
+                            branch.reducer.process_block_maps(block, source_maps)?
+                        } else {
+                            Vec::new()
                         }
-                        PipelineNode::MV(name) => {
-                            // Skip if filtered out
-                            if let Some(filter) = &only_nodes {
-                                if !filter.contains(name.as_str()) {
-                                    continue;
-                                }
-                            }
+                    } else {
+                        let reducer = self.reducers.get_mut(name).unwrap();
+                        let source = reducer.source().to_string();
+                        if let Some(source_rows) = row_cache.get(&source) {
+                            reducer.process_block(block, source_rows)?
+                        } else if let Some(source_maps) = output_rows.get(&source) {
+                            reducer.process_block_maps(block, source_maps)?
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    if !enriched.is_empty() {
+                        output_rows.insert(name.clone(), enriched);
+                    }
+                }
+                PipelineNode::MV(name) => {
+                    // Skip if filtered out
+                    if let Some(filter) = &only_nodes {
+                        if !filter.contains(name.as_str()) {
+                            continue;
+                        }
+                    }
 
-                            if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
-                                let mv = &mut self.branches[bi].mv_entries[mi].1;
-                                let source = mv.source().to_string();
-                                if let Some(source_rows) = output_rows.get(&source) {
-                                    mv.replay_block(block, source_rows);
-                                } else if let Some(raw_rows) = row_cache.get(&source) {
-                                    let maps: Vec<RowMap> =
-                                        raw_rows.iter().map(|r| r.to_map()).collect();
-                                    mv.replay_block(block, &maps);
-                                }
-                            } else {
-                                let mv = self.mvs.get_mut(name).unwrap();
-                                let source = mv.source().to_string();
-                                if let Some(source_rows) = output_rows.get(&source) {
-                                    mv.replay_block(block, source_rows);
-                                } else if let Some(raw_rows) = row_cache.get(&source) {
-                                    let maps: Vec<RowMap> =
-                                        raw_rows.iter().map(|r| r.to_map()).collect();
-                                    mv.replay_block(block, &maps);
-                                }
-                            }
+                    if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
+                        let mv = &mut self.branches[bi].mv_entries[mi].1;
+                        let source = mv.source().to_string();
+                        if let Some(source_rows) = output_rows.get(&source) {
+                            mv.replay_block(block, source_rows);
+                        } else if let Some(raw_rows) = row_cache.get(&source) {
+                            let maps: Vec<RowMap> = raw_rows.iter().map(|r| r.to_map()).collect();
+                            mv.replay_block(block, &maps);
+                        }
+                    } else {
+                        let mv = self.mvs.get_mut(name).unwrap();
+                        let source = mv.source().to_string();
+                        if let Some(source_rows) = output_rows.get(&source) {
+                            mv.replay_block(block, source_rows);
+                        } else if let Some(raw_rows) = row_cache.get(&source) {
+                            let maps: Vec<RowMap> = raw_rows.iter().map(|r| r.to_map()).collect();
+                            mv.replay_block(block, &maps);
                         }
                     }
                 }
@@ -2147,6 +2208,66 @@ mod tests {
             mv_changes.last().unwrap().values.get("total"),
             Some(&Value::Float64(350.0))
         );
+    }
+
+    /// Replay reads each table a few blocks at a time. Two tables whose parts
+    /// end at different blocks must still replay every block of each, in
+    /// block order: `first`, `last` and `sum` show a lost or reordered block.
+    #[test]
+    fn replay_merges_tables_read_in_parts() {
+        let view = |table: &str| {
+            format!(
+                "CREATE MATERIALIZED VIEW {table}_view AS
+                 SELECT k, first(v) AS first_v, last(v) AS last_v, sum(v) AS total, count() AS n
+                 FROM {table} GROUP BY k;"
+            )
+        };
+        let schema = crate::schema::parser::parse_schema(&format!(
+            "CREATE TABLE a (block_number UInt64, k String, v Float64);
+             CREATE TABLE b (block_number UInt64, k String, v Float64);
+             {}
+             {}",
+            view("a"),
+            view("b"),
+        ))
+        .unwrap();
+        let row = |v: f64| {
+            vec![RowMap::from([
+                ("k".to_string(), Value::String("x".into())),
+                ("v".to_string(), Value::Float64(v)),
+            ])]
+        };
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let mut live = SettleEngine::new(&schema, storage.clone());
+        for block in 1..=40 {
+            live.process_batch("a", block, row(block as f64)).unwrap();
+            if block % 7 == 0 {
+                live.process_batch("b", block, row(block as f64 * 10.0))
+                    .unwrap();
+            }
+        }
+
+        let mut replayed = SettleEngine::new(&schema, storage);
+        replayed.replay_unfinalized(1, 40).unwrap();
+
+        // The changes of one more block carry each view's state before it.
+        let next_block = |engine: &mut SettleEngine| {
+            let (mut changes, _) = engine.process_batch("a", 41, row(0.5)).unwrap();
+            changes.extend(engine.process_batch("b", 41, row(0.5)).unwrap().0);
+            changes
+                .into_iter()
+                .filter(|c| c.table.ends_with("_view"))
+                .map(|c| {
+                    let prev: Option<BTreeMap<_, _>> =
+                        c.prev_values.map(|p| p.into_iter().collect());
+                    format!("{} {prev:?}", c.table)
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = next_block(&mut live);
+        assert_eq!(expected.len(), 2);
+        assert_eq!(next_block(&mut replayed), expected);
     }
 
     /// add_reducer must update mv_branch_index so process_batch can find branch MVs.

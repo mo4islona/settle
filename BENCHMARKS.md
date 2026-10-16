@@ -126,6 +126,26 @@ block scanned all the block times of the window.
 | `sliding_last`, before the timestamp index | 137M | 445M | 1,568M | ×3.2–3.5 |
 | `sliding_last` | 53M | 109M | 218M | ×2.0 |
 
+### Reopen
+
+`recovery reopen` counts `Settle::open` of a database whose derived state is
+durable only up to its first ingest: setup ingests the `backfill` inputs of
+`mv_sum_stored` with persist deferral, so the open replays 700 blocks, 35K rows.
+DHAT cannot show the peak heap of the replay here: the peak of the process falls
+in setup.
+
+Peak RSS of a reopen that replays 2,000 blocks, 1.05M rows (RocksDB, `sum` MV on
+a stored table, a probe that is not in the repository), 2026-10-16:
+
+| Replay reads | Peak RSS | Open |
+|---|---:|---:|
+| the whole tail at once | 547 MB | 0.71–0.82 s |
+| 64 blocks per table at a time | 448 MB | 0.72–0.74 s |
+
+Most of the rest is the state that the replay rebuilds: the replayed blocks stay
+unfinalized until the next ingest brings the finality, so the MV holds per-block
+data for the whole tail.
+
 Each case leaves its profiles under `target/gungraun/settle/instructions/ingest/<mode>.<workload>/`.
 `callgrind_annotate --inclusive=yes callgrind.<mode>.<workload>.out` shows where
 the instructions go; `dhat.<mode>.<workload>.out` opens in Valgrind's `dh_view.html`.
