@@ -34,7 +34,8 @@ fn main() -> anyhow::Result<()> {
         .map(|i| gen_transfer(i, NUM_USERS))
         .collect();
 
-    let dir = tempfile::tempdir()?;
+    // In target/, on the disk: /tmp can be tmpfs, where fsync costs nothing.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
     let cfg = Config::with_data_dir(SETTLE_SCHEMA_MV, dir.path().to_str().unwrap());
     let mut db = Settle::open(cfg)?;
 

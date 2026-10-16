@@ -357,27 +357,27 @@ impl Scale {
     }
 }
 
+fn tick(block: u64, seconds: u64) -> RowMap {
+    HashMap::from([
+        ("block_number".into(), Value::UInt64(block)),
+        (
+            "ts".into(),
+            Value::DateTime(1_700_000_000_000 + seconds as i64 * 1000),
+        ),
+        ("pair".into(), Value::String("hot".into())),
+        ("value".into(), Value::Float64((block * 7919 % 1000) as f64)),
+    ])
+}
+
 /// One block per second, finality at the batch tip.
 fn prepare_scale(scale: Scale, blocks: u64) -> &'static mut Prepared {
     init_bench_process();
 
-    let row = |block: u64, seconds: u64| {
-        HashMap::from([
-            ("block_number".into(), Value::UInt64(block)),
-            (
-                "ts".into(),
-                Value::DateTime(1_700_000_000_000 + seconds as i64 * 1000),
-            ),
-            ("pair".into(), Value::String("hot".into())),
-            ("value".into(), Value::Float64((block * 7919 % 1000) as f64)),
-        ])
-    };
-
-    let mut rows: Vec<RowMap> = (1..=blocks).map(|block| row(block, block)).collect();
+    let mut rows: Vec<RowMap> = (1..=blocks).map(|block| tick(block, block)).collect();
     let mut last = blocks;
     if let Scale::SlidingJump = scale {
         last += 1;
-        rows.push(row(last, blocks + 2 * 86_400));
+        rows.push(tick(last, blocks + 2 * 86_400));
     }
 
     let input = IngestInput {
@@ -406,6 +406,74 @@ fn prepare_scale(scale: Scale, blocks: u64) -> &'static mut Prepared {
 #[bench::sliding_jump_4k(args = (Scale::SlidingJump, 4_000), setup = prepare_scale)]
 #[bench::sliding_jump_8k(args = (Scale::SlidingJump, 8_000), setup = prepare_scale)]
 fn scale(case: &'static mut Prepared) -> usize {
+    ingest_all(case)
+}
+
+/// A sliding window of one group that holds `window` blocks, one block per
+/// second, so each block expires the oldest. Each ingest advances finality
+/// and so writes a checkpoint; a checkpoint of the whole window grows the
+/// count with it.
+fn prepare_window(window: u64, mode: Mode) -> &'static mut Prepared {
+    init_bench_process();
+
+    let schema = format!(
+        "CREATE VIRTUAL TABLE ticks (
+            block_number UInt64,
+            ts           DateTime,
+            pair         String,
+            value        Float64
+        );
+        CREATE MATERIALIZED VIEW hot AS
+        SELECT pair, sum(value) AS total
+        FROM ticks GROUP BY pair
+        WINDOW SLIDING INTERVAL {window} SECONDS BY ts;"
+    );
+    let input = |first: u64, last: u64| {
+        let finalized = match mode {
+            Mode::Backfill => last,
+            Mode::Tip => last.saturating_sub(FINALITY_LAG),
+        };
+        IngestInput {
+            data: HashMap::from([(
+                "ticks".to_string(),
+                (first..=last).map(|block| tick(block, block)).collect(),
+            )]),
+            rollback_chain: (first..=last)
+                .filter(|b| *b > finalized)
+                .map(cursor)
+                .collect(),
+            finalized_head: cursor(finalized),
+        }
+    };
+
+    let mut db = Settle::open(Config::new(schema)).unwrap();
+    ingest_and_ack(&mut db, input(1, window));
+
+    let per_ingest = mode.blocks_per_ingest();
+    let inputs = (0..mode.ingests() as u64)
+        .map(|n| {
+            let first = window + 1 + n * per_ingest;
+            input(first, first + per_ingest - 1)
+        })
+        .collect();
+    Box::leak(Box::new(Prepared { db, inputs }))
+}
+
+fn prepare_window_tip(window: u64) -> &'static mut Prepared {
+    prepare_window(window, Mode::Tip)
+}
+
+fn prepare_window_backfill(window: u64) -> &'static mut Prepared {
+    prepare_window(window, Mode::Backfill)
+}
+
+#[library_benchmark]
+#[bench::window_1k(args = (1_000), setup = prepare_window_tip)]
+#[bench::window_2k(args = (2_000), setup = prepare_window_tip)]
+#[bench::window_4k(args = (4_000), setup = prepare_window_tip)]
+#[bench::backfill_window_1k(args = (1_000), setup = prepare_window_backfill)]
+#[bench::backfill_window_4k(args = (4_000), setup = prepare_window_backfill)]
+fn checkpoint(case: &'static mut Prepared) -> usize {
     ingest_all(case)
 }
 
@@ -440,7 +508,7 @@ fn reopen(config: Config) {
 }
 
 library_benchmark_group!(name = ingest, benchmarks = [backfill, tip]);
-library_benchmark_group!(name = scaling, benchmarks = [scale]);
+library_benchmark_group!(name = scaling, benchmarks = [scale, checkpoint]);
 library_benchmark_group!(name = recovery, benchmarks = [reopen]);
 
 // No cache simulation: it doubles the run time, and the limits read instructions.
