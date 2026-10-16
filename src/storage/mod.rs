@@ -611,6 +611,13 @@ pub trait StorageBackend: Send + Sync {
     /// All operations in the batch either succeed together or fail together.
     /// Used for crash-safe finalization.
     fn commit(&self, batch: &StorageWriteBatch) -> Result<()>;
+
+    /// Make every commit so far survive a power loss, not only a crash of
+    /// the process. A backend whose commits are that durable on return keeps
+    /// this default.
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
