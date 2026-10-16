@@ -121,7 +121,7 @@ export class Settle implements ISettle {
         'WASM build is memory-only and does not expose buffer tuning — `dataDir`, `compression`, `disableCompaction`, `cacheSize`, and `maxBufferSize` are not supported.',
       )
     }
-    return new Settle(new WasmSettle(config.schema))
+    return new Settle(new WasmSettle(config.schema, config.maxPendingBatches))
   }
 
   registerReducer<TState = any, TRow = any, TEmit = any>(
@@ -238,6 +238,10 @@ export class Settle implements ISettle {
 
   get isAwaitingAck(): boolean {
     return this.#native.isAwaitingAck
+  }
+
+  get unackedBatches(): number {
+    return this.#native.unackedBatches
   }
 
   get isPoisoned(): boolean {
