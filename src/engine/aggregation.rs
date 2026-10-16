@@ -220,9 +220,11 @@ fn drain_up_to<V>(blocks: &mut BTreeMap<BlockNumber, V>, block: BlockNumber, mut
 ///
 /// It equals a fresh fold bit for bit: float addition is not associative, so
 /// it folds in the same order and never subtracts (saturating integer
-/// addition has no inverse either). A removal, or a write below the newest
-/// block, folds again. Finalization does not touch it: draining the oldest
-/// blocks into `seed` performs the same additions in the same order.
+/// addition has no inverse either). A removal drops it, since an expiry or a
+/// restore moves many blocks one at a time; the next write folds again, and a
+/// read without it folds the blocks itself. A write below the newest block
+/// folds again too. Finalization does not touch it: draining the oldest blocks
+/// into `seed` performs the same additions in the same order.
 /// The unfinalized blocks from which an aggregate keeps a `RunningFold`. With
 /// fewer, a read folds them directly: the fold is two to three times the size
 /// of the aggregate, and most groups hold only a few unfinalized blocks.
@@ -371,19 +373,19 @@ impl AggregationFunc for SumAgg {
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
-        self.refold();
+        self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
-        self.refold();
+        self.running = None;
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
         let into = same_kind::<Self>(into);
         move_entry(&mut self.blocks, &mut into.blocks, block);
-        self.refold();
-        into.refold();
+        self.running = None;
+        into.running = None;
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -494,19 +496,19 @@ impl AggregationFunc for CountAgg {
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
-        self.refold();
+        self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
-        self.refold();
+        self.running = None;
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
         let into = same_kind::<Self>(into);
         move_entry(&mut self.blocks, &mut into.blocks, block);
-        self.refold();
-        into.refold();
+        self.running = None;
+        into.running = None;
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -619,19 +621,19 @@ impl AggregationFunc for MinAgg {
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
-        self.refold();
+        self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
-        self.refold();
+        self.running = None;
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
         let into = same_kind::<Self>(into);
         move_entry(&mut self.blocks, &mut into.blocks, block);
-        self.refold();
-        into.refold();
+        self.running = None;
+        into.running = None;
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -749,19 +751,19 @@ impl AggregationFunc for MaxAgg {
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
-        self.refold();
+        self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
-        self.refold();
+        self.running = None;
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
         let into = same_kind::<Self>(into);
         move_entry(&mut self.blocks, &mut into.blocks, block);
-        self.refold();
-        into.refold();
+        self.running = None;
+        into.running = None;
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -909,19 +911,19 @@ impl AggregationFunc for AvgAgg {
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
-        self.refold();
+        self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
-        self.refold();
+        self.running = None;
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
         let into = same_kind::<Self>(into);
         move_entry(&mut self.blocks, &mut into.blocks, block);
-        self.refold();
-        into.refold();
+        self.running = None;
+        into.running = None;
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
