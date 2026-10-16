@@ -99,17 +99,17 @@ const REDUCER_LUA_SCHEMA: &str = r#"
     )
     LANGUAGE lua
     PROCESS $$
+        local trade_pnl = 0
         if row.side == "buy" then
             state.quantity = state.quantity + row.amount
             state.cost_basis = state.cost_basis + row.amount * row.price
-            emit.trade_pnl = 0
         else
             local avg_cost = state.cost_basis / state.quantity
-            emit.trade_pnl = row.amount * (row.price - avg_cost)
+            trade_pnl = row.amount * (row.price - avg_cost)
             state.quantity = state.quantity - row.amount
             state.cost_basis = state.cost_basis - row.amount * avg_cost
         end
-        emit.position_size = state.quantity
+        emit { trade_pnl = trade_pnl, position_size = state.quantity }
     $$;
 
     CREATE MATERIALIZED VIEW position_summary AS
@@ -803,10 +803,12 @@ PROCESS $$
     state.sum_price_sq = state.sum_price_sq + price * price
     if state.first_seen == 0 then state.first_seen = row.timestamp end
     state.last_seen = row.timestamp
-    emit.asset_id = row.asset_id
-    emit.volume = vol
-    emit.price = price
-    emit.price_sq = price * price
+    emit {
+        asset_id = row.asset_id,
+        volume = vol,
+        price = price,
+        price_sq = price * price
+    }
 $$;
 
 CREATE MATERIALIZED VIEW token_summary AS
