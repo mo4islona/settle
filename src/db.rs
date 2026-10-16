@@ -831,6 +831,10 @@ impl Settle {
             return Err(e);
         }
 
+        // Before `advance_finality`: the emit marks the groups that the
+        // checkpoint writes (sliding windows) or deletes (emptied groups).
+        pending_changes.extend(self.engine.take_changes());
+
         self.buffer.push(
             pending_changes,
             self.engine.finalized_cursor(),

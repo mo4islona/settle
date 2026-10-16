@@ -121,9 +121,8 @@ impl PipelineBranch {
         block: BlockNumber,
         output_rows: &HashMap<String, Vec<RowMap>>,
         perf: bool,
-    ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
+    ) -> Result<Option<PerfNode>> {
         let timer = PerfTimer::start(perf);
-        let mut changes = Vec::new();
         let mut mv_nodes = Vec::new();
 
         if let Some(rows) = output_rows.get(self.reducer.source()) {
@@ -131,14 +130,13 @@ impl PipelineBranch {
             if !enriched.is_empty() {
                 for (mv_name, mv) in &mut self.mv_entries {
                     let mv_timer = PerfTimer::start(perf);
-                    changes.extend(mv.process_block(block, &enriched));
+                    mv.apply_rows(block, &enriched);
                     mv_nodes.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
             }
         }
 
-        let node = timer.stop(PerfNodeKind::Reducer, &self.reducer_name, mv_nodes);
-        Ok((changes, node))
+        Ok(timer.stop(PerfNodeKind::Reducer, &self.reducer_name, mv_nodes))
     }
 }
 
@@ -460,10 +458,14 @@ impl SettleEngine {
         block: BlockNumber,
         row_maps: Vec<RowMap>,
     ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
-        self.process_batch_inner(table, block, row_maps, None)
+        let (mut changes, perf_node) = self.process_batch_inner(table, block, row_maps, None)?;
+        changes.extend(self.take_changes());
+        Ok((changes, perf_node))
     }
 
     /// Process a batch, deferring raw row storage writes to the given WriteBatch.
+    /// Returns the raw-table changes only: the MV changes of all the blocks of
+    /// an ingest wait for `take_changes`.
     pub fn process_batch_deferred(
         &mut self,
         table: &str,
@@ -472,6 +474,32 @@ impl SettleEngine {
         write_batch: &mut StorageWriteBatch,
     ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
         self.process_batch_inner(table, block, row_maps, Some(write_batch))
+    }
+
+    /// The MV changes of the blocks processed since the last call, one per
+    /// group, in pipeline order.
+    pub fn take_changes(&mut self) -> Vec<ChangeRecord> {
+        let mut changes = Vec::new();
+        self.for_each_mv(|mv| changes.extend(mv.take_changes()));
+        changes
+    }
+
+    /// Forget the MV changes of a failed ingest.
+    fn discard_changes(&mut self) {
+        self.for_each_mv(MVEngine::discard_changes);
+    }
+
+    fn for_each_mv(&mut self, mut f: impl FnMut(&mut MVEngine)) {
+        for node in &self.pipeline {
+            let PipelineNode::MV(name) = node else {
+                continue;
+            };
+            let mv = match self.mv_branch_index.get(name) {
+                Some(&(bi, mi)) => &mut self.branches[bi].mv_entries[mi].1,
+                None => self.mvs.get_mut(name).expect("MV in the pipeline"),
+            };
+            f(mv);
+        }
     }
 
     fn process_batch_inner(
@@ -530,8 +558,7 @@ impl SettleEngine {
                     let mv = self.mvs.get_mut(mv_name).unwrap();
                     let source = mv.source().to_string();
                     if let Some(source_rows) = output_rows.get(&source) {
-                        let changes = mv.process_block(block, source_rows);
-                        all_changes.extend(changes);
+                        mv.apply_rows(block, source_rows);
                     }
                     perf_children.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
@@ -539,10 +566,8 @@ impl SettleEngine {
                 // Phase 2b: Process reducer branches in parallel.
                 let parallel_timer = PerfTimer::start(perf);
                 let mut branch_nodes = Vec::new();
-                let mut take = |result: Result<(Vec<ChangeRecord>, Option<PerfNode>)>| {
-                    let (changes, node) = result?;
-                    all_changes.extend(changes);
-                    branch_nodes.extend(node);
+                let mut take = |result: Result<Option<PerfNode>>| {
+                    branch_nodes.extend(result?);
                     Ok::<(), Error>(())
                 };
 
@@ -614,15 +639,13 @@ impl SettleEngine {
                             let mv = &mut self.branches[bi].mv_entries[mi].1;
                             mv_source = mv.source().to_string();
                             if let Some(source_rows) = output_rows.get(&mv_source) {
-                                let changes = mv.process_block(block, source_rows);
-                                all_changes.extend(changes);
+                                mv.apply_rows(block, source_rows);
                             }
                         } else {
                             let mv = self.mvs.get_mut(name).unwrap();
                             mv_source = mv.source().to_string();
                             if let Some(source_rows) = output_rows.get(&mv_source) {
-                                let changes = mv.process_block(block, source_rows);
-                                all_changes.extend(changes);
+                                mv.apply_rows(block, source_rows);
                             }
                         }
                         // Nest under parent reducer if exists, otherwise add as sibling
@@ -1009,6 +1032,8 @@ impl SettleEngine {
     /// the ingest's raw rows were never committed. `pending` holds the write
     /// batches of earlier ingests that are not committed yet.
     pub fn undo_ingest(&mut self, block: BlockNumber, pending: &PendingWrites) -> Result<()> {
+        self.discard_changes();
+
         if block > self.latest_block() {
             return Ok(());
         }
@@ -1877,6 +1902,7 @@ mod tests {
         engine
             .process_batch_deferred("swaps", 3, swap(100.0), &mut batch)
             .unwrap();
+        engine.take_changes();
         engine.set_rollback_chain(&[(100, "0x64".to_string())]);
         engine.advance_finality(100);
         engine.write_checkpoint(&mut batch);
@@ -1898,9 +1924,10 @@ mod tests {
         assert_eq!(engine.finalized_cursor().map(|c| c.number), Some(100));
 
         // Block 4 again counts once.
-        let (changes, _) = engine
+        engine
             .process_batch_deferred("swaps", 4, swap(200.0), &mut StorageWriteBatch::new())
             .unwrap();
+        let changes = engine.take_changes();
         let mv = changes.iter().find(|c| c.table == "pool_volume").unwrap();
         assert_eq!(mv.values.get("total"), Some(&Value::Float64(300.0)));
     }

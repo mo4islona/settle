@@ -171,6 +171,10 @@ pub struct MVEngine {
     /// `write_checkpoint` persists. Under backfill deferral keys wait here for
     /// several finalizations. See docs/backfill-mode-design.md.
     pending_durable: FxHashSet<GroupKey>,
+    /// The groups that the blocks of the current ingest touched, with their
+    /// values from before it. `take_changes` emits one record per group: the
+    /// change buffer would merge the records of each block into that anyway.
+    ingest_touched: Touched,
 }
 
 impl MVEngine {
@@ -326,6 +330,7 @@ impl MVEngine {
             removed_groups: Vec::new(),
             dirty_groups: FxHashSet::default(),
             pending_durable: FxHashSet::default(),
+            ingest_touched: Touched::default(),
         }
     }
 
@@ -348,9 +353,30 @@ impl MVEngine {
     /// Process a batch of rows from a single block.
     /// Returns change records for new/updated groups.
     pub fn process_block(&mut self, block: BlockNumber, rows: &[RowMap]) -> Vec<ChangeRecord> {
-        let mut touched = Touched::default();
+        self.apply_rows(block, rows);
+        self.take_changes()
+    }
+
+    /// Apply the rows of one block of the current ingest; `take_changes`
+    /// emits their changes.
+    pub fn apply_rows(&mut self, block: BlockNumber, rows: &[RowMap]) {
+        let mut touched = std::mem::take(&mut self.ingest_touched);
         self.apply_block(block, rows, &mut touched);
+        self.ingest_touched = touched;
+    }
+
+    /// The changes of the blocks applied since the last call, one per group.
+    pub fn take_changes(&mut self) -> Vec<ChangeRecord> {
+        let touched = std::mem::take(&mut self.ingest_touched);
+        if touched.groups.is_empty() {
+            return Vec::new();
+        }
         self.emit_changes(touched)
+    }
+
+    /// Forget the changes of a failed ingest, which its undo rolls back.
+    pub fn discard_changes(&mut self) {
+        self.ingest_touched = Touched::default();
     }
 
     /// `process_block` with no change records, for replay, which discards
@@ -425,6 +451,11 @@ impl MVEngine {
     /// Roll back all blocks after fork_point.
     /// Returns compensating change records.
     pub fn rollback(&mut self, fork_point: BlockNumber) -> Vec<ChangeRecord> {
+        debug_assert!(
+            self.ingest_touched.groups.is_empty(),
+            "rollback with the changes of an ingest not taken"
+        );
+
         // Guard: fork_point + 1 would overflow u64::MAX to 0, causing split_off(&0)
         // to remove the entire map. MAX is a valid no-op: nothing exists after it.
         if fork_point == BlockNumber::MAX {
@@ -512,6 +543,11 @@ impl MVEngine {
     /// A sliding window stores its blocks final or not, so it queues the groups
     /// touched since the last call instead.
     pub fn advance_finality(&mut self, block: BlockNumber) {
+        debug_assert!(
+            self.ingest_touched.groups.is_empty(),
+            "finality advanced with the changes of an ingest not taken"
+        );
+
         let changed = if self.sliding_window.is_some() {
             // No fork can go below `block` now, so these blocks stay expired.
             self.expired = match block.checked_add(1) {
