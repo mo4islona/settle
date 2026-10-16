@@ -16,6 +16,16 @@ export interface SettleConfig {
   schema: string
   dataDir?: string
   maxBufferSize?: number
+  /**
+   * Most change batches that may wait for `ack()` at a time (default 2).
+   * With 2, `ingest()` can run while the target still applies the batch
+   * before; 1 makes it wait for that ack. A call that returns no batch while
+   * batches wait takes a place too. Each batch reaches disk only when it is
+   * acked, in sequence order, so a restart goes back to the last acked
+   * batch. The target must apply every batch in sequence order, also a
+   * fork's compensating batch.
+   */
+  maxPendingBatches?: number
   /** Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4". */
   compression?: 'none' | 'snappy' | 'zstd' | 'lz4'
   /** Disable RocksDB automatic background compactions. */
@@ -85,24 +95,26 @@ export { SettlePendingAckError, SettleWrongAckSequenceError } from './errors'
  * should run in either environment.
  *
  * Durability contract: `ingest()` and `handleFork()` may return a `ChangeBatch`;
- * the caller MUST `await` apply it to the target (atomically or idempotently)
- * and then call `ack(batch.sequence)`. While a previously-returned batch
- * remains unacked, every mutating call throws `SettlePendingAckError`.
+ * the caller MUST apply it to the target (atomically or idempotently), in
+ * sequence order, and then call `ack(batch.sequence)`. While
+ * `unackedBatches` is `maxPendingBatches`, `ingest()` and `handleFork()`
+ * throw `SettlePendingAckError`; while any batch is unacked, so do
+ * `registerReducer` and `registerReducerCallback`.
  */
 export interface ISettle {
   ingest(input: IngestInput): Promise<ChangeBatch | null>
   /**
-   * Commit the pending batch's writes durably. Throws:
-   * - `SettleWrongAckSequenceError` if a pending batch exists but its
-   *   sequence differs from `sequence` — protocol bug on the caller side.
-   *   `isAwaitingAck` stays `true`.
+   * Commit the writes of every batch up to `sequence` durably, oldest
+   * first. Acks are cumulative. Throws:
+   * - `SettleWrongAckSequenceError` if `sequence` is above the newest
+   *   unacked batch (`expected`) — protocol bug on the caller side.
+   *   Nothing is committed.
    * - A generic `Error` on storage failure (disk full, I/O). On this path
-   *   the pending slot is **preserved** and `isAwaitingAck` stays `true`;
-   *   caller MUST retry by calling `ack(sequence)` with the SAME sequence
-   *   (NOT by calling `ingest()`, which would throw `SettlePendingAckError`
-   *   until the ack succeeds).
-   * No-op (silently `Ok`) when `isAwaitingAck` is `false` — covers
-   * double-ack after success and stale acks on startup.
+   *   the failed batch and all later ones stay unacked; caller MUST retry
+   *   by calling `ack(sequence)` again (NOT by calling `ingest()`, which can
+   *   throw `SettlePendingAckError` until the ack succeeds).
+   * No-op (silently `Ok`) when no batch up to `sequence` is unacked —
+   * covers double-ack after success and stale acks on startup.
    *
    * `sequence` must be a non-negative integer ≤ `Number.MAX_SAFE_INTEGER`.
    */
@@ -136,10 +148,14 @@ export interface ISettle {
   readonly isBackpressured: boolean
   readonly isAwaitingAck: boolean
   /**
-   * `true` when a previous immediate-commit failure (e.g. heartbeat-style
-   * ingest or fork that committed in one shot) corrupted the instance's
-   * in-memory ↔ disk invariant. Once set, all mutating calls reject — the
-   * only recovery is to drop this instance and reopen.
+   * Places in use in the ack queue: each change batch that waits for
+   * `ack()`, and each call without a batch whose writes wait with one.
+   */
+  readonly unackedBatches: number
+  /**
+   * `true` when a previous failure left memory in a state that no returned
+   * batch describes. Once set, every call but `ack()` rejects. Ack the
+   * batches that the target applied, then drop this instance and reopen.
    */
   readonly isPoisoned: boolean
   readonly cursor: SettleCursor | null
@@ -231,6 +247,10 @@ export class Settle implements ISettle {
 
   get isAwaitingAck(): boolean {
     return this.#native.isAwaitingAck
+  }
+
+  get unackedBatches(): number {
+    return this.#native.unackedBatches
   }
 
   get isPoisoned(): boolean {

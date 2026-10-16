@@ -15,8 +15,8 @@ export class Settle {
         wasm.__wbg_settle_free(ptr, 0);
     }
     /**
-     * Acknowledge the pending batch by sequence number and durably commit
-     * its writes. `sequence` is passed as f64 (JS number); values up to 2^53
+     * Acknowledge every batch up to `sequence` and durably commit their
+     * writes, oldest first. `sequence` is passed as f64 (JS number); values up to 2^53
      * preserve exact precision. Throws typed errors via the structured-
      * reason prefix protocol.
      * @param {number} sequence
@@ -83,8 +83,9 @@ export class Settle {
         return ret !== 0;
     }
     /**
-     * Whether an unrecoverable commit failure has poisoned this instance.
-     * Once true the only recovery is to drop the instance and reopen.
+     * Whether a previous failure has poisoned this instance. Once true,
+     * every call but `ack()` rejects. Ack the batches that the target
+     * applied, then drop and reopen.
      * @returns {boolean}
      */
     get isPoisoned() {
@@ -92,13 +93,15 @@ export class Settle {
         return ret !== 0;
     }
     /**
-     * Create a new Settle with in-memory storage.
+     * Create a new Settle with in-memory storage. `max_pending_batches`
+     * (default 2) is the most change batches that may wait for `ack()`.
      * @param {string} schema
+     * @param {number | null} [max_pending_batches]
      */
-    constructor(schema) {
+    constructor(schema, max_pending_batches) {
         const ptr0 = passStringToWasm0(schema, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.settle_new(ptr0, len0);
+        const ret = wasm.settle_new(ptr0, len0, isLikeNone(max_pending_batches) ? Number.MAX_SAFE_INTEGER : (max_pending_batches) >>> 0);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -165,6 +168,15 @@ export class Settle {
             throw takeFromExternrefTable0(ret[1]);
         }
         return takeFromExternrefTable0(ret[0]);
+    }
+    /**
+     * Places in use in the ack queue: each change batch that waits for
+     * `ack()`, and each call without a batch whose writes wait with one.
+     * @returns {number}
+     */
+    get unackedBatches() {
+        const ret = wasm.settle_unackedBatches(this.__wbg_ptr);
+        return ret >>> 0;
     }
 }
 if (Symbol.dispose) Settle.prototype[Symbol.dispose] = Settle.prototype.free;

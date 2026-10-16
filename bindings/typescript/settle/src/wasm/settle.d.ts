@@ -8,8 +8,8 @@ export class Settle {
     free(): void;
     [Symbol.dispose](): void;
     /**
-     * Acknowledge the pending batch by sequence number and durably commit
-     * its writes. `sequence` is passed as f64 (JS number); values up to 2^53
+     * Acknowledge every batch up to `sequence` and durably commit their
+     * writes, oldest first. `sequence` is passed as f64 (JS number); values up to 2^53
      * preserve exact precision. Throws typed errors via the structured-
      * reason prefix protocol.
      */
@@ -30,9 +30,10 @@ export class Settle {
      */
     ingest(input: any): any;
     /**
-     * Create a new Settle with in-memory storage.
+     * Create a new Settle with in-memory storage. `max_pending_batches`
+     * (default 2) is the most change batches that may wait for `ack()`.
      */
-    constructor(schema: string);
+    constructor(schema: string, max_pending_batches?: number | null);
     /**
      * Register an external reducer with a JS batch callback.
      *
@@ -67,14 +68,20 @@ export class Settle {
      */
     readonly isBackpressured: boolean;
     /**
-     * Whether an unrecoverable commit failure has poisoned this instance.
-     * Once true the only recovery is to drop the instance and reopen.
+     * Whether a previous failure has poisoned this instance. Once true,
+     * every call but `ack()` rejects. Ack the batches that the target
+     * applied, then drop and reopen.
      */
     readonly isPoisoned: boolean;
     /**
      * Number of pending (unflushed) change records.
      */
     readonly pendingCount: number;
+    /**
+     * Places in use in the ack queue: each change batch that waits for
+     * `ack()`, and each call without a batch whose writes wait with one.
+     */
+    readonly unackedBatches: number;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -89,11 +96,12 @@ export interface InitOutput {
     readonly settle_isAwaitingAck: (a: number) => number;
     readonly settle_isBackpressured: (a: number) => number;
     readonly settle_isPoisoned: (a: number) => number;
-    readonly settle_new: (a: number, b: number) => [number, number, number];
+    readonly settle_new: (a: number, b: number, c: number) => [number, number, number];
     readonly settle_pendingCount: (a: number) => number;
     readonly settle_registerReducer: (a: number, b: number, c: number, d: number, e: number, f: any, g: any, h: any) => [number, number];
     readonly settle_registerReducerCallback: (a: number, b: number, c: number, d: any) => [number, number];
     readonly settle_resolveForkCursor: (a: number, b: any) => [number, number, number];
+    readonly settle_unackedBatches: (a: number) => number;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

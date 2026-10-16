@@ -39,6 +39,11 @@ pub struct SettleConfig {
     pub data_dir: Option<String>,
     /// Maximum buffer size before backpressure (default: 10000).
     pub max_buffer_size: Option<u32>,
+    /// Most change batches that may wait for `ack()` at a time (default: 2,
+    /// so `ingest()` can run while the target applies the batch before; 1
+    /// makes it wait for that ack). The target must apply every batch in
+    /// sequence order.
+    pub max_pending_batches: Option<u32>,
     /// Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4".
     pub compression: Option<String>,
     /// Disable RocksDB automatic background compactions.
@@ -143,6 +148,9 @@ impl Settle {
         };
         if let Some(max) = config.max_buffer_size {
             cfg = cfg.max_buffer_size(max as usize);
+        }
+        if let Some(max) = config.max_pending_batches {
+            cfg = cfg.max_pending_batches(max as usize);
         }
         cfg.compression = config.compression;
         cfg.disable_compaction = config.disable_compaction.unwrap_or(false);
@@ -429,8 +437,8 @@ impl Settle {
         })
     }
 
-    /// Acknowledge the pending batch by sequence number and durably commit
-    /// its writes. `sequence` is passed as `i64` — the JS-side accepts a
+    /// Acknowledge every batch up to `sequence` and durably commit their
+    /// writes, oldest first. `sequence` is passed as `i64` — the JS-side accepts a
     /// non-negative integer up to `Number.MAX_SAFE_INTEGER` (2^53), well
     /// below `i64::MAX`; the TS wrapper rejects fractional / out-of-range
     /// values before they reach this boundary.
@@ -452,7 +460,7 @@ impl Settle {
     }
 
     /// Number of pending (unflushed) change records in the buffer. Does NOT
-    /// reflect the pending-ack slot — see `isAwaitingAck` for that.
+    /// reflect the unacked batches — see `unackedBatches` for that.
     #[napi(getter)]
     pub fn pending_count(&self) -> u32 {
         self.inner.pending_count() as u32
@@ -465,17 +473,24 @@ impl Settle {
     }
 
     /// Whether a previously-returned `ChangeBatch` is still awaiting `ack()`.
-    /// While true, mutating APIs (`ingest`, `handleFork`, `registerReducer`)
-    /// throw `SettlePendingAckError`.
+    /// While true, `registerReducer` and `registerReducerCallback` throw
+    /// `SettlePendingAckError`; `ingest` and `handleFork` throw it when
+    /// `maxPendingBatches` batches wait.
     #[napi(getter)]
     pub fn is_awaiting_ack(&self) -> bool {
         self.inner.is_awaiting_ack()
     }
 
-    /// Whether an unrecoverable commit failure has poisoned this instance.
-    /// Once true the only recovery is to drop the instance and reopen — all
-    /// mutating calls reject with `Error("instance poisoned ...")` so the
-    /// caller does not silently produce stale writes.
+    /// Places in use in the ack queue: each change batch that waits for
+    /// `ack()`, and each call without a batch whose writes wait with one.
+    #[napi(getter)]
+    pub fn unacked_batches(&self) -> u32 {
+        self.inner.unacked_batches() as u32
+    }
+
+    /// Whether a previous failure has poisoned this instance. Once true,
+    /// every call but `ack()` rejects with `Error("instance poisoned ...")`.
+    /// Ack the batches that the target applied, then drop and reopen.
     #[napi(getter)]
     pub fn is_poisoned(&self) -> bool {
         self.inner.is_poisoned()

@@ -10,7 +10,7 @@
  * Anything else is rethrown unchanged.
  */
 
-/** Thrown when a previously-returned `ChangeBatch` is still awaiting `ack()`. */
+/** Thrown when too many previously-returned `ChangeBatch`es still await `ack()`; `sequence` is the oldest. */
 export class SettlePendingAckError extends Error {
   readonly sequence: number
   readonly sinceMs: number
@@ -24,7 +24,7 @@ export class SettlePendingAckError extends Error {
   }
 }
 
-/** Thrown when `ack(seq)` is called with a sequence that doesn't match the pending slot. */
+/** Thrown when `ack(seq)` is called with a sequence above the newest unacked batch (`expected`). */
 export class SettleWrongAckSequenceError extends Error {
   readonly expected: number
   readonly got: number

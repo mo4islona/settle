@@ -27,10 +27,14 @@ pub struct Settle {
 
 #[wasm_bindgen]
 impl Settle {
-    /// Create a new Settle with in-memory storage.
+    /// Create a new Settle with in-memory storage. `max_pending_batches`
+    /// (default 2) is the most change batches that may wait for `ack()`.
     #[wasm_bindgen(constructor)]
-    pub fn new(schema: &str) -> Result<Settle, JsError> {
-        let config = Config::new(schema);
+    pub fn new(schema: &str, max_pending_batches: Option<u32>) -> Result<Settle, JsError> {
+        let mut config = Config::new(schema);
+        if let Some(max) = max_pending_batches {
+            config = config.max_pending_batches(max as usize);
+        }
         let inner = Inner::open(config).map_err(to_js_err)?;
         Ok(Settle {
             inner,
@@ -197,8 +201,8 @@ impl Settle {
         }
     }
 
-    /// Acknowledge the pending batch by sequence number and durably commit
-    /// its writes. `sequence` is passed as f64 (JS number); values up to 2^53
+    /// Acknowledge every batch up to `sequence` and durably commit their
+    /// writes, oldest first. `sequence` is passed as f64 (JS number); values up to 2^53
     /// preserve exact precision. Throws typed errors via the structured-
     /// reason prefix protocol.
     pub fn ack(&mut self, sequence: f64) -> Result<(), JsError> {
@@ -227,8 +231,16 @@ impl Settle {
         self.inner.is_awaiting_ack()
     }
 
-    /// Whether an unrecoverable commit failure has poisoned this instance.
-    /// Once true the only recovery is to drop the instance and reopen.
+    /// Places in use in the ack queue: each change batch that waits for
+    /// `ack()`, and each call without a batch whose writes wait with one.
+    #[wasm_bindgen(getter, js_name = unackedBatches)]
+    pub fn unacked_batches(&self) -> u32 {
+        self.inner.unacked_batches() as u32
+    }
+
+    /// Whether a previous failure has poisoned this instance. Once true,
+    /// every call but `ack()` rejects. Ack the batches that the target
+    /// applied, then drop and reopen.
     #[wasm_bindgen(getter, js_name = isPoisoned)]
     pub fn is_poisoned(&self) -> bool {
         self.inner.is_poisoned()
