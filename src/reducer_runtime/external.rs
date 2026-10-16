@@ -534,6 +534,10 @@ impl ReducerRuntime for ExternalRuntime {
         true
     }
 
+    fn needs_host_context(&self) -> bool {
+        true
+    }
+
     fn process_grouped(&self, groups: &mut [GroupBatch]) -> crate::error::Result<()> {
         #[cfg(feature = "napi")]
         {

@@ -4,6 +4,7 @@ pub mod rocks;
 
 use crate::error::{Error, Result};
 use crate::types::{BlockNumber, ColumnRegistry, GroupKey, Row, RowMap, Value};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// An operation to be committed atomically as part of a WriteBatch.
@@ -92,6 +93,84 @@ impl StorageWriteBatch {
             table: table.to_string(),
             after_block,
         });
+    }
+}
+
+/// Write batches that are made but not committed yet, oldest first. Disk
+/// lacks their raw rows and reducer checkpoints, so a rollback reads storage
+/// through them: it then sees what disk holds once they all commit.
+#[derive(Default)]
+pub struct PendingWrites<'a> {
+    batches: Vec<&'a StorageWriteBatch>,
+    /// Reducer → group key → newest pending finalized state.
+    reducer_finalized: HashMap<&'a str, HashMap<&'a [u8], &'a [u8]>>,
+}
+
+impl<'a> PendingWrites<'a> {
+    pub fn new(batches: impl IntoIterator<Item = &'a StorageWriteBatch>) -> Self {
+        let batches: Vec<&StorageWriteBatch> = batches.into_iter().collect();
+
+        let mut reducer_finalized: HashMap<&str, HashMap<&[u8], &[u8]>> = HashMap::new();
+        for op in batches.iter().copied().flat_map(|b| &b.ops) {
+            if let BatchOp::SetReducerFinalized {
+                reducer,
+                group_key,
+                state,
+            } = op
+            {
+                reducer_finalized
+                    .entry(reducer.as_str())
+                    .or_default()
+                    .insert(group_key.as_slice(), state.as_slice());
+            }
+        }
+
+        Self {
+            batches,
+            reducer_finalized,
+        }
+    }
+
+    /// The raw rows of `table` above `after_block` once every pending batch
+    /// commits, from the `stored` rows above it.
+    pub fn raw_rows_after(
+        &self,
+        table: &str,
+        after_block: BlockNumber,
+        stored: Vec<(BlockNumber, Vec<u8>)>,
+    ) -> Vec<(BlockNumber, Vec<u8>)> {
+        if self.batches.is_empty() {
+            return stored;
+        }
+
+        // Ops apply in batch order, as `commit` applies them.
+        let mut rows: BTreeMap<BlockNumber, Vec<u8>> = stored.into_iter().collect();
+        for op in self.batches.iter().copied().flat_map(|b| &b.ops) {
+            match op {
+                BatchOp::PutRawRows {
+                    table: t,
+                    block,
+                    data,
+                } if t == table && *block > after_block => {
+                    rows.insert(*block, data.clone());
+                }
+                BatchOp::DeleteRawRowsAfter {
+                    table: t,
+                    after_block: deleted_after,
+                } if t == table => {
+                    if let Some(first_deleted) = deleted_after.checked_add(1) {
+                        rows.split_off(&first_deleted);
+                    }
+                }
+                _ => {}
+            }
+        }
+        rows.into_iter().collect()
+    }
+
+    /// The newest finalized state of the group that a pending batch writes.
+    pub fn reducer_finalized(&self, reducer: &str, group_key: &[u8]) -> Option<&'a [u8]> {
+        self.reducer_finalized.get(reducer)?.get(group_key).copied()
     }
 }
 

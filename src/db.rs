@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 // `web_time::Instant` is `std::time::Instant` on native and a JS-Date-backed
@@ -13,7 +13,7 @@ use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
 #[cfg(feature = "rocksdb")]
 use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
-use crate::storage::{StorageBackend, StorageWriteBatch};
+use crate::storage::{PendingWrites, StorageBackend, StorageWriteBatch};
 use crate::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, RowMap, Value};
 
 /// Configuration for opening a Settle instance.
@@ -39,6 +39,16 @@ pub struct Config {
     /// the threshold only controls log noise. `handle_fork()` does not log
     /// (it rejects with `PendingAck` straight away).
     pub ack_warning_threshold: Duration,
+    /// Most change batches that may wait for `ack()` at a time. Default 2:
+    /// the caller can ingest the next blocks while the target still applies
+    /// the batch before, which already keeps a single target busy. 1 makes
+    /// `ingest()` wait for the ack of the batch before it. A call that
+    /// returns no batch while batches wait takes a place too: its writes wait
+    /// with the newest batch. Each batch reaches disk only when it is acked,
+    /// and in sequence order, so a reopen goes back to the last acked batch.
+    /// The target must apply every batch, in sequence order, also across a
+    /// fork: a fork's compensating batch undoes all the batches before it.
+    pub max_pending_batches: usize,
     /// Backfill durability checkpoint interval, in blocks. Default `1` =
     /// persist derived reducer/MV state on every finalize. When `> 1` AND the ingest is no-lag (finalized head at the
     /// batch tip, i.e. historical backfill) AND the pipeline is deferral-safe
@@ -64,6 +74,7 @@ impl Config {
             disable_compaction: false,
             cache_size: None,
             ack_warning_threshold: Duration::from_secs(10),
+            max_pending_batches: 2,
             backfill_checkpoint_interval: 1,
             collect_perf: true,
         }
@@ -80,14 +91,15 @@ impl Config {
             disable_compaction: false,
             cache_size: None,
             ack_warning_threshold: Duration::from_secs(10),
+            max_pending_batches: 2,
             backfill_checkpoint_interval: 1,
             collect_perf: true,
         }
     }
 
-    /// Threshold after which a still-pending unacked batch causes a warning
-    /// log on each subsequent `ingest()` / `handle_fork()` call (which all
-    /// return `Err(PendingAck)` immediately regardless).
+    /// Threshold after which the oldest unacked batch causes a warning log on
+    /// each `ingest()` that it blocks (which returns `Err(PendingAck)`
+    /// immediately regardless).
     pub fn ack_warning_threshold(mut self, threshold: Duration) -> Self {
         self.ack_warning_threshold = threshold;
         self
@@ -95,6 +107,13 @@ impl Config {
 
     pub fn max_buffer_size(mut self, size: usize) -> Self {
         self.max_buffer_size = size;
+        self
+    }
+
+    /// Most change batches that may wait for `ack()` at a time (default 2).
+    /// See [`Config::max_pending_batches`].
+    pub fn max_pending_batches(mut self, n: usize) -> Self {
+        self.max_pending_batches = n.max(1);
         self
     }
 
@@ -179,17 +198,19 @@ const META_BLOCK_HASHES: &str = "block_hashes";
 const META_NEXT_SEQUENCE: &str = "next_sequence";
 
 /// State stashed between a successful `ingest()` / `handle_fork()` and the
-/// caller's `ack()`. The on-disk view is one batch behind the engine
-/// in-memory view; this struct holds the write batch that advances disk to
-/// in-memory when `ack()` succeeds.
+/// caller's `ack()`: the write batch that advances disk to the state after
+/// this change batch.
 ///
-/// `pending` is only set for the data path (where the caller received a
-/// `ChangeBatch` and owns the apply→ack handshake). On the heartbeat path
-/// (empty-batch immediate commit) a commit failure poisons the instance
-/// instead — see [`Settle::poisoned`].
+/// Only the data path makes one (where the caller received a `ChangeBatch`
+/// and owns the apply→ack handshake). A call without a batch commits at
+/// once, or behind unacked batches joins the newest one. A failed immediate
+/// commit poisons the instance — see [`Settle::poisoned`].
 struct PendingAck {
     sequence: u64,
     write_batch: StorageWriteBatch,
+    /// Calls without a batch whose writes joined this one. Each takes a
+    /// place in the queue, so their writes cannot grow without a bound.
+    joined: usize,
     since: Instant,
 }
 
@@ -201,7 +222,12 @@ pub struct Settle {
     engine: SettleEngine,
     buffer: ChangeBuffer,
     storage: Arc<dyn StorageBackend>,
-    pending: Option<PendingAck>,
+    /// Unacked batches, oldest first. They commit in this order, so disk
+    /// always holds the state after some returned batch, and the engine reads
+    /// storage through them (`PendingWrites`) to see the state after the
+    /// newest.
+    pending: VecDeque<PendingAck>,
+    max_pending_batches: usize,
     ack_warning_threshold: Duration,
     /// Set when a non-recoverable commit (heartbeat immediate-commit) fails.
     /// In that case the engine's in-memory state has already mutated past
@@ -210,9 +236,11 @@ pub struct Settle {
     /// batch, silently leaving CF_REDUCER_FIN stale. Also set when a rollback
     /// fails part way, or an ingest fails after its fork rollback: memory then
     /// holds a state that no returned batch describes. Every
-    /// public mutating method short-circuits with `Error::Poisoned` once
-    /// this is set; the only recovery is `drop` + reopen, which rebuilds
-    /// in-memory state from disk via `replay_unfinalized`.
+    /// public mutating method but `ack` short-circuits with `Error::Poisoned`
+    /// once this is set; the only recovery is `drop` + reopen, which rebuilds
+    /// in-memory state from disk via `replay_unfinalized`. The unacked
+    /// batches were all returned before the failure, so `ack` may still
+    /// commit them.
     poisoned: Option<String>,
     /// Names of reducers whose runtime has been explicitly installed via
     /// `register_reducer_callback`. Enforces the strict "one callback per
@@ -305,7 +333,8 @@ impl Settle {
             engine,
             buffer,
             storage,
-            pending: None,
+            pending: VecDeque::new(),
+            max_pending_batches: config.max_pending_batches.max(1),
             ack_warning_threshold: config.ack_warning_threshold,
             poisoned: None,
             runtimes_attached: std::collections::HashSet::new(),
@@ -314,15 +343,26 @@ impl Settle {
     }
 
     /// Returns true if a previously-produced `ChangeBatch` is still awaiting
-    /// `ack()`. While true, mutating APIs (`ingest`, `handle_fork`,
-    /// `register_reducer`, `register_reducer_callback`, `replay_reducer`) return
-    /// `Err(PendingAck)`. Use to surface state in dashboards / readiness probes.
+    /// `ack()`. While true, `register_reducer`, `register_reducer_callback`
+    /// and `replay_reducer` return `Err(PendingAck)`; `ingest` and
+    /// `handle_fork` do so when the ack queue is full. Use to
+    /// surface state in dashboards / readiness probes.
     pub fn is_awaiting_ack(&self) -> bool {
-        self.pending.is_some()
+        !self.pending.is_empty()
     }
 
-    /// True if a previous immediate-commit failure has poisoned this
-    /// instance. The only recovery is `drop` + reopen.
+    /// Places in use in the ack queue: each change batch that waits for
+    /// `ack()`, and each call without a batch whose writes wait with one.
+    /// `ingest()` and `handle_fork()` return `PendingAck` once it reaches
+    /// `max_pending_batches`.
+    pub fn unacked_batches(&self) -> usize {
+        self.pending.iter().map(|p| 1 + p.joined).sum()
+    }
+
+    /// True if a previous failure has poisoned this instance. Every call but
+    /// `ack()` then returns `Poisoned`. Ack the batches that the target
+    /// applied, then drop and reopen: the reopened instance can undo only
+    /// what is on disk.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.is_some()
     }
@@ -469,43 +509,55 @@ impl Settle {
         self.engine.reducer_is_external(name)
     }
 
-    /// Acknowledge a previously returned `ChangeBatch` and durably commit the
-    /// pending state.
+    /// Acknowledge every returned `ChangeBatch` up to `sequence` and durably
+    /// commit their state, oldest first. Acks are cumulative: the target
+    /// applies the batches in sequence order, so an ack covers all batches
+    /// before it.
     ///
     /// Behaviour:
-    /// - `pending == None` → `Ok(())` (idempotent — covers double-ack after
-    ///   success, stale ack on startup before any new ingest).
-    /// - `pending == Some(p)`, `sequence != p.sequence` →
-    ///   `Err(WrongAckSequence)`. Pending is unchanged; this signals a
-    ///   protocol bug on the caller side.
-    /// - `pending == Some(p)`, matches: `storage.commit(&p.write_batch)`. On
-    ///   `Err`, pending is preserved — caller MUST retry by calling
-    ///   `ack(sequence)` again with the SAME sequence (NOT `ingest()`,
-    ///   which would return `Err(PendingAck)`). On `Ok`, `last_committed_meta`
-    ///   is refreshed and pending is cleared.
+    /// - No batch with a sequence `<= sequence` waits → `Ok(())`
+    ///   (idempotent — covers double-ack after success, stale ack on startup
+    ///   before any new ingest).
+    /// - `sequence` above the newest unacked batch →
+    ///   `Err(WrongAckSequence)` with that batch's sequence as `expected`.
+    ///   Nothing is committed; this signals a protocol bug on the caller side.
+    /// - Otherwise each batch up to `sequence` commits in turn. On `Err`,
+    ///   that batch and all later ones stay unacked — caller MUST retry by
+    ///   calling `ack(sequence)` again (NOT `ingest()`, which can return
+    ///   `Err(PendingAck)`).
+    ///
+    /// Also works on a poisoned instance: a failure leaves the unacked write
+    /// batches as they were, and each holds the state after a batch that was
+    /// returned before it. A target that applied such a batch must ack it
+    /// before the reopen, else a later fork cannot undo it in the target.
     pub fn ack(&mut self, sequence: u64) -> Result<()> {
-        self.guard_not_poisoned()?;
-        let Some(p) = self.pending.as_ref() else {
+        let Some(newest) = self.pending.back().map(|p| p.sequence) else {
             return Ok(());
         };
-        if p.sequence != sequence {
+        if sequence > newest {
             return Err(Error::WrongAckSequence {
-                expected: p.sequence,
+                expected: newest,
                 got: sequence,
             });
         }
-        // CRITICAL: only `take()` after a successful commit. Otherwise a
-        // commit failure would silently drop the write_batch and leave engine
-        // state ahead of disk with no path to recover.
-        self.storage.commit(&p.write_batch)?;
-        self.pending = None;
+
+        // CRITICAL: pop only after a successful commit. Otherwise a commit
+        // failure would silently drop the write_batch and leave engine state
+        // ahead of disk with no path to recover.
+        while let Some(oldest) = self.pending.front() {
+            if oldest.sequence > sequence {
+                break;
+            }
+            self.storage.commit(&oldest.write_batch)?;
+            self.pending.pop_front();
+        }
         Ok(())
     }
 
     /// Number of pending (unflushed) change records inside the buffer.
     ///
     /// Note: this is the buffer's record count; it does NOT reflect the
-    /// `pending` ack slot. Use `is_awaiting_ack()` for that.
+    /// unacked batches. Use `unacked_batches()` for that.
     pub fn pending_count(&self) -> usize {
         self.buffer.pending_count()
     }
@@ -565,21 +617,25 @@ impl Settle {
     ///
     /// Finds the highest common ancestor in `rollback_chain`, rolls back all
     /// state after that point, and (a) if no compensating records resulted —
-    /// commits metadata immediately and returns `batch: None`, or (b)
-    /// otherwise stashes the write batch as `pending` and returns the
-    /// compensating `ChangeBatch` to the caller. Caller MUST call
-    /// `ack(batch.sequence)` after applying the batch to durably commit.
+    /// commits metadata (behind unacked batches, with the newest of them) and
+    /// returns `batch: None`, or (b) otherwise stashes the write batch as
+    /// pending and returns the compensating `ChangeBatch` to the caller.
+    /// Caller MUST call `ack(batch.sequence)` after applying the batch to
+    /// durably commit.
     ///
-    /// Returns `Err(PendingAck)` if an unacked batch is already in flight —
-    /// caller must ack it first, then retry. Returns `Err(InvalidOperation)`
-    /// if `rollback_chain` is empty or no common ancestor exists.
+    /// The rollback starts from the state after every returned batch, also
+    /// the unacked ones, so the target must apply those before this one.
+    ///
+    /// Returns `Err(PendingAck)` if the ack queue is full (see
+    /// `unacked_batches`) — caller must ack first, then retry. Returns
+    /// `Err(InvalidOperation)` if `rollback_chain` is empty or no common
+    /// ancestor exists.
     pub fn handle_fork(&mut self, mut rollback_chain: Vec<BlockCursor>) -> Result<ForkResult> {
         // 0. Poison gate (see `ingest` for rationale).
         self.guard_not_poisoned()?;
-        // 1. Pending guard — before validation, so caller gets a clean
-        //    "ack first" signal instead of "bad input" derived from
-        //    uncommitted engine state.
-        self.guard_no_pending()?;
+        // 1. Queue guard — before validation, so caller gets a clean
+        //    "ack first" signal instead of "bad input".
+        self.guard_pending_room()?;
 
         // 2. Validation: empty chain has no resolvable common ancestor.
         if rollback_chain.is_empty() {
@@ -642,25 +698,16 @@ impl Settle {
 
         match batch_opt {
             None => {
-                // Heartbeat-style fork. Commit immediately; on failure
-                // poison the instance (engine state already rolled-back
-                // past disk — retry would re-encode against the mutated
-                // state and could silently land inconsistent writes).
-                if let Err(e) = self.storage.commit(&write_batch) {
-                    self.poisoned = Some(format!("heartbeat handle_fork commit failed: {e}"));
-                    return Err(e);
-                }
+                // Heartbeat-style fork. The engine state is already rolled
+                // back past disk, so a failed commit poisons the instance.
+                self.commit_without_batch(write_batch, "heartbeat handle_fork")?;
                 Ok(ForkResult {
                     cursor,
                     batch: None,
                 })
             }
             Some(batch) => {
-                self.pending = Some(PendingAck {
-                    sequence: batch.sequence,
-                    write_batch,
-                    since: Instant::now(),
-                });
+                self.push_pending(batch.sequence, write_batch);
                 Ok(ForkResult {
                     cursor,
                     batch: Some(batch),
@@ -671,22 +718,24 @@ impl Settle {
 
     /// Atomic ingest: process all tables, store rollback chain, finalize.
     ///
-    /// Returns `Ok(Some(batch))` and stashes the underlying write batch in
-    /// `pending` — caller MUST call `ack(batch.sequence)` after successfully
+    /// Returns `Ok(Some(batch))` and stashes the underlying write batch as
+    /// pending — caller MUST call `ack(batch.sequence)` after successfully
     /// applying the batch to durably commit. Returns `Ok(None)` for heartbeat
-    /// ingests (no records produced after merge) where the disk write is
-    /// committed immediately and nothing requires ack.
+    /// ingests (no records produced after merge): nothing requires ack, and
+    /// the disk write commits at once, or behind unacked batches with the
+    /// newest of them, where it takes a place in the queue.
     ///
-    /// Returns `Err(PendingAck)` if a previous batch is still awaiting ack —
-    /// caller must `ack(seq)` it first (or `drop` and reopen). Returns
-    /// `Err(InvalidOperation)` if `finalized_head` regresses below the
-    /// currently committed finalized block (finality is monotonic; going
-    /// above `latest_block` is allowed for gappy chains like Solana).
+    /// Returns `Err(PendingAck)` if the ack queue is full (see
+    /// `unacked_batches`) — caller must `ack(seq)` first (or `drop` and
+    /// reopen). Returns `Err(InvalidOperation)` if `finalized_head` regresses
+    /// below the currently committed finalized block (finality is monotonic;
+    /// going above `latest_block` is allowed for gappy chains like Solana).
     ///
     /// If the rollback chain shows a fork, the ingest rolls it back first and
     /// the batch carries the compensating changes. An input error is found
     /// before that rollback. A reducer error after it poisons the instance:
-    /// drop and reopen, and the next ingest detects the fork again.
+    /// ack the batches that the target applied, drop and reopen, and the next
+    /// ingest detects the fork again.
     ///
     /// Each row in `data` must contain a `block_number` field (UInt64).
     pub fn ingest(&mut self, mut input: IngestInput) -> Result<Option<ChangeBatch>> {
@@ -695,23 +744,16 @@ impl Settle {
         //    drops and reopens rather than silently producing stale writes.
         self.guard_not_poisoned()?;
 
-        // 1. Pending guard — before any read of engine state, since engine
-        //    may be ahead of disk when a pending exists. Reading
-        //    `engine.finalized_block()` for validation would compare against
-        //    the uncommitted finalize and reject valid inputs.
-        if let Some(p) = &self.pending {
-            let since = p.since.elapsed();
-            if since > self.ack_warning_threshold {
-                tracing::warn!(
-                    sequence = p.sequence,
-                    since = ?since,
-                    "ack pending, ingest blocked"
-                );
+        // 1. Queue guard — before validation, so a caller that retries the
+        //    input of an unacked batch gets a clean "ack first" signal, not a
+        //    duplicate-block error.
+        if let Err(e) = self.guard_pending_room() {
+            if let Error::PendingAck { sequence, since } = &e
+                && *since > self.ack_warning_threshold
+            {
+                tracing::warn!(sequence, since = ?since, "ack pending, ingest blocked");
             }
-            return Err(Error::PendingAck {
-                sequence: p.sequence,
-                since,
-            });
+            return Err(e);
         }
 
         // 2. Validation: finality must not regress. Going above current
@@ -764,8 +806,8 @@ impl Settle {
         if let Err(e) = result {
             // The fork rollback is done and its compensating changes would be
             // lost with this error, so the caller must drop and reopen. The
-            // reopened instance has the pre-fork state and detects the fork
-            // again.
+            // reopened instance has the pre-fork state of the acked batches
+            // and detects the fork again.
             if fork_point.is_some() {
                 self.poisoned = Some(format!("ingest failed after a fork rollback: {e}"));
                 return Err(e);
@@ -777,7 +819,8 @@ impl Settle {
             // storage has no `> recovery_block` rows to delete on disk, and no
             // separate commit can fail half-way. Not a chain rollback: on
             // gappy chains recovery_block can be below finality.
-            if let Err(rollback_err) = self.engine.undo_ingest(recovery_block) {
+            let pending = PendingWrites::new(self.pending.iter().map(|p| &p.write_batch));
+            if let Err(rollback_err) = self.engine.undo_ingest(recovery_block, &pending) {
                 let reason = format!(
                     "ingest failed ({e}) and recovery rollback also failed ({rollback_err}); \
                      instance state is inconsistent — drop and reopen",
@@ -855,24 +898,17 @@ impl Settle {
         match batch_opt {
             None => {
                 // Heartbeat: nothing to apply downstream, so nothing to ack.
-                // Commit immediately to avoid orphaning the checkpoint writes
+                // The checkpoint writes must not be orphaned
                 // (advance_finality() already pruned in-memory snapshots).
-                // On failure, poison the instance: the in-memory pruning is
-                // past disk, and a naive retry would write a checkpoint from
-                // the pruned state, silently leaving CF_REDUCER_FIN stale.
-                if let Err(e) = self.storage.commit(&write_batch) {
-                    self.poisoned = Some(format!("heartbeat ingest commit failed: {e}"));
-                    return Err(e);
-                }
+                // A failed commit poisons the instance: the in-memory pruning
+                // is past disk, and a naive retry would write a checkpoint
+                // from the pruned state, silently leaving CF_REDUCER_FIN stale.
+                self.commit_without_batch(write_batch, "heartbeat ingest")?;
                 Ok(None)
             }
             Some(batch) => {
                 // Stash for ack. storage.commit is deferred.
-                self.pending = Some(PendingAck {
-                    sequence: batch.sequence,
-                    write_batch,
-                    since: Instant::now(),
-                });
+                self.push_pending(batch.sequence, write_batch);
                 Ok(Some(batch))
             }
         }
@@ -995,8 +1031,9 @@ impl Settle {
         Ok(grouped)
     }
 
-    /// Roll the engine back to `fork_point`. A failure part way leaves some
-    /// nodes rolled back and others not, so it poisons the instance.
+    /// Roll the engine back to `fork_point`, from the state after the newest
+    /// unacked batch. A failure part way leaves some nodes rolled back and
+    /// others not, so it poisons the instance.
     fn rollback_engine(
         &mut self,
         fork_point: BlockNumber,
@@ -1004,23 +1041,59 @@ impl Settle {
     ) -> Result<Vec<ChangeRecord>> {
         self.engine.check_rollback_target(fork_point)?;
 
+        let pending = PendingWrites::new(self.pending.iter().map(|p| &p.write_batch));
         self.engine
-            .rollback_to_batch(fork_point, write_batch)
+            .rollback_to_batch(fork_point, write_batch, &pending)
             .inspect_err(|e| {
                 self.poisoned = Some(format!("rollback to block {fork_point} failed: {e}"));
             })
     }
 
+    fn push_pending(&mut self, sequence: u64, write_batch: StorageWriteBatch) {
+        self.pending.push_back(PendingAck {
+            sequence,
+            write_batch,
+            joined: 0,
+            since: Instant::now(),
+        });
+    }
+
+    /// Commit the writes of a call that returned no batch. Behind unacked
+    /// batches they must not reach disk first, so they join the newest one,
+    /// take a place in the queue, and commit with its ack. A failed commit
+    /// poisons the instance: the engine state is already past disk.
+    fn commit_without_batch(&mut self, write_batch: StorageWriteBatch, call: &str) -> Result<()> {
+        if let Some(newest) = self.pending.back_mut() {
+            newest.write_batch.ops.extend(write_batch.ops);
+            newest.joined += 1;
+            return Ok(());
+        }
+
+        self.storage.commit(&write_batch).inspect_err(|e| {
+            self.poisoned = Some(format!("{call} commit failed: {e}"));
+        })
+    }
+
     /// Returns `Err(PendingAck)` when an unacked batch is in flight, with the
-    /// pending sequence and elapsed time included. Used to gate mutating APIs.
+    /// oldest pending sequence and elapsed time included. Used to gate APIs
+    /// that read storage without the unacked batches.
     fn guard_no_pending(&self) -> Result<()> {
-        if let Some(p) = &self.pending {
+        if let Some(p) = self.pending.front() {
             return Err(Error::PendingAck {
                 sequence: p.sequence,
                 since: p.since.elapsed(),
             });
         }
         Ok(())
+    }
+
+    /// Returns `Err(PendingAck)`, as `guard_no_pending`, when the queue has
+    /// no free place (see `unacked_batches`).
+    fn guard_pending_room(&self) -> Result<()> {
+        if self.unacked_batches() < self.max_pending_batches {
+            return Ok(());
+        }
+        self.guard_no_pending()
     }
 
     /// Append engine metadata (latest_block, durable watermark, block_hashes)
@@ -1074,6 +1147,10 @@ mod validation_tests;
 #[cfg(test)]
 #[path = "db_recovery_tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+#[path = "db_pipeline_tests.rs"]
+mod pipeline_tests;
 
 #[cfg(all(test, feature = "rocksdb"))]
 #[path = "backfill_tests.rs"]

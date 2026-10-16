@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::schema::ast::TableDef;
-use crate::storage::{self, StorageBackend, StorageWriteBatch};
+use crate::storage::{self, PendingWrites, StorageBackend, StorageWriteBatch};
 use crate::types::{BlockNumber, ColumnRegistry, ChangeOp, ChangeRecord, Row, RowMap, Value};
 
 /// Manages ingestion, storage, and rollback for a single raw table.
@@ -126,27 +126,29 @@ impl RawTableEngine {
     /// Uses `rollback_to_batch` internally and commits atomically.
     pub fn rollback(&self, fork_point: BlockNumber) -> Result<Vec<ChangeRecord>> {
         let mut batch = StorageWriteBatch::new();
-        let changes = self.rollback_to_batch(fork_point, &mut batch)?;
+        let changes = self.rollback_to_batch(fork_point, &mut batch, &PendingWrites::default())?;
         self.storage.commit(&batch)?;
         Ok(changes)
     }
 
     /// Roll back all rows where block_number > fork_point, deferring the
     /// storage deletion to the provided write batch for atomic commit.
-    /// Returns compensating Delete change records for the rolled-back rows.
+    /// Returns compensating Delete change records for the rolled-back rows,
+    /// also for the rows that `pending` has not committed yet.
     pub fn rollback_to_batch(
         &self,
         fork_point: BlockNumber,
         batch: &mut StorageWriteBatch,
+        pending: &PendingWrites,
     ) -> Result<Vec<ChangeRecord>> {
         if fork_point == BlockNumber::MAX {
             return Ok(Vec::new());
         }
 
-        // Read rows that will be rolled back (they're still in storage)
-        let rolled_back =
+        let stored =
             self.storage
                 .get_raw_rows(&self.def.name, fork_point + 1, BlockNumber::MAX)?;
+        let rolled_back = pending.raw_rows_after(&self.def.name, fork_point, stored);
 
         // Defer the deletion to the write batch
         batch.delete_raw_rows_after(&self.def.name, fork_point);

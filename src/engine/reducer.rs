@@ -9,7 +9,7 @@ use crate::reducer_runtime::event_rules::EventRulesRuntime;
 use crate::reducer_runtime::lua::LuaRuntime;
 use crate::reducer_runtime::{GroupBatch, ReducerRuntime};
 use crate::schema::ast::{ReducerBody, ReducerDef};
-use crate::storage::{self, StorageBackend, StorageWriteBatch};
+use crate::storage::{self, PendingWrites, StorageBackend, StorageWriteBatch};
 use crate::types::{BlockNumber, ColumnId, ColumnRegistry, GroupKey, Row, RowMap, Value};
 
 type State = HashMap<String, Value>;
@@ -30,7 +30,8 @@ pub struct ReducerEngine {
     /// hot `HashMap` state to/from the positional `Vec<Value>` representation
     /// used by snapshots and finalized storage.
     state_field_names: Vec<String>,
-    /// Current hot state per group key.
+    /// Current hot state per group key. Never evicted: a miss loads the
+    /// stored state, which lacks the checkpoints of unacked batches.
     state_cache: FxHashMap<Vec<u8>, State>,
     /// In-memory state snapshots: group_key -> (block -> positional state values).
     /// Stored positionally (schema field order) so the per-block snapshot clone
@@ -220,7 +221,7 @@ impl ReducerEngine {
     /// context is installed on the current thread.
     pub fn needs_host_callback(&self) -> bool {
         self.is_external()
-            && self.runtime.use_batched_processing() // ExternalRuntime returns true, FnReducer returns false
+            && self.runtime.needs_host_context()
             && !crate::reducer_runtime::external::context_installed()
     }
 
@@ -254,6 +255,41 @@ impl ReducerEngine {
         let mut output_maps: Vec<RowMap> = Vec::new();
         let mut touched_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
 
+        let processed = self.process_rows(rows, &mut touched_keys, &mut output_maps);
+
+        // Registered on failure too: the undo of the failed ingest then
+        // restores the keys that the rows before the error changed.
+        let block_keys = self.block_groups.entry(block).or_default();
+        if let Err(e) = processed {
+            block_keys.extend(touched_keys);
+            return Err(e);
+        }
+
+        // Save in-memory snapshot for each touched group key (one positional
+        // Vec<Value> per key per block — cheap vs a full HashMap clone).
+        for group_key_bytes in touched_keys {
+            let snapshot = {
+                let state = self.state_cache.get(&group_key_bytes).unwrap();
+                state_to_values(state, &self.state_field_names)
+            };
+            self.block_snapshots
+                .entry(group_key_bytes.clone())
+                .or_default()
+                .insert(block, snapshot);
+            block_keys.insert(group_key_bytes);
+        }
+
+        Ok(output_maps)
+    }
+
+    /// The row loop of `process_block_per_row`. A key goes into
+    /// `touched_keys` before its row can fail.
+    fn process_rows(
+        &mut self,
+        rows: &[Row],
+        touched_keys: &mut FxHashSet<Vec<u8>>,
+        output_maps: &mut Vec<RowMap>,
+    ) -> Result<()> {
         for row in rows {
             let group_key_bytes = self.compute_group_key_bytes(row);
 
@@ -273,11 +309,9 @@ impl ReducerEngine {
                     .or_insert(loaded)
             };
 
-            // Call the runtime
-            let emits = self.runtime.process(state, row)?;
-
-            // Track touched key for deferred snapshot
+            let emits = self.runtime.process(state, row);
             touched_keys.insert(group_key_bytes);
+            let emits = emits?;
 
             for mut emit_row in emits {
                 // Add group-by columns to the output row for downstream MVs.
@@ -294,23 +328,7 @@ impl ReducerEngine {
                 output_maps.push(emit_row);
             }
         }
-
-        // Save in-memory snapshot for each touched group key (one positional
-        // Vec<Value> per key per block — cheap vs a full HashMap clone).
-        let block_keys = self.block_groups.entry(block).or_default();
-        for group_key_bytes in touched_keys {
-            let snapshot = {
-                let state = self.state_cache.get(&group_key_bytes).unwrap();
-                state_to_values(state, &self.state_field_names)
-            };
-            self.block_snapshots
-                .entry(group_key_bytes.clone())
-                .or_default()
-                .insert(block, snapshot);
-            block_keys.insert(group_key_bytes);
-        }
-
-        Ok(output_maps)
+        Ok(())
     }
 
     /// Batched path: groups rows by key, calls process_grouped() once.
@@ -363,7 +381,12 @@ impl ReducerEngine {
             .collect();
 
         // Phase 2: Single batch call
-        self.runtime.process_grouped(&mut batches)?;
+        if let Err(e) = self.runtime.process_grouped(&mut batches) {
+            // The undo of the failed ingest restores these keys from the
+            // blocks before, also the states taken out of `state_cache`.
+            self.block_groups.entry(block).or_default().extend(key_order);
+            return Err(e);
+        }
 
         // Phase 3: Collect results — restore states, save snapshots, enrich emits.
         // Emit in original row order (not grouped order) so first()/last() MVs
@@ -454,9 +477,10 @@ impl ReducerEngine {
     }
 
     /// Roll back all blocks after fork_point.
-    /// Restores state from in-memory block snapshots.
+    /// Restores state from in-memory block snapshots, else from the newest
+    /// finalized state in `pending` or storage.
     /// Returns the number of groups affected.
-    pub fn rollback(&mut self, fork_point: BlockNumber) -> Result<usize> {
+    pub fn rollback(&mut self, fork_point: BlockNumber, pending: &PendingWrites) -> Result<usize> {
         // Guard: fork_point + 1 would overflow u64::MAX to 0, causing split_off(&0)
         // to remove the entire map. MAX is a valid no-op: nothing exists after it.
         if fork_point == BlockNumber::MAX {
@@ -487,7 +511,7 @@ impl ReducerEngine {
             }
 
             // Find the state at fork_point (or the most recent before it)
-            let state = self.find_state_at_or_before(group_key_bytes, fork_point)?;
+            let state = self.find_state_at_or_before(group_key_bytes, fork_point, pending)?;
             self.state_cache.insert(group_key_bytes.clone(), state);
 
             // Clean up empty snapshot maps
@@ -554,11 +578,24 @@ impl ReducerEngine {
     }
 
     /// Find state at or before the given block from in-memory snapshots,
-    /// falling back to storage (finalized state) or defaults.
-    fn find_state_at_or_before(&self, group_key_bytes: &[u8], block: BlockNumber) -> Result<State> {
+    /// falling back to finalized state (pending, then stored) or defaults.
+    fn find_state_at_or_before(
+        &self,
+        group_key_bytes: &[u8],
+        block: BlockNumber,
+        pending: &PendingWrites,
+    ) -> Result<State> {
         if let Some(values) = self.find_snapshot_at_or_before(group_key_bytes, block) {
             return Ok(values_to_state(values, &self.state_field_names));
         }
+
+        // `write_checkpoint` drops the snapshots it persists, so a checkpoint
+        // that waits for an ack is the newest state of this group.
+        if let Some(bytes) = pending.reducer_finalized(&self.def.name, group_key_bytes) {
+            let values = storage::decode_values(bytes);
+            return Ok(values_to_state(&values, &self.state_field_names));
+        }
+
         // Fall back to finalized state in storage
         load_state_from(
             self.storage.as_ref(),
@@ -877,7 +914,7 @@ mod tests {
             .unwrap();
 
         // Rollback block 2
-        let affected = engine.rollback(1000).unwrap();
+        let affected = engine.rollback(1000, &PendingWrites::default()).unwrap();
         assert_eq!(affected, 1);
 
         // Process block 2 again with different data
@@ -946,7 +983,7 @@ mod tests {
             .unwrap();
 
         // Rollback to 1001
-        engine.rollback(1001).unwrap();
+        engine.rollback(1001, &PendingWrites::default()).unwrap();
 
         // After rollback: state should be at block 1001 (qty=15, cost=30500)
         let output = engine
@@ -986,7 +1023,7 @@ mod tests {
         storage.commit(&batch).unwrap();
 
         // Block 10 rolls back onto the persisted state: 9 bought at 100.
-        engine.rollback(9).unwrap();
+        engine.rollback(9, &PendingWrites::default()).unwrap();
         let output = engine
             .process_block(10, &[make_trade("alice", "sell", 9.0, 200.0)])
             .unwrap();
@@ -1175,7 +1212,7 @@ mod tests {
             .process_block(1001, &[make_trade("alice", "buy", 5.0, 2100.0)])
             .unwrap();
 
-        engine.rollback(1000).unwrap();
+        engine.rollback(1000, &PendingWrites::default()).unwrap();
 
         let output = engine
             .process_block(1001, &[make_trade("alice", "sell", 3.0, 2200.0)])

@@ -4,9 +4,10 @@
 
 use super::test_helpers::*;
 use super::*;
-use crate::test_helpers::cursor;
+use crate::test_helpers::{cursor, ingest_with_finalized_no_ack};
 use crate::types::{ChangeOp, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 const SUM_SCHEMA: &str = r#"
     CREATE TABLE swaps (
@@ -114,6 +115,86 @@ const SLIDING_NO_EXPIRY_SCHEMA: &str = r#"
     WINDOW SLIDING INTERVAL 30 DAY BY ts;
 "#;
 
+/// Two external reducers (`FailingSum`): one takes its rows one by one and
+/// fails on 13, the other takes a block of groups at once and fails on 14.
+/// External reducers run one after the other, so each needs its own amount.
+const FAILING_SCHEMA: &str = r#"
+    CREATE TABLE swaps (
+        block_number UInt64,
+        pool String,
+        amount UInt64,
+        ts DateTime
+    );
+
+    CREATE REDUCER per_row
+    SOURCE swaps
+    GROUP BY pool
+    STATE (
+        total UInt64 DEFAULT 0
+    )
+    LANGUAGE EXTERNAL;
+
+    CREATE REDUCER batched
+    SOURCE swaps
+    GROUP BY pool
+    STATE (
+        total UInt64 DEFAULT 0
+    )
+    LANGUAGE EXTERNAL;
+
+    CREATE MATERIALIZED VIEW per_row_total AS
+    SELECT pool, last(total) AS total, count() AS events
+    FROM per_row
+    GROUP BY pool;
+
+    CREATE MATERIALIZED VIEW batched_total AS
+    SELECT pool, last(total) AS total, count() AS events
+    FROM batched
+    GROUP BY pool;
+"#;
+
+const PER_ROW_POISON: u64 = 13;
+const BATCHED_POISON: u64 = 14;
+
+/// Sums `amount` per group and fails on `poison`, after the rows before it,
+/// also in other groups, changed their states.
+struct FailingSum {
+    batched: bool,
+    poison: u64,
+}
+
+impl crate::reducer_runtime::ReducerRuntime for FailingSum {
+    fn process(&self, state: &mut HashMap<String, Value>, row: &crate::types::Row) -> Result<Vec<RowMap>> {
+        let amount = row.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+        if amount == self.poison {
+            return Err(Error::Reducer("unlucky amount".into()));
+        }
+
+        let total = state.get("total").and_then(|v| v.as_u64()).unwrap_or(0) + amount;
+        state.insert("total".into(), Value::UInt64(total));
+        Ok(vec![HashMap::from([("total".to_string(), Value::UInt64(total))])])
+    }
+
+    fn use_batched_processing(&self) -> bool {
+        self.batched
+    }
+}
+
+fn attach_runtimes(db: &mut Settle, schema: &str) {
+    if schema == FAILING_SCHEMA {
+        let per_row = FailingSum {
+            batched: false,
+            poison: PER_ROW_POISON,
+        };
+        let batched = FailingSum {
+            batched: true,
+            poison: BATCHED_POISON,
+        };
+        db.register_reducer_callback("per_row", Box::new(per_row)).unwrap();
+        db.register_reducer_callback("batched", Box::new(batched)).unwrap();
+    }
+}
+
 /// Ten minutes per block, so a one-hour window holds six blocks.
 fn swap(block: BlockNumber, pool: &str, amount: u64) -> RowMap {
     HashMap::from([
@@ -127,7 +208,9 @@ fn reopen(schema: &str, storage: &Arc<MemoryBackend>, interval: u64) -> Settle {
     let config = Config::new(schema)
         .storage(storage.clone())
         .backfill_checkpoint_interval(interval);
-    Settle::open(config).unwrap()
+    let mut db = Settle::open(config).unwrap();
+    attach_runtimes(&mut db, schema);
+    db
 }
 
 fn total(batch: &ChangeBatch, view: &str, pool: &str) -> Value {
@@ -444,20 +527,26 @@ fn apply_and_ack(db: &mut Settle, target: &mut Target, batch: Option<ChangeBatch
     }
 }
 
-/// Blocks 1..=3 and then an ingest that detects a fork to block 1 and fails.
-/// A caller that goes on, or reopens a poisoned instance, and sends the new
-/// chain again must get the same downstream rows as a run without the
-/// failure.
+/// Block 1, then blocks 2 and 3 in a batch that the target applies and has
+/// not acked yet, then an ingest that detects a fork to block 1 and fails.
+/// Pool B is only on the old fork. A caller that acks the applied batch,
+/// goes on or reopens a poisoned instance, and sends the new chain again
+/// must get the same downstream rows as a run without the failure.
 fn check_failed_fork_ingest(schema: &str, failing: IngestInput) {
     let storage = Arc::new(MemoryBackend::new());
     let mut db = reopen(schema, &storage, 1);
     let mut target = Target::default();
 
-    let blocks = (1..=3).map(|b| ("swaps".into(), b, vec![swap(b, "A", b)])).collect();
-    let batch = ingest_with_finalized(&mut db, blocks, 0).unwrap();
-    target.apply(&batch.unwrap());
+    let block_1 = vec![("swaps".into(), 1, vec![swap(1, "A", 1)])];
+    let batch = ingest_with_finalized_no_ack(&mut db, block_1, 0).unwrap();
+    apply_and_ack(&mut db, &mut target, batch);
+
+    let old_fork = (2..=3).map(|b| ("swaps".into(), b, vec![swap(b, "B", b)])).collect();
+    let applied = ingest_with_finalized_no_ack(&mut db, old_fork, 0).unwrap().unwrap();
+    target.apply(&applied);
 
     assert!(db.ingest(failing).is_err());
+    db.ack(applied.sequence).unwrap();
 
     let batch = match db.ingest(new_chain_block(2, 5)) {
         Err(Error::Poisoned(_)) => {
@@ -501,52 +590,18 @@ fn input_error_after_ingest_fork_loses_no_compensation() {
     check_failed_fork_ingest(SUM_SCHEMA, bad_type);
 }
 
-/// `MemoryBackend` whose raw-row reads fail while `fail_reads` is set.
-#[derive(Default)]
-struct FailingReads {
-    inner: MemoryBackend,
-    fail_reads: std::sync::atomic::AtomicBool,
-}
-
-impl StorageBackend for FailingReads {
-    fn put_raw_rows(&self, t: &str, b: BlockNumber, d: &[u8]) -> Result<()> { self.inner.put_raw_rows(t, b, d) }
-    fn get_raw_rows(&self, t: &str, f: BlockNumber, u: BlockNumber) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
-        if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(Error::Storage("injected read failure".into()));
-        }
-        self.inner.get_raw_rows(t, f, u)
-    }
-    fn delete_raw_rows_after(&self, t: &str, a: BlockNumber) -> Result<()> { self.inner.delete_raw_rows_after(t, a) }
-    fn take_raw_rows_after(&self, t: &str, a: BlockNumber) -> Result<Vec<(BlockNumber, Vec<u8>)>> { self.inner.take_raw_rows_after(t, a) }
-    fn put_reducer_state(&self, r: &str, k: &[u8], b: BlockNumber, s: &[u8]) -> Result<()> { self.inner.put_reducer_state(r, k, b, s) }
-    fn get_reducer_state(&self, r: &str, k: &[u8], b: BlockNumber) -> Result<Option<Vec<u8>>> { self.inner.get_reducer_state(r, k, b) }
-    fn get_reducer_state_at_or_before(&self, r: &str, k: &[u8], b: BlockNumber) -> Result<Option<(BlockNumber, Vec<u8>)>> { self.inner.get_reducer_state_at_or_before(r, k, b) }
-    fn delete_reducer_states_after(&self, r: &str, k: &[u8], a: BlockNumber) -> Result<()> { self.inner.delete_reducer_states_after(r, k, a) }
-    fn get_reducer_finalized(&self, r: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_reducer_finalized(r, k) }
-    fn set_reducer_finalized(&self, r: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.set_reducer_finalized(r, k, s) }
-    fn delete_reducer_states_up_to(&self, r: &str, k: &[u8], u: BlockNumber) -> Result<()> { self.inner.delete_reducer_states_up_to(r, k, u) }
-    fn put_mv_state(&self, v: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.put_mv_state(v, k, s) }
-    fn get_mv_state(&self, v: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_mv_state(v, k) }
-    fn delete_mv_state(&self, v: &str, k: &[u8]) -> Result<()> { self.inner.delete_mv_state(v, k) }
-    fn list_mv_group_keys(&self, v: &str) -> Result<Vec<Vec<u8>>> { self.inner.list_mv_group_keys(v) }
-    fn put_meta(&self, k: &str, v: &[u8]) -> Result<()> { self.inner.put_meta(k, v) }
-    fn get_meta(&self, k: &str) -> Result<Option<Vec<u8>>> { self.inner.get_meta(k) }
-    fn list_reducer_group_keys(&self, r: &str) -> Result<Vec<Vec<u8>>> { self.inner.list_reducer_group_keys(r) }
-    fn commit(&self, batch: &StorageWriteBatch) -> Result<()> { self.inner.commit(batch) }
-}
-
 /// The raw tables roll back last, after the reducers and MVs. A read
 /// failure there leaves the engine half rolled back.
 #[test]
 fn rollback_failure_poisons_instance() {
-    let storage = Arc::new(FailingReads::default());
+    let storage = Arc::new(FailingStorage::default());
     let config = Config::new(REDUCER_SCHEMA).storage(storage.clone());
     let mut db = Settle::open(config).unwrap();
 
     let blocks = (1..=3).map(|b| ("swaps".into(), b, vec![swap(b, "A", b)])).collect();
     ingest_with_finalized(&mut db, blocks, 0).unwrap();
 
-    storage.fail_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+    storage.fail_reads.store(true, Ordering::SeqCst);
     assert!(db.handle_fork(vec![cursor(1)]).is_err());
     assert!(db.is_poisoned());
 }
@@ -577,7 +632,7 @@ impl Rng {
 }
 
 /// What a downstream database holds after it applies every change batch.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Target(BTreeMap<(String, String), String>);
 
 impl Target {
@@ -613,7 +668,7 @@ fn sorted_debug(map: &HashMap<String, Value>) -> String {
     format!("{:?}", map.iter().collect::<BTreeMap<_, _>>())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Op {
     /// Data blocks (none for a heartbeat). The rollback chain holds them and
     /// the current tip, as a client sends it, so an ingest never forks.
@@ -633,6 +688,19 @@ enum Op {
 }
 
 impl Op {
+    /// An ingest that `FailingSum` rejects.
+    fn poisoned(&self) -> bool {
+        let Op::Ingest { blocks, .. } = self else {
+            return false;
+        };
+        let poison = [PER_ROW_POISON, BATCHED_POISON].map(Value::UInt64);
+        blocks
+            .iter()
+            .flat_map(|(_, rows)| rows)
+            .filter_map(|row| row.get("amount"))
+            .any(|amount| poison.contains(amount))
+    }
+
     fn input(op: &Op) -> IngestInput {
         let mut rows = Vec::new();
         let mut chain = Vec::new();
@@ -679,6 +747,8 @@ impl Op {
 struct History {
     rng: Rng,
     forks: bool,
+    /// Some data ingests get a row that a `FailingSum` rejects.
+    poison: bool,
     latest: Option<BlockNumber>,
     finalized: BlockNumber,
     data_blocks: Vec<BlockNumber>,
@@ -717,7 +787,7 @@ impl History {
                 Some(latest) => latest + 1 + self.rng.below(2),
             };
             for _ in 0..1 + self.rng.below(3) {
-                let rows = (0..1 + self.rng.below(2))
+                let rows: Vec<RowMap> = (0..1 + self.rng.below(2))
                     .map(|_| {
                         let pool = ["A", "B", "C"][self.rng.below(3) as usize];
                         swap(block, pool, 1 + self.rng.below(9))
@@ -725,6 +795,17 @@ impl History {
                     .collect();
                 blocks.push((block, rows));
                 block += 1 + self.rng.below(2);
+            }
+
+            // An undo keeps block 0, which counts as no block (#31).
+            let above_block_0 = blocks[0].0 > 0;
+            if self.poison && above_block_0 && self.rng.below(4) == 0 {
+                let at = self.rng.below(blocks.len() as u64) as usize;
+                let (block, rows) = &mut blocks[at];
+                let pool = ["A", "B", "C"][self.rng.below(3) as usize];
+                let position = self.rng.below(rows.len() as u64 + 1) as usize;
+                let amount = [PER_ROW_POISON, BATCHED_POISON][self.rng.below(2) as usize];
+                rows.insert(position, swap(*block, pool, amount));
             }
         }
 
@@ -790,6 +871,7 @@ fn check_history(schema: &str, interval: u64, forks: bool, seed: u64, steps: usi
     let mut history = History {
         rng: Rng::new(seed),
         forks,
+        poison: schema == FAILING_SCHEMA,
         latest: None,
         finalized: 0,
         data_blocks: Vec::new(),
@@ -806,7 +888,12 @@ fn check_history(schema: &str, interval: u64, forks: bool, seed: u64, steps: usi
             continue;
         }
 
-        let expected = run(&mut reference, &mut reference_target, &op);
+        // The reference never sees a rejected ingest.
+        let expected = if op.poisoned() {
+            Err("poisoned".to_string())
+        } else {
+            run(&mut reference, &mut reference_target, &op)
+        };
         let actual = run(&mut reopened, &mut reopened_target, &op);
         assert_eq!(
             actual.is_ok(),
@@ -866,6 +953,15 @@ fn random_short_histories_survive_reopen() {
     }
 }
 
+/// A reducer error in the middle of an ingest leaves no trace, also with
+/// the rows before it in the same block and in other groups.
+#[test]
+fn random_histories_with_reducer_errors() {
+    for seed in 0..300 {
+        check_history(FAILING_SCHEMA, 1, true, seed, 40);
+    }
+}
+
 #[test]
 fn random_histories_survive_reopen_sliding_forks() {
     for seed in 0..300 {
@@ -884,5 +980,240 @@ fn random_histories_survive_reopen_sliding_expiry() {
 fn random_short_histories_survive_reopen_sliding() {
     for seed in 0..5000 {
         check_history(SLIDING_SCHEMA, 1, true, seed, 8);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipelined acks: the same random histories, with batches that wait for
+// their ack while the next ones are ingested.
+// ---------------------------------------------------------------------------
+
+/// A client that lets up to `depth` batches wait for their ack. Its target
+/// applies the batches late, in order, and acks some of the applied ones. A
+/// crash loses the unacked batches, so the client sends again every op whose
+/// writes were not acked.
+struct PipelinedClient {
+    schema: &'static str,
+    interval: u64,
+    depth: usize,
+    storage: Arc<MemoryBackend>,
+    db: Settle,
+    rng: Rng,
+    target: Target,
+    /// Returned and not applied yet, in sequence order.
+    unapplied: VecDeque<ChangeBatch>,
+    /// Applied and not acked yet.
+    applied_unacked: VecDeque<u64>,
+    /// Ops whose writes are not on disk, with the sequence whose ack commits
+    /// them.
+    not_durable: VecDeque<(Op, u64)>,
+}
+
+fn open_pipelined(schema: &str, storage: &Arc<MemoryBackend>, interval: u64, depth: usize) -> Settle {
+    let config = Config::new(schema)
+        .storage(storage.clone())
+        .backfill_checkpoint_interval(interval)
+        .max_pending_batches(depth);
+    let mut db = Settle::open(config).unwrap();
+    attach_runtimes(&mut db, schema);
+    db
+}
+
+impl PipelinedClient {
+
+    fn apply_next(&mut self) {
+        let batch = self.unapplied.pop_front().unwrap();
+        self.target.apply(&batch);
+        self.applied_unacked.push_back(batch.sequence);
+    }
+
+    fn ack(&mut self, sequence: u64) {
+        self.db.ack(sequence).unwrap();
+        self.applied_unacked.retain(|&s| s > sequence);
+        self.not_durable.retain(|&(_, s)| s > sequence);
+    }
+
+    fn make_room(&mut self) {
+        while self.db.unacked_batches() >= self.depth {
+            if self.applied_unacked.is_empty() {
+                self.apply_next();
+            }
+            let oldest = self.applied_unacked[0];
+            self.ack(oldest);
+        }
+    }
+
+    fn run(&mut self, op: &Op) -> std::result::Result<(), String> {
+        self.make_room();
+
+        let batch = match op {
+            Op::Fork {
+                at,
+                by_ingest: false,
+                ..
+            } => self.db.handle_fork(vec![cursor(*at)]).map(|r| r.batch),
+            _ => self.db.ingest(Op::input(op)),
+        }
+        .map_err(|e| e.to_string())?;
+
+        // An op without a batch commits at once, or with the newest batch.
+        let commit_sequence = match &batch {
+            Some(batch) => Some(batch.sequence),
+            None => self.newest_unacked(),
+        };
+        if let Some(sequence) = commit_sequence {
+            self.not_durable.push_back((op.clone(), sequence));
+        }
+        self.unapplied.extend(batch);
+        Ok(())
+    }
+
+    fn newest_unacked(&self) -> Option<u64> {
+        let unapplied = self.unapplied.back().map(|b| b.sequence);
+        unapplied.or(self.applied_unacked.back().copied())
+    }
+
+    /// The target applies some batches and acks up to one of them.
+    fn consume(&mut self) {
+        let apply = self.rng.below(self.unapplied.len() as u64 + 1);
+        for _ in 0..apply {
+            self.apply_next();
+        }
+
+        if !self.applied_unacked.is_empty() && self.rng.below(2) == 0 {
+            let at = self.rng.below(self.applied_unacked.len() as u64) as usize;
+            let sequence = self.applied_unacked[at];
+            self.ack(sequence);
+        }
+    }
+
+    /// The process dies: unacked batches are lost, applied rows stay.
+    fn crash(&mut self) {
+        self.db = open_pipelined(self.schema, &self.storage, self.interval, self.depth);
+        self.unapplied.clear();
+        self.applied_unacked.clear();
+
+        for (op, _) in std::mem::take(&mut self.not_durable) {
+            self.run(&op).expect("an op that succeeded before succeeds again");
+        }
+    }
+
+    /// The target once every returned batch is applied.
+    fn drained_target(&self) -> Target {
+        let mut target = self.target.clone();
+        for batch in &self.unapplied {
+            target.apply(batch);
+        }
+        target
+    }
+}
+
+fn check_pipelined_history(schema: &'static str, interval: u64, depth: usize, seed: u64, steps: usize) {
+    let storage = Arc::new(MemoryBackend::new());
+    let mut client = PipelinedClient {
+        schema,
+        interval,
+        depth,
+        db: open_pipelined(schema, &storage, interval, depth),
+        storage,
+        rng: Rng::new(seed ^ 0x5EED),
+        target: Target::default(),
+        unapplied: VecDeque::new(),
+        applied_unacked: VecDeque::new(),
+        not_durable: VecDeque::new(),
+    };
+
+    let mut reference = reopen(schema, &Arc::new(MemoryBackend::new()), interval);
+    let mut reference_target = Target::default();
+
+    let mut history = History {
+        rng: Rng::new(seed),
+        forks: true,
+        poison: schema == FAILING_SCHEMA,
+        latest: None,
+        finalized: 0,
+        data_blocks: Vec::new(),
+    };
+    let mut log = Vec::new();
+
+    for _ in 0..steps {
+        let op = history.next_op();
+        log.push(format!("{op:?}"));
+
+        if let Op::Reopen = op {
+            client.crash();
+        } else {
+            let expected = if op.poisoned() {
+                Err("poisoned".to_string())
+            } else {
+                run(&mut reference, &mut reference_target, &op)
+            };
+            let actual = client.run(&op);
+            assert_eq!(
+                actual.is_ok(),
+                expected.is_ok(),
+                "seed {seed}, depth {depth}, interval {interval}: pipelined {actual:?} vs reference {expected:?}\n{}",
+                log.join("\n")
+            );
+            if expected.is_ok() {
+                history.applied(&op);
+            }
+        }
+        client.consume();
+
+        let diff = client.drained_target().diff(&reference_target);
+        assert!(
+            diff.is_empty(),
+            "seed {seed}, depth {depth}, interval {interval}: outputs differ after\n{}\n\n{}",
+            log.join("\n"),
+            diff.join("\n")
+        );
+    }
+}
+
+#[test]
+fn random_pipelined_histories_sum() {
+    for seed in 0..300 {
+        for depth in [2, 4] {
+            check_pipelined_history(SUM_SCHEMA, 1, depth, seed, 40);
+            check_pipelined_history(SUM_SCHEMA, 3, depth, seed, 40);
+        }
+    }
+}
+
+#[test]
+fn random_pipelined_histories_reducer() {
+    for seed in 0..300 {
+        for depth in [2, 4] {
+            check_pipelined_history(REDUCER_SCHEMA, 1, depth, seed, 40);
+            check_pipelined_history(REDUCER_SCHEMA, 3, depth, seed, 40);
+        }
+    }
+}
+
+#[test]
+fn random_pipelined_histories_sliding() {
+    for seed in 0..300 {
+        for depth in [2, 4] {
+            check_pipelined_history(SLIDING_SCHEMA, 1, depth, seed, 40);
+            check_pipelined_history(SLIDING_NO_EXPIRY_SCHEMA, 1, depth, seed, 40);
+        }
+    }
+}
+
+#[test]
+fn random_pipelined_histories_with_reducer_errors() {
+    for seed in 0..300 {
+        for depth in [2, 4] {
+            check_pipelined_history(FAILING_SCHEMA, 1, depth, seed, 40);
+        }
+    }
+}
+
+#[test]
+fn random_short_pipelined_histories() {
+    for seed in 0..3000 {
+        check_pipelined_history(SUM_SCHEMA, 1, 2, seed, 10);
+        check_pipelined_history(REDUCER_SCHEMA, 3, 3, seed, 10);
     }
 }

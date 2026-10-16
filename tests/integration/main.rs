@@ -11,3 +11,4 @@ mod buffering;
 mod crash_recovery;
 mod dedup;
 mod fork;
+mod pipelined;
