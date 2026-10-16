@@ -235,8 +235,7 @@ struct Prepared {
     inputs: Vec<IngestInput>,
 }
 
-/// Leaked, so that dropping the engine is not counted.
-fn prepare(workload: Workload, mode: Mode) -> &'static mut Prepared {
+fn init_bench_process() {
     // A runtime check: a compile error would break `cargo build --all-targets`.
     if cfg!(feature = "mimalloc") {
         panic!(
@@ -250,6 +249,11 @@ fn prepare(workload: Workload, mode: Mode) -> &'static mut Prepared {
         .use_current_thread()
         .build_global()
         .unwrap();
+}
+
+/// Leaked, so that dropping the engine is not counted.
+fn prepare(workload: Workload, mode: Mode) -> &'static mut Prepared {
+    init_bench_process();
 
     let mut db = Settle::open(Config::new(workload.schema())).unwrap();
     let mut inputs = mode.inputs(workload);
@@ -309,7 +313,90 @@ fn tip(case: &'static mut Prepared) -> usize {
     ingest_all(case)
 }
 
+/// One ingest of many blocks with one row each, all in one group. A linear
+/// engine doubles the count when the blocks double; a path that reads all
+/// unfinalized blocks of a group on each block quadruples it.
+#[derive(Clone, Copy)]
+enum Scale {
+    Sum,
+    /// Aggregates with no reverse delta.
+    MinMax,
+    /// A window wider than the batch, so no block expires.
+    SlidingLast,
+}
+
+impl Scale {
+    fn schema(self) -> String {
+        let aggregates = match self {
+            Scale::Sum => "sum(value) AS total",
+            Scale::MinMax => "min(value) AS lo, max(value) AS hi",
+            Scale::SlidingLast => "last(value) AS latest",
+        };
+        let window = match self {
+            Scale::SlidingLast => "WINDOW SLIDING INTERVAL 1 DAY BY ts",
+            Scale::Sum | Scale::MinMax => "",
+        };
+
+        format!(
+            "CREATE VIRTUAL TABLE ticks (
+                block_number UInt64,
+                ts           DateTime,
+                pair         String,
+                value        Float64
+            );
+            CREATE MATERIALIZED VIEW hot AS
+            SELECT pair, {aggregates}
+            FROM ticks GROUP BY pair {window};"
+        )
+    }
+}
+
+/// One block per second, finality at the batch tip.
+fn prepare_scale(scale: Scale, blocks: u64) -> &'static mut Prepared {
+    init_bench_process();
+
+    let rows = (1..=blocks)
+        .map(|block| {
+            HashMap::from([
+                ("block_number".into(), Value::UInt64(block)),
+                (
+                    "ts".into(),
+                    Value::DateTime(1_700_000_000_000 + block as i64 * 1000),
+                ),
+                ("pair".into(), Value::String("hot".into())),
+                ("value".into(), Value::Float64((block * 7919 % 1000) as f64)),
+            ])
+        })
+        .collect();
+
+    let input = IngestInput {
+        data: HashMap::from([("ticks".to_string(), rows)]),
+        rollback_chain: Vec::new(),
+        finalized_head: cursor(blocks),
+    };
+
+    Box::leak(Box::new(Prepared {
+        db: Settle::open(Config::new(scale.schema())).unwrap(),
+        inputs: vec![input],
+    }))
+}
+
+#[library_benchmark]
+#[bench::sum_2k(args = (Scale::Sum, 2_000), setup = prepare_scale)]
+#[bench::sum_4k(args = (Scale::Sum, 4_000), setup = prepare_scale)]
+#[bench::sum_8k(args = (Scale::Sum, 8_000), setup = prepare_scale)]
+#[bench::minmax_2k(args = (Scale::MinMax, 2_000), setup = prepare_scale)]
+#[bench::minmax_4k(args = (Scale::MinMax, 4_000), setup = prepare_scale)]
+#[bench::minmax_8k(args = (Scale::MinMax, 8_000), setup = prepare_scale)]
+#[bench::sliding_last_2k(args = (Scale::SlidingLast, 2_000), setup = prepare_scale)]
+#[bench::sliding_last_4k(args = (Scale::SlidingLast, 4_000), setup = prepare_scale)]
+#[bench::sliding_last_8k(args = (Scale::SlidingLast, 8_000), setup = prepare_scale)]
+fn scale(case: &'static mut Prepared) -> usize {
+    ingest_all(case)
+}
+
 library_benchmark_group!(name = ingest, benchmarks = [backfill, tip]);
+library_benchmark_group!(name = scaling, benchmarks = [scale]);
 
 // No cache simulation: it doubles the run time, and the limits read instructions.
 main!(
@@ -329,5 +416,5 @@ main!(
                     (DhatMetric::TotalBlocks, 1.0),
                 ])
         ),
-    library_benchmark_groups = ingest
+    library_benchmark_groups = [ingest, scaling]
 );
