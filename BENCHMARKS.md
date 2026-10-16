@@ -122,8 +122,11 @@ group, with finality at the batch tip. A linear engine doubles the count when N
 doubles. Before the running fold, `sum` and `min`/`max` read every unfinalized
 block of the group on each block. `sliding_last` keeps a window wider than the
 batch, so no block expires; before the timestamp index of the window, each
-block scanned all the block times of the window. The last row of each case has
-one MV emit per ingest, instead of one change record per block.
+block scanned all the block times of the window. `sliding_jump` is `sum` in such
+a window, then one block whose timestamp expires all the others at once; when
+each moved block refolded the rest of the group, that expiry was quadratic. The
+last row of each case has one MV emit per ingest, instead of one change record
+per block.
 
 | Case | 2K blocks | 4K | 8K | Per doubling |
 |---|---:|---:|---:|---:|
@@ -136,6 +139,8 @@ one MV emit per ingest, instead of one change record per block.
 | `sliding_last`, before the timestamp index | 137M | 445M | 1,568M | ×3.2–3.5 |
 | `sliding_last`, timestamp index | 53M | 109M | 218M | ×2.0 |
 | `sliding_last` | 30M | 63M | 127M | ×2.0 |
+| `sliding_jump`, refold on each moved block | 98M | 314M | 1,100M | ×3.2–3.5 |
+| `sliding_jump` | 39M | 79M | 161M | ×2.0 |
 
 ### Reopen
 
