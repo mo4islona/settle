@@ -113,11 +113,13 @@ pub fn make_swap(pool: &str, amount: f64) -> RowMap {
 
 /// `MemoryBackend` with injected failures: raw-row reads fail while
 /// `fail_reads` is set, and commits fail once `commits_before_failure`
-/// commits have passed.
+/// commits have passed. It keeps the default bounded raw-row read, and
+/// `blocks_read` counts the blocks of raw rows that it returned.
 pub struct FailingStorage {
     inner: MemoryBackend,
     pub fail_reads: AtomicBool,
     pub commits_before_failure: AtomicU64,
+    pub blocks_read: AtomicU64,
 }
 
 impl Default for FailingStorage {
@@ -126,6 +128,7 @@ impl Default for FailingStorage {
             inner: MemoryBackend::new(),
             fail_reads: AtomicBool::new(false),
             commits_before_failure: AtomicU64::new(u64::MAX),
+            blocks_read: AtomicU64::new(0),
         }
     }
 }
@@ -136,7 +139,9 @@ impl StorageBackend for FailingStorage {
         if self.fail_reads.load(Ordering::SeqCst) {
             return Err(Error::Storage("injected read failure".into()));
         }
-        self.inner.get_raw_rows(t, f, u)
+        let rows = self.inner.get_raw_rows(t, f, u)?;
+        self.blocks_read.fetch_add(rows.len() as u64, Ordering::SeqCst);
+        Ok(rows)
     }
     fn delete_raw_rows_after(&self, t: &str, a: BlockNumber) -> Result<()> { self.inner.delete_raw_rows_after(t, a) }
     fn take_raw_rows_after(&self, t: &str, a: BlockNumber) -> Result<Vec<(BlockNumber, Vec<u8>)>> { self.inner.take_raw_rows_after(t, a) }

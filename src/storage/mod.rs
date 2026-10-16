@@ -486,6 +486,21 @@ pub trait StorageBackend: Send + Sync {
         to_block: BlockNumber,
     ) -> Result<Vec<(BlockNumber, Vec<u8>)>>;
 
+    /// `get_raw_rows` of the first `max_blocks` blocks in the range, for a
+    /// caller that reads a long range a part at a time. A backend that cannot
+    /// stop early keeps this default, which returns the whole range: the
+    /// caller accepts more blocks than it asked for, whereas a cut to
+    /// `max_blocks` would read the rest of the range again for each part.
+    fn get_raw_rows_limited(
+        &self,
+        table: &str,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+        _max_blocks: usize,
+    ) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
+        self.get_raw_rows(table, from_block, to_block)
+    }
+
     /// Delete all rows for a table where block_number > after_block.
     fn delete_raw_rows_after(&self, table: &str, after_block: BlockNumber) -> Result<()>;
 

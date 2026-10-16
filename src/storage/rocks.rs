@@ -209,6 +209,16 @@ impl StorageBackend for RocksDbBackend {
         from_block: BlockNumber,
         to_block: BlockNumber,
     ) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
+        self.get_raw_rows_limited(table, from_block, to_block, usize::MAX)
+    }
+
+    fn get_raw_rows_limited(
+        &self,
+        table: &str,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+        max_blocks: usize,
+    ) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
         let cf = self.db.cf_handle(CF_RAW).expect("raw CF");
         let prefix = raw_table_prefix(table);
         let start = raw_key(table, from_block);
@@ -225,7 +235,7 @@ impl StorageBackend for RocksDbBackend {
         let iter =
             self.db
                 .iterator_cf_opt(cf, opts, IteratorMode::From(&start, Direction::Forward));
-        for item in iter {
+        for item in iter.take(max_blocks) {
             let (k, v) = item.map_err(to_err)?;
             if !k.starts_with(&prefix) {
                 break;
