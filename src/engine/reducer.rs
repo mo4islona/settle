@@ -1379,11 +1379,11 @@ mod tests {
     /// fails the block.
     #[test]
     fn emits_past_the_column_limit_fail_the_block() {
+        use crate::reducer_runtime::MAX_EMIT_COLUMNS;
         use crate::reducer_runtime::fn_reducer::FnReducerRuntime;
-        use crate::types::MAX_COLUMNS;
 
         let runtime = FnReducerRuntime::new(|ctx, _row| {
-            for i in 0..MAX_COLUMNS {
+            for i in 0..MAX_EMIT_COLUMNS {
                 ctx.column(&format!("c{i}"));
             }
             ctx.emit(HashMap::from([("amount".to_string(), Value::Float64(1.0))]));

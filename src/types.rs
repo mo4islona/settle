@@ -820,6 +820,19 @@ impl ChangeBatch {
 mod tests {
     use super::*;
 
+    /// A registry stops at one name per `ColumnId`: a further name gets no
+    /// position, rather than one that wraps onto position 0.
+    #[test]
+    fn registry_stops_at_the_column_id_range() {
+        let names = (0..MAX_COLUMNS - 1).map(|i| format!("c{i}")).collect();
+        let mut registry = ColumnRegistry::new(names);
+
+        assert_eq!(registry.get_or_push("last"), Some(ColumnId::MAX));
+        assert_eq!(registry.get_or_push("one_more"), None);
+        assert_eq!(registry.get_or_push("c0"), Some(0));
+        assert_eq!(registry.len(), MAX_COLUMNS);
+    }
+
     #[test]
     fn value_numeric_conversions() {
         assert_eq!(Value::UInt64(42).as_f64(), Some(42.0));

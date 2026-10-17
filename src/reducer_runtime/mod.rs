@@ -7,7 +7,12 @@ pub mod lua;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::types::{ColumnId, ColumnRegistry, MAX_COLUMNS, Row, RowMap, Value};
+use crate::types::{ColumnId, ColumnRegistry, Row, RowMap, Value};
+
+/// The most distinct column names that the emits of a reducer use. Each
+/// emitted row has a value for every one of them, so emit keys taken from
+/// data would make every row as wide as the data has distinct keys.
+pub const MAX_EMIT_COLUMNS: usize = 1024;
 
 /// The state of one group: a value per STATE field of the reducer, in the
 /// order of `fields`.
@@ -57,13 +62,15 @@ impl Emits {
     }
 
     /// The position of column `name`, added on first use. None once the
-    /// emits use `MAX_COLUMNS` names: the engine then fails the block.
+    /// emits use `MAX_EMIT_COLUMNS` names: the engine then fails the block.
     pub fn column(&mut self, name: &str) -> Option<ColumnId> {
         if let Some(id) = self.columns.get_id(name) {
             return Some(id);
         }
         // Rows taken before keep the old registry, which has fewer columns.
-        let id = Arc::make_mut(&mut self.columns).get_or_push(name);
+        let id = (self.columns.len() < MAX_EMIT_COLUMNS)
+            .then(|| Arc::make_mut(&mut self.columns).get_or_push(name))
+            .flatten();
         if id.is_none() && self.overflow.is_none() {
             self.overflow = Some(name.to_string());
         }
@@ -90,13 +97,14 @@ impl Emits {
         self.push(values);
     }
 
-    /// Err if an emit asked for a column past `MAX_COLUMNS` since the last
-    /// call.
+    /// Err if an emit asked for a column past `MAX_EMIT_COLUMNS` since the
+    /// last call.
     pub(crate) fn check(&mut self) -> Result<()> {
         match self.overflow.take() {
             None => Ok(()),
             Some(name) => Err(Error::Reducer(format!(
-                "emit column '{name}' is past the limit of {MAX_COLUMNS} distinct emit columns"
+                "emit column '{name}' is past the limit of {MAX_EMIT_COLUMNS} distinct emit \
+                 columns: the keys of an emit must be column names, not data"
             ))),
         }
     }
@@ -287,12 +295,12 @@ mod tests {
         );
     }
 
-    /// Past `MAX_COLUMNS` names a column gets no position, so it cannot
-    /// wrap onto the first one; the block fails.
+    /// Past `MAX_EMIT_COLUMNS` names a column gets no position; the block
+    /// fails.
     #[test]
     fn emit_columns_stop_at_the_limit() {
         let mut emits = Emits::with_columns(&["user".to_string()]);
-        for i in 1..MAX_COLUMNS {
+        for i in 1..MAX_EMIT_COLUMNS {
             assert_eq!(emits.column(&format!("c{i}")), Some(i as ColumnId));
         }
         emits.check().unwrap();
@@ -307,6 +315,6 @@ mod tests {
         assert!(err.to_string().contains("emit column 'one_more'"), "{err}");
         let rows = emits.take();
         assert_eq!(rows[0].1[0], Value::String("alice".into()));
-        assert_eq!(emits.columns().len(), MAX_COLUMNS);
+        assert_eq!(emits.columns().len(), MAX_EMIT_COLUMNS);
     }
 }
