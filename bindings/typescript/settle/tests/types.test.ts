@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { float64, Pipeline, string } from '../src'
+import { float64, int64, Pipeline, string, uint64 } from '../src'
 
 describe('Type safety', () => {
   it('rejects raw strings as column types', () => {
@@ -93,6 +93,48 @@ describe('Type safety', () => {
         // @ts-expect-error — 'nonexistent' is not a key of Enriched
         const _x = row.nonexistent
         state.update({ prev: row.value })
+      },
+    })
+  })
+
+  it('types 64-bit integers as number | bigint', () => {
+    const p = new Pipeline()
+    const t = p.table('t', { user: string(), amount: uint64(), delta: int64() })
+
+    t.createReducer('r', {
+      groupBy: 'user',
+      initialState: { total: 0n },
+      reduce(state, row) {
+        const _a: number | bigint = row.amount
+        const _d: number | bigint = row.delta
+        // @ts-expect-error — a value above 2^53 is a bigint, and bigint / number throws
+        const _ratio = row.amount / 1_000_000
+        // @ts-expect-error — a bigint field of the state is a number while it is small
+        const _next = state.total + 1n
+        state.update({ total: BigInt(state.total) + BigInt(row.amount) })
+      },
+    })
+  })
+
+  it('types bigint fields of a parent emit as number | bigint', () => {
+    const p = new Pipeline()
+    const t = p.table('t', { v: float64() })
+
+    const parent = t.createReducer<{ n: number }, { big: bigint }>('parent', {
+      groupBy: [],
+      initialState: { n: 0 },
+      reduce(state, _row) {
+        state.emit({ big: 1n })
+      },
+    })
+
+    parent.createReducer('child', {
+      groupBy: [],
+      initialState: {},
+      reduce(_state, row) {
+        const _b: number | bigint = row.big
+        // @ts-expect-error — the parent's bigint is a number while it is small
+        const _x: bigint = row.big
       },
     })
   })
