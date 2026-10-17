@@ -1,4 +1,4 @@
-import type { ColumnType, InferRow } from './column'
+import type { ColumnType, FromEngine, InferRow } from './column'
 import {
   inferStateFields,
   type ReducerOptions,
@@ -195,7 +195,7 @@ export class ReducerHandle<TOutput = any> {
 
   createReducer<TState, TEmit>(
     name: string,
-    opts: ReducerOptions<TState, TOutput, TEmit>,
+    opts: ReducerOptions<TState, FromEngine<TOutput>, TEmit>,
   ): ReducerHandle<TEmit> {
     return this.#pipeline._addReducer(name, this.#name, opts)
   }
