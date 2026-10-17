@@ -84,6 +84,11 @@ consumer would do them.
 | `backfill` | 100 blocks × 50 rows | at the batch tip | 4 ingests, 20K rows |
 | `tip` | 1 block × 50 rows | 64 blocks behind | 200 ingests, 10K rows |
 
+The `msgpack` group counts what the napi binding does with an ingest: the rows
+arrive as one msgpack buffer, and the count includes its decode
+(`decode_table_rows_from_msgpack`) and `Settle::ingest_rows`. The other groups
+call `Settle::ingest` with rows by name, as a Rust caller does.
+
 Memory storage only: RocksDB flushes and compacts on its own threads, which
 neither tool counts. Rayon runs on the bench thread for the same reason. The
 counts use glibc malloc, which costs more instructions than mimalloc, so
@@ -161,6 +166,32 @@ a stored table, a probe that is not in the repository), 2026-10-16:
 Most of the rest is the state that the replay rebuilds: the replayed blocks stay
 unfinalized until the next ingest brings the finality, so the MV holds per-block
 data for the whole tail.
+
+### Rows by position (2026-10-18)
+
+Input rows used to reach the raw table, the reducers and the views as
+`HashMap<String, Value>`, and each stage looked up its columns by name. Now the
+napi binding decodes msgpack straight into rows in the column order of the
+table, `Settle::ingest` converts each map once, and `ColumnRegistry` hashes
+names with FxHash.
+
+| Case | Before | After | Change |
+|---|---:|---:|---:|
+| `msgpack_backfill mv_sum` | 430M | 320M | −25.7% |
+| `msgpack_backfill event_rules` | 753M | 594M | −21.1% |
+| `msgpack_backfill polymarket` | 2,355M | 2,039M | −13.4% |
+| `msgpack_tip mv_sum` | 209M | 156M | −25.3% |
+| `msgpack_tip polymarket` | 1,168M | 1,009M | −13.6% |
+| `backfill` / `tip`, rows by name | | | −8.7% to +0.5% |
+| `scale` cases | | | +4.4% to +9.0% |
+| `recovery reopen` | 409M | 215M | −47.4% |
+
+The scale cases have one row per block. Their engine code got cheaper, but glibc
+spends more in `malloc` and `free` (+2.8M self on `sum_2k`, with the same number
+of allocated blocks). The wall clock with mimalloc does not show it: in
+`throughput`, which ingests rows by name, every case is faster, median of three
+alternating rounds: raw ingestion +18%, raw + MV +12%, full pipelines +10% to
++18%, Polymarket +3% to +9%.
 
 Each case leaves its profiles under `target/gungraun/settle/instructions/ingest/<mode>.<workload>/`.
 `callgrind_annotate --inclusive=yes callgrind.<mode>.<workload>.out` shows where

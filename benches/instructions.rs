@@ -26,10 +26,11 @@ use std::sync::Arc;
 
 use gungraun::prelude::*;
 use gungraun::{Callgrind, Dhat, DhatMetric, EventKind};
-use settle::db::{Config, IngestInput, Settle};
+use settle::db::{Config, IngestInput, IngestRows, Settle};
+use settle::msgpack_conv::decode_table_rows_from_msgpack;
 use settle::storage::memory::MemoryBackend;
 use settle::test_helpers::cursor;
-use settle::types::{RowMap, Value};
+use settle::types::{BlockCursor, ChangeBatch, RowMap, Value};
 
 const ROWS_PER_BLOCK: u64 = 50;
 /// Finality lag at the tip, in blocks: about two Ethereum epochs.
@@ -255,6 +256,12 @@ fn init_bench_process() {
 
 /// Leaked, so that dropping the engine is not counted.
 fn prepare(workload: Workload, mode: Mode) -> &'static mut Prepared {
+    let (db, inputs) = warm_up(workload, mode);
+    Box::leak(Box::new(Prepared { db, inputs }))
+}
+
+/// The engine after the warm-up ingests, and the inputs to count.
+fn warm_up(workload: Workload, mode: Mode) -> (Settle, Vec<IngestInput>) {
     init_bench_process();
 
     let mut db = Settle::open(Config::new(workload.schema())).unwrap();
@@ -263,11 +270,7 @@ fn prepare(workload: Workload, mode: Mode) -> &'static mut Prepared {
     for input in inputs {
         ingest_and_ack(&mut db, input);
     }
-
-    Box::leak(Box::new(Prepared {
-        db,
-        inputs: counted,
-    }))
+    (db, counted)
 }
 
 fn ingest_and_ack(db: &mut Settle, input: IngestInput) -> usize {
@@ -507,7 +510,101 @@ fn reopen(config: Config) {
     std::mem::forget(black_box(Settle::open(config).unwrap()));
 }
 
+/// An ingest as the napi binding receives it.
+struct MsgpackInput {
+    data: Vec<u8>,
+    rollback_chain: Vec<BlockCursor>,
+    finalized_head: BlockCursor,
+}
+
+impl From<IngestInput> for MsgpackInput {
+    fn from(input: IngestInput) -> Self {
+        let plain = |value: &Value| match value {
+            Value::String(s) => serde_json::json!(s),
+            Value::Float64(f) => serde_json::json!(f),
+            Value::UInt64(n) => serde_json::json!(n),
+            other => panic!("no plain msgpack for {other:?}"),
+        };
+        let tables: HashMap<&String, Vec<HashMap<&String, serde_json::Value>>> = input
+            .data
+            .iter()
+            .map(|(table, rows)| {
+                let rows = rows
+                    .iter()
+                    .map(|row| row.iter().map(|(k, v)| (k, plain(v))).collect())
+                    .collect();
+                (table, rows)
+            })
+            .collect();
+
+        Self {
+            data: rmp_serde::to_vec(&tables).unwrap(),
+            rollback_chain: input.rollback_chain,
+            finalized_head: input.finalized_head,
+        }
+    }
+}
+
+/// What the napi binding does with an ingest.
+fn ingest_msgpack(db: &mut Settle, input: MsgpackInput) -> Option<ChangeBatch> {
+    let data = decode_table_rows_from_msgpack(&input.data, |t| db.table_registry(t)).unwrap();
+    db.ingest_rows(IngestRows {
+        data,
+        rollback_chain: input.rollback_chain,
+        finalized_head: input.finalized_head,
+    })
+    .unwrap()
+}
+
+struct PreparedMsgpack {
+    db: Settle,
+    inputs: Vec<MsgpackInput>,
+}
+
+/// Leaked, so that dropping the engine is not counted.
+fn prepare_msgpack(workload: Workload, mode: Mode) -> &'static mut PreparedMsgpack {
+    let (db, inputs) = warm_up(workload, mode);
+    let inputs = inputs.into_iter().map(MsgpackInput::from).collect();
+    Box::leak(Box::new(PreparedMsgpack { db, inputs }))
+}
+
+fn prepare_msgpack_backfill(workload: Workload) -> &'static mut PreparedMsgpack {
+    prepare_msgpack(workload, Mode::Backfill)
+}
+
+fn prepare_msgpack_tip(workload: Workload) -> &'static mut PreparedMsgpack {
+    prepare_msgpack(workload, Mode::Tip)
+}
+
+fn ingest_all_msgpack(case: &'static mut PreparedMsgpack) -> usize {
+    let inputs = std::mem::take(&mut case.inputs);
+    let mut records = 0;
+    for input in inputs {
+        if let Some(batch) = ingest_msgpack(&mut case.db, input) {
+            case.db.ack(batch.sequence).unwrap();
+            records += batch.record_count();
+        }
+    }
+    black_box(records)
+}
+
+#[library_benchmark]
+#[bench::mv_sum(args = (Workload::MvSum), setup = prepare_msgpack_backfill)]
+#[bench::event_rules(args = (Workload::EventRules), setup = prepare_msgpack_backfill)]
+#[bench::polymarket(args = (Workload::Polymarket), setup = prepare_msgpack_backfill)]
+fn msgpack_backfill(case: &'static mut PreparedMsgpack) -> usize {
+    ingest_all_msgpack(case)
+}
+
+#[library_benchmark]
+#[bench::mv_sum(args = (Workload::MvSum), setup = prepare_msgpack_tip)]
+#[bench::polymarket(args = (Workload::Polymarket), setup = prepare_msgpack_tip)]
+fn msgpack_tip(case: &'static mut PreparedMsgpack) -> usize {
+    ingest_all_msgpack(case)
+}
+
 library_benchmark_group!(name = ingest, benchmarks = [backfill, tip]);
+library_benchmark_group!(name = msgpack, benchmarks = [msgpack_backfill, msgpack_tip]);
 library_benchmark_group!(name = scaling, benchmarks = [scale, checkpoint]);
 library_benchmark_group!(name = recovery, benchmarks = [reopen]);
 
@@ -529,5 +626,5 @@ main!(
                     (DhatMetric::TotalBlocks, 1.0),
                 ])
         ),
-    library_benchmark_groups = [ingest, scaling, recovery]
+    library_benchmark_groups = [ingest, msgpack, scaling, recovery]
 );
