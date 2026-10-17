@@ -39,6 +39,12 @@ pub enum BatchOp {
         table: String,
         after_block: BlockNumber,
     },
+    /// The raw rows of the blocks `from_block..=to_block`.
+    DeleteRawRows {
+        table: String,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+    },
     PutBlockHash {
         block: BlockNumber,
         hash: String,
@@ -112,6 +118,14 @@ impl StorageWriteBatch {
         self.ops.push(BatchOp::DeleteRawRowsAfter {
             table: table.to_string(),
             after_block,
+        });
+    }
+
+    pub fn delete_raw_rows(&mut self, table: &str, from_block: BlockNumber, to_block: BlockNumber) {
+        self.ops.push(BatchOp::DeleteRawRows {
+            table: table.to_string(),
+            from_block,
+            to_block,
         });
     }
 
@@ -204,6 +218,13 @@ impl<'a> PendingWrites<'a> {
                     if let Some(first_deleted) = deleted_after.checked_add(1) {
                         rows.split_off(&first_deleted);
                     }
+                }
+                BatchOp::DeleteRawRows {
+                    table: t,
+                    from_block,
+                    to_block,
+                } if t == table => {
+                    rows.retain(|block, _| !(from_block..=to_block).contains(&block));
                 }
                 _ => {}
             }
@@ -656,6 +677,61 @@ pub trait StorageBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_blocks(rows: &[(BlockNumber, Vec<u8>)]) -> Vec<(BlockNumber, &[u8])> {
+        rows.iter().map(|(b, data)| (*b, data.as_slice())).collect()
+    }
+
+    /// A range delete takes only the rows of its table and blocks, and the
+    /// ops of a batch apply in order: a row put before the delete goes, a row
+    /// put after it stays. A rollback that reads storage through the pending
+    /// batch sees the same rows.
+    fn check_delete_raw_rows(backend: &dyn StorageBackend) {
+        let mut first = StorageWriteBatch::new();
+        for block in 1..=5 {
+            first.put_raw_rows("t", block, vec![block as u8]);
+            first.put_raw_rows("u", block, vec![block as u8]);
+        }
+        backend.commit(&first).unwrap();
+
+        let mut second = StorageWriteBatch::new();
+        second.delete_raw_rows("t", 2, 4);
+        second.put_raw_rows("t", 3, vec![30]);
+        second.put_raw_rows("u", 6, vec![6]);
+        second.delete_raw_rows("u", 5, BlockNumber::MAX);
+        second.delete_raw_rows("t", 9, 1);
+
+        let pending = PendingWrites::new([&second]);
+        let through_pending = |table: &str| {
+            let stored = backend.get_raw_rows(table, 1, BlockNumber::MAX).unwrap();
+            pending.raw_rows_after(table, 0, stored)
+        };
+        let pending_t = through_pending("t");
+        let pending_u = through_pending("u");
+
+        backend.commit(&second).unwrap();
+        let t = backend.get_raw_rows("t", 0, BlockNumber::MAX).unwrap();
+        let u = backend.get_raw_rows("u", 0, BlockNumber::MAX).unwrap();
+
+        let expected_t: Vec<(BlockNumber, &[u8])> = vec![(1, &[1]), (3, &[30]), (5, &[5])];
+        let expected_u: Vec<(BlockNumber, &[u8])> = vec![(1, &[1]), (2, &[2]), (3, &[3]), (4, &[4])];
+        assert_eq!(raw_blocks(&t), expected_t);
+        assert_eq!(raw_blocks(&u), expected_u);
+        assert_eq!(raw_blocks(&pending_t), expected_t);
+        assert_eq!(raw_blocks(&pending_u), expected_u);
+    }
+
+    #[test]
+    fn delete_raw_rows_in_memory() {
+        check_delete_raw_rows(&memory::MemoryBackend::new());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn delete_raw_rows_in_rocksdb() {
+        let dir = tempfile::tempdir().unwrap();
+        check_delete_raw_rows(&rocks::RocksDbBackend::open(dir.path()).unwrap());
+    }
 
     #[test]
     fn decode_rows_truncated_returns_err() {
