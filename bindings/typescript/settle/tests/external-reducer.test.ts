@@ -180,11 +180,11 @@ describe('External Reducer', () => {
       rollbackChain: [{ number: 1001, hash: '0x1001' }, { number: 1000, hash: '0x1000' }],
     })
 
-    // Rollback block 1001: ingest with rollbackChain that only includes block 1000
+    // Rollback block 1001: ingest with a new hash for it
     const batch = await ingestAndAck(db, {
       data: {},
       finalizedHead: { number: 1000, hash: '0x1000' },
-      rollbackChain: [{ number: 1000, hash: '0x1000' }],
+      rollbackChain: [{ number: 1001, hash: '0x1001b' }, { number: 1000, hash: '0x1000' }],
     })
 
     expect(batch).toBeTruthy()
@@ -400,5 +400,88 @@ describe('External Reducer', () => {
     })
     expect(active).toBe('B')
     expect(calls.filter((c) => c.startsWith('B:')).length).toBeGreaterThan(0)
+  })
+})
+
+const ORDER_SCHEMA = `
+  CREATE TABLE events (block_number UInt64, user String, pool String, seq UInt64, keep UInt64);
+  CREATE REDUCER kept SOURCE events GROUP BY user STATE (n UInt64 DEFAULT 0) LANGUAGE EXTERNAL;
+  CREATE MATERIALIZED VIEW pool_seq AS
+  SELECT pool, first(seq) AS first_seq, last(seq) AS last_seq
+  FROM kept
+  GROUP BY pool;
+`
+
+const PRECISION_SCHEMA = `
+  CREATE TABLE transfers (block_number UInt64, account String, amount UInt64);
+  CREATE REDUCER echo SOURCE transfers GROUP BY account STATE (n UInt64 DEFAULT 0) LANGUAGE EXTERNAL;
+  CREATE MATERIALIZED VIEW latest AS
+  SELECT account, last(amount) AS amount, last(doubled) AS doubled
+  FROM echo
+  GROUP BY account;
+`
+
+describe('External reducer output', () => {
+  /**
+   * A row that emits nothing must not shift the emits after it: the output
+   * keeps the input order across groups.
+   */
+  it('keeps input order when a row emits nothing', async () => {
+    const db = Settle.open({ schema: ORDER_SCHEMA })
+    db.registerReducerCallback('kept', (state, row: any) => {
+      if (row.keep) state.emit({ pool: row.pool, seq: row.seq })
+    })
+
+    const batch = await ingestAndAck(db, {
+      data: {
+        events: [
+          { block_number: 1, user: 'a', pool: 'P', seq: 1, keep: 0 },
+          { block_number: 1, user: 'b', pool: 'P', seq: 2, keep: 1 },
+          { block_number: 1, user: 'a', pool: 'P', seq: 3, keep: 1 },
+        ],
+      },
+      finalizedHead: { number: 0, hash: '0x0' },
+      rollbackChain: [{ number: 1, hash: '0x1' }],
+    })
+
+    const pool = batch!.tables.pool_seq[0]
+    expect(pool.values.first_seq).toBe(2)
+    expect(pool.values.last_seq).toBe(3)
+  })
+
+  /**
+   * Integers beyond 2^53 cross the boundary as BigInt in both directions;
+   * smaller ones stay numbers.
+   */
+  it('keeps 64-bit integers exact', async () => {
+    const big = 9007199254740993n
+    const db = Settle.open({ schema: PRECISION_SCHEMA })
+    const received: unknown[] = []
+    db.registerReducerCallback('echo', (state, row: any) => {
+      received.push(row.amount)
+      state.emit({ account: row.account, amount: row.amount, doubled: BigInt(row.amount) * 2n })
+    })
+
+    const batch = await ingestAndAck(db, {
+      data: {
+        transfers: [
+          { block_number: 1, account: 'big', amount: big },
+          { block_number: 1, account: 'small', amount: 5 },
+        ],
+      },
+      finalizedHead: { number: 0, hash: '0x0' },
+      rollbackChain: [{ number: 1, hash: '0x1' }],
+    })
+
+    expect(received).toEqual([big, 5])
+    const latest = (account: string) =>
+      batch!.tables.latest.find((r) => r.key.account === account)!.values
+    expect(latest('big').amount).toBe(big)
+    expect(latest('big').doubled).toBe(2n * big)
+    expect(latest('small').amount).toBe(5)
+    expect(latest('small').doubled).toBe(10)
+
+    const raw = batch!.tables.transfers.find((r) => r.values.account === 'big')!
+    expect(raw.values.amount).toBe(big)
   })
 })

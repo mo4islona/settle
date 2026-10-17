@@ -355,11 +355,11 @@ describe('Uniswap PnL pipeline', () => {
       rollbackChain: [{ number: 2, hash: '0x2' }, { number: 1, hash: '0x1' }],
     })
 
-    // Rollback block 2: ingest with rollbackChain that only includes block 1
+    // Rollback block 2: ingest with a new hash for it
     const batch = await ingestAndAck(db, {
       data: {},
       finalizedHead: { number: 1, hash: '0x1' },
-      rollbackChain: [{ number: 1, hash: '0x1' }],
+      rollbackChain: [{ number: 2, hash: '0x2b' }, { number: 1, hash: '0x1' }],
     })
 
     expect(batch).toBeTruthy()

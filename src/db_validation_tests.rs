@@ -321,3 +321,70 @@ fn failed_ingest_is_undone_when_finality_is_ahead_of_latest() {
     assert_eq!(alice.get("trade_count"), Some(&Value::UInt64(3)));
     assert_eq!(alice.get("current_position"), Some(&Value::Float64(20.0)));
 }
+
+/// Block 0 is a block like any other: ingested twice, it is a duplicate.
+#[test]
+fn block_zero_is_not_ingested_twice() {
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let block_zero = || vec![("swaps".into(), 0, vec![make_swap("ETH", 10.0)])];
+
+    ingest_with_finalized(&mut db, block_zero(), 0).unwrap();
+    let err = ingest_with_finalized(&mut db, block_zero(), 0).unwrap_err();
+    assert!(matches!(err, Error::InvalidOperation(_)), "{err}");
+
+    let batch = ingest_with_finalized(&mut db, vec![("swaps".into(), 1, vec![make_swap("ETH", 10.0)])], 0)
+        .unwrap()
+        .unwrap();
+    let eth = &batch.records_for("pool_volume")[0];
+    assert_eq!(eth.get("total_volume"), Some(&Value::Float64(20.0)));
+}
+
+#[cfg(feature = "lua")]
+const FAILING_REDUCER_SCHEMA: &str = r#"
+    CREATE TABLE swaps (block_number UInt64, pool String, amount UInt64);
+
+    CREATE REDUCER running
+    SOURCE swaps
+    GROUP BY pool
+    STATE (total UInt64 DEFAULT 0)
+    LANGUAGE lua
+    PROCESS $$
+        if row.amount == 13 then error("unlucky amount") end
+        state.total = state.total + row.amount
+        emit({ pool = row.pool, total = state.total })
+    $$;
+
+    CREATE MATERIALIZED VIEW pool_total AS
+    SELECT pool, last(total) AS total, count() AS events
+    FROM running
+    GROUP BY pool;
+"#;
+
+/// A failed first ingest leaves an empty database, also when it processed
+/// block 0: the retry is no duplicate, and each row counts once.
+#[cfg(feature = "lua")]
+#[test]
+fn failed_first_ingest_with_block_zero_is_undone() {
+    let swap = |amount: u64| {
+        HashMap::from([
+            ("pool".to_string(), Value::String("A".into())),
+            ("amount".to_string(), Value::UInt64(amount)),
+        ])
+    };
+
+    for failing in [vec![(0, 5), (0, 13)], vec![(0, 5), (1, 13)]] {
+        let mut db = Settle::open(Config::new(FAILING_REDUCER_SCHEMA)).unwrap();
+        let rows = failing.iter().map(|&(b, a)| ("swaps".to_string(), b, vec![swap(a)])).collect();
+        assert!(ingest_with_finalized(&mut db, rows, 0).is_err());
+        assert_eq!(db.latest_cursor(), None, "{failing:?}");
+
+        let rows = vec![
+            ("swaps".to_string(), 0, vec![swap(5)]),
+            ("swaps".to_string(), 1, vec![swap(6)]),
+        ];
+        let batch = ingest_with_finalized(&mut db, rows, 0).unwrap().unwrap();
+        let pool = &batch.records_for("pool_total")[0];
+        assert_eq!(pool.get("total"), Some(&Value::Int64(11)), "{failing:?}");
+        assert_eq!(pool.get("events"), Some(&Value::UInt64(2)), "{failing:?}");
+    }
+}

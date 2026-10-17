@@ -67,6 +67,7 @@ import type {
   SettleCursor,
 } from './settle'
 import { rethrowSettleError } from './errors'
+import { groupBatchCallback } from './reducer-callback'
 
 // The wasm module is loaded lazily via init()
 let wasmReady = false
@@ -129,29 +130,7 @@ export class Settle implements ISettle {
   ): void {
     const { reduce } = options
 
-    const batchFn = (groups: { state: TState; rows: TRow[] }[]) => {
-      return groups.map(({ state, rows }) => {
-        let s = state
-        const emits: any[] = []
-        const ctx = Object.create(null)
-        ctx.update = (newState: TState) => {
-          s = newState
-          for (const k of Object.keys(newState as any)) {
-            ctx[k] = (newState as any)[k]
-          }
-        }
-        ctx.emit = (row: TEmit) => {
-          if (row != null) emits.push(row)
-        }
-        for (const k of Object.keys(state as any)) {
-          ctx[k] = (state as any)[k]
-        }
-        for (const row of rows) {
-          reduce(ctx, row)
-        }
-        return { state: s, emits }
-      })
-    }
+    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce)
 
     try {
       this.#native.registerReducer(
@@ -170,29 +149,7 @@ export class Settle implements ISettle {
     name: string,
     reduce: (state: any, row: TRow) => void,
   ): void {
-    const batchFn = (groups: { state: TState; rows: TRow[] }[]) => {
-      return groups.map(({ state, rows }) => {
-        let s = state
-        const emits: any[] = []
-        const ctx = Object.create(null)
-        ctx.update = (newState: TState) => {
-          s = newState
-          for (const k of Object.keys(newState as any)) {
-            ctx[k] = (newState as any)[k]
-          }
-        }
-        ctx.emit = (row: TEmit) => {
-          if (row != null) emits.push(row)
-        }
-        for (const k of Object.keys(state as any)) {
-          ctx[k] = (state as any)[k]
-        }
-        for (const row of rows) {
-          reduce(ctx, row)
-        }
-        return { state: s, emits }
-      })
-    }
+    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce)
 
     try {
       this.#native.registerReducerCallback(name, batchFn)
