@@ -210,11 +210,12 @@ the output of a reducer is positional rows, as raw tables already were.
 | `msgpack_backfill polymarket` | 2,035M | 1,747M | −14.1% |
 | cases without a reducer | | | −0.8% to 0% |
 
-Wall clock, `throughput`, median of three alternating rounds: Rust closure
-(`FnReducerRuntime`) full pipeline +11% (Memory) / +3.5% (RocksDB) and
-reducer-only +18%, Lua +8% to +10%, EventRules +17% to +31%, Polymarket +18% to
-+27%; cases without a reducer within noise. Through the napi binding
-(`spikes/runtime-spike.mjs`, 100 / 100K groups), µs per row: External JS
+Wall clock, `throughput`, time per case, median of three alternating rounds:
+Rust closure (`FnReducerRuntime`) full pipeline −10% (Memory) / −3% (RocksDB)
+and reducer-only −15%, Lua −8% to −9%, EventRules −15% to −24%, Polymarket −15%
+to −21%; cases without a reducer within noise; rollback of 75 blocks +4% / +2%,
+from one 2–3 ms measurement per run. Through the napi binding
+(`spikes/runtime-spike.mjs`, 100 / 100K groups), time per row: External JS
 −3.4% / −9.9%, Lua −4.6% / −9.5%, EventRules −13% / −12%. Most of the External
 cost is still the JS object marshal: 3.1 of 3.4 µs per row at 100 groups.
 
