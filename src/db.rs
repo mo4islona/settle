@@ -386,8 +386,12 @@ impl Settle {
             Arc::new(MemoryBackend::new())
         };
 
-        let stamp = format::check(storage.as_ref(), &schema, has_data(storage.as_ref())?)?;
+        // Refuse another format before the journal writes to storage, and
+        // check again after it: before the first ack, the format version and
+        // the layouts are only in the journal.
+        format::check(storage.as_ref(), &schema, has_data(storage.as_ref())?)?;
         recover_journal(storage.as_ref(), config.applied_sequence)?;
+        let stamp = format::check(storage.as_ref(), &schema, has_data(storage.as_ref())?)?;
 
         let mut engine = SettleEngine::new(&schema, storage.clone())?;
         engine.set_collect_perf(config.collect_perf);
