@@ -19,7 +19,7 @@ mod common;
 
 use common::{
     build_multi_insert, gen_transfer, print_result, print_result_no_pg, row_f64, row_str,
-    split_blocks, PgRuntime, BATCH_SIZE, BLOCKS_PER_BATCH, ROWS_PER_BLOCK,
+    split_blocks, PgBaseline, PgCase, PgRuntime, BATCH_SIZE, BLOCKS_PER_BATCH, ROWS_PER_BLOCK,
 };
 
 const SETTLE_SCHEMA: &str = r#"
@@ -125,22 +125,30 @@ fn main() -> anyhow::Result<()> {
         .map(|i| gen_transfer(i, 10_000))
         .collect();
 
-    eprintln!("workload: vs_postgres_raw");
-    eprintln!(
-        "  config: {TOTAL_ROWS} rows, {ROWS_PER_BLOCK} rows/block, \
+    let config = format!(
+        "{TOTAL_ROWS} rows, {ROWS_PER_BLOCK} rows/block, \
          {BLOCKS_PER_BATCH} blocks/batch, {} batches",
         TOTAL_ROWS / BATCH_SIZE
     );
+    eprintln!("workload: vs_postgres_raw");
+    eprintln!("  config: {config}");
+    let mut pg_baseline = PgBaseline::open("vs_postgres_raw", 1, &config)?;
 
     // postgres_only
-    let pg = PgRuntime::start()?;
-    pg.batch_execute(PG_SCHEMA)?;
-    pg.take_stats();
-    let t = Instant::now();
-    run_pg_only(&pg, &rows)?;
-    let elapsed = t.elapsed();
-    print_result("postgres_only", TOTAL_ROWS, elapsed, pg.take_stats());
-    drop(pg);
+    let case = pg_baseline.case("postgres_only", || {
+        let pg = PgRuntime::start()?;
+        pg.batch_execute(PG_SCHEMA)?;
+        pg.take_stats();
+        let t = Instant::now();
+        run_pg_only(&pg, &rows)?;
+        let elapsed = t.elapsed();
+        Ok(PgCase {
+            elapsed,
+            stats: pg.take_stats(),
+            output: (),
+        })
+    })?;
+    print_result("postgres_only", TOTAL_ROWS, case.elapsed, case.stats);
 
     // settle_only — Settle ingest, no PG
     {
