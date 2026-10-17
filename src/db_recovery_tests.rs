@@ -244,10 +244,14 @@ fn swap(block: BlockNumber, pool: &str, amount: u64) -> RowMap {
     ])
 }
 
+/// Retention 0 here and in the other open helpers: each checkpoint deletes
+/// every raw row up to the durable block, so a reopen must replay from the
+/// rows that stay.
 fn reopen(schema: &str, storage: &Arc<MemoryBackend>, interval: u64) -> Settle {
     let config = Config::new(schema)
         .storage(storage.clone())
-        .backfill_checkpoint_interval(interval);
+        .backfill_checkpoint_interval(interval)
+        .raw_retention_blocks(0);
     let mut db = Settle::open(config).unwrap();
     attach_runtimes(&mut db, schema);
     db
@@ -396,6 +400,85 @@ fn empty_heartbeat_does_not_make_later_blocks_durable() {
         .unwrap()
         .unwrap();
     assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(20));
+}
+
+fn stored_raw_blocks(storage: &MemoryBackend) -> Vec<BlockNumber> {
+    let rows = storage.get_raw_rows("swaps", 0, BlockNumber::MAX).unwrap();
+    rows.into_iter().map(|(block, _)| block).collect()
+}
+
+fn ingest_eth(db: &mut Settle, block: BlockNumber, finalized: BlockNumber) -> Option<ChangeBatch> {
+    let data = vec![("swaps".into(), block, vec![swap(block, "ETH", 1)])];
+    ingest_with_finalized(db, data, finalized).unwrap()
+}
+
+/// A checkpoint deletes the raw rows of the blocks `raw_retention_blocks` or
+/// more below the durable block, in steps of a tenth of that margin, and a
+/// reopen rebuilds the state from the rows that stay. The first purge after
+/// open starts from block 0.
+#[test]
+fn checkpoints_delete_raw_rows_below_the_margin() {
+    let storage = Arc::new(MemoryBackend::new());
+    let open = || {
+        let config = Config::new(SUM_SCHEMA)
+            .storage(storage.clone())
+            .raw_retention_blocks(100);
+        Settle::open(config).unwrap()
+    };
+
+    let mut db = open();
+    for block in 1..=200 {
+        ingest_eth(&mut db, block, block.saturating_sub(5));
+    }
+    assert_eq!(db.durable_block(), 195);
+    // The purges at durable blocks 100, 110, ..., 190 delete blocks 0..=90.
+    assert_eq!(stored_raw_blocks(&storage), (91..=200).collect::<Vec<_>>());
+
+    drop(db);
+    let mut db = open();
+    let batch = ingest_eth(&mut db, 201, 196).unwrap();
+    assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(201));
+    assert_eq!(stored_raw_blocks(&storage), (97..=201).collect::<Vec<_>>());
+}
+
+/// Under backfill deferral the durable block lags finality: the raw rows
+/// above it stay, so that a reopen can replay them.
+#[test]
+fn deferral_keeps_the_raw_rows_above_the_durable_block() {
+    let storage = Arc::new(MemoryBackend::new());
+    let open = || {
+        let config = Config::new(SUM_SCHEMA)
+            .storage(storage.clone())
+            .backfill_checkpoint_interval(50)
+            .raw_retention_blocks(0);
+        Settle::open(config).unwrap()
+    };
+
+    let mut db = open();
+    for block in 1..=120 {
+        ingest_eth(&mut db, block, block);
+    }
+    assert_eq!(db.durable_block(), 101);
+    assert_eq!(stored_raw_blocks(&storage), (102..=120).collect::<Vec<_>>());
+
+    drop(db);
+    let mut db = open();
+    let batch = ingest_eth(&mut db, 121, 121).unwrap();
+    assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(121));
+}
+
+#[test]
+fn max_raw_retention_keeps_every_raw_row() {
+    let storage = Arc::new(MemoryBackend::new());
+    let config = Config::new(SUM_SCHEMA)
+        .storage(storage.clone())
+        .raw_retention_blocks(u64::MAX);
+    let mut db = Settle::open(config).unwrap();
+
+    for block in 0..50 {
+        ingest_eth(&mut db, block, block);
+    }
+    assert_eq!(stored_raw_blocks(&storage), (0..50).collect::<Vec<_>>());
 }
 
 /// Backfill deferral from the first block: block 0 must survive a reopen
@@ -1152,7 +1235,8 @@ fn open_pipelined(
     let mut config = Config::new(schema)
         .storage(storage.clone())
         .backfill_checkpoint_interval(interval)
-        .max_pending_batches(depth);
+        .max_pending_batches(depth)
+        .raw_retention_blocks(0);
     config.applied_sequence = applied;
     let mut db = Settle::open(config).unwrap();
     attach_runtimes(&mut db, schema);
@@ -1415,7 +1499,8 @@ fn random_short_journaled_histories() {
 fn open_journaled(schema: &str, storage: &Arc<MemoryBackend>, applied: u64) -> Settle {
     let config = Config::new(schema)
         .storage(storage.clone())
-        .applied_sequence(applied);
+        .applied_sequence(applied)
+        .raw_retention_blocks(0);
     Settle::open(config).unwrap()
 }
 
