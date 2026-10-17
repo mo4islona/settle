@@ -1,7 +1,8 @@
 //! Wall-clock cost of an ingest and its ack at the chain tip on RocksDB: one
 //! block per ingest, finality `FINALITY_LAG` blocks behind, so each ingest
 //! advances finality and writes a checkpoint. A sliding window of `window`
-//! blocks shows what a checkpoint writes per block.
+//! blocks shows what a checkpoint writes per block. Each case runs without
+//! and with the journal (`Config::applied_sequence`).
 //!
 //! Run with: cargo bench --bench tip_rocks
 //!
@@ -64,10 +65,13 @@ fn ingest_and_ack(db: &mut Settle, input: IngestInput) {
 }
 
 /// Microseconds per tip ingest, after a backfill that fills the window.
-fn run(window: u64) -> f64 {
+fn run(window: u64, journal: bool) -> f64 {
     // In target/, on the disk: /tmp can be tmpfs, where fsync costs nothing.
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let config = Config::with_data_dir(schema(window), dir.path().to_str().unwrap());
+    let mut config = Config::with_data_dir(schema(window), dir.path().to_str().unwrap());
+    if journal {
+        config = config.applied_sequence(0);
+    }
     let mut db = Settle::open(config).unwrap();
 
     let mut block = 0;
@@ -87,11 +91,19 @@ fn run(window: u64) -> f64 {
 
 fn main() {
     println!("tip ingest + ack on RocksDB, sliding window, {ROWS_PER_BLOCK} rows per block");
-    println!("{:>10} {:>14}", "window", "us/ingest");
+    println!("{:>10} {:>14} {:>14}", "window", "us/ingest", "with journal");
 
     for window in [600, 3_600, 14_400] {
-        let mut times: Vec<f64> = (0..RUNS).map(|_| run(window)).collect();
-        times.sort_by(f64::total_cmp);
-        println!("{:>10} {:>14.1}", format!("{window} s"), times[RUNS / 2]);
+        let median = |journal| {
+            let mut times: Vec<f64> = (0..RUNS).map(|_| run(window, journal)).collect();
+            times.sort_by(f64::total_cmp);
+            times[RUNS / 2]
+        };
+        println!(
+            "{:>10} {:>14.1} {:>14.1}",
+            format!("{window} s"),
+            median(false),
+            median(true)
+        );
     }
 }

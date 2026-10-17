@@ -13,6 +13,9 @@
 //! N+1 while another thread applies batch N to PG, so the total is about the
 //! slower side instead of the sum of both.
 //!
+//! `SETTLE_JOURNAL=1` turns on the journal (`Config::applied_sequence`) for
+//! the RocksDB cases.
+//!
 //! Run with: `cargo bench --bench vs_postgres_simple_agg` (Docker required)
 
 use std::collections::HashMap;
@@ -164,7 +167,10 @@ fn make_cfg(
         Storage::Rocks => {
             // In target/, on the disk: /tmp can be tmpfs, where fsync costs nothing.
             let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-            let cfg = Config::with_data_dir(schema, dir.path().to_str().unwrap());
+            let mut cfg = Config::with_data_dir(schema, dir.path().to_str().unwrap());
+            if std::env::var("SETTLE_JOURNAL").is_ok_and(|v| v == "1") {
+                cfg = cfg.applied_sequence(0);
+            }
             (cfg, Some(dir))
         }
     };

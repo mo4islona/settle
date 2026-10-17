@@ -516,6 +516,9 @@ impl StorageBackend for FailFirstCommitBackend {
     fn get_block_hashes(&self) -> settle::error::Result<Vec<(BlockNumber, String)>> {
         self.inner.get_block_hashes()
     }
+    fn journal(&self) -> settle::error::Result<Vec<settle::storage::journal::JournalPart>> {
+        self.inner.journal()
+    }
     fn list_reducer_group_keys(&self, reducer: &str) -> settle::error::Result<Vec<Vec<u8>>> {
         self.inner.list_reducer_group_keys(reducer)
     }
@@ -641,6 +644,7 @@ impl StorageBackend for AlwaysFailCommit {
     fn put_meta(&self, k: &str, v: &[u8]) -> settle::error::Result<()> { self.inner.put_meta(k, v) }
     fn get_meta(&self, k: &str) -> settle::error::Result<Option<Vec<u8>>> { self.inner.get_meta(k) }
     fn get_block_hashes(&self) -> settle::error::Result<Vec<(BlockNumber, String)>> { self.inner.get_block_hashes() }
+    fn journal(&self) -> settle::error::Result<Vec<settle::storage::journal::JournalPart>> { self.inner.journal() }
     fn list_reducer_group_keys(&self, r: &str) -> settle::error::Result<Vec<Vec<u8>>> { self.inner.list_reducer_group_keys(r) }
     fn commit(&self, _batch: &settle::storage::StorageWriteBatch) -> settle::error::Result<()> {
         self.commits_attempted.fetch_add(1, Ordering::SeqCst);

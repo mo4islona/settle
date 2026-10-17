@@ -140,6 +140,28 @@ TypeScript) changes it, and 1 makes `ingest()` wait for every ack:
   to the last acked batch, and a later fork cannot undo the others. After a
   failed sync, `ack()` returns `SyncFailed` too: drop and reopen.
 
+### Applied sequence
+
+The process can stop after the target applied a batch and before its ack.
+The reopen then goes back to the last acked batch, behind the target. The
+same blocks sent again give the same batch, but if they fork away first,
+the reopened instance cannot undo their changes in the target: it does not
+know them. To close that gap, store `batch.sequence` in the target, in the
+same transaction as the data of the batch, and pass it at open as
+`applied_sequence` (`appliedSequence` in TypeScript; 0 before the first
+batch). This turns on the journal:
+
+- Each returned batch is on disk, in the journal, before the caller gets it.
+  With RocksDB that write syncs the write-ahead log, and `ack()` does not
+  sync: still one fsync per batch, but each batch is written twice.
+- Open commits the journaled batches up to the applied sequence and drops the
+  others, so Settle and the target hold the same state.
+- Open fails when the target is behind the last acked batch, when it applied
+  a batch that the journal does not hold, and when the journal holds batches
+  but no applied sequence is given.
+- After an error that poisons the instance, drop and reopen with the applied
+  sequence: no ack is necessary.
+
 ## Storage Backends
 
 - **Memory** — Default. No persistence, data lost on restart.
