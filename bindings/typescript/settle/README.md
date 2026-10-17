@@ -128,8 +128,8 @@ const db = p.build({ dataDir: ':memory:' })   // explicit in-memory (SQLite conv
 
 | Function     | SQL type   | TypeScript type |
 |-------------|------------|-----------------|
-| `uint64()`  | `UInt64`   | `number`        |
-| `int64()`   | `Int64`    | `number`        |
+| `uint64()`  | `UInt64`   | `number \| bigint` |
+| `int64()`   | `Int64`    | `number \| bigint` |
 | `float64()` | `Float64`  | `number`        |
 | `uint256()` | `Uint256`  | `bigint`        |
 | `string()`  | `String`   | `string`        |
@@ -138,6 +138,11 @@ const db = p.build({ dataDir: ':memory:' })   // explicit in-memory (SQLite conv
 | `bytes()`   | `Bytes`    | `Uint8Array`    |
 | `base58()`  | `Base58`   | `string`        |
 | `json<T>()` | `Json`     | `T` (default `any`) |
+
+A 64-bit integer is a `number` while it fits in 2^53, and a `bigint` above,
+so that no digit is lost. This also applies to a `bigint` field of the
+reducer state, and to a `bigint` field that a parent reducer emits. Convert
+before arithmetic, for example `BigInt(row.amount) * 2n`.
 
 ### Settle (low-level)
 
