@@ -8,8 +8,8 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod change;
 pub mod db;
-pub mod change;
 pub mod engine;
 pub mod error;
 pub mod json_conv;
