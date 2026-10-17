@@ -90,31 +90,36 @@ impl ChangeBuffer {
 
         for record in self.pending.drain(..) {
             let key_hash = hash_change_key(record.table(), &record.key);
+            let bucket = index.entry(key_hash).or_default();
+            let slot = bucket
+                .iter()
+                .position(|&idx| same_row(&merged[idx], &record));
 
-            let match_idx = index.get(&key_hash).and_then(|bucket| {
-                bucket
-                    .iter()
-                    .copied()
-                    .find(|&idx| same_row(&merged[idx], &record))
-            });
-
-            if let Some(idx) = match_idx {
-                if !merge_in_place(&mut merged[idx], record) {
-                    // Records cancel out — mark as cancelled and remove from bucket
-                    merged[idx].operation = ChangeOp::Delete;
-                    merged[idx].prev_values = None;
-                    merged[idx].values = Box::default();
-                    if let Some(bucket) = index.get_mut(&key_hash) {
-                        bucket.retain(|i| *i != idx);
+            match slot {
+                Some(slot) if same_layout(&merged[bucket[slot]], &record) => {
+                    let idx = bucket[slot];
+                    if !merge_in_place(&mut merged[idx], record) {
+                        // Records cancel out — mark as cancelled and remove from bucket
+                        merged[idx].operation = ChangeOp::Delete;
+                        merged[idx].prev_values = None;
+                        merged[idx].values = Box::default();
+                        bucket.swap_remove(slot);
                         if bucket.is_empty() {
                             index.remove(&key_hash);
                         }
                     }
                 }
-            } else {
-                let idx = merged.len();
-                index.entry(key_hash).or_default().push(idx);
-                merged.push(record);
+                // Values of another layout cannot merge by position. The record
+                // follows the earlier one and becomes the row's merge target, so
+                // a later record never merges past it.
+                Some(slot) => {
+                    bucket[slot] = merged.len();
+                    merged.push(record);
+                }
+                None => {
+                    bucket.push(merged.len());
+                    merged.push(record);
+                }
             }
         }
 
@@ -214,6 +219,12 @@ fn is_cancelled(record: &ChangeRecord) -> bool {
 fn same_row(a: &ChangeRecord, b: &ChangeRecord) -> bool {
     let same_table = Arc::ptr_eq(&a.schema, &b.schema) || a.table() == b.table();
     same_table && a.key == b.key
+}
+
+/// The engine shares one schema per table, so the pointer check decides;
+/// the comparison covers records built outside the engine.
+fn same_layout(a: &ChangeRecord, b: &ChangeRecord) -> bool {
+    Arc::ptr_eq(&a.schema, &b.schema) || a.schema == b.schema
 }
 
 fn hash_change_key(table: &str, key: &[Value]) -> u64 {
@@ -629,5 +640,91 @@ mod tests {
         assert_eq!(json, "\"mv\"");
         let json = serde_json::to_string(&PerfNodeKind::Pipeline).unwrap();
         assert_eq!(json, "\"pipeline\"");
+    }
+
+    /// An MV `t` keyed by `id`, with two value columns in the given order.
+    fn two_value_schema(columns: [&str; 2]) -> Arc<ChangeSchema> {
+        let columns = [("id", true), (columns[0], false), (columns[1], false)];
+        Arc::new(ChangeSchema::mv(
+            "t",
+            columns.map(|(name, is_key)| (name.to_string(), is_key)),
+        ))
+    }
+
+    /// An Update of row `1` to `amount` and `count`, in the layout of `schema`.
+    fn update_row(schema: &Arc<ChangeSchema>, amount: i64, count: i64) -> ChangeRecord {
+        let values = |amount: i64, count: i64| -> Box<[Value]> {
+            schema
+                .columns()
+                .filter(|&name| name != "id")
+                .map(|name| match name {
+                    "amount" => Value::Int64(amount),
+                    _ => Value::Int64(count),
+                })
+                .collect()
+        };
+
+        ChangeRecord::new(
+            ChangeOp::Update,
+            schema.clone(),
+            smallvec![Value::String("1".into())],
+            values(amount, count),
+            Some(values(0, 0)),
+        )
+    }
+
+    fn flush_amounts(records: Vec<ChangeRecord>) -> Vec<(i64, i64)> {
+        let mut buffer = ChangeBuffer::new(100);
+        buffer.push(records, cursor(0), cursor(1000), vec![]);
+        let batch = buffer.flush().unwrap();
+
+        let int = |value: Option<&Value>| match value {
+            Some(Value::Int64(n)) => *n,
+            other => panic!("expected an Int64, got {other:?}"),
+        };
+        batch
+            .records_for("t")
+            .iter()
+            .map(|record| (int(record.get("amount")), int(record.get("count"))))
+            .collect()
+    }
+
+    #[test]
+    fn records_of_another_layout_do_not_merge_by_position() {
+        let amount_first = two_value_schema(["amount", "count"]);
+        let count_first = two_value_schema(["count", "amount"]);
+
+        let rows = flush_amounts(vec![
+            update_row(&amount_first, 10, 1),
+            update_row(&count_first, 20, 2),
+        ]);
+
+        assert_eq!(rows, [(10, 1), (20, 2)]);
+    }
+
+    #[test]
+    fn a_record_does_not_merge_past_another_layout() {
+        let amount_first = two_value_schema(["amount", "count"]);
+        let count_first = two_value_schema(["count", "amount"]);
+
+        let rows = flush_amounts(vec![
+            update_row(&amount_first, 10, 1),
+            update_row(&count_first, 20, 2),
+            update_row(&amount_first, 30, 3),
+        ]);
+
+        // Merged into the first record, the last update would come before
+        // the second one and leave the row at (20, 2).
+        assert_eq!(rows, [(10, 1), (20, 2), (30, 3)]);
+    }
+
+    #[test]
+    fn equal_layouts_merge_across_schema_instances() {
+        let rows = flush_amounts(vec![
+            update_row(&two_value_schema(["amount", "count"]), 10, 1),
+            update_row(&two_value_schema(["amount", "count"]), 20, 2),
+        ]);
+
+        assert_eq!(rows, [(20, 2)]);
     }
 }
