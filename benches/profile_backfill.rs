@@ -8,6 +8,7 @@
 //! The delta = cost of reducer+MV finalize serialize + RocksDB commit of
 //! derived state on this load. (SKIP mode yields an unrecoverable DB — probe
 //! only, see storage::skip_finalize_persist.)
+//! `SETTLE_JOURNAL=1` turns on the journal (`Config::applied_sequence`).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -82,8 +83,12 @@ fn main() {
 
     // In target/, on the disk: /tmp can be tmpfs, where fsync costs nothing.
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let cfg = Config::with_data_dir(SCHEMA, dir.path().to_str().unwrap())
+    let journal = std::env::var("SETTLE_JOURNAL").is_ok_and(|v| v == "1");
+    let mut cfg = Config::with_data_dir(SCHEMA, dir.path().to_str().unwrap())
         .backfill_checkpoint_interval(interval);
+    if journal {
+        cfg = cfg.applied_sequence(0);
+    }
     let mut db = Settle::open(cfg).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
@@ -106,9 +111,10 @@ fn main() {
     }
     let elapsed = t.elapsed();
     eprintln!(
-        "backfill rocks batch={} interval={} durable={}: {} rows in {:.3}s = {:.0} rows/s",
+        "backfill rocks batch={} interval={} journal={} durable={}: {} rows in {:.3}s = {:.0} rows/s",
         batch_size,
         interval,
+        journal,
         db.durable_block(),
         profile_rows,
         elapsed.as_secs_f64(),

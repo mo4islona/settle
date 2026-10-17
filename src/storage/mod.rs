@@ -1,4 +1,5 @@
 pub mod format;
+pub mod journal;
 pub mod memory;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
@@ -9,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// An operation to be committed atomically as part of a WriteBatch.
+#[derive(Debug)]
 pub enum BatchOp {
     PutRawRows {
         table: String,
@@ -43,6 +45,16 @@ pub enum BatchOp {
     },
     DeleteBlockHash {
         block: BlockNumber,
+    },
+    /// See [`journal::JournalPart`].
+    PutJournal {
+        sequence: u64,
+        part: u64,
+        entry: Vec<u8>,
+    },
+    DeleteJournal {
+        sequence: u64,
+        part: u64,
     },
 }
 
@@ -112,6 +124,18 @@ impl StorageWriteBatch {
 
     pub fn delete_block_hash(&mut self, block: BlockNumber) {
         self.ops.push(BatchOp::DeleteBlockHash { block });
+    }
+
+    pub fn put_journal(&mut self, sequence: u64, part: u64, entry: Vec<u8>) {
+        self.ops.push(BatchOp::PutJournal {
+            sequence,
+            part,
+            entry,
+        });
+    }
+
+    pub fn delete_journal(&mut self, sequence: u64, part: u64) {
+        self.ops.push(BatchOp::DeleteJournal { sequence, part });
     }
 }
 
@@ -608,6 +632,11 @@ pub trait StorageBackend: Send + Sync {
     // --- Bulk operations ---
 
     fn list_reducer_group_keys(&self, reducer: &str) -> Result<Vec<Vec<u8>>>;
+
+    // --- Journal (written only through `commit`) ---
+
+    /// Every journal part, in sequence and part order.
+    fn journal(&self) -> Result<Vec<journal::JournalPart>>;
 
     // --- Atomic batch commit ---
 

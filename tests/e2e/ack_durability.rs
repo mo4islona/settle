@@ -17,7 +17,7 @@ use settle::storage::{StorageBackend, StorageWriteBatch};
 use settle::types::{BlockCursor, BlockNumber, RowMap, Value};
 use tempfile::TempDir;
 
-use super::common::pg::{apply_batch, pg_row, start_pg};
+use super::common::pg::{apply_batch, applied_sequence, pg_row, start_pg};
 use super::common::{open_rocks, order, SCHEMA};
 
 const ASSET: &str = "token_a";
@@ -98,6 +98,56 @@ async fn crash_before_ack_target_replay_is_idempotent() {
     let (total, count) = pg_row(&pg.client, ASSET).await.unwrap();
     assert_eq!(count, 2, "no double-count from replay");
     assert_eq!(total, 300);
+}
+
+fn open_journaled(dir: &std::path::Path, applied: u64) -> Settle {
+    let config = Config::with_data_dir(SCHEMA, dir.to_str().expect("utf-8 path"));
+    Settle::open(config.applied_sequence(applied)).expect("open settle with rocksdb backend")
+}
+
+/// Postgres applies b2 and the process stops before the ack. Then block 2
+/// forks away, and its replacement trades another asset. Opened with the
+/// sequence that Postgres stored with b2, Settle has b2 again, so the fork
+/// undoes b2 in Postgres; reopened at b1, it would leave b2's total there.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_after_crash_before_ack_is_undone_in_target() {
+    let mut pg = start_pg().await;
+    let tmp = TempDir::new().unwrap();
+
+    {
+        let mut db = open_journaled(tmp.path(), applied_sequence(&pg.client).await);
+
+        let b1 = db.ingest(ingest_block(1, 100, 0)).unwrap().expect("b1");
+        apply_batch(&mut pg.client, &b1).await.expect("apply b1");
+        db.ack(b1.sequence).expect("ack b1");
+
+        let b2 = db.ingest(ingest_block(2, 200, 0)).unwrap().expect("b2");
+        apply_batch(&mut pg.client, &b2).await.expect("apply b2");
+        // Drop without acking b2 — simulates crash.
+    }
+
+    let mut db = open_journaled(tmp.path(), applied_sequence(&pg.client).await);
+    assert_eq!(db.latest_block(), 2, "b2 restored from the journal");
+
+    let mut row = order("token_b", 50);
+    row.insert("block_number".into(), Value::UInt64(2));
+    let new_block_2 = IngestInput {
+        data: HashMap::from([("orders".to_string(), vec![row])]),
+        rollback_chain: vec![
+            cursor(1),
+            BlockCursor {
+                number: 2,
+                hash: "0xnew".into(),
+            },
+        ],
+        finalized_head: cursor(0),
+    };
+    let b = db.ingest(new_block_2).unwrap().expect("compensation and new block 2");
+    apply_batch(&mut pg.client, &b).await.expect("apply fork batch");
+    db.ack(b.sequence).expect("ack fork batch");
+
+    assert_eq!(pg_row(&pg.client, ASSET).await, Some((100, 1)));
+    assert_eq!(pg_row(&pg.client, "token_b").await, Some((50, 1)));
 }
 
 /// Apply fails (target table dropped). Caller does NOT call ack → pending
@@ -499,6 +549,7 @@ impl StorageBackend for FailNthCommit {
     fn put_meta(&self, k: &str, v: &[u8]) -> settle::error::Result<()> { self.inner.put_meta(k, v) }
     fn get_meta(&self, k: &str) -> settle::error::Result<Option<Vec<u8>>> { self.inner.get_meta(k) }
     fn get_block_hashes(&self) -> settle::error::Result<Vec<(BlockNumber, String)>> { self.inner.get_block_hashes() }
+    fn journal(&self) -> settle::error::Result<Vec<settle::storage::journal::JournalPart>> { self.inner.journal() }
     fn list_reducer_group_keys(&self, r: &str) -> settle::error::Result<Vec<Vec<u8>>> { self.inner.list_reducer_group_keys(r) }
     fn commit(&self, batch: &StorageWriteBatch) -> settle::error::Result<()> {
         let n = self.seen.fetch_add(1, Ordering::SeqCst) + 1;

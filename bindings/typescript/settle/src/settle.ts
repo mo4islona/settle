@@ -51,8 +51,8 @@ export interface SettleConfig {
    * before; 1 makes it wait for that ack. A call that returns no batch while
    * batches wait takes a place too. Each batch reaches disk only when it is
    * acked, in sequence order, so a restart goes back to the last acked
-   * batch. The target must apply every batch in sequence order, also a
-   * fork's compensating batch.
+   * batch (with `appliedSequence`, to that batch). The target must apply
+   * every batch in sequence order, also a fork's compensating batch.
    */
   maxPendingBatches?: number
   /** Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4". */
@@ -61,6 +61,17 @@ export interface SettleConfig {
   disableCompaction?: boolean
   /** Block cache size in bytes. Omit for RocksDB default (~8MB per CF), 0 to disable. */
   cacheSize?: number
+  /**
+   * The `sequence` of the newest change batch that the target applied; 0
+   * before the first. The target stores it in the same transaction as the
+   * data of that batch. Set, it turns on the journal: each batch that
+   * `ingest()` or `handleFork()` returns is on disk first, and open brings
+   * the database to the state after this batch, acked or not. Without it, a
+   * restart goes back to the last acked batch, and a fork of blocks that the
+   * target applied but did not ack leaves their changes in the target. The
+   * web build keeps no data across restarts and ignores it.
+   */
+  appliedSequence?: number
 }
 
 export interface SettleCursor {

@@ -33,6 +33,13 @@ export interface SettleConfig {
    * Negative values are rejected.
    */
   cacheSize?: number
+  /**
+   * The sequence of the newest change batch that the target applied, as
+   * the target stored it with the data of that batch; 0 before the first.
+   * Set, it turns on the journal: open brings the database to the state
+   * after this batch, acked or not. Negative values are rejected.
+   */
+  appliedSequence?: number
 }
 /** Block cursor: number + hash. */
 export interface SettleCursor {
