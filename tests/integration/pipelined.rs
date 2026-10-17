@@ -48,7 +48,7 @@ fn swap_block(db: &mut Settle, block: BlockNumber) -> ChangeBatch {
 }
 
 fn total(batch: &ChangeBatch) -> Value {
-    batch.records_for("volume")[0].values["total"].clone()
+    batch.records_for("volume")[0].get("total").unwrap().clone()
 }
 
 #[test]

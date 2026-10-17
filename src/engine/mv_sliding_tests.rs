@@ -133,10 +133,7 @@ fn sliding_window_no_expiry_within_window() {
     );
     assert_eq!(d1.len(), 1);
     assert_eq!(d1[0].operation, ChangeOp::Insert);
-    assert_eq!(
-        d1[0].values.get("total_volume"),
-        Some(&Value::Float64(100.0))
-    );
+    assert_eq!(d1[0].get("total_volume"), Some(&Value::Float64(100.0)));
 
     let d2 = mv.process_block(
         2,
@@ -150,10 +147,7 @@ fn sliding_window_no_expiry_within_window() {
     );
     assert_eq!(d2.len(), 1);
     assert_eq!(d2[0].operation, ChangeOp::Update);
-    assert_eq!(
-        d2[0].values.get("total_volume"),
-        Some(&Value::Float64(300.0))
-    );
+    assert_eq!(d2[0].get("total_volume"), Some(&Value::Float64(300.0)));
 
     let d3 = mv.process_block(
         3,
@@ -166,11 +160,8 @@ fn sliding_window_no_expiry_within_window() {
         )],
     );
     assert_eq!(d3.len(), 1);
-    assert_eq!(
-        d3[0].values.get("total_volume"),
-        Some(&Value::Float64(350.0))
-    );
-    assert_eq!(d3[0].values.get("trade_count"), Some(&Value::UInt64(3)));
+    assert_eq!(d3[0].get("total_volume"), Some(&Value::Float64(350.0)));
+    assert_eq!(d3[0].get("trade_count"), Some(&Value::UInt64(3)));
 }
 
 #[test]
@@ -220,11 +211,8 @@ fn sliding_window_basic_expiry() {
     assert_eq!(d3.len(), 1);
     assert_eq!(d3[0].operation, ChangeOp::Update);
     // After expiry: 200 + 300 = 500 (block 1's 100 expired)
-    assert_eq!(
-        d3[0].values.get("total_volume"),
-        Some(&Value::Float64(500.0))
-    );
-    assert_eq!(d3[0].values.get("trade_count"), Some(&Value::UInt64(2)));
+    assert_eq!(d3[0].get("total_volume"), Some(&Value::Float64(500.0)));
+    assert_eq!(d3[0].get("trade_count"), Some(&Value::UInt64(2)));
 }
 
 #[test]
@@ -269,8 +257,8 @@ fn sliding_window_full_expiry_delete() {
         .iter()
         .find(|d| d.operation == ChangeOp::Delete)
         .unwrap();
-    assert_eq!(insert.key.get("pair"), Some(&Value::String("B".into())));
-    assert_eq!(delete.key.get("pair"), Some(&Value::String("A".into())));
+    assert_eq!(insert.key("pair"), Some(&Value::String("B".into())));
+    assert_eq!(delete.key("pair"), Some(&Value::String("A".into())));
 }
 
 #[test]
@@ -314,10 +302,7 @@ fn sliding_window_sum_correctness_across_expiry() {
     );
     assert_eq!(d.len(), 1);
     // Sum: 20+30+40+50+1 = 141
-    assert_eq!(
-        d[0].values.get("total_volume"),
-        Some(&Value::Float64(141.0))
-    );
+    assert_eq!(d[0].get("total_volume"), Some(&Value::Float64(141.0)));
 }
 
 #[test]
@@ -364,7 +349,7 @@ fn sliding_window_all_agg_types() {
         )],
     );
     assert_eq!(d3.len(), 1);
-    let v = &d3[0].values;
+    let v = &d3[0];
     // After expiry of block 1 (val=10):
     // Remaining: block 2 (val=20), block 3 (val=15)
     assert_eq!(v.get("s"), Some(&Value::Float64(35.0))); // sum: 20+15
@@ -420,7 +405,7 @@ fn sliding_window_rollback() {
     assert_eq!(rollback_changes.len(), 1);
     assert_eq!(rollback_changes[0].operation, ChangeOp::Update);
     assert_eq!(
-        rollback_changes[0].values.get("total_volume"),
+        rollback_changes[0].get("total_volume"),
         Some(&Value::Float64(100.0))
     );
 
@@ -436,10 +421,7 @@ fn sliding_window_rollback() {
         )],
     );
     assert_eq!(d.len(), 1);
-    assert_eq!(
-        d[0].values.get("total_volume"),
-        Some(&Value::Float64(150.0))
-    );
+    assert_eq!(d[0].get("total_volume"), Some(&Value::Float64(150.0)));
 }
 
 #[test]
@@ -488,10 +470,7 @@ fn sliding_window_rollback_plus_expiry() {
     // the watermark goes back to 1_800_000.
     let rb = mv.rollback(2);
     assert_eq!(rb.len(), 1);
-    assert_eq!(
-        rb[0].values.get("total_volume"),
-        Some(&Value::Float64(300.0))
-    );
+    assert_eq!(rb[0].get("total_volume"), Some(&Value::Float64(300.0)));
 }
 
 fn trade(pair: &str, volume: f64, ts_ms: i64) -> RowMap {
@@ -514,25 +493,23 @@ fn sliding_window_rollback_restores_group_removed_by_expiry() {
     mv.process_block(2, &[trade("ETH", 10.0, 5_000)]);
     let expiry = mv.process_block(3, &[trade("ETH", 20.0, 11_000)]);
     assert!(
-        expiry
-            .iter()
-            .any(|c| c.operation == ChangeOp::Delete && c.key["pair"] == Value::String("BTC".into()))
+        expiry.iter().any(|c| c.operation == ChangeOp::Delete
+            && c.key("pair") == Some(&Value::String("BTC".into())))
     );
 
     let rb = mv.rollback(2);
     let btc = rb
         .iter()
-        .find(|c| c.key["pair"] == Value::String("BTC".into()))
+        .find(|c| c.key("pair") == Some(&Value::String("BTC".into())))
         .unwrap();
     assert_eq!(btc.operation, ChangeOp::Insert);
-    assert_eq!(btc.values.get("total_volume"), Some(&Value::Float64(5.0)));
+    assert_eq!(btc.get("total_volume"), Some(&Value::Float64(5.0)));
 
     // Block 1 is a live block again: the next expiry removes it once more.
     let again = mv.process_block(3, &[trade("ETH", 20.0, 11_000)]);
     assert!(
-        again
-            .iter()
-            .any(|c| c.operation == ChangeOp::Delete && c.key["pair"] == Value::String("BTC".into()))
+        again.iter().any(|c| c.operation == ChangeOp::Delete
+            && c.key("pair") == Some(&Value::String("BTC".into())))
     );
 }
 
@@ -571,9 +548,11 @@ fn sliding_window_expired_block_survives_reopen() {
     assert_eq!(mv.block_times.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
 
     let changes = mv.process_block(3, &[trade("ETH", 300.0, 3_601_000)]);
-    let total = |values: &HashMap<String, Value>| values["total_volume"].clone();
-    assert_eq!(total(changes[0].prev_values.as_ref().unwrap()), Value::Float64(300.0));
-    assert_eq!(total(&changes[0].values), Value::Float64(500.0));
+    assert_eq!(
+        changes[0].prev("total_volume"),
+        Some(&Value::Float64(300.0))
+    );
+    assert_eq!(changes[0].get("total_volume"), Some(&Value::Float64(500.0)));
 }
 
 /// A checkpoint stores the block that became final and deletes the stored
@@ -636,10 +615,7 @@ fn sliding_window_rapid_expiry() {
             0,
         )],
     );
-    assert_eq!(
-        d1[0].values.get("total_volume"),
-        Some(&Value::Float64(10.0))
-    );
+    assert_eq!(d1[0].get("total_volume"), Some(&Value::Float64(10.0)));
 
     let d2 = mv.process_block(
         2,
@@ -652,11 +628,8 @@ fn sliding_window_rapid_expiry() {
         )],
     );
     // Block 1 (ts=0) expired (cutoff = 2000 - 1000 = 1000, 0 < 1000)
-    assert_eq!(
-        d2[0].values.get("total_volume"),
-        Some(&Value::Float64(20.0))
-    );
-    assert_eq!(d2[0].values.get("trade_count"), Some(&Value::UInt64(1)));
+    assert_eq!(d2[0].get("total_volume"), Some(&Value::Float64(20.0)));
+    assert_eq!(d2[0].get("trade_count"), Some(&Value::UInt64(1)));
 
     let d3 = mv.process_block(
         3,
@@ -669,10 +642,7 @@ fn sliding_window_rapid_expiry() {
         )],
     );
     // Block 2 (ts=2000) expired (cutoff = 4000 - 1000 = 3000, 2000 < 3000)
-    assert_eq!(
-        d3[0].values.get("total_volume"),
-        Some(&Value::Float64(30.0))
-    );
+    assert_eq!(d3[0].get("total_volume"), Some(&Value::Float64(30.0)));
 }
 
 #[test]
@@ -721,17 +691,14 @@ fn sliding_window_multiple_groups_independent_expiry() {
     // Group B: block 2 (ts=3000s) still within window (cutoff=3_601_000-3_600_000=1_000)
     let a_change = d3
         .iter()
-        .find(|d| d.key.get("pair") == Some(&Value::String("A".into())))
+        .find(|d| d.key("pair") == Some(&Value::String("A".into())))
         .unwrap();
-    assert_eq!(
-        a_change.values.get("total_volume"),
-        Some(&Value::Float64(50.0))
-    );
+    assert_eq!(a_change.get("total_volume"), Some(&Value::Float64(50.0)));
 
     // Group B should NOT appear in changes (not touched and not expired)
     assert!(
         d3.iter()
-            .all(|d| d.key.get("pair") != Some(&Value::String("B".into())))
+            .all(|d| d.key("pair") != Some(&Value::String("B".into())))
     );
 }
 
@@ -854,10 +821,7 @@ fn sliding_window_replay_skip() {
         )],
     );
     assert_eq!(d2.len(), 1);
-    assert_eq!(
-        d2[0].values.get("total_volume"),
-        Some(&Value::Float64(150.0))
-    );
+    assert_eq!(d2[0].get("total_volume"), Some(&Value::Float64(150.0)));
 }
 
 #[test]
@@ -900,10 +864,7 @@ fn sliding_window_out_of_order_timestamps() {
     );
     assert_eq!(d3.len(), 1);
     // Remaining: block 1 (10) + block 3 (30) = 40
-    assert_eq!(
-        d3[0].values.get("total_volume"),
-        Some(&Value::Float64(40.0))
-    );
+    assert_eq!(d3[0].get("total_volume"), Some(&Value::Float64(40.0)));
 }
 
 #[test]
@@ -938,10 +899,7 @@ fn sliding_window_boundary_inclusive() {
     );
     assert_eq!(d2.len(), 1);
     // Both blocks remain: 10 + 20 = 30
-    assert_eq!(
-        d2[0].values.get("total_volume"),
-        Some(&Value::Float64(30.0))
-    );
+    assert_eq!(d2[0].get("total_volume"), Some(&Value::Float64(30.0)));
 }
 
 #[test]
@@ -1038,11 +996,8 @@ fn sliding_window_group_expired_on_arrival_is_removed() {
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].operation, ChangeOp::Insert);
     assert_eq!(live[0].prev_values, None);
-    assert_eq!(
-        live[0].values.get("total_volume"),
-        Some(&Value::Float64(0.0))
-    );
-    assert_eq!(live[0].values.get("trade_count"), Some(&Value::UInt64(1)));
+    assert_eq!(live[0].get("total_volume"), Some(&Value::Float64(0.0)));
+    assert_eq!(live[0].get("trade_count"), Some(&Value::UInt64(1)));
 }
 
 #[test]
@@ -1097,13 +1052,13 @@ type View = BTreeMap<String, HashMap<String, Value>>;
 
 fn apply_changes(view: &mut View, changes: Vec<ChangeRecord>) {
     for change in changes {
-        let key = format!("{:?}", change.key.get("grp"));
+        let key = format!("{:?}", change.key("grp"));
         match change.operation {
             ChangeOp::Delete => {
                 view.remove(&key);
             }
             _ => {
-                view.insert(key, change.values);
+                view.insert(key, change.values_map());
             }
         }
     }

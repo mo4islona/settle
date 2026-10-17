@@ -6,7 +6,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::ast::{AggFunc, MVDef, SelectExpr, SelectItem, SlidingWindowDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
-use crate::types::{BlockNumber, ColumnType, ChangeOp, ChangeRecord, GroupKey, RowMap, Value};
+use crate::types::{
+    BlockNumber, ChangeOp, ChangeRecord, ChangeSchema, ColumnType, GroupKey, RowMap, Value,
+};
 
 use super::aggregation::{AggregationFunc, create_agg, restore_agg, to_start_of_interval};
 
@@ -129,8 +131,7 @@ impl Deref for BlockTimes {
 /// Manages a single materialized view: GROUP BY routing, aggregation, rollback, changes.
 pub struct MVEngine {
     def: MVDef,
-    /// The output column descriptors (in SELECT order).
-    output_columns: Vec<OutputColumn>,
+    change_schema: Arc<ChangeSchema>,
     /// The AggFunc types in SELECT order (for deserialization).
     agg_funcs: Vec<AggFunc>,
     /// Number of aggregation functions per group.
@@ -267,10 +268,19 @@ impl MVEngine {
             })
             .collect();
 
+        let change_schema = Arc::new(ChangeSchema::mv(
+            &def.name,
+            output_columns.iter().map(|col| match col {
+                OutputColumn::GroupBy { output_name, .. }
+                | OutputColumn::Window { output_name, .. } => (output_name.clone(), true),
+                OutputColumn::Agg { output_name, .. } => (output_name.clone(), false),
+            }),
+        ));
+
         let mut mv = MVEngine {
             sliding_window: def.sliding_window.clone(),
             def,
-            output_columns,
+            change_schema,
             agg_funcs,
             agg_count,
             agg_feeds,
@@ -760,37 +770,6 @@ impl MVEngine {
         touched.groups.insert(group_key.clone(), (order, at));
     }
 
-    /// The output row of a group: its key columns plus `agg_values`, which
-    /// are moved out.
-    fn build_output(
-        &self,
-        group_key: &GroupKey,
-        agg_values: &mut [Value],
-    ) -> HashMap<String, Value> {
-        let mut output = HashMap::with_capacity(self.output_columns.len());
-
-        let mut key_idx = 0;
-        for col in &self.output_columns {
-            match col {
-                OutputColumn::GroupBy { output_name, .. }
-                | OutputColumn::Window { output_name, .. } => {
-                    output.insert(output_name.clone(), group_key[key_idx].clone());
-                    key_idx += 1;
-                }
-                OutputColumn::Agg {
-                    agg_index,
-                    output_name,
-                    ..
-                } => {
-                    let value = std::mem::replace(&mut agg_values[*agg_index], Value::Null);
-                    output.insert(output_name.clone(), value);
-                }
-            }
-        }
-
-        output
-    }
-
     /// Emit one change per touched group against its snapshot. Output rows
     /// are built only for the groups whose values changed.
     fn emit_changes(&mut self, touched: Touched) -> Vec<ChangeRecord> {
@@ -823,17 +802,17 @@ impl MVEngine {
             match (prev_values, has_data) {
                 (None, true) => {
                     // New group -> Insert
-                    let values = self.build_output(&key, &mut current);
-                    changes.push(self.change_record(ChangeOp::Insert, &key, values, None));
+                    let values = current.drain(..).collect();
+                    changes.push(self.change_record(ChangeOp::Insert, key, values, None));
                 }
                 (Some(prev_values), true) => {
                     // Existing group updated -> Update
                     if current[..] != prev_values[..] {
-                        let values = self.build_output(&key, &mut current);
-                        let prev_values = self.build_output(&key, prev_values);
+                        let values = current.drain(..).collect();
+                        let prev_values = take_values(prev_values);
                         changes.push(self.change_record(
                             ChangeOp::Update,
-                            &key,
+                            key,
                             values,
                             Some(prev_values),
                         ));
@@ -841,17 +820,18 @@ impl MVEngine {
                 }
                 (Some(prev_values), false) => {
                     // Group became empty after rollback/expiry -> Delete
-                    let prev_values = self.build_output(&key, prev_values);
-                    changes.push(self.change_record(
-                        ChangeOp::Delete,
-                        &key,
-                        prev_values.clone(),
-                        Some(prev_values),
-                    ));
+                    let prev_values = take_values(prev_values);
 
                     // Clean up empty group and track for storage deletion
                     self.groups.remove(&key);
                     self.removed_groups.push(key.clone());
+
+                    changes.push(self.change_record(
+                        ChangeOp::Delete,
+                        key,
+                        prev_values.clone(),
+                        Some(prev_values),
+                    ));
                 }
                 (None, false) => {
                     // Never emitted and already empty, e.g. its rows expired on
@@ -889,33 +869,17 @@ impl MVEngine {
     fn change_record(
         &self,
         operation: ChangeOp,
-        group_key: &GroupKey,
-        values: HashMap<String, Value>,
-        prev_values: Option<HashMap<String, Value>>,
+        group_key: GroupKey,
+        values: Box<[Value]>,
+        prev_values: Option<Box<[Value]>>,
     ) -> ChangeRecord {
-        ChangeRecord {
-            table: self.def.name.clone(),
+        ChangeRecord::new(
             operation,
-            key: self.build_change_key(group_key),
+            self.change_schema.clone(),
+            group_key,
             values,
             prev_values,
-        }
-    }
-
-    fn build_change_key(&self, group_key: &GroupKey) -> HashMap<String, Value> {
-        let mut change_key = HashMap::with_capacity(group_key.len());
-        let mut key_idx = 0;
-        for col in &self.output_columns {
-            match col {
-                OutputColumn::GroupBy { output_name, .. }
-                | OutputColumn::Window { output_name, .. } => {
-                    change_key.insert(output_name.clone(), group_key[key_idx].clone());
-                    key_idx += 1;
-                }
-                OutputColumn::Agg { .. } => {}
-            }
-        }
-        change_key
+        )
     }
 
     fn create_agg_vec(&self) -> Vec<Box<dyn AggregationFunc>> {
@@ -925,6 +889,14 @@ impl MVEngine {
         }
         aggs
     }
+}
+
+/// Moves the values out of a snapshot, which is dropped after the emit.
+fn take_values(values: &mut [Value]) -> Box<[Value]> {
+    values
+        .iter_mut()
+        .map(|v| std::mem::replace(v, Value::Null))
+        .collect()
 }
 
 fn resolve_output_name(item: &SelectItem) -> String {

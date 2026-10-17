@@ -68,14 +68,14 @@ pub async fn apply_batch(client: &mut Client, batch: &ChangeBatch) -> Result<(),
     let tx = client.transaction().await?;
     if let Some(records) = batch.tables.get("token_summary") {
         for rec in records {
-            let asset_id = match rec.key.get("asset_id") {
+            let asset_id = match rec.key("asset_id") {
                 Some(Value::String(s)) => s.clone(),
                 other => panic!("unexpected asset_id key: {other:?}"),
             };
             match rec.operation {
                 ChangeOp::Insert | ChangeOp::Update => {
-                    let total = num_u64(rec.values.get("total_volume")) as i64;
-                    let count = num_u64(rec.values.get("trade_count")) as i64;
+                    let total = num_u64(rec.get("total_volume")) as i64;
+                    let count = num_u64(rec.get("trade_count")) as i64;
                     tx.execute(
                         "INSERT INTO token_summary (asset_id, total_volume, trade_count)
                          VALUES ($1, $2, $3)

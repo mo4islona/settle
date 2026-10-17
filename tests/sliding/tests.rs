@@ -45,18 +45,11 @@ fn sliding_window_basic_volume_tracking() {
     let eth_insert = vol_recs
         .iter()
         .find(|r| {
-            r.operation == ChangeOp::Insert
-                && r.key.get("pair") == Some(&Value::String("ETH".into()))
+            r.operation == ChangeOp::Insert && r.key("pair") == Some(&Value::String("ETH".into()))
         })
         .expect("should have ETH insert in volume_1h");
-    assert_eq!(
-        eth_insert.values.get("total_volume"),
-        Some(&Value::Float64(100.0))
-    );
-    assert_eq!(
-        eth_insert.values.get("trade_count"),
-        Some(&Value::UInt64(1))
-    );
+    assert_eq!(eth_insert.get("total_volume"), Some(&Value::Float64(100.0)));
+    assert_eq!(eth_insert.get("trade_count"), Some(&Value::UInt64(1)));
 }
 
 #[test]
@@ -90,28 +83,19 @@ fn sliding_window_expiry_reduces_volume() {
     // Should have an Update for ETH with volume=200+50=250 (block 1 expired)
     let eth_update = vol_recs
         .iter()
-        .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
+        .find(|r| r.key("pair") == Some(&Value::String("ETH".into())))
         .expect("should have ETH change in volume_1h");
     assert_eq!(eth_update.operation, ChangeOp::Update);
-    assert_eq!(
-        eth_update.values.get("total_volume"),
-        Some(&Value::Float64(250.0))
-    );
-    assert_eq!(
-        eth_update.values.get("trade_count"),
-        Some(&Value::UInt64(2))
-    );
+    assert_eq!(eth_update.get("total_volume"), Some(&Value::Float64(250.0)));
+    assert_eq!(eth_update.get("trade_count"), Some(&Value::UInt64(2)));
 
     // Meanwhile, the unbounded "totals" MV should still have all data
     let total_recs = records_for_table(&batch, "totals");
     let eth_total = total_recs
         .iter()
-        .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
+        .find(|r| r.key("pair") == Some(&Value::String("ETH".into())))
         .expect("should have ETH change in totals");
-    assert_eq!(
-        eth_total.values.get("total_volume"),
-        Some(&Value::Float64(350.0))
-    ); // 100+200+50
+    assert_eq!(eth_total.get("total_volume"), Some(&Value::Float64(350.0))); // 100+200+50
 }
 
 #[test]
@@ -147,13 +131,10 @@ fn sliding_window_rollback_and_reprocess() {
     let vol_recs = records_for_table(&rb_batch, "volume_1h");
     let eth_rb = vol_recs
         .iter()
-        .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
+        .find(|r| r.key("pair") == Some(&Value::String("ETH".into())))
         .expect("should have ETH rollback change");
     assert_eq!(eth_rb.operation, ChangeOp::Update);
-    assert_eq!(
-        eth_rb.values.get("total_volume"),
-        Some(&Value::Float64(100.0))
-    );
+    assert_eq!(eth_rb.get("total_volume"), Some(&Value::Float64(100.0)));
 
     // Re-ingest block 2 with different data
     let new_batch = ingest_one(
@@ -168,12 +149,9 @@ fn sliding_window_rollback_and_reprocess() {
     let vol_recs = records_for_table(&new_batch, "volume_1h");
     let eth_new = vol_recs
         .iter()
-        .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
+        .find(|r| r.key("pair") == Some(&Value::String("ETH".into())))
         .expect("should have ETH update after re-ingest");
-    assert_eq!(
-        eth_new.values.get("total_volume"),
-        Some(&Value::Float64(150.0))
-    );
+    assert_eq!(eth_new.get("total_volume"), Some(&Value::Float64(150.0)));
 }
 
 #[test]
@@ -219,40 +197,22 @@ fn sliding_window_multiple_groups_and_windows() {
     let vol_recs = records_for_table(&batch, "volume_1h");
     let eth_vol = vol_recs
         .iter()
-        .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
+        .find(|r| r.key("pair") == Some(&Value::String("ETH".into())))
         .expect("ETH volume_1h");
-    assert_eq!(
-        eth_vol.values.get("total_volume"),
-        Some(&Value::Float64(350.0))
-    );
+    assert_eq!(eth_vol.get("total_volume"), Some(&Value::Float64(350.0)));
 
     // stats_30m: block 1 expired for ETH and BTC
     let stats_recs = records_for_table(&batch, "stats_30m");
     let eth_stats = stats_recs
         .iter()
-        .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
+        .find(|r| r.key("pair") == Some(&Value::String("ETH".into())))
         .expect("ETH stats_30m");
     // ETH: blocks 2+3 remain (prices: 2100, 2200; volumes: 200, 50)
-    assert_eq!(
-        eth_stats.values.get("vol_sum"),
-        Some(&Value::Float64(250.0))
-    );
-    assert_eq!(
-        eth_stats.values.get("price_min"),
-        Some(&Value::Float64(2100.0))
-    );
-    assert_eq!(
-        eth_stats.values.get("price_max"),
-        Some(&Value::Float64(2200.0))
-    );
-    assert_eq!(
-        eth_stats.values.get("price_first"),
-        Some(&Value::Float64(2100.0))
-    );
-    assert_eq!(
-        eth_stats.values.get("price_last"),
-        Some(&Value::Float64(2200.0))
-    );
+    assert_eq!(eth_stats.get("vol_sum"), Some(&Value::Float64(250.0)));
+    assert_eq!(eth_stats.get("price_min"), Some(&Value::Float64(2100.0)));
+    assert_eq!(eth_stats.get("price_max"), Some(&Value::Float64(2200.0)));
+    assert_eq!(eth_stats.get("price_first"), Some(&Value::Float64(2100.0)));
+    assert_eq!(eth_stats.get("price_last"), Some(&Value::Float64(2200.0)));
 }
 
 #[test]
@@ -283,7 +243,7 @@ fn sliding_window_complete_expiry_deletes_group() {
     // DOGE should be deleted
     let doge_delete = vol_recs
         .iter()
-        .find(|r| r.key.get("pair") == Some(&Value::String("DOGE".into())));
+        .find(|r| r.key("pair") == Some(&Value::String("DOGE".into())));
     assert!(
         doge_delete
             .map(|d| d.operation == ChangeOp::Delete)
@@ -294,7 +254,7 @@ fn sliding_window_complete_expiry_deletes_group() {
     // ETH should be inserted
     let eth_insert = vol_recs
         .iter()
-        .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())));
+        .find(|r| r.key("pair") == Some(&Value::String("ETH".into())));
     assert!(eth_insert.is_some());
     assert_eq!(eth_insert.unwrap().operation, ChangeOp::Insert);
 }
@@ -334,7 +294,7 @@ fn sliding_window_with_finalization() {
     let vol_recs = records_for_table(&batch, "volume_1h");
     let eth = vol_recs
         .iter()
-        .find(|r| r.key.get("pair") == Some(&Value::String("ETH".into())))
+        .find(|r| r.key("pair") == Some(&Value::String("ETH".into())))
         .expect("ETH should have change");
     assert_eq!(eth.operation, ChangeOp::Update);
 
@@ -342,5 +302,5 @@ fn sliding_window_with_finalization() {
     // Block 2: vol=20 (ts=600k), Block 3: vol=30 (ts=1200k), Block 4: vol=40 (ts=1800k),
     // Block 5: vol=50 (ts=2400k), Block 6: vol=100 (ts=3601k)
     // cutoff = 3601000 - 3600000 = 1000. Block 1 (ts=0) < 1000 → expired.
-    assert_eq!(eth.values.get("total_volume"), Some(&Value::Float64(240.0)));
+    assert_eq!(eth.get("total_volume"), Some(&Value::Float64(240.0)));
 }

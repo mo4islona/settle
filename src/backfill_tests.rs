@@ -80,8 +80,8 @@ fn mv_value(batch: &ChangeBatch, view: &str, group_col: &str, group_val: &str, o
     batch
         .records_for(view)
         .iter()
-        .find(|r| r.values.get(group_col) == Some(&Value::String(group_val.to_string())))
-        .and_then(|r| r.values.get(out))
+        .find(|r| r.get(group_col) == Some(&Value::String(group_val.to_string())))
+        .and_then(|r| r.get(out))
         .and_then(|v| v.as_f64())
 }
 

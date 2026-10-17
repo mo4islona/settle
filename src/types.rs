@@ -114,6 +114,10 @@ impl Row {
         &self.values
     }
 
+    pub fn into_values(self) -> Vec<Value> {
+        self.values
+    }
+
     /// Access the column registry.
     pub fn registry(&self) -> &Arc<ColumnRegistry> {
         &self.registry
@@ -480,13 +484,261 @@ pub enum ChangeOp {
     Delete,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Where a column of a change record lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Key(usize),
+    Value(usize),
+}
+
+static NULL: Value = Value::Null;
+
+/// The column layout of the change records of one table. All records of a
+/// table share one schema, so a record holds only its values, by position.
+#[derive(Debug)]
+pub struct ChangeSchema {
+    table: String,
+    key_columns: Box<[String]>,
+    columns: Box<[(String, Slot)]>,
+}
+
+impl ChangeSchema {
+    /// A raw table: the row is the values, and its block and its index in
+    /// the block are the key.
+    pub fn raw_table(table: &str, columns: &[String]) -> Self {
+        Self {
+            table: table.to_string(),
+            key_columns: ["block_number".to_string(), "_row_index".to_string()].into(),
+            columns: columns
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), Slot::Value(i)))
+                .collect(),
+        }
+    }
+
+    /// An MV: `columns` in SELECT order, each with whether it is a GROUP BY
+    /// column. GROUP BY columns are the key, the others the values.
+    pub fn mv(table: &str, columns: impl IntoIterator<Item = (String, bool)>) -> Self {
+        let mut key_columns = Vec::new();
+        let mut value_count = 0;
+
+        let columns = columns
+            .into_iter()
+            .map(|(name, is_key)| {
+                let slot = if is_key {
+                    key_columns.push(name.clone());
+                    Slot::Key(key_columns.len() - 1)
+                } else {
+                    value_count += 1;
+                    Slot::Value(value_count - 1)
+                };
+                (name, slot)
+            })
+            .collect();
+
+        Self {
+            table: table.to_string(),
+            key_columns: key_columns.into(),
+            columns,
+        }
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    pub fn key_columns(&self) -> &[String] {
+        &self.key_columns
+    }
+
+    /// The column names, in the order of `ChangeRecord::values`.
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.columns.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// The position of `column`, for `ChangeRecord::get` in a hot loop.
+    pub fn index_of(&self, column: &str) -> Option<usize> {
+        self.columns.iter().position(|(name, _)| name == column)
+    }
+}
+
+/// A column of a change record: its name, or its position in the schema.
+pub trait ColumnIndex {
+    fn position(&self, schema: &ChangeSchema) -> Option<usize>;
+}
+
+impl ColumnIndex for usize {
+    fn position(&self, schema: &ChangeSchema) -> Option<usize> {
+        (*self < schema.columns.len()).then_some(*self)
+    }
+}
+
+impl ColumnIndex for str {
+    fn position(&self, schema: &ChangeSchema) -> Option<usize> {
+        schema.index_of(self)
+    }
+}
+
+impl ColumnIndex for String {
+    fn position(&self, schema: &ChangeSchema) -> Option<usize> {
+        schema.index_of(self)
+    }
+}
+
+impl<T: ColumnIndex + ?Sized> ColumnIndex for &T {
+    fn position(&self, schema: &ChangeSchema) -> Option<usize> {
+        (**self).position(schema)
+    }
+}
+
+/// One change of one row of an output table. The values are positional;
+/// `schema` names them.
+#[derive(Debug, Clone)]
 pub struct ChangeRecord {
-    pub table: String,
     pub operation: ChangeOp,
-    pub key: HashMap<String, Value>,
-    pub values: HashMap<String, Value>,
-    pub prev_values: Option<HashMap<String, Value>>,
+    pub(crate) schema: Arc<ChangeSchema>,
+    pub(crate) key: GroupKey,
+    /// The non-key columns: an MV keeps its GROUP BY columns only in `key`.
+    pub(crate) values: Box<[Value]>,
+    pub(crate) prev_values: Option<Box<[Value]>>,
+}
+
+impl ChangeRecord {
+    pub fn new(
+        operation: ChangeOp,
+        schema: Arc<ChangeSchema>,
+        key: GroupKey,
+        values: Box<[Value]>,
+        prev_values: Option<Box<[Value]>>,
+    ) -> Self {
+        debug_assert_eq!(key.len(), schema.key_columns.len());
+        Self {
+            operation,
+            schema,
+            key,
+            values,
+            prev_values,
+        }
+    }
+
+    pub fn table(&self) -> &str {
+        &self.schema.table
+    }
+
+    pub fn schema(&self) -> &Arc<ChangeSchema> {
+        &self.schema
+    }
+
+    /// The value of a column, by name or position: `record.get("balance")`.
+    pub fn get(&self, column: impl ColumnIndex) -> Option<&Value> {
+        let (_, slot) = &self.schema.columns[column.position(&self.schema)?];
+        Some(self.resolve(*slot, &self.values))
+    }
+
+    /// The value of a column before the change; None without `prev_values`.
+    pub fn prev(&self, column: impl ColumnIndex) -> Option<&Value> {
+        let prev = self.prev_values.as_deref()?;
+        let (_, slot) = &self.schema.columns[column.position(&self.schema)?];
+        Some(self.resolve(*slot, prev))
+    }
+
+    /// The value of a key column.
+    pub fn key(&self, column: &str) -> Option<&Value> {
+        let i = self.schema.key_columns.iter().position(|c| c == column)?;
+        self.key.get(i)
+    }
+
+    pub fn has_prev(&self) -> bool {
+        self.prev_values.is_some()
+    }
+
+    /// All columns in schema order, Nulls included.
+    pub fn values(&self) -> impl ExactSizeIterator<Item = (&str, &Value)> + Clone + '_ {
+        self.columns(&self.values)
+    }
+
+    pub fn prev_values(
+        &self,
+    ) -> Option<impl ExactSizeIterator<Item = (&str, &Value)> + Clone + '_> {
+        self.prev_values.as_deref().map(|prev| self.columns(prev))
+    }
+
+    pub fn key_values(&self) -> impl ExactSizeIterator<Item = (&str, &Value)> + Clone + '_ {
+        self.schema
+            .key_columns
+            .iter()
+            .zip(self.key.iter())
+            .map(|(name, value)| (name.as_str(), value))
+    }
+
+    pub fn values_map(&self) -> HashMap<String, Value> {
+        to_map(self.values())
+    }
+
+    pub fn prev_map(&self) -> Option<HashMap<String, Value>> {
+        self.prev_values().map(to_map)
+    }
+
+    pub fn key_map(&self) -> HashMap<String, Value> {
+        to_map(self.key_values())
+    }
+
+    fn columns<'a>(
+        &'a self,
+        values: &'a [Value],
+    ) -> impl ExactSizeIterator<Item = (&'a str, &'a Value)> + Clone + 'a {
+        self.schema
+            .columns
+            .iter()
+            .map(move |(name, slot)| (name.as_str(), self.resolve(*slot, values)))
+    }
+
+    /// A cancelled record in `ChangeBuffer::flush` has no values: Null then.
+    fn resolve<'a>(&'a self, slot: Slot, values: &'a [Value]) -> &'a Value {
+        match slot {
+            Slot::Key(i) => &self.key[i],
+            Slot::Value(i) => values.get(i).unwrap_or(&NULL),
+        }
+    }
+}
+
+fn to_map<'a>(columns: impl Iterator<Item = (&'a str, &'a Value)>) -> HashMap<String, Value> {
+    columns
+        .map(|(name, value)| (name.to_string(), value.clone()))
+        .collect()
+}
+
+/// Serializes `(name, value)` pairs as a map.
+struct Columns<I>(I);
+
+impl<'a, I> Serialize for Columns<I>
+where
+    I: ExactSizeIterator<Item = (&'a str, &'a Value)> + Clone,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, value) in self.0.clone() {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
+impl Serialize for ChangeRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(5))?;
+        map.serialize_entry("table", self.table())?;
+        map.serialize_entry("operation", &self.operation)?;
+        map.serialize_entry("key", &Columns(self.key_values()))?;
+        map.serialize_entry("values", &Columns(self.values()))?;
+        map.serialize_entry("prev_values", &self.prev_values().map(Columns))?;
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -508,7 +760,7 @@ pub struct PerfNode {
     pub children: Vec<PerfNode>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChangeBatch {
     pub sequence: u64,
     pub finalized_head: Option<BlockCursor>,
@@ -679,31 +931,61 @@ mod tests {
         assert_eq!(decoded, v);
     }
 
-    #[test]
-    fn serde_roundtrip() {
-        let record = ChangeRecord {
-            table: "swaps".into(),
-            operation: ChangeOp::Insert,
-            key: HashMap::from([("block_number".into(), Value::UInt64(1000))]),
-            values: HashMap::from([
-                ("user".into(), Value::String("alice".into())),
-                ("amount".into(), Value::Float64(10.0)),
-            ]),
-            prev_values: None,
-        };
-
-        let bytes = rmp_serde::to_vec(&record).unwrap();
-        let decoded: ChangeRecord = rmp_serde::from_slice(&bytes).unwrap();
-        assert_eq!(decoded.table, "swaps");
-        assert_eq!(decoded.operation, ChangeOp::Insert);
-        assert_eq!(
-            decoded.values.get("user"),
-            Some(&Value::String("alice".into()))
+    fn balance_update() -> ChangeRecord {
+        let schema = ChangeSchema::mv(
+            "balances",
+            [
+                ("amount".to_string(), false),
+                ("user".to_string(), true),
+                ("count".to_string(), false),
+            ],
         );
+        ChangeRecord::new(
+            ChangeOp::Update,
+            Arc::new(schema),
+            smallvec::smallvec![Value::String("alice".into())],
+            Box::from([Value::Float64(10.0), Value::UInt64(2)]),
+            Some(Box::from([Value::Float64(4.0), Value::UInt64(1)])),
+        )
     }
 
     #[test]
-    fn change_batch_serde_roundtrip() {
+    fn change_record_reads_columns_by_name_and_position() {
+        let record = balance_update();
+
+        assert_eq!(record.table(), "balances");
+        assert_eq!(record.get("amount"), Some(&Value::Float64(10.0)));
+        assert_eq!(record.get("user"), Some(&Value::String("alice".into())));
+        assert_eq!(record.get(2), Some(&Value::UInt64(2)));
+        assert_eq!(record.get("count".to_string()), Some(&Value::UInt64(2)));
+        assert_eq!(record.get("missing"), None);
+        assert_eq!(record.get(3), None);
+
+        assert_eq!(record.key("user"), Some(&Value::String("alice".into())));
+        assert_eq!(record.key("amount"), None);
+        assert_eq!(record.prev("amount"), Some(&Value::Float64(4.0)));
+        assert_eq!(record.prev("user"), Some(&Value::String("alice".into())));
+
+        let names: Vec<&str> = record.values().map(|(name, _)| name).collect();
+        assert_eq!(names, ["amount", "user", "count"]);
+        assert_eq!(record.schema().index_of("count"), Some(2));
+    }
+
+    #[test]
+    fn change_record_serializes_by_name() {
+        let json = serde_json::to_value(balance_update()).unwrap();
+        let value = |v: Value| serde_json::to_value(v).unwrap();
+
+        assert_eq!(json["table"], "balances");
+        assert_eq!(json["operation"], "update");
+        assert_eq!(json["key"]["user"], value(Value::String("alice".into())));
+        assert_eq!(json["values"]["user"], value(Value::String("alice".into())));
+        assert_eq!(json["values"]["amount"], value(Value::Float64(10.0)));
+        assert_eq!(json["prev_values"]["count"], value(Value::UInt64(1)));
+    }
+
+    #[test]
+    fn change_batch_serializes() {
         let batch = ChangeBatch {
             sequence: 1,
             finalized_head: Some(BlockCursor {
@@ -714,15 +996,14 @@ mod tests {
                 number: 1000,
                 hash: "0xdef".into(),
             }),
-            tables: HashMap::new(),
+            tables: HashMap::from([("balances".to_string(), vec![balance_update()])]),
             perf: vec![],
         };
 
-        let json = serde_json::to_string(&batch).unwrap();
-        let decoded: ChangeBatch = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.sequence, 1);
-        assert_eq!(decoded.finalized_head.as_ref().unwrap().number, 900);
-        assert_eq!(decoded.finalized_head.as_ref().unwrap().hash, "0xabc");
-        assert_eq!(decoded.latest_head.as_ref().unwrap().number, 1000);
+        let json = serde_json::to_value(&batch).unwrap();
+        assert_eq!(json["sequence"], 1);
+        assert_eq!(json["finalized_head"]["number"], 900);
+        assert_eq!(json["latest_head"]["hash"], "0xdef");
+        assert_eq!(json["tables"]["balances"][0]["operation"], "update");
     }
 }

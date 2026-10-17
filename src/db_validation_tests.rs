@@ -133,11 +133,10 @@ fn partial_ingest_failure_rolls_back() {
     let mv = batch.records_for("pool_volume");
     let eth_rec = mv
         .iter()
-        .find(|r| r.key.get("pool") == Some(&Value::String("ETH/USDC".into())));
+        .find(|r| r.key("pool") == Some(&Value::String("ETH/USDC".into())));
     assert!(eth_rec.is_some());
     let total = eth_rec
         .unwrap()
-        .values
         .get("total_volume")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
@@ -264,8 +263,8 @@ fn mv_at_aggregate_limit_survives_reopen() {
         .unwrap();
     let eth = &batch.records_for("wide")[0];
     let last = format!("s{}", MAX_MV_AGGREGATES - 1);
-    assert_eq!(eth.values.get("s0"), Some(&Value::Float64(20.0)));
-    assert_eq!(eth.values.get(&last), Some(&Value::Float64(20.0)));
+    assert_eq!(eth.get("s0"), Some(&Value::Float64(20.0)));
+    assert_eq!(eth.get(&last), Some(&Value::Float64(20.0)));
 }
 
 /// On a gappy chain finality can be ahead of the latest data block. A failed
@@ -317,11 +316,8 @@ fn failed_ingest_is_undone_when_finality_is_ahead_of_latest() {
     let alice = batch
         .records_for("position_summary")
         .iter()
-        .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+        .find(|r| r.key("user") == Some(&Value::String("alice".into())))
         .unwrap();
-    assert_eq!(alice.values.get("trade_count"), Some(&Value::UInt64(3)));
-    assert_eq!(
-        alice.values.get("current_position"),
-        Some(&Value::Float64(20.0))
-    );
+    assert_eq!(alice.get("trade_count"), Some(&Value::UInt64(3)));
+    assert_eq!(alice.get("current_position"), Some(&Value::Float64(20.0)));
 }

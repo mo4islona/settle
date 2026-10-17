@@ -59,36 +59,18 @@ fn market_stats_tracks_volume_and_price_stats() {
 
     assert_eq!(mv_records.len(), 1);
     assert_eq!(mv_records[0].operation, ChangeOp::Insert);
-    assert_eq!(
-        mv_records[0].values.get("trade_count"),
-        Some(&Value::UInt64(2))
-    );
+    assert_eq!(mv_records[0].get("trade_count"), Some(&Value::UInt64(2)));
 
     // last_price should be the second trade's price (0.5)
-    let last_price = mv_records[0]
-        .values
-        .get("last_price")
-        .unwrap()
-        .as_f64()
-        .unwrap();
+    let last_price = mv_records[0].get("last_price").unwrap().as_f64().unwrap();
     assert!((last_price - 0.5).abs() < 0.001);
 
     // sum_price = 0.5 + 0.5 = 1.0
-    let sum_price = mv_records[0]
-        .values
-        .get("sum_price")
-        .unwrap()
-        .as_f64()
-        .unwrap();
+    let sum_price = mv_records[0].get("sum_price").unwrap().as_f64().unwrap();
     assert!((sum_price - 1.0).abs() < 0.001);
 
     // sum_price_sq = 0.25 + 0.25 = 0.5
-    let sum_price_sq = mv_records[0]
-        .values
-        .get("sum_price_sq")
-        .unwrap()
-        .as_f64()
-        .unwrap();
+    let sum_price_sq = mv_records[0].get("sum_price_sq").unwrap().as_f64().unwrap();
     assert!((sum_price_sq - 0.5).abs() < 0.001);
 }
 
@@ -111,16 +93,16 @@ fn market_stats_different_prices() {
     .unwrap();
     let mv = batch.records_for("token_summary").first().unwrap();
 
-    let last_price = mv.values.get("last_price").unwrap().as_f64().unwrap();
+    let last_price = mv.get("last_price").unwrap().as_f64().unwrap();
     assert!((last_price - 0.6).abs() < 0.001);
 
     // sum_price = 0.4 + 0.6 = 1.0, mean = 0.5
-    let sum_price = mv.values.get("sum_price").unwrap().as_f64().unwrap();
+    let sum_price = mv.get("sum_price").unwrap().as_f64().unwrap();
     assert!((sum_price - 1.0).abs() < 0.001);
 
     // sum_price_sq = 0.16 + 0.36 = 0.52
     // variance = 0.52/2 - 0.5^2 = 0.26 - 0.25 = 0.01, stddev = 0.1
-    let sum_price_sq = mv.values.get("sum_price_sq").unwrap().as_f64().unwrap();
+    let sum_price_sq = mv.get("sum_price_sq").unwrap().as_f64().unwrap();
     assert!((sum_price_sq - 0.52).abs() < 0.001);
 }
 
@@ -220,22 +202,22 @@ fn insider_detected_with_full_fields() {
 
     assert_eq!(insider_records.len(), 1);
     let rec = &insider_records[0];
-    assert_eq!(rec.values.get("trade_count"), Some(&Value::UInt64(1)));
+    assert_eq!(rec.get("trade_count"), Some(&Value::UInt64(1)));
 
     // sum_price should be the price (0.5)
-    let sum_price = rec.values.get("sum_price").unwrap().as_f64().unwrap();
+    let sum_price = rec.get("sum_price").unwrap().as_f64().unwrap();
     assert!((sum_price - 0.5).abs() < 0.001);
 
     // sum_price_sq = 0.25
-    let sum_price_sq = rec.values.get("sum_price_sq").unwrap().as_f64().unwrap();
+    let sum_price_sq = rec.get("sum_price_sq").unwrap().as_f64().unwrap();
     assert!((sum_price_sq - 0.25).abs() < 0.001);
 
     // first_seen = last_seen = 1000
-    assert_eq!(rec.values.get("first_seen"), Some(&Value::Int64(1000)));
-    assert_eq!(rec.values.get("last_seen"), Some(&Value::Int64(1000)));
+    assert_eq!(rec.get("first_seen"), Some(&Value::Int64(1000)));
+    assert_eq!(rec.get("last_seen"), Some(&Value::Int64(1000)));
 
     // detected_at = 1000
-    assert_eq!(rec.values.get("detected_at"), Some(&Value::Int64(1000)));
+    assert_eq!(rec.get("detected_at"), Some(&Value::Int64(1000)));
 }
 
 #[test]
@@ -264,13 +246,13 @@ fn insider_accumulates_across_orders_in_window() {
 
     let total_count: u64 = insider_records
         .iter()
-        .map(|r| r.values.get("trade_count").unwrap().as_u64().unwrap())
+        .map(|r| r.get("trade_count").unwrap().as_u64().unwrap())
         .sum();
     assert_eq!(total_count, 2); // one emit per token
 
     // Both should have detected_at = 1100 (timestamp when threshold was crossed)
     for rec in &insider_records {
-        let detected_at = rec.values.get("detected_at").unwrap().as_f64().unwrap();
+        let detected_at = rec.get("detected_at").unwrap().as_f64().unwrap();
         assert!((detected_at - 1100.0).abs() < 0.001);
     }
 }
@@ -320,28 +302,17 @@ fn insider_subsequent_orders_emit_with_timestamps() {
     let token_b_rec = insider_records
         .iter()
         .find(|r| {
-            r.key
-                .get("asset_id")
+            r.key("asset_id")
                 .map_or(false, |v| v == &Value::String("token_b".into()))
         })
         .expect("should have token_b record");
 
     // first_seen = last_seen = 2000 (only one order on this token)
-    let first_seen = token_b_rec
-        .values
-        .get("first_seen")
-        .unwrap()
-        .as_f64()
-        .unwrap();
+    let first_seen = token_b_rec.get("first_seen").unwrap().as_f64().unwrap();
     assert!((first_seen - 2000.0).abs() < 0.001);
 
     // detected_at = 2000 (path 2: known insider, detected_at = order timestamp)
-    let detected_at = token_b_rec
-        .values
-        .get("detected_at")
-        .unwrap()
-        .as_f64()
-        .unwrap();
+    let detected_at = token_b_rec.get("detected_at").unwrap().as_f64().unwrap();
     assert!((detected_at - 2000.0).abs() < 0.001);
 }
 
@@ -525,17 +496,9 @@ fn market_stats_rollback() {
     assert_eq!(mv_records.len(), 1);
     assert_eq!(mv_records[0].operation, ChangeOp::Update);
     // Only 1 trade left
-    assert_eq!(
-        mv_records[0].values.get("trade_count"),
-        Some(&Value::UInt64(1))
-    );
+    assert_eq!(mv_records[0].get("trade_count"), Some(&Value::UInt64(1)));
     // last_price should be the remaining trade's price (0.5)
-    let last_price = mv_records[0]
-        .values
-        .get("last_price")
-        .unwrap()
-        .as_f64()
-        .unwrap();
+    let last_price = mv_records[0].get("last_price").unwrap().as_f64().unwrap();
     assert!((last_price - 0.5).abs() < 0.001);
 }
 
@@ -570,28 +533,20 @@ fn full_pipeline_both_reducers() {
     // token_summary should have 3 trades for token_a
     let token_records: Vec<_> = batch.records_for("token_summary").iter().collect();
     assert_eq!(token_records.len(), 1);
-    assert_eq!(
-        token_records[0].values.get("trade_count"),
-        Some(&Value::UInt64(3))
-    );
+    assert_eq!(token_records[0].get("trade_count"), Some(&Value::UInt64(3)));
     // All three trades have price=0.5, so sum_price=1.5, sum_price_sq=0.75
-    let sum_price = token_records[0]
-        .values
-        .get("sum_price")
-        .unwrap()
-        .as_f64()
-        .unwrap();
+    let sum_price = token_records[0].get("sum_price").unwrap().as_f64().unwrap();
     assert!((sum_price - 1.5).abs() < 0.001);
 
     // insider_positions should have 1 entry (only insider_1 exceeded threshold)
     let insider_records: Vec<_> = batch.records_for("insider_positions").iter().collect();
     assert_eq!(insider_records.len(), 1);
     // Verify it has all required fields
-    assert!(insider_records[0].values.contains_key("sum_price"));
-    assert!(insider_records[0].values.contains_key("sum_price_sq"));
-    assert!(insider_records[0].values.contains_key("first_seen"));
-    assert!(insider_records[0].values.contains_key("last_seen"));
-    assert!(insider_records[0].values.contains_key("detected_at"));
+    assert!(insider_records[0].values_map().contains_key("sum_price"));
+    assert!(insider_records[0].values_map().contains_key("sum_price_sq"));
+    assert!(insider_records[0].values_map().contains_key("first_seen"));
+    assert!(insider_records[0].values_map().contains_key("last_seen"));
+    assert!(insider_records[0].values_map().contains_key("detected_at"));
 }
 
 // ── Tests ported from polygains-main reference implementation ───────
@@ -687,7 +642,7 @@ fn price_filter_high_vs_low_in_same_batch() {
     // Only low_price_trader should appear
     assert_eq!(insider_records.len(), 1);
     assert_eq!(
-        insider_records[0].key.get("trader"),
+        insider_records[0].key("trader"),
         Some(&Value::String("low_price_trader".into()))
     );
 }
@@ -727,21 +682,21 @@ fn market_stats_both_sides_multiple_tokens_with_derivation() {
 
     let yes = mv_records
         .iter()
-        .find(|r| r.key.get("asset_id") == Some(&Value::String("yes_token".into())))
+        .find(|r| r.key("asset_id") == Some(&Value::String("yes_token".into())))
         .expect("should have yes_token record");
     let no = mv_records
         .iter()
-        .find(|r| r.key.get("asset_id") == Some(&Value::String("no_token".into())))
+        .find(|r| r.key("asset_id") == Some(&Value::String("no_token".into())))
         .expect("should have no_token record");
 
     // YES token: 2 trades
-    assert_eq!(yes.values.get("trade_count"), Some(&Value::UInt64(2)));
+    assert_eq!(yes.get("trade_count"), Some(&Value::UInt64(2)));
     // NO token: 2 trades
-    assert_eq!(no.values.get("trade_count"), Some(&Value::UInt64(2)));
+    assert_eq!(no.get("trade_count"), Some(&Value::UInt64(2)));
 
     // YES token: mean = (0.35 + 0.42) / 2 = 0.385
-    let yes_sum_price = yes.values.get("sum_price").unwrap().as_f64().unwrap();
-    let yes_count = yes.values.get("trade_count").unwrap().as_u64().unwrap() as f64;
+    let yes_sum_price = yes.get("sum_price").unwrap().as_f64().unwrap();
+    let yes_count = yes.get("trade_count").unwrap().as_u64().unwrap() as f64;
     let yes_mean = yes_sum_price / yes_count;
     assert!(
         (yes_mean - 0.385).abs() < 0.001,
@@ -750,7 +705,7 @@ fn market_stats_both_sides_multiple_tokens_with_derivation() {
     );
 
     // YES token: stddev = sqrt(sum_price_sq/n - mean^2)
-    let yes_sum_price_sq = yes.values.get("sum_price_sq").unwrap().as_f64().unwrap();
+    let yes_sum_price_sq = yes.get("sum_price_sq").unwrap().as_f64().unwrap();
     let yes_variance = yes_sum_price_sq / yes_count - yes_mean * yes_mean;
     let yes_stddev = yes_variance.sqrt();
     assert!(
@@ -766,8 +721,8 @@ fn market_stats_both_sides_multiple_tokens_with_derivation() {
     );
 
     // NO token: mean = (0.96 + 0.91) / 2 = 0.935
-    let no_sum_price = no.values.get("sum_price").unwrap().as_f64().unwrap();
-    let no_count = no.values.get("trade_count").unwrap().as_u64().unwrap() as f64;
+    let no_sum_price = no.get("sum_price").unwrap().as_f64().unwrap();
+    let no_count = no.get("trade_count").unwrap().as_u64().unwrap() as f64;
     let no_mean = no_sum_price / no_count;
     assert!(
         (no_mean - 0.935).abs() < 0.001,
@@ -776,7 +731,7 @@ fn market_stats_both_sides_multiple_tokens_with_derivation() {
     );
 
     // NO token: stddev
-    let no_sum_price_sq = no.values.get("sum_price_sq").unwrap().as_f64().unwrap();
+    let no_sum_price_sq = no.get("sum_price_sq").unwrap().as_f64().unwrap();
     let no_variance = no_sum_price_sq / no_count - no_mean * no_mean;
     let no_stddev = no_variance.sqrt();
     assert!(
@@ -846,7 +801,7 @@ fn multiple_insiders_same_block() {
 
     let traders: Vec<&str> = insider_records
         .iter()
-        .map(|r| r.key.get("trader").unwrap().as_str().unwrap())
+        .map(|r| r.key("trader").unwrap().as_str().unwrap())
         .collect();
     assert!(traders.contains(&"whale_a"));
     assert!(traders.contains(&"whale_b"));
@@ -1002,10 +957,10 @@ fn multi_block_rollback() {
         .expect("should have token_summary after rollback");
 
     // Only 1 trade remains (from block 1000)
-    assert_eq!(mv.values.get("trade_count"), Some(&Value::UInt64(1)));
+    assert_eq!(mv.get("trade_count"), Some(&Value::UInt64(1)));
 
     // Volume: 100_000_000 / 1_000_000 = 100.0
-    let total_vol = mv.values.get("total_volume").unwrap().as_f64().unwrap();
+    let total_vol = mv.get("total_volume").unwrap().as_f64().unwrap();
     assert!((total_vol - 100.0).abs() < 0.001);
 }
 
@@ -1067,10 +1022,7 @@ fn insider_multi_block_subsequent_orders() {
     // token_a should get an Update (trade_count goes from 1 to 2)
     let token_a = insider_records
         .iter()
-        .find(|r| r.key.get("asset_id") == Some(&Value::String("token_a".into())));
+        .find(|r| r.key("asset_id") == Some(&Value::String("token_a".into())));
     assert!(token_a.is_some(), "token_a should have an updated position");
-    assert_eq!(
-        token_a.unwrap().values.get("trade_count"),
-        Some(&Value::UInt64(2))
-    );
+    assert_eq!(token_a.unwrap().get("trade_count"), Some(&Value::UInt64(2)));
 }

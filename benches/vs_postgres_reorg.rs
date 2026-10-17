@@ -450,9 +450,8 @@ fn apply_batch_noninvertible(
 ) {
     for rec in batch.records_for(mv) {
         let asset = rec
-            .key
-            .get("asset_id")
-            .or_else(|| rec.values.get("asset_id"))
+            .key("asset_id")
+            .or_else(|| rec.get("asset_id"))
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
@@ -461,13 +460,9 @@ fn apply_batch_noninvertible(
                 mirror.remove(&asset);
             }
             ChangeOp::Insert | ChangeOp::Update => {
-                let hi = rec.values.get("hi").and_then(|v| v.as_f64()).unwrap();
-                let lo = rec.values.get("lo").and_then(|v| v.as_f64()).unwrap();
-                let last = rec
-                    .values
-                    .get("last_price")
-                    .and_then(|v| v.as_f64())
-                    .unwrap();
+                let hi = rec.get("hi").and_then(|v| v.as_f64()).unwrap();
+                let lo = rec.get("lo").and_then(|v| v.as_f64()).unwrap();
+                let last = rec.get("last_price").and_then(|v| v.as_f64()).unwrap();
                 mirror.insert(asset, (hi, lo, last));
             }
         }
@@ -478,9 +473,8 @@ fn apply_batch_noninvertible(
 fn apply_batch_additive(mirror: &mut HashMap<String, (f64, i64)>, batch: &ChangeBatch, mv: &str) {
     for rec in batch.records_for(mv) {
         let asset = rec
-            .key
-            .get("asset_id")
-            .or_else(|| rec.values.get("asset_id"))
+            .key("asset_id")
+            .or_else(|| rec.get("asset_id"))
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
@@ -489,8 +483,8 @@ fn apply_batch_additive(mirror: &mut HashMap<String, (f64, i64)>, batch: &Change
                 mirror.remove(&asset);
             }
             ChangeOp::Insert | ChangeOp::Update => {
-                let vol = rec.values.get("volume").and_then(|v| v.as_f64()).unwrap();
-                let cnt = rec.values.get("cnt").and_then(|v| v.as_i64()).unwrap();
+                let vol = rec.get("volume").and_then(|v| v.as_f64()).unwrap();
+                let cnt = rec.get("cnt").and_then(|v| v.as_i64()).unwrap();
                 mirror.insert(asset, (vol, cnt));
             }
         }
