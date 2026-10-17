@@ -1,5 +1,6 @@
 use super::test_helpers::*;
 use super::*;
+use crate::test_helpers::cursor;
 use crate::types::{BlockCursor, ChangeOp, Value};
 use std::collections::HashMap;
 
@@ -370,20 +371,20 @@ fn crash_recovery_replays_unfinalized_blocks() {
             rollback_chain: vec![
                 BlockCursor {
                     number: 1000,
-                    hash: "0xa".into(),
+                    hash: crate::test_helpers::block_hash(1000),
                 },
                 BlockCursor {
                     number: 1001,
-                    hash: "0xb".into(),
+                    hash: crate::test_helpers::block_hash(1001),
                 },
                 BlockCursor {
                     number: 1002,
-                    hash: "0xc".into(),
+                    hash: crate::test_helpers::block_hash(1002),
                 },
             ],
             finalized_head: BlockCursor {
                 number: 1000,
-                hash: "0xa".into(),
+                hash: crate::test_helpers::block_hash(1000),
             },
         })
         .unwrap();
@@ -491,8 +492,8 @@ fn resolve_fork_cursor_finds_common_ancestor() {
 
 #[test]
 fn ingest_auto_rollback_on_fork() {
-    // Verify that ingest() automatically rolls back when rollback_chain shrinks.
-    // This tests the fork detection path in ingest().
+    // Verify that ingest() automatically rolls back when the rollback chain
+    // holds a new hash for an ingested block.
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
     // Ingest blocks 1 and 2. Block 2 is unfinalized (finalizedHead = 1).
@@ -531,14 +532,20 @@ fn ingest_auto_rollback_on_fork() {
 
     assert_eq!(db.latest_block(), 2);
 
-    // Rollback: send ingest with rollback_chain that omits block 2.
+    // Rollback: send ingest with a new hash for block 2.
     // ingest() must detect the fork and roll back to block 1.
     let batch = ingest_input(&mut db, IngestInput {
             data: std::collections::HashMap::new(),
-            rollback_chain: vec![BlockCursor {
-                number: 1,
-                hash: "0x1".into(),
-            }],
+            rollback_chain: vec![
+                BlockCursor {
+                    number: 2,
+                    hash: "0x2b".into(),
+                },
+                BlockCursor {
+                    number: 1,
+                    hash: "0x1".into(),
+                },
+            ],
             finalized_head: BlockCursor {
                 number: 1,
                 hash: "0x1".into(),
@@ -986,4 +993,103 @@ fn checkpoint_persists_mv_group_finalized_during_deferral() {
         .unwrap();
     let eth = record_for(&batch, "pool_volume", "pool", "ETH");
     assert_eq!(eth.get("total_volume"), Some(&Value::Float64(20.0)));
+}
+
+/// Swaps of pool ETH, one per block, with block hashes from `cursor` unless
+/// the chain says otherwise.
+fn eth_swaps(
+    blocks: &[(BlockNumber, f64)],
+    rollback_chain: Vec<BlockCursor>,
+    finalized_head: BlockCursor,
+) -> IngestInput {
+    let rows = blocks
+        .iter()
+        .map(|&(block, amount)| {
+            let mut row = make_swap("ETH", amount);
+            row.insert("block_number".into(), Value::UInt64(block));
+            row
+        })
+        .collect();
+    IngestInput {
+        data: HashMap::from([("swaps".to_string(), rows)]),
+        rollback_chain,
+        finalized_head,
+    }
+}
+
+fn eth_volume(batch: &ChangeBatch) -> Option<Value> {
+    batch
+        .records_for("pool_volume")
+        .iter()
+        .find(|r| r.key("pool") == Some(&Value::String("ETH".into())))
+        .and_then(|r| r.get("total_volume").cloned())
+}
+
+fn new_hash(number: BlockNumber) -> BlockCursor {
+    BlockCursor {
+        number,
+        hash: format!("0xnew{number}"),
+    }
+}
+
+/// A chain that leaves out ingested blocks shows no fork: blocks sent with
+/// no rollback chain all count, also after a heartbeat whose finality is
+/// below the latest block.
+#[test]
+fn ingest_without_rollback_chain_keeps_earlier_blocks() {
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+
+    for block in [1, 2] {
+        ingest_input(&mut db, eth_swaps(&[(block, 10.0)], vec![], cursor(0))).unwrap();
+    }
+    let heartbeat = ingest_input(&mut db, eth_swaps(&[], vec![], cursor(0))).unwrap();
+    assert!(heartbeat.is_none());
+    assert_eq!(db.latest_block(), 2);
+
+    let batch = ingest_input(&mut db, eth_swaps(&[(3, 10.0)], vec![], cursor(0)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(eth_volume(&batch), Some(Value::Float64(30.0)));
+}
+
+/// A chain that extends past the latest block but holds a new hash for an
+/// ingested block shows a fork there. The ingest rolls back the old block,
+/// so its data does not stay under the new hash.
+#[test]
+fn advancing_chain_with_a_new_hash_rolls_back_the_old_block() {
+    for new_blocks in [&[(2, 20.0), (3, 30.0)][..], &[(3, 30.0)]] {
+        let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+        let old = eth_swaps(&[(1, 10.0), (2, 100.0)], vec![cursor(1), cursor(2)], cursor(0));
+        ingest_input(&mut db, old).unwrap();
+
+        let chain = vec![cursor(1), new_hash(2), new_hash(3)];
+        let batch = ingest_input(&mut db, eth_swaps(new_blocks, chain, cursor(0)))
+            .unwrap()
+            .unwrap();
+        let expected = 10.0 + new_blocks.iter().map(|&(_, amount)| amount).sum::<f64>();
+        assert_eq!(eth_volume(&batch), Some(Value::Float64(expected)), "{new_blocks:?}");
+
+        // The old hash of block 2 is no common ancestor.
+        let fork = handle_fork(&mut db, vec![cursor(2), cursor(1)]).unwrap();
+        assert_eq!(fork.cursor, cursor(1), "{new_blocks:?}");
+    }
+}
+
+/// A new hash for a finalized block is a fork that no rollback may follow.
+/// The ingest fails and changes nothing.
+#[test]
+fn new_hash_for_a_finalized_block_is_rejected() {
+    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    ingest_input(&mut db, eth_swaps(&[(1, 10.0), (2, 10.0)], vec![cursor(2)], cursor(1))).unwrap();
+
+    let err = db
+        .ingest(eth_swaps(&[(3, 10.0)], vec![cursor(3)], new_hash(1)))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidOperation(_)), "{err}");
+    assert_eq!(db.latest_cursor(), Some(cursor(2)));
+
+    let batch = ingest_input(&mut db, eth_swaps(&[(3, 10.0)], vec![cursor(3)], cursor(1)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(eth_volume(&batch), Some(Value::Float64(30.0)));
 }

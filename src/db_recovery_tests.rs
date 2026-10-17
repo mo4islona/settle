@@ -467,35 +467,32 @@ fn reopen_of_empty_database_keeps_block_zero() {
 
 /// Versions before the durable watermark stored latest 0 for an empty
 /// database, and their finality even when it is above the latest block. A
-/// block at or below such a watermark must still be persisted.
+/// block at or below such a watermark must still be persisted. Such a
+/// database has no format version, so open refuses it; a stored latest
+/// block 0 is block 0, and a new block 0 is a duplicate.
 #[test]
 fn legacy_watermark_without_data_does_not_hide_new_blocks() {
-    for (stored_finalized, first) in [(0u64, 0), (100, 0), (100, 7)] {
-        let storage = Arc::new(MemoryBackend::new());
-        let mut legacy = StorageWriteBatch::new();
-        legacy.put_meta("format_version", &crate::storage::format::FORMAT_VERSION.to_be_bytes());
-        legacy.put_meta(META_LATEST_BLOCK, &0u64.to_be_bytes());
-        legacy.put_meta(META_FINALIZED_BLOCK, &stored_finalized.to_be_bytes());
-        storage.commit(&legacy).unwrap();
+    let (stored_finalized, first) = (100u64, 7);
+    let storage = Arc::new(MemoryBackend::new());
+    let mut legacy = StorageWriteBatch::new();
+    legacy.put_meta("format_version", &crate::storage::format::FORMAT_VERSION.to_be_bytes());
+    legacy.put_meta(META_LATEST_BLOCK, &0u64.to_be_bytes());
+    legacy.put_meta(META_FINALIZED_BLOCK, &stored_finalized.to_be_bytes());
+    storage.commit(&legacy).unwrap();
 
-        {
-            let mut db = reopen(SUM_SCHEMA, &storage, 1);
-            let rows = vec![("swaps".into(), first, vec![swap(first, "ETH", 10)])];
-            ingest_with_finalized(&mut db, rows, stored_finalized).unwrap();
-        }
-
+    {
         let mut db = reopen(SUM_SCHEMA, &storage, 1);
-        let next = stored_finalized + 1;
-        let batch =
-            ingest_with_finalized(&mut db, vec![("swaps".into(), next, vec![swap(next, "ETH", 10)])], next)
-                .unwrap()
-                .unwrap();
-        assert_eq!(
-            total(&batch, "pool_volume", "ETH"),
-            Value::UInt64(20),
-            "stored finality {stored_finalized}, first block {first}"
-        );
+        let rows = vec![("swaps".into(), first, vec![swap(first, "ETH", 10)])];
+        ingest_with_finalized(&mut db, rows, stored_finalized).unwrap();
     }
+
+    let mut db = reopen(SUM_SCHEMA, &storage, 1);
+    let next = stored_finalized + 1;
+    let batch =
+        ingest_with_finalized(&mut db, vec![("swaps".into(), next, vec![swap(next, "ETH", 10)])], next)
+            .unwrap()
+            .unwrap();
+    assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(20));
 }
 
 /// The same for a legacy database with data: finality stored above its
@@ -1347,5 +1344,102 @@ fn random_short_pipelined_histories() {
     for seed in 0..3000 {
         check_pipelined_history(SUM_SCHEMA, 1, 2, seed, 10);
         check_pipelined_history(REDUCER_SCHEMA, 3, 3, seed, 10);
+    }
+}
+
+type Corruption = fn(Vec<u8>) -> Vec<u8>;
+
+/// Ways to damage a stored record: each leaves bytes that no codec wrote.
+const CORRUPTIONS: [(&str, Corruption); 4] = [
+    ("truncated", |mut r| {
+        r.pop();
+        r
+    }),
+    ("trailing byte", |mut r| {
+        r.push(0);
+        r
+    }),
+    ("garbage", |_| vec![0xff]),
+    ("empty", |_| Vec::new()),
+];
+
+/// Block 1 of pool ETH, final and so stored, in a database that then closes.
+fn stored_block_one(schema: &str) -> Arc<MemoryBackend> {
+    let storage = Arc::new(MemoryBackend::new());
+    let mut db = reopen(schema, &storage, 1);
+    ingest_with_finalized(&mut db, vec![("swaps".into(), 1, vec![swap(1, "ETH", 10)])], 1)
+        .unwrap();
+    storage
+}
+
+fn overwrite_mv_state(storage: &MemoryBackend, view: &str, key: Vec<u8>, record: Vec<u8>) {
+    let mut batch = StorageWriteBatch::new();
+    batch.put_mv_state(view, key, record);
+    storage.commit(&batch).unwrap();
+}
+
+fn assert_open_fails(schema: &str, storage: &Arc<MemoryBackend>, case: &str) {
+    let opened = Settle::open(Config::new(schema).storage(storage.clone()));
+    assert!(
+        matches!(opened, Err(Error::Storage(_))),
+        "{case}: {:?}",
+        opened.err()
+    );
+}
+
+/// A view whose stored state it cannot read must fail the open. A reopen
+/// that skipped the state would lose finalized aggregates, and replay starts
+/// above them, so it cannot rebuild them.
+#[test]
+fn unreadable_mv_state_fails_open() {
+    let eth = crate::storage::encode_group_key(&[Value::String("ETH".into())]);
+    let block_one = 1u64.to_be_bytes().to_vec();
+    let views = [
+        (SUM_SCHEMA, "pool_volume", eth),
+        (SLIDING_SCHEMA, "pool_1h", block_one),
+    ];
+
+    for (schema, view, key) in views {
+        let fewer_aggregates: Corruption = |mut r| {
+            r[0] -= 1;
+            r
+        };
+        let corruptions = CORRUPTIONS.iter().copied().chain([("aggregate count", fewer_aggregates)]);
+        for (name, corrupt) in corruptions {
+            // The window record starts with its time, not an aggregate count.
+            if view == "pool_1h" && name == "aggregate count" {
+                continue;
+            }
+            let storage = stored_block_one(schema);
+            let record = storage.get_mv_state(view, &key).unwrap().expect("stored state");
+            overwrite_mv_state(&storage, view, key.clone(), corrupt(record));
+            assert_open_fails(schema, &storage, &format!("{view}, {name}"));
+        }
+
+        let storage = stored_block_one(schema);
+        let record = storage.get_mv_state(view, &key).unwrap().unwrap();
+        overwrite_mv_state(&storage, view, vec![0xff, 0xff], record);
+        assert_open_fails(schema, &storage, &format!("{view}, unreadable key"));
+    }
+}
+
+/// The same for a reducer: it loads a stored state on the first row of the
+/// group, and that ingest must fail, not start from the default state.
+#[test]
+fn unreadable_reducer_state_fails_the_ingest() {
+    // A single String group key is stored as its bytes.
+    let key = b"ETH".to_vec();
+
+    for (name, corrupt) in CORRUPTIONS {
+        let storage = stored_block_one(REDUCER_SCHEMA);
+        let record = storage.get_reducer_finalized("running", &key).unwrap().expect("stored state");
+        let mut batch = StorageWriteBatch::new();
+        batch.set_reducer_finalized("running", key.clone(), corrupt(record));
+        storage.commit(&batch).unwrap();
+
+        let mut db = reopen(REDUCER_SCHEMA, &storage, 1);
+        let ingested =
+            ingest_with_finalized(&mut db, vec![("swaps".into(), 2, vec![swap(2, "ETH", 10)])], 1);
+        assert!(matches!(ingested, Err(Error::Storage(_))), "{name}: {:?}", ingested.err());
     }
 }

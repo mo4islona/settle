@@ -1,4 +1,4 @@
-import { decode, Encoder } from '@msgpack/msgpack'
+import { Decoder, Encoder } from '@msgpack/msgpack'
 import type { ReducerCtx } from './ddl'
 // Import from src/native/ directly — not copied to dist/ to avoid stale binaries
 import { Settle as NativeSettle } from '../src/native/native.js'
@@ -7,8 +7,37 @@ import {
   SettlePendingAckError,
   SettleWrongAckSequenceError,
 } from './errors'
+import { groupBatchCallback } from './reducer-callback'
 
 const encoder = new Encoder({ useBigInt64: true })
+const decoder = new Decoder({ useBigInt64: true })
+
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER)
+
+/**
+ * Decode a change batch. 64-bit integers decode as BigInt, so none loses
+ * precision; each one that a number holds exactly becomes a number again.
+ */
+function decodeBatch(buf: Uint8Array): ChangeBatch {
+  return toSafeNumbers(decoder.decode(buf)) as ChangeBatch
+}
+
+function toSafeNumbers(value: unknown): unknown {
+  if (typeof value === 'bigint') {
+    return value >= -MAX_SAFE && value <= MAX_SAFE ? Number(value) : value
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      value[i] = toSafeNumbers(value[i])
+    }
+  } else if (value !== null && typeof value === 'object' && !ArrayBuffer.isView(value)) {
+    const fields = value as Record<string, unknown>
+    for (const key in fields) {
+      fields[key] = toSafeNumbers(fields[key])
+    }
+  }
+  return value
+}
 
 // ─── Types ───────────────────────────────────────────────────────
 
@@ -41,6 +70,10 @@ export interface SettleCursor {
 
 export type ChangeOp = 'insert' | 'update' | 'delete'
 
+/**
+ * One changed row. An integer beyond `Number.MAX_SAFE_INTEGER` arrives as a
+ * `bigint`, so that it keeps every digit; smaller ones arrive as numbers.
+ */
 export interface ChangeRecord {
   table: string
   operation: ChangeOp
@@ -191,7 +224,7 @@ export class Settle implements ISettle {
     }
 
     const t1 = performance.now()
-    const batch = buf ? (decode(buf) as ChangeBatch) : null
+    const batch = buf ? decodeBatch(buf) : null
     const decodeMs = performance.now() - t1
 
     if (batch) {
@@ -219,7 +252,7 @@ export class Settle implements ISettle {
     } catch (e) {
       rethrowSettleError(e)
     }
-    const batch = result.batch ? (decode(result.batch) as ChangeBatch) : null
+    const batch = result.batch ? decodeBatch(result.batch) : null
     return { cursor: result.cursor, batch }
   }
 
@@ -266,29 +299,7 @@ export class Settle implements ISettle {
   ): void {
     const { reduce } = options
 
-    const batchFn = (groups: { state: TState; rows: TRow[] }[]) => {
-      return groups.map(({ state, rows }) => {
-        let s = state
-        const emits: any[] = []
-        const ctx = Object.create(null)
-        ctx.update = (newState: TState) => {
-          s = newState
-          for (const k of Object.keys(newState as any)) {
-            ctx[k] = (newState as any)[k]
-          }
-        }
-        ctx.emit = (row: TEmit) => {
-          if (row != null) emits.push(row)
-        }
-        for (const k of Object.keys(state as any)) {
-          ctx[k] = (state as any)[k]
-        }
-        for (const row of rows) {
-          reduce(ctx, row)
-        }
-        return { state: s, emits }
-      })
-    }
+    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce)
 
     try {
       this.#native.registerReducer(
@@ -309,29 +320,7 @@ export class Settle implements ISettle {
     name: string,
     reduce: (state: ReducerCtx<TState, TEmit>, row: TRow) => void,
   ): void {
-    const batchFn = (groups: { state: TState; rows: TRow[] }[]) => {
-      return groups.map(({ state, rows }) => {
-        let s = state
-        const emits: any[] = []
-        const ctx = Object.create(null)
-        ctx.update = (newState: TState) => {
-          s = newState
-          for (const k of Object.keys(newState as any)) {
-            ctx[k] = (newState as any)[k]
-          }
-        }
-        ctx.emit = (row: TEmit) => {
-          if (row != null) emits.push(row)
-        }
-        for (const k of Object.keys(state as any)) {
-          ctx[k] = (state as any)[k]
-        }
-        for (const row of rows) {
-          reduce(ctx, row)
-        }
-        return { state: s, emits }
-      })
-    }
+    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce)
 
     try {
       this.#native.registerReducerCallback(name, batchFn)

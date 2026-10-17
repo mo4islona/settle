@@ -191,3 +191,75 @@ describe('Web (WASM) Settle', () => {
     expect(alice?.values.running_total).toBe(150)
   })
 })
+
+describe('Web (WASM) external reducer output', () => {
+  it('keeps input order when a row emits nothing', async () => {
+    const db = Settle.open({
+      schema: `
+        CREATE TABLE events (block_number UInt64, user String, pool String, seq UInt64, keep UInt64);
+        CREATE REDUCER kept SOURCE events GROUP BY user STATE (n UInt64 DEFAULT 0) LANGUAGE EXTERNAL;
+        CREATE MATERIALIZED VIEW pool_seq AS
+        SELECT pool, first(seq) AS first_seq, last(seq) AS last_seq
+        FROM kept
+        GROUP BY pool;
+      `,
+    })
+    db.registerReducerCallback('kept', (state, row: any) => {
+      if (row.keep) state.emit({ pool: row.pool, seq: row.seq })
+    })
+
+    const batch = await db.ingest({
+      data: {
+        events: [
+          { block_number: 1, user: 'a', pool: 'P', seq: 1, keep: 0 },
+          { block_number: 1, user: 'b', pool: 'P', seq: 2, keep: 1 },
+          { block_number: 1, user: 'a', pool: 'P', seq: 3, keep: 1 },
+        ],
+      },
+      finalizedHead: { number: 0, hash: '0x0' },
+      rollbackChain: [{ number: 1, hash: '0x1' }],
+    })
+
+    const pool = batch!.tables.pool_seq[0]
+    expect(pool.values.first_seq).toBe(2)
+    expect(pool.values.last_seq).toBe(3)
+  })
+
+  it('keeps 64-bit integers exact', async () => {
+    const big = 9007199254740993n
+    const db = Settle.open({
+      schema: `
+        CREATE TABLE transfers (block_number UInt64, account String, amount UInt64);
+        CREATE REDUCER echo SOURCE transfers GROUP BY account STATE (n UInt64 DEFAULT 0) LANGUAGE EXTERNAL;
+        CREATE MATERIALIZED VIEW latest AS
+        SELECT account, last(amount) AS amount, last(doubled) AS doubled
+        FROM echo
+        GROUP BY account;
+      `,
+    })
+    const received: unknown[] = []
+    db.registerReducerCallback('echo', (state, row: any) => {
+      received.push(row.amount)
+      state.emit({ account: row.account, amount: row.amount, doubled: BigInt(row.amount) * 2n })
+    })
+
+    const batch = await db.ingest({
+      data: {
+        transfers: [
+          { block_number: 1, account: 'big', amount: big },
+          { block_number: 1, account: 'small', amount: 5 },
+        ],
+      },
+      finalizedHead: { number: 0, hash: '0x0' },
+      rollbackChain: [{ number: 1, hash: '0x1' }],
+    })
+
+    expect(received).toEqual([big, 5])
+    const latest = (account: string) =>
+      batch!.tables.latest.find((r) => r.key.account === account)!.values
+    expect(latest('big').amount).toBe(big)
+    expect(latest('big').doubled).toBe(2n * big)
+    expect(latest('small').amount).toBe(5)
+    expect(latest('small').doubled).toBe(10)
+  })
+})

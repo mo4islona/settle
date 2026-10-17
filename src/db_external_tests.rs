@@ -481,7 +481,7 @@ fn replay_reducer_catches_up_existing_external() {
 /// (not a FnReducer substitute) by installing a test context.
 ///
 /// This is the true NAPI code path: ExternalRuntime stays as the runtime
-/// throughout; `context_installed()` gates replay on the thread-local.
+/// throughout; `callback_installed()` gates replay on the thread-local.
 #[test]
 fn external_runtime_replay_uses_real_external_runtime() {
     use crate::reducer_runtime::GroupBatch;
@@ -493,7 +493,7 @@ fn external_runtime_replay_uses_real_external_runtime() {
     let pnl_batch_cb = || {
         |groups: &mut [GroupBatch]| {
             for group in groups.iter_mut() {
-                for row in &group.rows {
+                for (index, row) in group.rows.iter().enumerate() {
                     let side = row.get("side").and_then(|v| v.as_str()).unwrap_or("");
                     let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let price = row.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -536,7 +536,7 @@ fn external_runtime_replay_uses_real_external_runtime() {
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
                     emit.insert("position_size".into(), Value::Float64(new_qty));
-                    group.emits.push(emit);
+                    group.emits.push((index, emit));
                 }
             }
         }
@@ -605,7 +605,7 @@ fn external_runtime_replay_uses_real_external_runtime() {
         // Install test context (simulates JS callback registration in NAPI)
         let _ctx = install_test_context(pnl_batch_cb());
 
-        // replay_reducer must NOT skip: context_installed() returns true
+        // replay_reducer must NOT skip: callback_installed() returns true
         db.replay_reducer("pnl").unwrap();
 
         // Ingest block 1002 — MV output should incorporate all 3 blocks
@@ -649,5 +649,96 @@ fn external_runtime_replay_uses_real_external_runtime() {
             trade_count, 3,
             "ExternalRuntime replay: trade_count should be 3 (b1000+b1001+b1002), got {trade_count}"
         );
+    }
+}
+
+/// raw → `upstream` → external `counter` → view. The external reducer counts
+/// the rows of each pool; `upstream` passes the amount through.
+fn chained_schema(upstream_body: &str) -> String {
+    format!(
+        r#"
+        CREATE TABLE swaps (block_number UInt64, pool String, amount UInt64);
+
+        CREATE REDUCER upstream
+        SOURCE swaps
+        GROUP BY pool
+        STATE (n UInt64 DEFAULT 0)
+        {upstream_body}
+
+        CREATE REDUCER counter
+        SOURCE upstream
+        GROUP BY pool
+        STATE (n UInt64 DEFAULT 0)
+        LANGUAGE EXTERNAL;
+
+        CREATE MATERIALIZED VIEW pool_counts AS
+        SELECT pool, count() AS events, last(seen) AS seen
+        FROM counter
+        GROUP BY pool;
+        "#
+    )
+}
+
+/// The callback of every external reducer: count the rows of the group,
+/// and emit the count with the amount of the row.
+fn count_rows(groups: &mut [crate::reducer_runtime::GroupBatch]) {
+    for group in groups.iter_mut() {
+        for (index, row) in group.rows.iter().enumerate() {
+            let n = group.state.get("n").and_then(Value::as_u64).unwrap_or(0) + 1;
+            group.state.insert("n".into(), Value::UInt64(n));
+
+            let mut emit = HashMap::from([("seen".to_string(), Value::UInt64(n))]);
+            if let Some(amount) = row.get("amount") {
+                emit.insert("amount".into(), amount.clone());
+            }
+            group.emits.push((index, emit));
+        }
+    }
+}
+
+/// After a reopen, the callbacks replay the unfinalized blocks. The replay
+/// of `counter` must also run `upstream`, which produces its input, or the
+/// count restarts from the finalized state.
+#[test]
+fn chained_reducers_survive_reopen() {
+    use crate::reducer_runtime::external::install_test_context;
+    use crate::storage::memory::MemoryBackend;
+
+    let event_rules = "WHEN row.amount > 0 THEN EMIT amount = row.amount END;";
+    let external = "LANGUAGE EXTERNAL;";
+    let cases = [
+        (event_rules, &["counter"][..]),
+        (external, &["upstream", "counter"]),
+        (external, &["counter", "upstream"]),
+    ];
+
+    for (upstream_body, callbacks) in cases {
+        let schema = chained_schema(upstream_body);
+        let storage = Arc::new(MemoryBackend::new());
+        let block = |b: BlockNumber| {
+            let swap = HashMap::from([
+                ("pool".to_string(), Value::String("A".into())),
+                ("amount".to_string(), Value::UInt64(b)),
+            ]);
+            vec![("swaps".to_string(), b, vec![swap])]
+        };
+
+        {
+            let mut db = Settle::open(Config::new(schema.as_str()).storage(storage.clone())).unwrap();
+            let _ctx = install_test_context(count_rows);
+            ingest_with_finalized(&mut db, block(1), 0).unwrap();
+        }
+
+        let mut db = Settle::open(Config::new(schema.as_str()).storage(storage.clone())).unwrap();
+        let _ctx = install_test_context(count_rows);
+        for name in callbacks {
+            db.replay_reducer(name).unwrap();
+        }
+        let batch = ingest_with_finalized(&mut db, block(2), 0).unwrap().unwrap();
+
+        let pool = &batch.records_for("pool_counts")[0];
+        let case = format!("{upstream_body} {callbacks:?}");
+        assert_eq!(pool.get("events"), Some(&Value::UInt64(2)), "{case}");
+        assert_eq!(pool.get("seen"), Some(&Value::UInt64(2)), "{case}");
     }
 }

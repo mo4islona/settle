@@ -14,6 +14,40 @@ use crate::types::{Row, RowMap, Value};
 
 use super::{GroupBatch, ReducerRuntime};
 
+/// The largest integer that a JS number holds exactly: 2^53 - 1. Larger
+/// integers cross to JS as BigInt.
+#[cfg_attr(not(any(feature = "napi", feature = "wasm")), allow(dead_code))]
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+/// The value of a JS BigInt from its sign and its 64-bit words, least
+/// significant first: UInt64, Int64 or Uint256. None if none of them holds it.
+#[cfg_attr(not(any(feature = "napi", feature = "wasm")), allow(dead_code))]
+fn bigint_to_value(negative: bool, words: &[u64]) -> Option<Value> {
+    let len = words.iter().rposition(|&w| w != 0).map_or(0, |i| i + 1);
+    let words = &words[..len];
+
+    match (negative, words) {
+        (_, []) => Some(Value::UInt64(0)),
+        (false, &[w]) => Some(Value::UInt64(w)),
+        (true, &[w]) if w <= 1 << 63 => Some(Value::Int64((w as i64).wrapping_neg())),
+        (false, _) if words.len() <= 4 => {
+            let mut be = [0u8; 32];
+            for (i, w) in words.iter().enumerate() {
+                be[32 - 8 * (i + 1)..32 - 8 * i].copy_from_slice(&w.to_be_bytes());
+            }
+            Some(Value::Uint256(be))
+        }
+        _ => None,
+    }
+}
+
+/// The row of emit `index` from a callback that names no rows: emit n
+/// belongs to row n, and each emit past the rows to the last row.
+#[cfg_attr(not(any(feature = "napi", feature = "wasm")), allow(dead_code))]
+fn legacy_emit_row(index: usize, rows: usize) -> usize {
+    index.min(rows.saturating_sub(1))
+}
+
 // ─── Thread-local callback context (napi only) ────────────────────
 
 #[cfg(feature = "napi")]
@@ -27,7 +61,7 @@ mod napi_bridge {
     use crate::json_conv::value_to_json;
     use crate::types::{Row, Value};
 
-    use super::GroupBatch;
+    use super::{GroupBatch, MAX_SAFE_INTEGER, bigint_to_value, legacy_emit_row};
 
     /// Raw napi env + callback pointers. Stored in thread-local.
     /// We store raw pointers because napi::Ref<()> is not Clone.
@@ -35,6 +69,12 @@ mod napi_bridge {
         env: napi::Env,
         /// reducer_id → raw napi_ref (prevent GC)
         callbacks: HashMap<String, sys::napi_ref>,
+    }
+
+    impl ExternalContext {
+        pub(crate) fn has_callback(&self, reducer_id: &str) -> bool {
+            self.callbacks.contains_key(reducer_id)
+        }
     }
 
     thread_local! {
@@ -149,8 +189,14 @@ mod napi_bridge {
     fn value_to_napi(env: &napi::Env, val: &Value) -> napi::JsUnknown {
         match val {
             Value::Float64(f) => env.create_double(*f).unwrap().into_unknown(),
-            Value::UInt64(n) => env.create_double(*n as f64).unwrap().into_unknown(),
-            Value::Int64(n) => env.create_double(*n as f64).unwrap().into_unknown(),
+            Value::UInt64(n) if *n <= MAX_SAFE_INTEGER => {
+                env.create_double(*n as f64).unwrap().into_unknown()
+            }
+            Value::UInt64(n) => env.create_bigint_from_u64(*n).unwrap().into_unknown().unwrap(),
+            Value::Int64(n) if n.unsigned_abs() <= MAX_SAFE_INTEGER => {
+                env.create_double(*n as f64).unwrap().into_unknown()
+            }
+            Value::Int64(n) => env.create_bigint_from_i64(*n).unwrap().into_unknown().unwrap(),
             Value::String(s) => env.create_string(s).unwrap().into_unknown(),
             Value::Boolean(b) => env.get_boolean(*b).unwrap().into_unknown(),
             Value::Null => env.get_null().unwrap().into_unknown(),
@@ -180,17 +226,31 @@ mod napi_bridge {
                 .expect("result group missing 'state'");
             group.state = js_object_to_value_map(env, &js_state);
 
-            // Parse emits
             let js_emits: napi::JsObject = group_result
                 .get_named_property("emits")
                 .expect("result group missing 'emits'");
             let emits_len = js_emits.get_array_length().expect("emits must be an array");
+            let js_emit_rows: napi::JsUnknown = group_result
+                .get_named_property("emitRows")
+                .expect("failed to read 'emitRows'");
+            let emit_rows = match js_emit_rows.get_type().unwrap() {
+                napi::ValueType::Object => Some(js_emit_rows.coerce_to_object().unwrap()),
+                _ => None,
+            };
 
             for j in 0..emits_len {
                 let js_emit: napi::JsObject =
                     js_emits.get_element(j).expect("emit element missing");
                 let emit_map = js_object_to_value_map(env, &js_emit);
-                group.emits.push(emit_map);
+                let row = match &emit_rows {
+                    Some(rows) => rows
+                        .get_element::<napi::JsNumber>(j)
+                        .and_then(|n| n.get_uint32())
+                        .expect("'emitRows' must hold a row index per emit")
+                        as usize,
+                    None => legacy_emit_row(j as usize, group.rows.len()),
+                };
+                group.emits.push((row, emit_map));
             }
         }
     }
@@ -251,6 +311,14 @@ mod napi_bridge {
                     env.from_js_value(val).unwrap_or(serde_json::Value::Null);
                 Value::JSON(json)
             }
+            ValueType::BigInt => {
+                let mut big: napi::JsBigInt = unsafe { val.cast() };
+                let (negative, words) = big.get_words().unwrap();
+                bigint_to_value(negative, &words).unwrap_or_else(|| {
+                    let text = val.coerce_to_string().unwrap().into_utf8().unwrap();
+                    Value::String(text.as_str().unwrap().to_string())
+                })
+            }
             _ => Value::Null,
         }
     }
@@ -272,7 +340,7 @@ mod wasm_bridge {
     use crate::json_conv::value_to_json;
     use crate::types::{Row, Value};
 
-    use super::GroupBatch;
+    use super::{GroupBatch, MAX_SAFE_INTEGER, bigint_to_value, legacy_emit_row};
 
     thread_local! {
         pub(super) static WASM_CTX: RefCell<Option<HashMap<String, Function>>> = RefCell::new(None);
@@ -360,8 +428,10 @@ mod wasm_bridge {
     fn value_to_js(val: &Value) -> JsValue {
         match val {
             Value::Float64(f) => JsValue::from_f64(*f),
-            Value::UInt64(n) => JsValue::from_f64(*n as f64),
-            Value::Int64(n) => JsValue::from_f64(*n as f64),
+            Value::UInt64(n) if *n <= MAX_SAFE_INTEGER => JsValue::from_f64(*n as f64),
+            Value::UInt64(n) => js_sys::BigInt::from(*n).into(),
+            Value::Int64(n) if n.unsigned_abs() <= MAX_SAFE_INTEGER => JsValue::from_f64(*n as f64),
+            Value::Int64(n) => js_sys::BigInt::from(*n).into(),
             Value::String(s) => JsValue::from_str(s),
             Value::Boolean(b) => JsValue::from_bool(*b),
             Value::Null => JsValue::NULL,
@@ -386,10 +456,44 @@ mod wasm_bridge {
 
             let js_emits = js_sys::Reflect::get(&item_obj, &JsValue::from_str("emits")).unwrap();
             let emits_arr: js_sys::Array = js_emits.dyn_into().expect("emits must be an array");
+            let js_emit_rows =
+                js_sys::Reflect::get(&item_obj, &JsValue::from_str("emitRows")).unwrap();
+            let emit_rows: Option<js_sys::Array> = js_emit_rows.dyn_into().ok();
             for j in 0..emits_arr.length() {
-                group.emits.push(js_to_value_map(emits_arr.get(j)));
+                let row = match &emit_rows {
+                    Some(rows) => rows
+                        .get(j)
+                        .as_f64()
+                        .expect("'emitRows' must hold a row index per emit")
+                        as usize,
+                    None => legacy_emit_row(j as usize, group.rows.len()),
+                };
+                group.emits.push((row, js_to_value_map(emits_arr.get(j))));
             }
         }
+    }
+
+    /// A BigInt as UInt64, Int64 or Uint256, else as its decimal text.
+    fn bigint_value(big: &js_sys::BigInt) -> Value {
+        let decimal = || String::from(big.to_string(10).unwrap());
+        let Some(hex) = big.to_string(16).ok().map(String::from) else {
+            return Value::String(decimal());
+        };
+
+        let (negative, digits) = match hex.strip_prefix('-') {
+            Some(digits) => (true, digits),
+            None => (false, hex.as_str()),
+        };
+        // 64-bit words, least significant first.
+        let words: Option<Vec<u64>> = digits
+            .as_bytes()
+            .rchunks(16)
+            .map(|chunk| u64::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok())
+            .collect();
+
+        words
+            .and_then(|words| bigint_to_value(negative, &words))
+            .unwrap_or_else(|| Value::String(decimal()))
     }
 
     fn js_to_value_map(val: JsValue) -> HashMap<String, Value> {
@@ -423,6 +527,9 @@ mod wasm_bridge {
         }
         if let Some(s) = val.as_string() {
             return Value::String(s);
+        }
+        if let Some(big) = val.dyn_ref::<js_sys::BigInt>() {
+            return bigint_value(big);
         }
         match serde_wasm_bindgen::from_value::<serde_json::Value>(val) {
             Ok(json) => Value::JSON(json),
@@ -476,22 +583,31 @@ pub mod test_bridge {
 #[cfg(test)]
 pub use test_bridge::{TestContextGuard, install_test_context};
 
-/// Returns true when a JS (or test) callback context is installed on the
-/// current thread. Used by `replay_unfinalized` to decide whether to skip
-/// external reducers — false means "no host yet, skip to avoid panic".
-pub fn context_installed() -> bool {
+/// Whether the callback context on the current thread holds a callback for
+/// `reducer_id`. Replay skips an external reducer without one.
+pub fn callback_installed(reducer_id: &str) -> bool {
     #[cfg(feature = "napi")]
-    if napi_bridge::EXTERNAL_CTX.with(|cell| cell.borrow().is_some()) {
+    if napi_bridge::EXTERNAL_CTX.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|ctx| ctx.has_callback(reducer_id))
+    }) {
         return true;
     }
     #[cfg(feature = "wasm")]
-    if wasm_bridge::WASM_CTX.with(|cell| cell.borrow().is_some()) {
+    if wasm_bridge::WASM_CTX.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|callbacks| callbacks.contains_key(reducer_id))
+    }) {
         return true;
     }
+    // The test context is one callback for every reducer.
     #[cfg(test)]
     if test_bridge::TEST_CTX.with(|cell| cell.borrow().is_some()) {
         return true;
     }
+    let _ = reducer_id;
     false
 }
 
@@ -534,11 +650,17 @@ impl ReducerRuntime for ExternalRuntime {
         true
     }
 
-    fn needs_host_context(&self) -> bool {
-        true
+    fn missing_host_callback(&self) -> bool {
+        !callback_installed(&self.reducer_id)
     }
 
     fn process_grouped(&self, groups: &mut [GroupBatch]) -> crate::error::Result<()> {
+        if self.missing_host_callback() {
+            return Err(crate::error::Error::InvalidOperation(format!(
+                "external reducer '{}' has no callback: register it before the first ingest",
+                self.reducer_id
+            )));
+        }
         #[cfg(feature = "napi")]
         {
             napi_bridge::call_js_batch(&self.reducer_id, groups);
@@ -567,5 +689,36 @@ impl ReducerRuntime for ExternalRuntime {
         }
         #[allow(unreachable_code)]
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bigint_to_value_keeps_every_digit() {
+        assert_eq!(bigint_to_value(false, &[]), Some(Value::UInt64(0)));
+        assert_eq!(bigint_to_value(true, &[0, 0]), Some(Value::UInt64(0)));
+        assert_eq!(bigint_to_value(false, &[u64::MAX, 0]), Some(Value::UInt64(u64::MAX)));
+        assert_eq!(bigint_to_value(true, &[5]), Some(Value::Int64(-5)));
+        assert_eq!(bigint_to_value(true, &[1 << 63]), Some(Value::Int64(i64::MIN)));
+        assert_eq!(bigint_to_value(true, &[(1 << 63) + 1]), None);
+        assert_eq!(bigint_to_value(true, &[0, 1]), None);
+
+        let mut two_pow_64 = [0u8; 32];
+        two_pow_64[23] = 1;
+        assert_eq!(bigint_to_value(false, &[0, 1]), Some(Value::Uint256(two_pow_64)));
+        assert_eq!(
+            bigint_to_value(false, &[u64::MAX; 4]),
+            Some(Value::Uint256([0xff; 32]))
+        );
+        assert_eq!(bigint_to_value(false, &[0, 0, 0, 0, 1]), None);
+    }
+
+    #[test]
+    fn legacy_emit_rows_follow_the_rows() {
+        let rows: Vec<usize> = (0..4).map(|i| legacy_emit_row(i, 2)).collect();
+        assert_eq!(rows, [0, 1, 1, 1]);
     }
 }

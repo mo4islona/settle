@@ -178,8 +178,8 @@ pub trait AggregationFunc: Send + Sync {
     /// Used for crash-safe MV persistence — unfinalized blocks are replayed on recovery.
     fn write_finalized(&self, out: &mut Vec<u8>);
 
-    /// Deserialize from bytes.
-    fn from_bytes(bytes: &[u8]) -> Self
+    /// Deserialize from bytes: None if they are not a valid aggregate.
+    fn from_bytes(bytes: &[u8]) -> Option<Self>
     where
         Self: Sized;
 
@@ -456,10 +456,10 @@ impl AggregationFunc for SumAgg {
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut agg: Self = rmp_serde::from_slice(bytes).ok()?;
         agg.refold();
-        agg
+        Some(agg)
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -585,10 +585,10 @@ impl AggregationFunc for CountAgg {
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut agg: Self = rmp_serde::from_slice(bytes).ok()?;
         agg.refold();
-        agg
+        Some(agg)
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -724,10 +724,10 @@ impl AggregationFunc for MinAgg {
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut agg: Self = rmp_serde::from_slice(bytes).ok()?;
         agg.refold();
-        agg
+        Some(agg)
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -863,10 +863,10 @@ impl AggregationFunc for MaxAgg {
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut agg: Self = rmp_serde::from_slice(bytes).ok()?;
         agg.refold();
-        agg
+        Some(agg)
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -1030,10 +1030,10 @@ impl AggregationFunc for AvgAgg {
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut agg: Self = rmp_serde::from_slice(bytes).unwrap();
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut agg: Self = rmp_serde::from_slice(bytes).ok()?;
         agg.refold();
-        agg
+        Some(agg)
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -1130,8 +1130,8 @@ impl AggregationFunc for FirstAgg {
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
-        rmp_serde::from_slice(bytes).unwrap()
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        rmp_serde::from_slice(bytes).ok()
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -1220,8 +1220,8 @@ impl AggregationFunc for LastAgg {
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
-        rmp_serde::from_slice(bytes).unwrap()
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        rmp_serde::from_slice(bytes).ok()
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
@@ -1270,16 +1270,16 @@ pub fn create_agg(func: &AggFunc, column_type: &ColumnType) -> Box<dyn Aggregati
 }
 
 /// Restore a boxed aggregation function from persisted bytes.
-pub fn restore_agg(func: &AggFunc, bytes: &[u8]) -> Box<dyn AggregationFunc> {
-    match func {
-        AggFunc::Sum => Box::new(SumAgg::from_bytes(bytes)),
-        AggFunc::Count => Box::new(CountAgg::from_bytes(bytes)),
-        AggFunc::Min => Box::new(MinAgg::from_bytes(bytes)),
-        AggFunc::Max => Box::new(MaxAgg::from_bytes(bytes)),
-        AggFunc::Avg => Box::new(AvgAgg::from_bytes(bytes)),
-        AggFunc::First => Box::new(FirstAgg::from_bytes(bytes)),
-        AggFunc::Last => Box::new(LastAgg::from_bytes(bytes)),
-    }
+pub fn restore_agg(func: &AggFunc, bytes: &[u8]) -> Option<Box<dyn AggregationFunc>> {
+    Some(match func {
+        AggFunc::Sum => Box::new(SumAgg::from_bytes(bytes)?),
+        AggFunc::Count => Box::new(CountAgg::from_bytes(bytes)?),
+        AggFunc::Min => Box::new(MinAgg::from_bytes(bytes)?),
+        AggFunc::Max => Box::new(MaxAgg::from_bytes(bytes)?),
+        AggFunc::Avg => Box::new(AvgAgg::from_bytes(bytes)?),
+        AggFunc::First => Box::new(FirstAgg::from_bytes(bytes)?),
+        AggFunc::Last => Box::new(LastAgg::from_bytes(bytes)?),
+    })
 }
 
 #[cfg(test)]
@@ -1653,7 +1653,7 @@ mod tests {
         agg.finalize_up_to(100);
 
         let bytes = agg.to_bytes();
-        let restored = SumAgg::from_bytes(&bytes);
+        let restored = SumAgg::from_bytes(&bytes).unwrap();
         assert_eq!(restored.current_value(), agg.current_value());
     }
 
@@ -1664,7 +1664,7 @@ mod tests {
         agg.finalize_up_to(100);
 
         let bytes = agg.to_bytes();
-        let restored = FirstAgg::from_bytes(&bytes);
+        let restored = FirstAgg::from_bytes(&bytes).unwrap();
         assert_eq!(restored.current_value(), Value::String("hello".into()));
     }
 
@@ -1675,7 +1675,7 @@ mod tests {
         agg.add_block(101, &[Value::UInt64(99)]);
 
         let bytes = agg.to_bytes();
-        let restored = LastAgg::from_bytes(&bytes);
+        let restored = LastAgg::from_bytes(&bytes).unwrap();
         assert_eq!(restored.current_value(), Value::UInt64(99));
     }
 
@@ -2026,7 +2026,7 @@ mod tests {
                         }
                     }
                     _ => {
-                        agg = A::from_bytes(&agg.to_bytes());
+                        agg = A::from_bytes(&agg.to_bytes()).unwrap();
                     }
                 }
 
