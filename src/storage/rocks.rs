@@ -122,6 +122,12 @@ fn upper_bound(prefix: &[u8]) -> Vec<u8> {
 // Backend
 // ---------------------------------------------------------------------------
 
+/// Above this, RocksDB flushes the column families that hold the oldest WAL
+/// file. The default bound is 4× the memtable budget of all of them, and the
+/// column families with few writes (`meta`, `block_hash`) keep old WAL files
+/// alive: the WAL grows to gigabytes, and a reopen replays all of it.
+const MAX_TOTAL_WAL_SIZE: u64 = 256 << 20;
+
 /// RocksDB tuning options exposed via Config.
 #[derive(Debug, Default)]
 pub struct RocksDbConfig {
@@ -188,6 +194,7 @@ impl RocksDbBackend {
         let mut db_opts = make_opts();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        db_opts.set_max_total_wal_size(MAX_TOTAL_WAL_SIZE);
 
         let cfs = [CF_RAW, CF_REDUCER_SNAP, CF_REDUCER_FIN, CF_MV, CF_META, CF_BLOCK_HASH]
             .into_iter()
