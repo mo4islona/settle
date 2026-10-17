@@ -495,7 +495,7 @@ static NULL: Value = Value::Null;
 
 /// The column layout of the change records of one table. All records of a
 /// table share one schema, so a record holds only its values, by position.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ChangeSchema {
     table: String,
     key_columns: Box<[String]>,
