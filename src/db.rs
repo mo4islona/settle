@@ -30,8 +30,6 @@ pub struct Config {
     pub storage: Option<Arc<dyn StorageBackend>>,
     /// Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4".
     pub compression: Option<String>,
-    /// Disable RocksDB automatic background compactions.
-    pub disable_compaction: bool,
     /// Block cache size in bytes. None = RocksDB default, 0 = disable.
     pub cache_size: Option<usize>,
     /// How long an unacked pending batch may live before `ingest()` logs a
@@ -80,7 +78,6 @@ impl Config {
             data_dir: None,
             storage: None,
             compression: None,
-            disable_compaction: false,
             cache_size: None,
             ack_warning_threshold: Duration::from_secs(10),
             max_pending_batches: 2,
@@ -98,7 +95,6 @@ impl Config {
             data_dir: Some(data_dir.into()),
             storage: None,
             compression: None,
-            disable_compaction: false,
             cache_size: None,
             ack_warning_threshold: Duration::from_secs(10),
             max_pending_batches: 2,
@@ -146,12 +142,6 @@ impl Config {
     /// `"none" | "snappy" | "zstd" | "lz4"`.
     pub fn compression(mut self, algo: impl Into<String>) -> Self {
         self.compression = Some(algo.into());
-        self
-    }
-
-    /// Disable RocksDB background compaction.
-    pub fn disable_compaction(mut self, value: bool) -> Self {
-        self.disable_compaction = value;
         self
     }
 
@@ -371,7 +361,6 @@ impl Settle {
             {
                 let rocks_config = RocksDbConfig {
                     compression: config.compression.clone(),
-                    disable_compaction: config.disable_compaction,
                     cache_size: config.cache_size,
                 };
                 Arc::new(RocksDbBackend::open_with_config(_dir, &rocks_config)?)

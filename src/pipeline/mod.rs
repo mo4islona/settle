@@ -107,7 +107,6 @@ pub struct BuildOptions {
     pub max_buffer_size: Option<usize>,
     /// `"none"` | `"snappy"` | `"zstd"` | `"lz4"`.
     pub compression: Option<String>,
-    pub disable_compaction: bool,
     pub cache_size: Option<usize>,
 }
 
@@ -144,12 +143,6 @@ impl BuildOptions {
     /// `"none" | "snappy" | "zstd" | "lz4"`.
     pub fn compression(mut self, algo: impl Into<String>) -> Self {
         self.compression = Some(algo.into());
-        self
-    }
-
-    /// Disable RocksDB background compaction.
-    pub fn disable_compaction(mut self, value: bool) -> Self {
-        self.disable_compaction = value;
         self
     }
 
@@ -230,7 +223,6 @@ impl Pipeline {
         }
         config.data_dir = opts.data_dir;
         config.compression = opts.compression;
-        config.disable_compaction = opts.disable_compaction;
         config.cache_size = opts.cache_size;
 
         let mut db = Settle::open(config)?;
