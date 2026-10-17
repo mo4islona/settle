@@ -193,6 +193,31 @@ of allocated blocks). The wall clock with mimalloc does not show it: in
 alternating rounds: raw ingestion +18%, raw + MV +12%, full pipelines +10% to
 +18%, Polymarket +3% to +9%.
 
+### Positional reducer state and emits (2026-10-18)
+
+A reducer used to keep the state of each group as `HashMap<String, Value>` and
+return its emits as such maps, so the state fields, the emitted columns and the
+views on a reducer went by name. Now a group's state is a value per STATE field
+in schema order, emits go into an engine-owned buffer by column position, and
+the output of a reducer is positional rows, as raw tables already were.
+
+| Case | Before | After | Change |
+|---|---:|---:|---:|
+| `backfill event_rules` | 586M | 517M | −11.7% |
+| `backfill polymarket` (Lua) | 2,019M | 1,731M | −14.3% |
+| `tip event_rules` | 286M | 253M | −11.5% |
+| `tip polymarket` | 997M | 852M | −14.5% |
+| `msgpack_backfill polymarket` | 2,035M | 1,747M | −14.1% |
+| cases without a reducer | | | −0.8% to 0% |
+
+Wall clock, `throughput`, median of three alternating rounds: Rust closure
+(`FnReducerRuntime`) full pipeline +11% (Memory) / +3.5% (RocksDB) and
+reducer-only +18%, Lua +8% to +10%, EventRules +17% to +31%, Polymarket +18% to
++27%; cases without a reducer within noise. Through the napi binding
+(`spikes/runtime-spike.mjs`, 100 / 100K groups), µs per row: External JS
+−3.4% / −9.9%, Lua −4.6% / −9.5%, EventRules −13% / −12%. Most of the External
+cost is still the JS object marshal: 3.1 of 3.4 µs per row at 100 groups.
+
 Each case leaves its profiles under `target/gungraun/settle/instructions/ingest/<mode>.<workload>/`.
 `callgrind_annotate --inclusive=yes callgrind.<mode>.<workload>.out` shows where
 the instructions go; `dhat.<mode>.<workload>.out` opens in Valgrind's `dh_view.html`.
