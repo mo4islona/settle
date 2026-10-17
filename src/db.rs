@@ -277,7 +277,8 @@ fn recover_journal(storage: &dyn StorageBackend, applied: Option<u64>) -> Result
 }
 
 /// Whether the database holds data: every commit of an ingest or a fork
-/// writes one of these keys. Versions before format 2 wrote `block_hashes`.
+/// writes one of these keys. Versions before format versions wrote
+/// `block_hashes`.
 fn has_data(storage: &dyn StorageBackend) -> Result<bool> {
     for key in [
         META_LATEST_BLOCK,
