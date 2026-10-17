@@ -176,6 +176,15 @@ pub fn decode_table_rows_from_msgpack<'r>(
     Ok(data)
 }
 
+/// The most rows that a table reserves before it decodes them: 1 MiB.
+const MAX_PREALLOC_ROWS: usize = (1 << 20) / std::mem::size_of::<(Option<Value>, Row)>();
+
+/// The rows to reserve for a table whose array header claims `hint`: the
+/// header is input, not rows that exist.
+fn prealloc_rows(hint: Option<usize>) -> usize {
+    hint.unwrap_or(0).min(MAX_PREALLOC_ROWS)
+}
+
 enum DecodedTable {
     /// A table that `registry` does not know, with its row count.
     Unknown { rows: usize },
@@ -248,7 +257,7 @@ impl<'de> Visitor<'de> for TableSeed<'_> {
             return Ok(DecodedTable::Unknown { rows });
         };
 
-        let mut rows = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        let mut rows = Vec::with_capacity(prealloc_rows(seq.size_hint()));
         while let Some(row) = seq.next_element_seed(RowSeed { registry })? {
             rows.push(row);
         }
@@ -796,5 +805,25 @@ mod tests {
         );
         assert!(err(serde_json::json!({"swaps": [1]})).starts_with("invalid msgpack"));
         assert!(err(serde_json::json!([])).starts_with("invalid msgpack"));
+    }
+
+    #[test]
+    fn row_reservation_is_capped() {
+        assert_eq!(prealloc_rows(None), 0);
+        assert_eq!(prealloc_rows(Some(10)), 10);
+        assert_eq!(prealloc_rows(Some(u32::MAX as usize)), MAX_PREALLOC_ROWS);
+    }
+
+    /// An array header that claims more rows than the buffer holds is a
+    /// decode error, not a reservation of that many rows.
+    #[test]
+    fn decode_table_rows_with_a_false_row_count() {
+        let mut buf = vec![0x81, 0xa5];
+        buf.extend_from_slice(b"swaps");
+        buf.extend_from_slice(&[0xdd, 0xff, 0xff, 0xff, 0xff]);
+
+        let registry = Arc::new(ColumnRegistry::new(vec!["pool".into()]));
+        let err = decode_table_rows_from_msgpack(&buf, |_| Some(&registry)).unwrap_err();
+        assert!(err.starts_with("invalid msgpack"), "{err}");
     }
 }
