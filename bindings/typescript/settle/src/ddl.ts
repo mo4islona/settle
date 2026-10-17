@@ -1,4 +1,4 @@
-import type { ColumnType } from './column'
+import type { ColumnType, FromEngine } from './column'
 import type { StateFieldDef } from './settle'
 
 // ─── Duration parsing ────────────────────────────────────────────
@@ -97,7 +97,7 @@ export type GroupByItem = string | IntervalExpr
 
 // ─── Options types ───────────────────────────────────────────────
 
-export type ReducerCtx<TState, TEmit> = Readonly<TState> & {
+export type ReducerCtx<TState, TEmit> = Readonly<FromEngine<TState>> & {
   update(newState: TState): void
   emit(row: TEmit): void
 }

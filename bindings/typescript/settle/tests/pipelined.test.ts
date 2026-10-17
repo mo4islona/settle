@@ -12,8 +12,9 @@ import {
   SettleWrongAckSequenceError,
 } from '../src/index'
 import { Settle as WebSettle, init } from '../src/web'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 const SCHEMA = `
   CREATE TABLE events (
@@ -76,5 +77,25 @@ describe('pipelined acks', () => {
     const db = Settle.open({ schema: SCHEMA, maxPendingBatches: 1 })
     await db.ingest(block(1))
     await expect(db.ingest(block(2))).rejects.toBeInstanceOf(SettlePendingAckError)
+  })
+})
+
+describe('applied sequence', () => {
+  it('reaches the native open', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'settle-applied-'))
+    try {
+      const open = (appliedSequence: number) => () =>
+        Settle.open({ schema: SCHEMA, dataDir, appliedSequence })
+      expect(open(-1)).toThrow(/non-negative/)
+      // A new database has no batch that the target can have applied.
+      expect(open(3)).toThrow(/no record of batch 1/)
+
+      const db = Settle.open({ schema: SCHEMA, dataDir, appliedSequence: 0 })
+      const batch = await db.ingest(block(1))
+      db.ack(batch!.sequence)
+      expect(db.isAwaitingAck).toBe(false)
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true })
+    }
   })
 })

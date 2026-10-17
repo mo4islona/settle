@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use crate::error::Result;
 use crate::types::BlockNumber;
 
+use super::journal::JournalPart;
 use super::{BatchOp, StorageBackend, StorageWriteBatch};
 
 /// In-memory storage backend using BTreeMap. Suitable for testing and small datasets.
@@ -23,6 +24,8 @@ struct MemoryInner {
     /// meta:{key} -> value bytes
     meta: BTreeMap<String, Vec<u8>>,
     block_hashes: BTreeMap<BlockNumber, String>,
+    /// (sequence, part) -> journal entry
+    journal: BTreeMap<(u64, u64), Vec<u8>>,
 }
 
 impl MemoryBackend {
@@ -35,6 +38,7 @@ impl MemoryBackend {
                 mv_states: BTreeMap::new(),
                 meta: BTreeMap::new(),
                 block_hashes: BTreeMap::new(),
+                journal: BTreeMap::new(),
             }),
         }
     }
@@ -336,9 +340,32 @@ impl StorageBackend for MemoryBackend {
                 BatchOp::DeleteBlockHash { block } => {
                     inner.block_hashes.remove(block);
                 }
+                BatchOp::PutJournal {
+                    sequence,
+                    part,
+                    entry,
+                } => {
+                    inner.journal.insert((*sequence, *part), entry.clone());
+                }
+                BatchOp::DeleteJournal { sequence, part } => {
+                    inner.journal.remove(&(*sequence, *part));
+                }
             }
         }
         Ok(())
+    }
+
+    fn journal(&self) -> Result<Vec<JournalPart>> {
+        let inner = self.inner.lock().unwrap();
+        let parts = inner
+            .journal
+            .iter()
+            .map(|(&(sequence, part), entry)| JournalPart {
+                sequence,
+                part,
+                entry: entry.clone(),
+            });
+        Ok(parts.collect())
     }
 
     // --- Bulk operations ---

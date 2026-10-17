@@ -1,4 +1,5 @@
 pub mod format;
+pub mod journal;
 pub mod memory;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
@@ -9,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// An operation to be committed atomically as part of a WriteBatch.
+#[derive(Debug)]
 pub enum BatchOp {
     PutRawRows {
         table: String,
@@ -43,6 +45,16 @@ pub enum BatchOp {
     },
     DeleteBlockHash {
         block: BlockNumber,
+    },
+    /// See [`journal::JournalPart`].
+    PutJournal {
+        sequence: u64,
+        part: u64,
+        entry: Vec<u8>,
+    },
+    DeleteJournal {
+        sequence: u64,
+        part: u64,
     },
 }
 
@@ -112,6 +124,18 @@ impl StorageWriteBatch {
 
     pub fn delete_block_hash(&mut self, block: BlockNumber) {
         self.ops.push(BatchOp::DeleteBlockHash { block });
+    }
+
+    pub fn put_journal(&mut self, sequence: u64, part: u64, entry: Vec<u8>) {
+        self.ops.push(BatchOp::PutJournal {
+            sequence,
+            part,
+            entry,
+        });
+    }
+
+    pub fn delete_journal(&mut self, sequence: u64, part: u64) {
+        self.ops.push(BatchOp::DeleteJournal { sequence, part });
     }
 }
 
@@ -206,8 +230,8 @@ pub fn encode_group_key(key: &[Value]) -> GroupKeyBytes {
 }
 
 /// Decode a group key from storage bytes.
-pub fn decode_group_key(bytes: &[u8]) -> GroupKey {
-    decode_values(bytes).into_iter().collect()
+pub fn decode_group_key(bytes: &[u8]) -> Result<GroupKey> {
+    Ok(decode_values(bytes)?.into_iter().collect())
 }
 
 /// Encode reducer state (RowMap) to bytes.
@@ -239,19 +263,23 @@ pub fn write_values(buf: &mut Vec<u8>, values: &[Value]) {
 }
 
 /// Decode a positional list of `Value`s encoded by [`encode_values`].
-pub fn decode_values(bytes: &[u8]) -> Vec<Value> {
+pub fn decode_values(bytes: &[u8]) -> Result<Vec<Value>> {
     let mut pos = 0usize;
-    let n = u32::from_le_bytes(
-        read_bytes(bytes, &mut pos, 4)
-            .expect("decode_values: missing length header")
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let mut out = Vec::with_capacity(n);
+    let n = u32::from_le_bytes(read_bytes(bytes, &mut pos, 4)?.try_into().unwrap()) as usize;
+
+    // Each value takes at least one byte: a corrupt count must not allocate.
+    let mut out = Vec::with_capacity(n.min(bytes.len()));
     for _ in 0..n {
-        out.push(decode_value(bytes, &mut pos).expect("decode_values: malformed value"));
+        out.push(decode_value(bytes, &mut pos)?);
     }
-    out
+
+    if pos != bytes.len() {
+        return Err(Error::Storage(format!(
+            "{} trailing bytes after {n} encoded values",
+            bytes.len() - pos
+        )));
+    }
+    Ok(out)
 }
 
 // --- Custom binary row encoding ---
@@ -604,6 +632,11 @@ pub trait StorageBackend: Send + Sync {
     // --- Bulk operations ---
 
     fn list_reducer_group_keys(&self, reducer: &str) -> Result<Vec<Vec<u8>>>;
+
+    // --- Journal (written only through `commit`) ---
+
+    /// Every journal part, in sequence and part order.
+    fn journal(&self) -> Result<Vec<journal::JournalPart>>;
 
     // --- Atomic batch commit ---
 

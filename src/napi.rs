@@ -54,6 +54,11 @@ pub struct SettleConfig {
     /// `2^53` (≈9 PB), so larger values cannot be passed reliably from JS anyway.
     /// Negative values are rejected.
     pub cache_size: Option<i64>,
+    /// The sequence of the newest change batch that the target applied, as
+    /// the target stored it with the data of that batch; 0 before the first.
+    /// Set, it turns on the journal: open brings the database to the state
+    /// after this batch, acked or not. Negative values are rejected.
+    pub applied_sequence: Option<i64>,
 }
 
 /// Block cursor: number + hash.
@@ -173,6 +178,12 @@ impl Settle {
             Some(s) => Some(s as usize),
             None => None,
         };
+        if let Some(sequence) = config.applied_sequence {
+            let sequence = u64::try_from(sequence).map_err(|_| {
+                Error::new(Status::InvalidArg, "applied_sequence must be non-negative")
+            })?;
+            cfg = cfg.applied_sequence(sequence);
+        }
 
         let inner = Inner::open(cfg)
             .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;

@@ -13,7 +13,7 @@ use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
 #[cfg(feature = "rocksdb")]
 use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
-use crate::storage::{PendingWrites, StorageBackend, StorageWriteBatch, format};
+use crate::storage::{PendingWrites, StorageBackend, StorageWriteBatch, format, journal};
 use crate::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, RowMap, Value};
 
 /// Configuration for opening a Settle instance.
@@ -45,7 +45,8 @@ pub struct Config {
     /// `ingest()` wait for the ack of the batch before it. A call that
     /// returns no batch while batches wait takes a place too: its writes wait
     /// with the newest batch. Each batch reaches disk only when it is acked,
-    /// and in sequence order, so a reopen goes back to the last acked batch.
+    /// and in sequence order, so a reopen goes back to the last acked batch
+    /// (with the journal, to the applied sequence).
     /// The target must apply every batch, in sequence order, also across a
     /// fork: a fork's compensating batch undoes all the batches before it.
     pub max_pending_batches: usize,
@@ -59,6 +60,14 @@ pub struct Config {
     pub backfill_checkpoint_interval: u64,
     /// Build the `ChangeBatch::perf` timing tree on ingest. Default `true`.
     pub collect_perf: bool,
+    /// The sequence of the newest change batch that the target applied, as
+    /// the target stored it with the data of that batch; 0 before the first.
+    /// Set, it turns on the journal: each batch that `ingest()` or
+    /// `handle_fork()` returns is on disk first, and open brings storage to
+    /// the state after this batch, acked or not. Unset, open goes back to the
+    /// last acked batch, so a fork of blocks that the target applied but did
+    /// not ack leaves their changes in the target.
+    pub applied_sequence: Option<u64>,
 }
 
 impl Config {
@@ -77,6 +86,7 @@ impl Config {
             max_pending_batches: 2,
             backfill_checkpoint_interval: 1,
             collect_perf: true,
+            applied_sequence: None,
         }
     }
 
@@ -94,6 +104,7 @@ impl Config {
             max_pending_batches: 2,
             backfill_checkpoint_interval: 1,
             collect_perf: true,
+            applied_sequence: None,
         }
     }
 
@@ -167,6 +178,12 @@ impl Config {
         self.collect_perf = on;
         self
     }
+
+    /// See [`Config::applied_sequence`].
+    pub fn applied_sequence(mut self, sequence: u64) -> Self {
+        self.applied_sequence = Some(sequence);
+        self
+    }
 }
 
 /// Sentinel value (SQLite convention) — passing this as `data_dir` is
@@ -197,8 +214,71 @@ const META_FINALIZED_BLOCK: &str = "finalized_block";
 const META_BLOCK_HASHES: &str = "block_hashes";
 const META_NEXT_SEQUENCE: &str = "next_sequence";
 
+fn meta_u64(storage: &dyn StorageBackend, key: &str) -> Result<Option<u64>> {
+    let Some(bytes) = storage.get_meta(key)? else {
+        return Ok(None);
+    };
+    let bytes = bytes
+        .try_into()
+        .map_err(|_| Error::Storage(format!("corrupt {key} metadata")))?;
+    Ok(Some(u64::from_be_bytes(bytes)))
+}
+
+/// Bring storage to the state after batch `applied`, the newest batch that
+/// the target applied: commit the journaled batches up to it, in order, and
+/// drop the others.
+fn recover_journal(storage: &dyn StorageBackend, applied: Option<u64>) -> Result<()> {
+    let parts = storage.journal()?;
+
+    let Some(applied) = applied else {
+        return match parts.first() {
+            Some(first) => Err(Error::InvalidOperation(format!(
+                "the database holds change batches from sequence {} that were returned and \
+                 not acked: open it with the applied sequence of the target",
+                first.sequence
+            ))),
+            None => Ok(()),
+        };
+    };
+
+    // The newest batch whose writes are on disk; 0 before the first.
+    let committed = meta_u64(storage, META_NEXT_SEQUENCE)?.map_or(0, |next| next.saturating_sub(1));
+    if applied < committed {
+        return Err(Error::InvalidOperation(format!(
+            "the target applied batch {applied}, but batch {committed} is acked: the target \
+             lost batches that it applied, or does not store their sequence"
+        )));
+    }
+
+    let journaled: std::collections::HashSet<u64> = parts
+        .iter()
+        .filter(|p| p.part == 0)
+        .map(|p| p.sequence)
+        .collect();
+    if let Some(missing) = (committed + 1..=applied).find(|s| !journaled.contains(s)) {
+        return Err(Error::InvalidOperation(format!(
+            "the target applied batch {applied}, but the database has no record of batch \
+             {missing}"
+        )));
+    }
+
+    let mut recovery = StorageWriteBatch::new();
+    for part in &parts {
+        if part.sequence > committed && part.sequence <= applied {
+            recovery.ops.extend(journal::decode(&part.entry)?.ops);
+        }
+        recovery.delete_journal(part.sequence, part.part);
+    }
+    if recovery.ops.is_empty() {
+        return Ok(());
+    }
+    storage.commit(&recovery)?;
+    storage.sync()
+}
+
 /// Whether the database holds data: every commit of an ingest or a fork
-/// writes one of these keys. Versions before format 2 wrote `block_hashes`.
+/// writes one of these keys. Versions before format versions wrote
+/// `block_hashes`.
 fn has_data(storage: &dyn StorageBackend) -> Result<bool> {
     for key in [
         META_LATEST_BLOCK,
@@ -273,6 +353,9 @@ pub struct Settle {
     /// carries them until one commits; each unacked batch holds all of them,
     /// as they grow only while no batch waits.
     stamp: format::Stamp,
+    /// Whether returned batches go to the journal. See
+    /// [`Config::applied_sequence`].
+    journal: bool,
 }
 
 impl Settle {
@@ -303,26 +386,21 @@ impl Settle {
             Arc::new(MemoryBackend::new())
         };
 
+        // Refuse another format before the journal writes to storage, and
+        // check again after it: before the first ack, the format version and
+        // the layouts are only in the journal.
+        format::check(storage.as_ref(), &schema, has_data(storage.as_ref())?)?;
+        recover_journal(storage.as_ref(), config.applied_sequence)?;
         let stamp = format::check(storage.as_ref(), &schema, has_data(storage.as_ref())?)?;
 
-        let mut engine = SettleEngine::new(&schema, storage.clone());
+        let mut engine = SettleEngine::new(&schema, storage.clone())?;
         engine.set_collect_perf(config.collect_perf);
 
         // Restore persisted state
-        if let Some(bytes) = storage.get_meta(META_LATEST_BLOCK)? {
-            let block = u64::from_be_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| Error::Storage("corrupt latest_block metadata".into()))?,
-            );
+        if let Some(block) = meta_u64(storage.as_ref(), META_LATEST_BLOCK)? {
             engine.set_latest_block(block);
         }
-        if let Some(bytes) = storage.get_meta(META_FINALIZED_BLOCK)? {
-            let block = u64::from_be_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| Error::Storage("corrupt finalized_block metadata".into()))?,
-            );
+        if let Some(block) = meta_u64(storage.as_ref(), META_FINALIZED_BLOCK)? {
             engine.set_finalized_block(block);
         }
         engine.restore_block_hashes(storage.get_block_hashes()?.into_iter().collect());
@@ -338,12 +416,7 @@ impl Settle {
 
         let mut buffer = ChangeBuffer::new(config.max_buffer_size);
         // Restore monotonic sequence across restart. Default 1 on fresh DB.
-        if let Some(bytes) = storage.get_meta(META_NEXT_SEQUENCE)? {
-            let seq = u64::from_be_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| Error::Storage("corrupt next_sequence metadata".into()))?,
-            );
+        if let Some(seq) = meta_u64(storage.as_ref(), META_NEXT_SEQUENCE)? {
             buffer.set_next_sequence(seq);
         }
 
@@ -359,6 +432,7 @@ impl Settle {
             runtimes_attached: std::collections::HashSet::new(),
             backfill_checkpoint_interval: config.backfill_checkpoint_interval,
             stamp,
+            journal: config.applied_sequence.is_some(),
         })
     }
 
@@ -452,20 +526,15 @@ impl Settle {
         }
         self.engine.set_reducer_runtime(name, runtime);
         self.runtimes_attached.insert(name.to_string());
+        self.replay_reducer_chain(name)
+    }
 
-        // Replay only this reducer and its downstream MVs. Reset their
-        // in-memory state to the finalized baseline first — otherwise the
-        // replay applies on top of state already populated by prior ingests,
-        // doubling every emit / aggregate contribution.
+    /// Rebuild the unfinalized state of `name` and of what feeds it or
+    /// depends on it, from the raw rows. See `SettleEngine::replay_reducer_chain`.
+    fn replay_reducer_chain(&mut self, name: &str) -> Result<()> {
         let finalized = self.engine.finalized_block();
         let latest = self.engine.latest_block();
-        if latest > finalized {
-            self.engine
-                .reset_reducer_branch_for_replay(name, finalized)?;
-            self.engine
-                .replay_unfinalized_for(finalized + 1, latest, name)?;
-        }
-        Ok(())
+        self.engine.replay_reducer_chain(name, finalized, latest)
     }
 
     /// Register a *new* external reducer definition. The reducer is added
@@ -494,37 +563,18 @@ impl Settle {
         self.engine.add_reducer(def, self.storage.clone())?;
         self.stamp.extend(stamp);
 
-        // Newly-added reducer starts with empty state — replay rebuilds it
-        // from the unfinalized range without any double-counting risk.
-        let finalized = self.engine.finalized_block();
-        let latest = self.engine.latest_block();
-        if latest > finalized {
-            self.engine
-                .replay_unfinalized_for(finalized + 1, latest, &name)?;
-        }
-        Ok(())
+        self.replay_reducer_chain(&name)
     }
 
-    /// Replay unfinalized blocks for a specific reducer and its downstream MVs.
-    /// Used after installing an external reducer's JS callback.
+    /// Replay unfinalized blocks for a specific reducer, the reducers that
+    /// feed it, and the reducers and MVs that depend on it. Used after
+    /// installing an external reducer's JS callback.
     ///
     /// Returns `Err(PendingAck)` if an unacked batch is in flight.
     pub fn replay_reducer(&mut self, name: &str) -> Result<()> {
         self.guard_not_poisoned()?;
         self.guard_no_pending()?;
-        let finalized = self.engine.finalized_block();
-        let latest = self.engine.latest_block();
-        if latest > finalized {
-            // Reset reducer + downstream MVs to finalized baseline BEFORE
-            // replaying. Without this, a replay called after the reducer
-            // already processed the unfinalized range would double every
-            // emit and aggregate contribution.
-            self.engine
-                .reset_reducer_branch_for_replay(name, finalized)?;
-            self.engine
-                .replay_unfinalized_for(finalized + 1, latest, name)?;
-        }
-        Ok(())
+        self.replay_reducer_chain(name)
     }
 
     /// Check if a reducer with the given name already exists in the engine.
@@ -598,8 +648,13 @@ impl Settle {
 
         // One sync covers every commit before it. The batches have left the
         // queue, so a retried ack would not sync them; and a failed fsync
-        // can lose writes that a second one then reports as synced.
-        if committed && let Err(e) = self.storage.sync() {
+        // can lose writes that a second one then reports as synced. With the
+        // journal, each acked batch is on disk already, and the sync of the
+        // next journal write covers the commit.
+        if committed
+            && !self.journal
+            && let Err(e) = self.storage.sync()
+        {
             let reason = e.to_string();
             self.poisoned = Some(format!("sync after ack failed: {reason}"));
             self.sync_failed = Some(reason.clone());
@@ -761,7 +816,7 @@ impl Settle {
                 })
             }
             Some(batch) => {
-                self.push_pending(batch.sequence, write_batch);
+                self.push_pending(batch.sequence, write_batch)?;
                 Ok(ForkResult {
                     cursor,
                     batch: Some(batch),
@@ -785,8 +840,11 @@ impl Settle {
     /// below the currently committed finalized block (finality is monotonic;
     /// going above `latest_block` is allowed for gappy chains like Solana).
     ///
-    /// If the rollback chain shows a fork, the ingest rolls it back first and
-    /// the batch carries the compensating changes. An input error is found
+    /// If a hash in the rollback chain or the finalized head differs from the
+    /// stored hash of a block up to the latest one, the ingest rolls back to
+    /// the highest supplied block below it whose hash matches, and the batch
+    /// carries the compensating changes. Blocks that the chain leaves out are
+    /// not evidence of a fork. An input error is found
     /// before that rollback. A reducer error after it poisons the instance:
     /// ack the batches that the target applied, drop and reopen, and the next
     /// ingest detects the fork again.
@@ -829,8 +887,9 @@ impl Settle {
         let mut pending_changes: Vec<ChangeRecord> = Vec::new();
         let mut block_perf: Vec<PerfNode> = Vec::new();
 
-        let fork_point = self.detect_fork(&input);
-        let recovery_block = fork_point.unwrap_or_else(|| self.engine.latest_block());
+        let fork_point = self.detect_fork(&input)?;
+        // The latest block once the fork is rolled back; None on an empty database.
+        let recovery_block = fork_point.or(self.engine.latest_block_if_any());
 
         // Checked before the fork rollback, which cannot be undone: a bad
         // input then leaves the instance as it was.
@@ -867,8 +926,8 @@ impl Settle {
                 return Err(e);
             }
 
-            // Undo in-memory state to recovery_block (0 for a fresh DB). The
-            // undo stays in-memory only: raw rows from this ingest were never
+            // Undo in-memory state to recovery_block. The undo stays
+            // in-memory only: raw rows from this ingest were never
             // committed (they live in `write_batch`, dropped below), so
             // storage has no `> recovery_block` rows to delete on disk, and no
             // separate commit can fail half-way. Not a chain rollback: on
@@ -966,68 +1025,66 @@ impl Settle {
             }
             Some(batch) => {
                 // Stash for ack. storage.commit is deferred.
-                self.push_pending(batch.sequence, write_batch);
+                self.push_pending(batch.sequence, write_batch)?;
                 Ok(Some(batch))
             }
         }
     }
 
-    /// The fork point if the input's rollback chain shows that blocks above
-    /// it are no longer canonical, else None.
+    /// The fork point if the input's chain shows that blocks we hold are no
+    /// longer canonical, else None.
     ///
-    /// The chain is sorted DESC (newest first) so the HIGHEST common ancestor
-    /// wins — preventing catastrophic deep rollbacks when the caller sends
-    /// blocks in ascending order.
-    ///
-    /// IMPORTANT: no fork when the chain is advancing (rollbackChain or
-    /// finalizedHead contains blocks above current_latest). In that case, the
-    /// caller is providing new unseen blocks, not a rollback signal. External
-    /// fork handling (e.g. 409 in pipes-sdk) runs before ingest() is called.
-    fn detect_fork(&self, input: &IngestInput) -> Option<BlockNumber> {
-        let current_latest = self.engine.latest_block();
-        if current_latest == 0 {
-            return None;
-        }
+    /// The evidence is a supplied hash that differs from the stored hash of
+    /// the same block, up to the latest block. A chain that leaves blocks out
+    /// shows nothing about them: an empty chain, or one that only extends
+    /// past the latest block, is no fork. The fork point is the highest
+    /// supplied block below the lowest conflict whose hash matches, else 0;
+    /// Err if that is below finality.
+    fn detect_fork(&self, input: &IngestInput) -> Result<Option<BlockNumber>> {
+        let Some(current_latest) = self.engine.latest_block_if_any() else {
+            return Ok(None);
+        };
 
-        let mut sorted_chain: Vec<_> = input.rollback_chain.iter().collect();
-        sorted_chain.sort_unstable_by_key(|c| std::cmp::Reverse(c.number));
-
-        // Resolve-fork-cursor would fall through to an old finalized anchor
-        // and trigger a spurious rollback.
-        let advancing = sorted_chain
-            .first()
-            .is_some_and(|c| c.number > current_latest)
-            || input.finalized_head.number > current_latest;
-        if advancing {
-            return None;
-        }
-
-        let new_chain: Vec<(BlockNumber, &str)> = sorted_chain
+        let supplied: Vec<(BlockNumber, &str)> = input
+            .rollback_chain
             .iter()
+            .chain(std::iter::once(&input.finalized_head))
             .map(|c| (c.number, c.hash.as_str()))
-            .chain(std::iter::once((
-                input.finalized_head.number,
-                input.finalized_head.hash.as_str(),
-            )))
             .collect();
+        let Some(conflict) = self.engine.lowest_hash_conflict(&supplied, current_latest) else {
+            return Ok(None);
+        };
 
-        // Use `_bounded` so a stale future hash can't push the resolved fork
-        // point above latest and cause silent skips. No common ancestor means
-        // a full rollback.
+        let mut ancestors: Vec<(BlockNumber, &str)> = supplied
+            .into_iter()
+            .filter(|&(n, _)| n < conflict)
+            .collect();
+        ancestors.sort_unstable_by_key(|&(n, _)| std::cmp::Reverse(n));
+
+        // `_bounded`: no match below finality or above the latest block.
         let fork_point = self
             .engine
-            .resolve_fork_cursor_bounded(&new_chain)
+            .resolve_fork_cursor_bounded(&ancestors)
             .map_or(0, |c| c.number);
-        (fork_point < current_latest).then_some(fork_point)
+
+        let finalized = self.engine.finalized_block();
+        if fork_point < finalized {
+            return Err(Error::InvalidOperation(format!(
+                "the hash of block {conflict} differs from the stored one, and the chain \
+                 holds no common ancestor at or above finalized block {finalized} — \
+                 finalized state is irreversible"
+            )));
+        }
+        Ok((fork_point < current_latest).then_some(fork_point))
     }
 
     /// Check the input rows and group them by table (in name order, for a
     /// deterministic processing order) and by block. `latest` is the latest
-    /// block once a detected fork is rolled back.
+    /// block once a detected fork is rolled back, None on an empty database.
     fn group_input_rows(
         &self,
         data: std::collections::HashMap<String, Vec<RowMap>>,
-        latest: BlockNumber,
+        latest: Option<BlockNumber>,
     ) -> Result<Vec<(String, BTreeMap<BlockNumber, Vec<RowMap>>)>> {
         // Dedup guard: reject any block at or below the current
         // (post-fork-detection) latest. Re-ingesting an already-processed
@@ -1036,7 +1093,7 @@ impl Settle {
         // state back BEFORE feeding new-chain data — relying on ingest()'s
         // in-line fork detection to also delete duplicate content at the
         // fork point is not supported.
-        if latest > 0 {
+        if let Some(latest) = latest {
             let min_input = data
                 .values()
                 .flat_map(|rows| {
@@ -1107,13 +1164,46 @@ impl Settle {
             })
     }
 
-    fn push_pending(&mut self, sequence: u64, write_batch: StorageWriteBatch) {
+    /// Queue a batch for its ack. With the journal, the batch is on disk
+    /// before the caller gets it: the target can apply it at once.
+    fn push_pending(&mut self, sequence: u64, mut write_batch: StorageWriteBatch) -> Result<()> {
+        if self.journal {
+            self.write_journal(sequence, 0, &write_batch, true)?;
+            write_batch.delete_journal(sequence, 0);
+        }
+
         self.pending.push_back(PendingAck {
             sequence,
             write_batch,
             joined: 0,
             since: Instant::now(),
         });
+        Ok(())
+    }
+
+    /// Store a journal part. A failure poisons the instance: the engine
+    /// state is already past disk, and the caller does not get the batch.
+    fn write_journal(
+        &mut self,
+        sequence: u64,
+        part: u64,
+        writes: &StorageWriteBatch,
+        sync: bool,
+    ) -> Result<()> {
+        let mut batch = StorageWriteBatch::new();
+        batch.put_journal(sequence, part, journal::encode(writes));
+        if let Err(e) = self.storage.commit(&batch) {
+            self.poisoned = Some(format!("journal write of batch {sequence} failed: {e}"));
+            return Err(e);
+        }
+
+        if sync && let Err(e) = self.storage.sync() {
+            let reason = e.to_string();
+            self.poisoned = Some(format!("sync of the journal failed: {reason}"));
+            self.sync_failed = Some(reason.clone());
+            return Err(Error::SyncFailed(reason));
+        }
+        Ok(())
     }
 
     /// Commit the writes of a call that returned no batch. Behind unacked
@@ -1121,8 +1211,20 @@ impl Settle {
     /// take a place in the queue, and commit with its ack. A failed commit
     /// poisons the instance: the engine state is already past disk.
     fn commit_without_batch(&mut self, write_batch: StorageWriteBatch, call: &str) -> Result<()> {
-        if let Some(newest) = self.pending.back_mut() {
+        if let Some(newest) = self.pending.back() {
+            let sequence = newest.sequence;
+            let part = newest.joined as u64 + 1;
+            // No sync: this call returns nothing to apply, and the sync of
+            // the next batch covers the write.
+            if self.journal {
+                self.write_journal(sequence, part, &write_batch, false)?;
+            }
+
+            let newest = self.pending.back_mut().expect("checked above");
             newest.write_batch.ops.extend(write_batch.ops);
+            if self.journal {
+                newest.write_batch.delete_journal(sequence, part);
+            }
             newest.joined += 1;
             return Ok(());
         }

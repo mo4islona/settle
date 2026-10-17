@@ -155,11 +155,11 @@ describe('Pipeline builder', () => {
             rollbackChain: [{number: 2, hash: '0x2'}, {number: 1, hash: '0x1'}],
         })
 
-        // Rollback block 2: ingest with rollbackChain that only includes block 1
+        // Rollback block 2: ingest with a new hash for it
         const batch = await ingestAndAck(db, {
             data: {},
             finalizedHead: {number: 1, hash: '0x1'},
-            rollbackChain: [{number: 1, hash: '0x1'}],
+            rollbackChain: [{number: 2, hash: '0x2b'}, {number: 1, hash: '0x1'}],
         })
 
         expect(batch).toBeTruthy()
@@ -442,5 +442,35 @@ describe('Pipeline builder', () => {
         const ethInsert = records.find((r: any) => r.key.pair === 'ETH')
         expect(ethInsert).toBeDefined()
         expect(ethInsert!.operation).toBe('insert')
+    })
+
+    it('gives a typed reducer 64-bit integers without loss', async () => {
+        const big = 9007199254740993n
+        const p = new Pipeline()
+        const transfers = p.table('transfers', {block_number: uint64(), account: string(), amount: uint64()})
+
+        const rows: (number | bigint)[] = []
+        const totals: (number | bigint)[] = []
+        transfers.createReducer('totals', {
+            groupBy: 'account',
+            initialState: {total: 0n},
+            reduce(state, row) {
+                rows.push(row.amount)
+                totals.push(state.total)
+                state.update({total: BigInt(state.total) + BigInt(row.amount)})
+            },
+        })
+
+        const db = p.build()
+        const block = (n: number, amount: number | bigint) => ({
+            data: {transfers: [{block_number: n, account: 'a', amount}]},
+            finalizedHead: {number: 0, hash: '0x0'},
+            rollbackChain: [{number: n, hash: `0x${n}`}],
+        })
+        await ingestAndAck(db, block(1, big))
+        await ingestAndAck(db, block(2, 5))
+
+        expect(rows).toEqual([big, 5])
+        expect(totals).toEqual([0, big])
     })
 })

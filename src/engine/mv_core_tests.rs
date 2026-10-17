@@ -96,7 +96,7 @@ fn simple_sum_mv_def() -> MVDef {
 
 #[test]
 fn simple_mv_insert_changes() {
-    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types()).unwrap();
 
     let rows = vec![
         make_row(&[
@@ -136,7 +136,7 @@ fn simple_mv_insert_changes() {
 
 #[test]
 fn mv_update_changes_on_second_block() {
-    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types()).unwrap();
 
     let rows1 = vec![make_row(&[
         ("pool", Value::String("ETH/USDC".into())),
@@ -162,7 +162,7 @@ fn mv_update_changes_on_second_block() {
 
 #[test]
 fn mv_rollback_produces_update_change() {
-    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types()).unwrap();
 
     mv.process_block(
         1000,
@@ -188,7 +188,7 @@ fn mv_rollback_produces_update_change() {
 
 #[test]
 fn mv_rollback_produces_delete_when_empty() {
-    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types()).unwrap();
 
     mv.process_block(
         1000,
@@ -205,7 +205,7 @@ fn mv_rollback_produces_delete_when_empty() {
 
 #[test]
 fn mv_rollback_noop_when_nothing_to_rollback() {
-    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types()).unwrap();
 
     mv.process_block(
         1000,
@@ -221,7 +221,7 @@ fn mv_rollback_noop_when_nothing_to_rollback() {
 
 #[test]
 fn mv_finalize_then_rollback() {
-    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types()).unwrap();
 
     mv.process_block(
         1000,
@@ -259,7 +259,7 @@ fn mv_finalize_then_rollback() {
 
 #[test]
 fn ohlcv_candle_end_to_end() {
-    let mut mv = MVEngine::new(ohlcv_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(ohlcv_mv_def(), test_storage(), &test_column_types()).unwrap();
 
     // All trades in same 5-min window (block_time within same 300s interval)
     let window_base = 1_700_000_000_000i64; // some ms timestamp
@@ -324,7 +324,7 @@ fn ohlcv_candle_end_to_end() {
 
 #[test]
 fn ohlcv_multiple_pairs_isolated() {
-    let mut mv = MVEngine::new(ohlcv_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(ohlcv_mv_def(), test_storage(), &test_column_types()).unwrap();
     let ts = 1_700_000_000_000i64;
 
     mv.process_block(
@@ -353,7 +353,7 @@ fn ohlcv_multiple_pairs_isolated() {
 
 #[test]
 fn mv_different_time_windows() {
-    let mut mv = MVEngine::new(ohlcv_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(ohlcv_mv_def(), test_storage(), &test_column_types()).unwrap();
 
     // Two trades in different 5-min windows
     let window1 = 1_700_000_000_000i64;
@@ -386,7 +386,7 @@ fn mv_different_time_windows() {
 
 #[test]
 fn full_cycle_ingest_rollback_reingest() {
-    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), test_storage(), &test_column_types()).unwrap();
 
     // Block 1000
     mv.process_block(
@@ -443,7 +443,7 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
 
     // Phase 1: Two groups persisted — ETH/USDC and BTC/USDC
     {
-        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
+        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types()).unwrap();
         mv.process_block(
             1,
             &[make_row(&[
@@ -466,7 +466,7 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
 
     // Phase 2: Rollback block 2 (above finalized=1) — BTC/USDC group empties
     {
-        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
+        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types()).unwrap();
         // Replay unfinalized block 2
         mv.process_block(
             2,
@@ -488,7 +488,7 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
 
     // Phase 3: Restore — BTC/USDC should not be resurrected
     {
-        let mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
+        let mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types()).unwrap();
         assert_eq!(mv.groups.len(), 1, "only ETH/USDC should survive");
     }
 }
@@ -507,7 +507,7 @@ fn persisted_pools(batch: &StorageWriteBatch) -> Vec<Value> {
         .iter()
         .filter_map(|op| match op {
             storage::BatchOp::PutMvState { group_key, .. } => {
-                Some(storage::decode_group_key(group_key)[0].clone())
+                Some(storage::decode_group_key(group_key).unwrap()[0].clone())
             }
             _ => None,
         })
@@ -539,13 +539,13 @@ fn finalize_persists_group_when_finality_catches_up() {
     let storage = test_storage();
 
     {
-        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
+        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types()).unwrap();
         mv.process_block(1, &[pool_row("ETH/USDC", 10.0)]);
         finalize_and_commit(&mut mv, &storage, 0, true);
         finalize_and_commit(&mut mv, &storage, 1, true);
     }
 
-    let mut mv = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types()).unwrap();
     let changes = mv.process_block(2, &[pool_row("ETH/USDC", 10.0)]);
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].operation, ChangeOp::Update);
@@ -560,7 +560,7 @@ fn checkpoint_persists_group_finalized_by_deferred_finalize() {
     let storage = test_storage();
 
     {
-        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
+        let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types()).unwrap();
         mv.process_block(1, &[pool_row("ETH/USDC", 10.0)]);
         finalize_and_commit(&mut mv, &storage, 0, true);
 
@@ -574,7 +574,7 @@ fn checkpoint_persists_group_finalized_by_deferred_finalize() {
         );
     }
 
-    let mut mv = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types()).unwrap();
     let changes = mv.process_block(2, &[pool_row("ETH/USDC", 10.0)]);
     assert_eq!(changes[0].get("total_volume"), Some(&Value::Float64(20.0)));
 }
@@ -584,7 +584,7 @@ fn checkpoint_persists_group_finalized_by_deferred_finalize() {
 #[test]
 fn finalize_persists_groups_of_finalized_blocks_only() {
     let storage = test_storage();
-    let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types());
+    let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types()).unwrap();
 
     mv.process_block(1, &[pool_row("A", 1.0)]);
     mv.process_block(2, &[pool_row("B", 2.0)]);
@@ -606,7 +606,7 @@ fn finalize_persists_groups_of_finalized_blocks_only() {
     );
 
     // Every group is on disk with all its finalized data.
-    let restored = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types());
+    let restored = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types()).unwrap();
     let total = |pool: &str| {
         let key: GroupKey = std::iter::once(Value::String(pool.into())).collect();
         restored.groups[&key][0].current_value()
@@ -622,7 +622,7 @@ fn finalize_persists_groups_of_finalized_blocks_only() {
 fn replay_block_drops_group_without_data() {
     let mut def = simple_sum_mv_def();
     def.select.truncate(2);
-    let mut mv = MVEngine::new(def, test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(def, test_storage(), &test_column_types()).unwrap();
 
     let pool = ("pool", Value::String("ETH/USDC".into()));
     mv.replay_block(1000, &[make_row(&[pool.clone(), ("amount", Value::Null)])]);

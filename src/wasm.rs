@@ -17,6 +17,43 @@ fn to_js<T: Serialize>(v: &T) -> Result<JsValue, serde_wasm_bindgen::Error> {
     v.serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
 }
 
+/// A JSON value as a plain JS value. An integer beyond 2^53 becomes a BigInt:
+/// a JS number would round it, and `serde_wasm_bindgen` refuses it.
+fn json_to_js(value: &serde_json::Value) -> JsValue {
+    const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+    match value {
+        serde_json::Value::Null => JsValue::NULL,
+        serde_json::Value::Bool(b) => JsValue::from_bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                if u <= MAX_SAFE_INTEGER {
+                    JsValue::from_f64(u as f64)
+                } else {
+                    js_sys::BigInt::from(u).into()
+                }
+            } else if let Some(i) = n.as_i64() {
+                if i.unsigned_abs() <= MAX_SAFE_INTEGER {
+                    JsValue::from_f64(i as f64)
+                } else {
+                    js_sys::BigInt::from(i).into()
+                }
+            } else {
+                JsValue::from_f64(n.as_f64().unwrap_or(f64::NAN))
+            }
+        }
+        serde_json::Value::String(s) => JsValue::from_str(s),
+        serde_json::Value::Array(items) => items.iter().map(json_to_js).collect::<js_sys::Array>().into(),
+        serde_json::Value::Object(fields) => {
+            let object = js_sys::Object::new();
+            for (key, field) in fields {
+                js_sys::Reflect::set(&object, &JsValue::from_str(key), &json_to_js(field)).unwrap();
+            }
+            object.into()
+        }
+    }
+}
+
 /// WASM binding for Settle.
 #[wasm_bindgen]
 pub struct Settle {
@@ -196,7 +233,7 @@ impl Settle {
         let _guard = self.install_context();
         let batch = self.inner.ingest(ingest_input).map_err(settle_err_to_js)?;
         match batch {
-            Some(b) => to_js(&encode_batch_to_json_value(&b)).map_err(to_js_err),
+            Some(b) => Ok(json_to_js(&encode_batch_to_json_value(&b))),
             None => Ok(JsValue::NULL),
         }
     }
@@ -326,7 +363,7 @@ impl Settle {
         .map_err(to_js_err)?;
 
         let batch = match result.batch {
-            Some(b) => to_js(&encode_batch_to_json_value(&b)).map_err(to_js_err)?,
+            Some(b) => json_to_js(&encode_batch_to_json_value(&b)),
             None => JsValue::NULL,
         };
 

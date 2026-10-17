@@ -467,35 +467,32 @@ fn reopen_of_empty_database_keeps_block_zero() {
 
 /// Versions before the durable watermark stored latest 0 for an empty
 /// database, and their finality even when it is above the latest block. A
-/// block at or below such a watermark must still be persisted.
+/// block at or below such a watermark must still be persisted. Such a
+/// database has no format version, so open refuses it; a stored latest
+/// block 0 is block 0, and a new block 0 is a duplicate.
 #[test]
 fn legacy_watermark_without_data_does_not_hide_new_blocks() {
-    for (stored_finalized, first) in [(0u64, 0), (100, 0), (100, 7)] {
-        let storage = Arc::new(MemoryBackend::new());
-        let mut legacy = StorageWriteBatch::new();
-        legacy.put_meta("format_version", &crate::storage::format::FORMAT_VERSION.to_be_bytes());
-        legacy.put_meta(META_LATEST_BLOCK, &0u64.to_be_bytes());
-        legacy.put_meta(META_FINALIZED_BLOCK, &stored_finalized.to_be_bytes());
-        storage.commit(&legacy).unwrap();
+    let (stored_finalized, first) = (100u64, 7);
+    let storage = Arc::new(MemoryBackend::new());
+    let mut legacy = StorageWriteBatch::new();
+    legacy.put_meta("format_version", &crate::storage::format::FORMAT_VERSION.to_be_bytes());
+    legacy.put_meta(META_LATEST_BLOCK, &0u64.to_be_bytes());
+    legacy.put_meta(META_FINALIZED_BLOCK, &stored_finalized.to_be_bytes());
+    storage.commit(&legacy).unwrap();
 
-        {
-            let mut db = reopen(SUM_SCHEMA, &storage, 1);
-            let rows = vec![("swaps".into(), first, vec![swap(first, "ETH", 10)])];
-            ingest_with_finalized(&mut db, rows, stored_finalized).unwrap();
-        }
-
+    {
         let mut db = reopen(SUM_SCHEMA, &storage, 1);
-        let next = stored_finalized + 1;
-        let batch =
-            ingest_with_finalized(&mut db, vec![("swaps".into(), next, vec![swap(next, "ETH", 10)])], next)
-                .unwrap()
-                .unwrap();
-        assert_eq!(
-            total(&batch, "pool_volume", "ETH"),
-            Value::UInt64(20),
-            "stored finality {stored_finalized}, first block {first}"
-        );
+        let rows = vec![("swaps".into(), first, vec![swap(first, "ETH", 10)])];
+        ingest_with_finalized(&mut db, rows, stored_finalized).unwrap();
     }
+
+    let mut db = reopen(SUM_SCHEMA, &storage, 1);
+    let next = stored_finalized + 1;
+    let batch =
+        ingest_with_finalized(&mut db, vec![("swaps".into(), next, vec![swap(next, "ETH", 10)])], next)
+            .unwrap()
+            .unwrap();
+    assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(20));
 }
 
 /// The same for a legacy database with data: finality stored above its
@@ -1123,15 +1120,19 @@ fn random_short_histories_survive_reopen_sliding() {
 /// A client that lets up to `depth` batches wait for their ack. Its target
 /// applies the batches late, in order, and acks some of the applied ones. A
 /// crash loses the unacked batches, so the client sends again every op whose
-/// writes were not acked.
+/// writes were not acked. With the journal, the reopen restores the batches
+/// that the target applied, and the client sends again only the others.
 struct PipelinedClient {
     schema: &'static str,
     interval: u64,
     depth: usize,
+    journal: bool,
     storage: Arc<MemoryBackend>,
     db: Settle,
     rng: Rng,
     target: Target,
+    /// The newest batch that the target applied.
+    applied: u64,
     /// Returned and not applied yet, in sequence order.
     unapplied: VecDeque<ChangeBatch>,
     /// Applied and not acked yet.
@@ -1141,11 +1142,18 @@ struct PipelinedClient {
     not_durable: VecDeque<(Op, u64)>,
 }
 
-fn open_pipelined(schema: &str, storage: &Arc<MemoryBackend>, interval: u64, depth: usize) -> Settle {
-    let config = Config::new(schema)
+fn open_pipelined(
+    schema: &str,
+    storage: &Arc<MemoryBackend>,
+    interval: u64,
+    depth: usize,
+    applied: Option<u64>,
+) -> Settle {
+    let mut config = Config::new(schema)
         .storage(storage.clone())
         .backfill_checkpoint_interval(interval)
         .max_pending_batches(depth);
+    config.applied_sequence = applied;
     let mut db = Settle::open(config).unwrap();
     attach_runtimes(&mut db, schema);
     db
@@ -1156,7 +1164,13 @@ impl PipelinedClient {
     fn apply_next(&mut self) {
         let batch = self.unapplied.pop_front().unwrap();
         self.target.apply(&batch);
+        self.applied = batch.sequence;
         self.applied_unacked.push_back(batch.sequence);
+    }
+
+    fn open(&self) -> Settle {
+        let applied = self.journal.then_some(self.applied);
+        open_pipelined(self.schema, &self.storage, self.interval, self.depth, applied)
     }
 
     fn ack(&mut self, sequence: u64) {
@@ -1221,11 +1235,15 @@ impl PipelinedClient {
 
     /// The process dies: unacked batches are lost, applied rows stay.
     fn crash(&mut self) {
-        self.db = open_pipelined(self.schema, &self.storage, self.interval, self.depth);
+        self.db = self.open();
         self.unapplied.clear();
         self.applied_unacked.clear();
 
-        for (op, _) in std::mem::take(&mut self.not_durable) {
+        let mut lost = std::mem::take(&mut self.not_durable);
+        if self.journal {
+            lost.retain(|&(_, sequence)| sequence > self.applied);
+        }
+        for (op, _) in lost {
             self.run(&op).expect("an op that succeeded before succeeds again");
         }
     }
@@ -1241,15 +1259,28 @@ impl PipelinedClient {
 }
 
 fn check_pipelined_history(schema: &'static str, interval: u64, depth: usize, seed: u64, steps: usize) {
+    check_client_history(schema, interval, depth, false, seed, steps);
+}
+
+fn check_client_history(
+    schema: &'static str,
+    interval: u64,
+    depth: usize,
+    journal: bool,
+    seed: u64,
+    steps: usize,
+) {
     let storage = Arc::new(MemoryBackend::new());
     let mut client = PipelinedClient {
         schema,
         interval,
         depth,
-        db: open_pipelined(schema, &storage, interval, depth),
+        journal,
+        db: open_pipelined(schema, &storage, interval, depth, journal.then_some(0)),
         storage,
         rng: Rng::new(seed ^ 0x5EED),
         target: Target::default(),
+        applied: 0,
         unapplied: VecDeque::new(),
         applied_unacked: VecDeque::new(),
         not_durable: VecDeque::new(),
@@ -1284,7 +1315,8 @@ fn check_pipelined_history(schema: &'static str, interval: u64, depth: usize, se
             assert_eq!(
                 actual.is_ok(),
                 expected.is_ok(),
-                "seed {seed}, depth {depth}, interval {interval}: pipelined {actual:?} vs reference {expected:?}\n{}",
+                "seed {seed}, depth {depth}, interval {interval}, journal {journal}: pipelined \
+                 {actual:?} vs reference {expected:?}\n{}",
                 log.join("\n")
             );
             if expected.is_ok() {
@@ -1296,7 +1328,8 @@ fn check_pipelined_history(schema: &'static str, interval: u64, depth: usize, se
         let diff = client.drained_target().diff(&reference_target);
         assert!(
             diff.is_empty(),
-            "seed {seed}, depth {depth}, interval {interval}: outputs differ after\n{}\n\n{}",
+            "seed {seed}, depth {depth}, interval {interval}, journal {journal}: outputs differ \
+             after\n{}\n\n{}",
             log.join("\n"),
             diff.join("\n")
         );
@@ -1347,5 +1380,249 @@ fn random_short_pipelined_histories() {
     for seed in 0..3000 {
         check_pipelined_history(SUM_SCHEMA, 1, 2, seed, 10);
         check_pipelined_history(REDUCER_SCHEMA, 3, 3, seed, 10);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Journal: open with the applied sequence of the target.
+// ---------------------------------------------------------------------------
+
+/// The pipelined histories, where a crash keeps the batches that the target
+/// applied. The client does not send their ops again, as if their blocks
+/// were gone from the chain, so the state of the reopened instance comes
+/// from the journal alone.
+#[test]
+fn random_journaled_histories() {
+    for seed in 0..300 {
+        for depth in [1, 2, 4] {
+            check_client_history(SUM_SCHEMA, 1, depth, true, seed, 40);
+            check_client_history(SUM_SCHEMA, 3, depth, true, seed, 40);
+            check_client_history(REDUCER_SCHEMA, 1, depth, true, seed, 40);
+            check_client_history(SLIDING_SCHEMA, 1, depth, true, seed, 40);
+            check_client_history(FAILING_SCHEMA, 1, depth, true, seed, 40);
+        }
+    }
+}
+
+#[test]
+fn random_short_journaled_histories() {
+    for seed in 0..3000 {
+        check_client_history(SUM_SCHEMA, 1, 2, true, seed, 10);
+        check_client_history(REDUCER_SCHEMA, 3, 3, true, seed, 10);
+    }
+}
+
+fn open_journaled(schema: &str, storage: &Arc<MemoryBackend>, applied: u64) -> Settle {
+    let config = Config::new(schema)
+        .storage(storage.clone())
+        .applied_sequence(applied);
+    Settle::open(config).unwrap()
+}
+
+/// Block 1 is acked. Blocks 2 and 3, only pool B, are in a batch that the
+/// target applies or not, and the process stops before the ack. Then block
+/// 2 forks away. With the sequence that the target applied, the reopened
+/// instance brings the target to the rows of a run that never stopped.
+#[test]
+fn reopen_restores_the_batch_that_the_target_applied() {
+    let block_1 = || vec![("swaps".into(), 1, vec![swap(1, "A", 1)])];
+
+    let mut reference_db = reopen(SUM_SCHEMA, &Arc::new(MemoryBackend::new()), 1);
+    let mut reference = Target::default();
+    reference.apply(&ingest_with_finalized(&mut reference_db, block_1(), 0).unwrap().unwrap());
+    let batch = reference_db.ingest(new_chain_block(2, 5)).unwrap();
+    apply_and_ack(&mut reference_db, &mut reference, batch);
+
+    for target_applies in [true, false] {
+        let storage = Arc::new(MemoryBackend::new());
+        let mut db = open_journaled(SUM_SCHEMA, &storage, 0);
+        let mut target = Target::default();
+
+        let first = ingest_with_finalized_no_ack(&mut db, block_1(), 0).unwrap().unwrap();
+        target.apply(&first);
+        db.ack(first.sequence).unwrap();
+        let mut applied = first.sequence;
+
+        let old_fork = (2..=3).map(|b| ("swaps".into(), b, vec![swap(b, "B", b)])).collect();
+        let batch = ingest_with_finalized_no_ack(&mut db, old_fork, 0).unwrap().unwrap();
+        if target_applies {
+            target.apply(&batch);
+            applied = batch.sequence;
+        }
+        drop(db);
+
+        let mut db = open_journaled(SUM_SCHEMA, &storage, applied);
+        let expected_latest = if target_applies { 3 } else { 1 };
+        assert_eq!(db.latest_block(), expected_latest);
+        assert!(storage.journal().unwrap().is_empty());
+
+        let batch = db.ingest(new_chain_block(2, 5)).unwrap();
+        apply_and_ack(&mut db, &mut target, batch);
+
+        let diff = target.diff(&reference);
+        assert!(diff.is_empty(), "target applies: {target_applies}\n{}", diff.join("\n"));
+    }
+}
+
+/// A call without a batch joins the batch that waits. A reopen that
+/// restores the batch restores the writes of that call too.
+#[test]
+fn reopen_restores_the_writes_that_joined_the_applied_batch() {
+    let storage = Arc::new(MemoryBackend::new());
+    let mut db = open_journaled(SUM_SCHEMA, &storage, 0);
+
+    let block_1 = vec![("swaps".into(), 1, vec![swap(1, "A", 1)])];
+    let batch = ingest_with_finalized_no_ack(&mut db, block_1, 0).unwrap().unwrap();
+    let heartbeat = ingest_with_finalized_no_ack(&mut db, vec![], 1).unwrap();
+    assert!(heartbeat.is_none());
+    assert_eq!(db.unacked_batches(), 2);
+    drop(db);
+
+    let db = open_journaled(SUM_SCHEMA, &storage, batch.sequence);
+    assert_eq!(db.finalized_block(), 1);
+    assert!(storage.journal().unwrap().is_empty());
+}
+
+/// The applied sequence must lie between the last acked batch and the
+/// newest returned one; open refuses the database otherwise, and changes
+/// nothing.
+#[test]
+fn journal_open_checks_the_applied_sequence() {
+    let storage = Arc::new(MemoryBackend::new());
+    let mut db = open_journaled(SUM_SCHEMA, &storage, 0);
+    let block = |b| vec![("swaps".into(), b, vec![swap(b, "A", b)])];
+    let first = ingest_with_finalized(&mut db, block(1), 0).unwrap().unwrap();
+    let second = ingest_with_finalized_no_ack(&mut db, block(2), 0).unwrap().unwrap();
+    drop(db);
+
+    let refused = [
+        (None, "not acked"),
+        (Some(first.sequence - 1), "lost batches"),
+        (Some(second.sequence + 1), "no record"),
+    ];
+    for (applied, message) in refused {
+        let mut config = Config::new(SUM_SCHEMA).storage(storage.clone());
+        config.applied_sequence = applied;
+        match Settle::open(config) {
+            Err(Error::InvalidOperation(m)) => assert!(m.contains(message), "{m}"),
+            other => panic!("applied {applied:?}: {:?}", other.err()),
+        }
+    }
+
+    let db = open_journaled(SUM_SCHEMA, &storage, second.sequence);
+    assert_eq!(db.latest_block(), 2);
+}
+
+/// Without the journal, open needs no applied sequence, and the target
+/// keeps the database that it had.
+#[test]
+fn database_without_journal_opens_with_or_without_applied_sequence() {
+    let storage = Arc::new(MemoryBackend::new());
+    let mut db = reopen(SUM_SCHEMA, &storage, 1);
+    let block_1 = vec![("swaps".into(), 1, vec![swap(1, "A", 1)])];
+    let batch = ingest_with_finalized(&mut db, block_1, 0).unwrap().unwrap();
+    drop(db);
+
+    let db = open_journaled(SUM_SCHEMA, &storage, batch.sequence);
+    assert_eq!(db.latest_block(), 1);
+    drop(db);
+    let db = reopen(SUM_SCHEMA, &storage, 1);
+    assert_eq!(db.latest_block(), 1);
+}
+
+type Corruption = fn(Vec<u8>) -> Vec<u8>;
+
+/// Ways to damage a stored record: each leaves bytes that no codec wrote.
+const CORRUPTIONS: [(&str, Corruption); 4] = [
+    ("truncated", |mut r| {
+        r.pop();
+        r
+    }),
+    ("trailing byte", |mut r| {
+        r.push(0);
+        r
+    }),
+    ("garbage", |_| vec![0xff]),
+    ("empty", |_| Vec::new()),
+];
+
+/// Block 1 of pool ETH, final and so stored, in a database that then closes.
+fn stored_block_one(schema: &str) -> Arc<MemoryBackend> {
+    let storage = Arc::new(MemoryBackend::new());
+    let mut db = reopen(schema, &storage, 1);
+    ingest_with_finalized(&mut db, vec![("swaps".into(), 1, vec![swap(1, "ETH", 10)])], 1)
+        .unwrap();
+    storage
+}
+
+fn overwrite_mv_state(storage: &MemoryBackend, view: &str, key: Vec<u8>, record: Vec<u8>) {
+    let mut batch = StorageWriteBatch::new();
+    batch.put_mv_state(view, key, record);
+    storage.commit(&batch).unwrap();
+}
+
+fn assert_open_fails(schema: &str, storage: &Arc<MemoryBackend>, case: &str) {
+    let opened = Settle::open(Config::new(schema).storage(storage.clone()));
+    assert!(
+        matches!(opened, Err(Error::Storage(_))),
+        "{case}: {:?}",
+        opened.err()
+    );
+}
+
+/// A view whose stored state it cannot read must fail the open. A reopen
+/// that skipped the state would lose finalized aggregates, and replay starts
+/// above them, so it cannot rebuild them.
+#[test]
+fn unreadable_mv_state_fails_open() {
+    let eth = crate::storage::encode_group_key(&[Value::String("ETH".into())]);
+    let block_one = 1u64.to_be_bytes().to_vec();
+    let views = [
+        (SUM_SCHEMA, "pool_volume", eth),
+        (SLIDING_SCHEMA, "pool_1h", block_one),
+    ];
+
+    for (schema, view, key) in views {
+        let fewer_aggregates: Corruption = |mut r| {
+            r[0] -= 1;
+            r
+        };
+        let corruptions = CORRUPTIONS.iter().copied().chain([("aggregate count", fewer_aggregates)]);
+        for (name, corrupt) in corruptions {
+            // The window record starts with its time, not an aggregate count.
+            if view == "pool_1h" && name == "aggregate count" {
+                continue;
+            }
+            let storage = stored_block_one(schema);
+            let record = storage.get_mv_state(view, &key).unwrap().expect("stored state");
+            overwrite_mv_state(&storage, view, key.clone(), corrupt(record));
+            assert_open_fails(schema, &storage, &format!("{view}, {name}"));
+        }
+
+        let storage = stored_block_one(schema);
+        let record = storage.get_mv_state(view, &key).unwrap().unwrap();
+        overwrite_mv_state(&storage, view, vec![0xff, 0xff], record);
+        assert_open_fails(schema, &storage, &format!("{view}, unreadable key"));
+    }
+}
+
+/// The same for a reducer: it loads a stored state on the first row of the
+/// group, and that ingest must fail, not start from the default state.
+#[test]
+fn unreadable_reducer_state_fails_the_ingest() {
+    // A single String group key is stored as its bytes.
+    let key = b"ETH".to_vec();
+
+    for (name, corrupt) in CORRUPTIONS {
+        let storage = stored_block_one(REDUCER_SCHEMA);
+        let record = storage.get_reducer_finalized("running", &key).unwrap().expect("stored state");
+        let mut batch = StorageWriteBatch::new();
+        batch.set_reducer_finalized("running", key.clone(), corrupt(record));
+        storage.commit(&batch).unwrap();
+
+        let mut db = reopen(REDUCER_SCHEMA, &storage, 1);
+        let ingested =
+            ingest_with_finalized(&mut db, vec![("swaps".into(), 2, vec![swap(2, "ETH", 10)])], 1);
+        assert!(matches!(ingested, Err(Error::Storage(_))), "{name}: {:?}", ingested.err());
     }
 }

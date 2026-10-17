@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::reducer_runtime::event_rules::EventRulesRuntime;
 #[cfg(feature = "lua")]
 use crate::reducer_runtime::lua::LuaRuntime;
@@ -216,13 +216,11 @@ impl ReducerEngine {
         matches!(self.def.body, ReducerBody::External { .. })
     }
 
-    /// True when calling process would panic: the reducer uses LANGUAGE EXTERNAL,
-    /// the runtime hasn't been replaced (still ExternalRuntime), and no JS
-    /// context is installed on the current thread.
+    /// True when processing would fail: the runtime is still the
+    /// ExternalRuntime of a LANGUAGE EXTERNAL reducer, and the callback
+    /// context on the current thread holds no callback for it.
     pub fn needs_host_callback(&self) -> bool {
-        self.is_external()
-            && self.runtime.needs_host_context()
-            && !crate::reducer_runtime::external::context_installed()
+        self.runtime.missing_host_callback()
     }
 
     /// Replace the runtime (used to inject external/fn runtimes after construction).
@@ -381,7 +379,11 @@ impl ReducerEngine {
             .collect();
 
         // Phase 2: Single batch call
-        if let Err(e) = self.runtime.process_grouped(&mut batches) {
+        let processed = self
+            .runtime
+            .process_grouped(&mut batches)
+            .and_then(|()| self.check_emit_rows(&batches));
+        if let Err(e) = processed {
             // The undo of the failed ingest restores these keys from the
             // blocks before, also the states taken out of `state_cache`.
             self.block_groups.entry(block).or_default().extend(key_order);
@@ -408,15 +410,7 @@ impl ReducerEngine {
             block_keys.insert(key.clone());
 
             let first_row = &rows[row_indices[0]];
-            // Batched path assumes 1 emit per input row for correct ordering.
-            // Multi-emit per row would break the row_indices mapping.
-            debug_assert!(
-                batch.emits.len() <= row_indices.len(),
-                "batched path: got {} emits for {} rows in group — multi-emit not supported",
-                batch.emits.len(),
-                row_indices.len()
-            );
-            for (emit_idx, mut emit_row) in batch.emits.into_iter().enumerate() {
+            for (group_row, mut emit_row) in batch.emits {
                 for col in &self.def.group_by {
                     if !emit_row.contains_key(col.as_str()) {
                         if let Some(v) = first_row.get(col.as_str()) {
@@ -424,22 +418,29 @@ impl ReducerEngine {
                         }
                     }
                 }
-                // Map back to original row index for ordering
-                let orig_idx = if emit_idx < row_indices.len() {
-                    row_indices[emit_idx]
-                } else {
-                    // Multi-emit: append after last row
-                    usize::MAX
-                };
-                indexed_emits.push((orig_idx, emit_row));
+                indexed_emits.push((row_indices[group_row], emit_row));
             }
         }
 
-        // Sort by original row index to preserve input order
+        // Stable: the emits of one row keep their order.
         indexed_emits.sort_by_key(|(idx, _)| *idx);
         let output_maps: Vec<RowMap> = indexed_emits.into_iter().map(|(_, row)| row).collect();
 
         Ok(output_maps)
+    }
+
+    /// Err if an emit names a row that its group does not have.
+    fn check_emit_rows(&self, batches: &[GroupBatch]) -> Result<()> {
+        for batch in batches {
+            if let Some((row, _)) = batch.emits.iter().find(|(row, _)| *row >= batch.rows.len()) {
+                return Err(Error::InvalidOperation(format!(
+                    "reducer '{}': an emit names row {row} of a group with {} rows",
+                    self.def.name,
+                    batch.rows.len()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Process a batch of RowMaps for a given block (normal ingestion path).
@@ -525,6 +526,15 @@ impl ReducerEngine {
         Ok(affected_keys.len())
     }
 
+    /// Drop all in-memory state: each group loads its stored state again on
+    /// its next row.
+    pub fn reload(&mut self) {
+        self.state_cache.clear();
+        self.block_snapshots.clear();
+        self.block_groups.clear();
+        self.pending_durable.clear();
+    }
+
     /// Merge the blocks up to `block` into finalized state: they can no longer
     /// roll back. Their groups wait in `pending_durable` for `write_checkpoint`,
     /// which reads each group's newest snapshot at or before finality, so the
@@ -592,8 +602,7 @@ impl ReducerEngine {
         // `write_checkpoint` drops the snapshots it persists, so a checkpoint
         // that waits for an ack is the newest state of this group.
         if let Some(bytes) = pending.reducer_finalized(&self.def.name, group_key_bytes) {
-            let values = storage::decode_values(bytes);
-            return Ok(values_to_state(&values, &self.state_field_names));
+            return decode_state(bytes, &self.def.name, &self.state_field_names);
         }
 
         // Fall back to finalized state in storage
@@ -672,10 +681,25 @@ fn load_state_from(
     field_names: &[String],
 ) -> Result<State> {
     if let Some(bytes) = storage.get_reducer_finalized(reducer_name, group_key_bytes)? {
-        let values = storage::decode_values(&bytes);
-        return Ok(values_to_state(&values, field_names));
+        return decode_state(&bytes, reducer_name, field_names);
     }
     Ok(default_state.clone())
+}
+
+/// Decode a finalized state that `write_checkpoint` encoded.
+fn decode_state(bytes: &[u8], reducer_name: &str, field_names: &[String]) -> Result<State> {
+    let unreadable =
+        |reason: String| Error::Storage(format!("unreadable state of reducer '{reducer_name}': {reason}"));
+
+    let values = storage::decode_values(bytes).map_err(|e| unreadable(e.to_string()))?;
+    if values.len() != field_names.len() {
+        return Err(unreadable(format!(
+            "{} values for {} state fields",
+            values.len(),
+            field_names.len()
+        )));
+    }
+    Ok(values_to_state(&values, field_names))
 }
 
 /// Convert the hot `HashMap` state into a positional `Vec<Value>` in schema
@@ -1300,11 +1324,8 @@ mod tests {
         assert_eq!(val, Value::Uint256([0u8; 32]));
     }
 
-    /// Batched path must preserve original input row order in emits.
-    #[test]
-    fn batched_path_preserves_emit_order() {
-        use crate::reducer_runtime::external::{ExternalRuntime, install_test_context};
-
+    /// An external reducer `counter` over `events`, grouped by user.
+    fn external_counter() -> ReducerEngine {
         let def = ReducerDef {
             name: "counter".to_string(),
             source: "events".to_string(),
@@ -1321,12 +1342,27 @@ mod tests {
         };
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
-        let mut engine = ReducerEngine::new(def, storage, &reg, &[]);
+        ReducerEngine::new(def, storage, &reg, &[])
+    }
+
+    fn event(user: &str, amount: f64) -> RowMap {
+        HashMap::from([
+            ("user".into(), Value::String(user.into())),
+            ("amount".into(), Value::Float64(amount)),
+        ])
+    }
+
+    /// Batched path must preserve original input row order in emits.
+    #[test]
+    fn batched_path_preserves_emit_order() {
+        use crate::reducer_runtime::external::install_test_context;
+
+        let mut engine = external_counter();
 
         // Install test context that increments count and emits it
         let _guard = install_test_context(|groups| {
             for group in groups.iter_mut() {
-                for row in &group.rows {
+                for (index, row) in group.rows.iter().enumerate() {
                     let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let count = group
                         .state
@@ -1339,28 +1375,15 @@ mod tests {
                         .insert("count".into(), Value::Float64(new_count));
                     group
                         .emits
-                        .push(HashMap::from([("count".into(), Value::Float64(new_count))]));
+                        .push((index, HashMap::from([("count".into(), Value::Float64(new_count))])));
                 }
             }
         });
 
         // Input: alice, bob, alice — interleaved
-        let rows = vec![
-            Row::from(HashMap::from([
-                ("user".into(), Value::String("alice".into())),
-                ("amount".into(), Value::Float64(1.0)),
-            ])),
-            Row::from(HashMap::from([
-                ("user".into(), Value::String("bob".into())),
-                ("amount".into(), Value::Float64(10.0)),
-            ])),
-            Row::from(HashMap::from([
-                ("user".into(), Value::String("alice".into())),
-                ("amount".into(), Value::Float64(2.0)),
-            ])),
-        ];
+        let rows = vec![event("alice", 1.0), event("bob", 10.0), event("alice", 2.0)];
 
-        let output = engine.process_block(1000, &rows).unwrap();
+        let output = engine.process_block_maps(1000, &rows).unwrap();
 
         // The key assertion: output follows original input order (alice, bob, alice)
         // not grouped order (alice, alice, bob)
@@ -1368,5 +1391,44 @@ mod tests {
         assert_eq!(output[0].get("user"), Some(&Value::String("alice".into())));
         assert_eq!(output[1].get("user"), Some(&Value::String("bob".into())));
         assert_eq!(output[2].get("user"), Some(&Value::String("alice".into())));
+    }
+
+    /// A row that emits nothing does not shift the emits of its group: each
+    /// emit keeps the place of the row that emitted it.
+    #[test]
+    fn batched_path_keeps_order_when_a_row_emits_nothing() {
+        use crate::reducer_runtime::external::install_test_context;
+
+        let mut engine = external_counter();
+        let _guard = install_test_context(|groups| {
+            for group in groups.iter_mut() {
+                for (index, row) in group.rows.iter().enumerate() {
+                    let amount = row.get("amount").cloned().unwrap();
+                    if amount != Value::Float64(0.0) {
+                        group.emits.push((index, HashMap::from([("amount".into(), amount)])));
+                    }
+                }
+            }
+        });
+
+        let rows = vec![event("alice", 0.0), event("bob", 1.0), event("alice", 2.0)];
+        let output = engine.process_block_maps(1000, &rows).unwrap();
+
+        let amounts: Vec<_> = output.iter().map(|r| r.get("amount").cloned().unwrap()).collect();
+        assert_eq!(amounts, [Value::Float64(1.0), Value::Float64(2.0)]);
+    }
+
+    /// An emit that names a row its group lacks fails the block.
+    #[test]
+    fn batched_path_rejects_an_emit_of_a_missing_row() {
+        use crate::reducer_runtime::external::install_test_context;
+
+        let mut engine = external_counter();
+        let _guard = install_test_context(|groups| {
+            groups[0].emits.push((groups[0].rows.len(), HashMap::new()));
+        });
+
+        let rows = vec![event("alice", 1.0)];
+        assert!(engine.process_block_maps(1000, &rows).is_err());
     }
 }

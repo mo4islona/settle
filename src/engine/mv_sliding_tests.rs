@@ -118,7 +118,7 @@ fn sliding_window_no_expiry_within_window() {
         sliding_sum_mv_def(3600),
         test_storage(),
         &test_column_types(),
-    );
+    ).unwrap();
 
     // Three blocks all within 1 hour
     let d1 = mv.process_block(
@@ -170,7 +170,7 @@ fn sliding_window_basic_expiry() {
         sliding_sum_mv_def(3600),
         test_storage(),
         &test_column_types(),
-    ); // 1 hour
+    ).unwrap(); // 1 hour
 
     // Block 1: ts=0, volume=100
     mv.process_block(
@@ -221,7 +221,7 @@ fn sliding_window_full_expiry_delete() {
         sliding_sum_mv_def(3600),
         test_storage(),
         &test_column_types(),
-    );
+    ).unwrap();
 
     // Block 1: group A at ts=0
     mv.process_block(
@@ -263,7 +263,7 @@ fn sliding_window_full_expiry_delete() {
 
 #[test]
 fn sliding_window_sum_correctness_across_expiry() {
-    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()); // 10 second window
+    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()).unwrap(); // 10 second window
 
     // 5 blocks, each 3 seconds apart
     for i in 0..5u64 {
@@ -311,7 +311,7 @@ fn sliding_window_all_agg_types() {
         sliding_all_aggs_mv_def(3600),
         test_storage(),
         &test_column_types(),
-    );
+    ).unwrap();
 
     // Block 1: val=10 at ts=0
     mv.process_block(
@@ -367,7 +367,7 @@ fn sliding_window_rollback() {
         sliding_sum_mv_def(3600),
         test_storage(),
         &test_column_types(),
-    );
+    ).unwrap();
 
     mv.process_block(
         1,
@@ -430,7 +430,7 @@ fn sliding_window_rollback_plus_expiry() {
         sliding_sum_mv_def(3600),
         test_storage(),
         &test_column_types(),
-    );
+    ).unwrap();
 
     // Block 1: ts=0
     mv.process_block(
@@ -487,7 +487,7 @@ fn trade(pair: &str, volume: f64, ts_ms: i64) -> RowMap {
 /// brings the group back as an Insert.
 #[test]
 fn sliding_window_rollback_restores_group_removed_by_expiry() {
-    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()).unwrap();
 
     mv.process_block(1, &[trade("BTC", 5.0, 0)]);
     mv.process_block(2, &[trade("ETH", 10.0, 5_000)]);
@@ -516,7 +516,7 @@ fn sliding_window_rollback_restores_group_removed_by_expiry() {
 /// A block that expires on arrival is rolled back with itself, not restored.
 #[test]
 fn sliding_window_rollback_drops_block_expired_on_arrival() {
-    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()).unwrap();
 
     mv.process_block(1, &[trade("ETH", 10.0, 20_000)]);
     mv.process_block(2, &[trade("BTC", 5.0, 1_000)]);
@@ -533,7 +533,7 @@ fn sliding_window_rollback_drops_block_expired_on_arrival() {
 fn sliding_window_expired_block_survives_reopen() {
     let storage = test_storage();
     {
-        let mut mv = MVEngine::new(sliding_sum_mv_def(3600), storage.clone(), &test_column_types());
+        let mut mv = MVEngine::new(sliding_sum_mv_def(3600), storage.clone(), &test_column_types()).unwrap();
         mv.process_block(1, &[trade("ETH", 100.0, 0)]);
         mv.process_block(2, &[trade("ETH", 200.0, 1_800_000)]);
         mv.process_block(3, &[trade("ETH", 300.0, 3_601_000)]);
@@ -544,7 +544,7 @@ fn sliding_window_expired_block_survives_reopen() {
         storage.commit(&batch).unwrap();
     }
 
-    let mut mv = MVEngine::new(sliding_sum_mv_def(3600), storage.clone(), &test_column_types());
+    let mut mv = MVEngine::new(sliding_sum_mv_def(3600), storage.clone(), &test_column_types()).unwrap();
     assert_eq!(mv.block_times.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
 
     let changes = mv.process_block(3, &[trade("ETH", 300.0, 3_601_000)]);
@@ -561,7 +561,7 @@ fn sliding_window_expired_block_survives_reopen() {
 fn sliding_checkpoint_does_not_grow_with_the_window() {
     for window in [10u64, 1_000] {
         let storage = test_storage();
-        let mut mv = MVEngine::new(sliding_sum_mv_def(window), storage.clone(), &test_column_types());
+        let mut mv = MVEngine::new(sliding_sum_mv_def(window), storage.clone(), &test_column_types()).unwrap();
 
         // One block per second; finality 5 blocks behind.
         let mut last = StorageWriteBatch::new();
@@ -589,7 +589,7 @@ fn sliding_checkpoint_does_not_grow_with_the_window() {
 /// Once the block that expired a block is final, the expired data goes.
 #[test]
 fn sliding_window_final_expiry_drops_expired_data() {
-    let mut mv = MVEngine::new(sliding_sum_mv_def(3600), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(sliding_sum_mv_def(3600), test_storage(), &test_column_types()).unwrap();
     mv.process_block(1, &[trade("ETH", 100.0, 0)]);
     mv.process_block(2, &[trade("ETH", 200.0, 3_601_000)]);
 
@@ -603,7 +603,7 @@ fn sliding_window_final_expiry_drops_expired_data() {
 #[test]
 fn sliding_window_rapid_expiry() {
     // 1-second window: every new block expires the previous one
-    let mut mv = MVEngine::new(sliding_sum_mv_def(1), test_storage(), &test_column_types());
+    let mut mv = MVEngine::new(sliding_sum_mv_def(1), test_storage(), &test_column_types()).unwrap();
 
     let d1 = mv.process_block(
         1,
@@ -651,7 +651,7 @@ fn sliding_window_multiple_groups_independent_expiry() {
         sliding_sum_mv_def(3600),
         test_storage(),
         &test_column_types(),
-    );
+    ).unwrap();
 
     // Group A at ts=0
     mv.process_block(
@@ -712,7 +712,7 @@ fn sliding_window_persistence_and_restore() {
             sliding_sum_mv_def(3600),
             storage.clone(),
             &test_column_types(),
-        );
+        ).unwrap();
 
         mv.process_block(
             1,
@@ -747,7 +747,7 @@ fn sliding_window_persistence_and_restore() {
             sliding_sum_mv_def(3600),
             storage.clone(),
             &test_column_types(),
-        );
+        ).unwrap();
 
         // block_times should be restored
         assert_eq!(mv.block_times.len(), 2);
@@ -772,7 +772,7 @@ fn sliding_window_replay_skip() {
             sliding_sum_mv_def(3600),
             storage.clone(),
             &test_column_types(),
-        );
+        ).unwrap();
         mv.process_block(
             1,
             &[make_ts_row(
@@ -794,7 +794,7 @@ fn sliding_window_replay_skip() {
         sliding_sum_mv_def(3600),
         storage.clone(),
         &test_column_types(),
-    );
+    ).unwrap();
 
     // Replay block 1 — should be skipped (already in block_times)
     let d = mv.process_block(
@@ -826,7 +826,7 @@ fn sliding_window_replay_skip() {
 
 #[test]
 fn sliding_window_out_of_order_timestamps() {
-    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()); // 10 second window
+    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()).unwrap(); // 10 second window
 
     // Block 1 at ts=5000
     mv.process_block(
@@ -870,7 +870,7 @@ fn sliding_window_out_of_order_timestamps() {
 #[test]
 fn sliding_window_boundary_inclusive() {
     // Test that the window boundary is inclusive (data AT cutoff is NOT expired)
-    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()); // 10 second window
+    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()).unwrap(); // 10 second window
 
     // Block 1 at ts=0
     mv.process_block(
@@ -905,7 +905,7 @@ fn sliding_window_boundary_inclusive() {
 #[test]
 fn sliding_window_empty_group_cleanup_on_finalize() {
     let storage = test_storage();
-    let mut mv = MVEngine::new(sliding_sum_mv_def(1), storage.clone(), &test_column_types()); // 1 second window
+    let mut mv = MVEngine::new(sliding_sum_mv_def(1), storage.clone(), &test_column_types()).unwrap(); // 1 second window
 
     // Block 1 at ts=0
     mv.process_block(
@@ -944,7 +944,7 @@ fn sliding_window_empty_group_cleanup_on_finalize() {
     storage.commit(&batch).unwrap();
 
     // Restore — group X should not exist
-    let mv2 = MVEngine::new(sliding_sum_mv_def(1), storage.clone(), &test_column_types());
+    let mv2 = MVEngine::new(sliding_sum_mv_def(1), storage.clone(), &test_column_types()).unwrap();
     assert_eq!(mv2.groups.len(), 1); // only Y
 }
 
@@ -957,7 +957,7 @@ fn sliding_window_group_expired_on_arrival_is_removed() {
         sliding_sum_mv_def(10),
         storage.clone(),
         &test_column_types(),
-    );
+    ).unwrap();
     let trade = |pair: &str, volume: f64, ts_ms: i64| {
         make_ts_row(
             &[
@@ -988,7 +988,7 @@ fn sliding_window_group_expired_on_arrival_is_removed() {
         sliding_sum_mv_def(10),
         storage.clone(),
         &test_column_types(),
-    );
+    ).unwrap();
     assert_eq!(restored.groups.len(), 1); // only ETH
 
     // A zero volume leaves the sum unchanged: only an Insert carries the row.
@@ -1002,7 +1002,7 @@ fn sliding_window_group_expired_on_arrival_is_removed() {
 
 #[test]
 fn sliding_window_missing_timestamp_uses_watermark() {
-    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()); // 10s window
+    let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage(), &test_column_types()).unwrap(); // 10s window
 
     // Block 1: has timestamp
     mv.process_block(
@@ -1072,7 +1072,7 @@ fn sliding_sum_only_mv_def(window_secs: u64) -> MVDef {
 }
 
 fn random_forks_mv(def: fn(u64) -> MVDef, storage: &Arc<dyn StorageBackend>) -> MVEngine {
-    MVEngine::new(def(10), storage.clone(), &test_column_types())
+    MVEngine::new(def(10), storage.clone(), &test_column_types()).unwrap()
 }
 
 /// The view of a fresh MV fed only `chain`.

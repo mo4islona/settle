@@ -1,4 +1,4 @@
-import type { ColumnType, InferRow } from './column'
+import type { ColumnType, FromEngine, InferRow } from './column'
 import {
   inferStateFields,
   type ReducerOptions,
@@ -29,6 +29,8 @@ export interface BuildOptions {
   compression?: 'none' | 'snappy' | 'zstd' | 'lz4'
   disableCompaction?: boolean
   cacheSize?: number
+  /** See `SettleConfig.appliedSequence`. */
+  appliedSequence?: number
 }
 
 /**
@@ -50,6 +52,7 @@ export function openCompiled<S extends ISettle>(
     compression: opts?.compression,
     disableCompaction: opts?.disableCompaction,
     cacheSize: opts?.cacheSize,
+    appliedSequence: opts?.appliedSequence,
   })
   for (const r of compiled.reducers) {
     // Reducer was declared in SQL above (via `reducerToSql` → `LANGUAGE
@@ -192,7 +195,7 @@ export class ReducerHandle<TOutput = any> {
 
   createReducer<TState, TEmit>(
     name: string,
-    opts: ReducerOptions<TState, TOutput, TEmit>,
+    opts: ReducerOptions<TState, FromEngine<TOutput>, TEmit>,
   ): ReducerHandle<TEmit> {
     return this.#pipeline._addReducer(name, this.#name, opts)
   }

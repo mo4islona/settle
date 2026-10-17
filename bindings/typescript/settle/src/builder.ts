@@ -280,7 +280,12 @@ export class Pipeline {
     return new ViewHandle(name)
   }
 
-  build(opts?: { dataDir?: string; maxBufferSize?: number; maxPendingBatches?: number }): Settle {
+  build(opts?: {
+    dataDir?: string
+    maxBufferSize?: number
+    maxPendingBatches?: number
+    appliedSequence?: number
+  }): Settle {
     const ddl: string[] = []
     for (const t of this.#tables) {
       ddl.push(tableToSql(t.name, t.columns, t.virtual))
@@ -297,6 +302,7 @@ export class Pipeline {
       dataDir: opts?.dataDir,
       maxBufferSize: opts?.maxBufferSize,
       maxPendingBatches: opts?.maxPendingBatches,
+      appliedSequence: opts?.appliedSequence,
     })
 
     for (const r of this.#reducers) {
