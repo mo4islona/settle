@@ -57,8 +57,6 @@ export interface SettleConfig {
   maxPendingBatches?: number
   /** Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4". */
   compression?: 'none' | 'snappy' | 'zstd' | 'lz4'
-  /** Disable RocksDB automatic background compactions. */
-  disableCompaction?: boolean
   /** Block cache size in bytes. Omit for RocksDB default (~8MB per CF), 0 to disable. */
   cacheSize?: number
   /**

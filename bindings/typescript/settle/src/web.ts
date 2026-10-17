@@ -10,8 +10,8 @@
  * External reducers work via JS callbacks (same API as Node.js).
  *
  * Persistence options on `SettleConfig` (`dataDir`, `compression`,
- * `disableCompaction`, `cacheSize`) are not supported in WASM and will
- * cause `Settle.open` to throw — the WASM build is memory-only by design.
+ * `cacheSize`) are not supported in WASM and will cause `Settle.open` to
+ * throw — the WASM build is memory-only by design.
  */
 
 // Re-export types that are shared with Node.js entry point
@@ -103,7 +103,7 @@ export class Settle implements ISettle {
    *
    * Mirrors the Node-side `Settle.open(config)` so the same code can target
    * both environments. WASM is memory-only — supplying any persistence option
-   * (`dataDir`, `compression`, `disableCompaction`, `cacheSize`) throws.
+   * (`dataDir`, `compression`, `cacheSize`) throws.
    */
   static open(config: SettleConfig): Settle {
     if (!wasmReady) {
@@ -114,12 +114,11 @@ export class Settle implements ISettle {
     if (
       config.dataDir !== undefined ||
       config.compression !== undefined ||
-      config.disableCompaction !== undefined ||
       config.cacheSize !== undefined ||
       config.maxBufferSize !== undefined
     ) {
       throw new Error(
-        'WASM build is memory-only and does not expose buffer tuning — `dataDir`, `compression`, `disableCompaction`, `cacheSize`, and `maxBufferSize` are not supported.',
+        'WASM build is memory-only and does not expose buffer tuning — `dataDir`, `compression`, `cacheSize`, and `maxBufferSize` are not supported.',
       )
     }
     return new Settle(new WasmSettle(config.schema, config.maxPendingBatches))

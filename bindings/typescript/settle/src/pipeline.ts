@@ -27,7 +27,6 @@ export interface BuildOptions {
   maxBufferSize?: number
   maxPendingBatches?: number
   compression?: 'none' | 'snappy' | 'zstd' | 'lz4'
-  disableCompaction?: boolean
   cacheSize?: number
   /** See `SettleConfig.appliedSequence`. */
   appliedSequence?: number
@@ -50,7 +49,6 @@ export function openCompiled<S extends ISettle>(
     maxBufferSize: opts?.maxBufferSize,
     maxPendingBatches: opts?.maxPendingBatches,
     compression: opts?.compression,
-    disableCompaction: opts?.disableCompaction,
     cacheSize: opts?.cacheSize,
     appliedSequence: opts?.appliedSequence,
   })
