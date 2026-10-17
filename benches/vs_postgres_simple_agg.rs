@@ -32,8 +32,8 @@ use tokio_postgres::types::ToSql;
 mod common;
 
 use common::{
-    build_multi_insert, gen_transfer, print_result_split, row_f64, row_str,
-    split_blocks, PgRuntime, BATCH_SIZE, BLOCKS_PER_BATCH, ROWS_PER_BLOCK,
+    build_multi_insert, gen_transfer, print_result_split, row_f64, row_str, split_blocks,
+    PgBaseline, PgCase, PgRuntime, BATCH_SIZE, BLOCKS_PER_BATCH, ROWS_PER_BLOCK,
 };
 
 const SETTLE_SCHEMA_FN: &str = r#"
@@ -500,45 +500,38 @@ fn main() -> anyhow::Result<()> {
         .map(|i| gen_transfer(i, NUM_USERS))
         .collect();
 
-    eprintln!("workload: vs_postgres_simple_agg");
-    eprintln!(
-        "  config: {TOTAL_ROWS} rows, {NUM_USERS} users, {ROWS_PER_BLOCK} rows/block, \
+    let config = format!(
+        "{TOTAL_ROWS} rows, {NUM_USERS} users, {ROWS_PER_BLOCK} rows/block, \
          {BLOCKS_PER_BATCH} blocks/batch, {} batches",
         TOTAL_ROWS / BATCH_SIZE
     );
+    eprintln!("workload: vs_postgres_simple_agg");
+    eprintln!("  config: {config}");
+    let mut pg_baseline = PgBaseline::open("vs_postgres_simple_agg", 1, &config)?;
 
     // postgres_only (no Settle) — PG handles everything, settle portion = 0
-    let pg = PgRuntime::start()?;
-    pg.batch_execute(PG_SCHEMA)?;
-    pg.take_stats();
-    let t = Instant::now();
-    run_pg_only_per_row(&pg, &rows)?;
-    let elapsed = t.elapsed();
-    print_result_split(
-        "pg_only_per_row",
-        TOTAL_ROWS,
-        elapsed,
-        std::time::Duration::ZERO,
-        pg.take_stats(),
-    );
-    check_pg_state(&pg, "pg_only_per_row")?;
-    drop(pg);
-
-    let pg = PgRuntime::start()?;
-    pg.batch_execute(PG_SCHEMA)?;
-    pg.take_stats();
-    let t = Instant::now();
-    run_pg_only_batch(&pg, &rows)?;
-    let elapsed = t.elapsed();
-    print_result_split(
-        "pg_only_batch",
-        TOTAL_ROWS,
-        elapsed,
-        std::time::Duration::ZERO,
-        pg.take_stats(),
-    );
-    check_pg_state(&pg, "pg_only_batch")?;
-    drop(pg);
+    let pg_only: [(&str, fn(&PgRuntime, &[RowMap]) -> anyhow::Result<()>); 2] = [
+        ("pg_only_per_row", run_pg_only_per_row),
+        ("pg_only_batch", run_pg_only_batch),
+    ];
+    for (label, run_pg_only) in pg_only {
+        let case = pg_baseline.case(label, || {
+            let pg = PgRuntime::start()?;
+            pg.batch_execute(PG_SCHEMA)?;
+            pg.take_stats();
+            let t = Instant::now();
+            run_pg_only(&pg, &rows)?;
+            let elapsed = t.elapsed();
+            let stats = pg.take_stats();
+            check_pg_state(&pg, label)?;
+            Ok(PgCase {
+                elapsed,
+                stats,
+                output: (),
+            })
+        })?;
+        print_result_split(label, TOTAL_ROWS, case.elapsed, Duration::ZERO, case.stats);
+    }
 
     // Settle: reducer style × {Memory, Rocks} × {mode}.
     //

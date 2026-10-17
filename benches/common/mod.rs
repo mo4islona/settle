@@ -6,10 +6,13 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use settle::types::{RowMap, Value};
 use testcontainers::{runners::AsyncRunner, ContainerAsync};
 use testcontainers_modules::postgres::Postgres as PgImage;
@@ -41,7 +44,7 @@ pub fn split_blocks<'a>(
 
 /// Snapshot of Postgres operation counters. Print after each pipeline run
 /// to compare op-count between `postgres-only` and `settle→postgres`.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct PgStats {
     pub write_statements: u64,
     pub read_statements: u64,
@@ -226,6 +229,163 @@ impl PgRuntime {
             rows_read: self.rows_read.swap(0, Ordering::Relaxed),
         }
     }
+}
+
+// ─── Pure-Postgres baseline ────────────────────────────────────────────────
+
+/// One measured run of a pure-Postgres case. `output` is what the bench
+/// checks later (a final state, a counter), so a cached case can still
+/// take part in the correctness checks.
+pub struct PgCase<T> {
+    pub elapsed: Duration,
+    pub stats: PgStats,
+    pub output: T,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedCase {
+    elapsed_secs: f64,
+    runs: usize,
+    recorded_at: u64,
+    stats: PgStats,
+    output: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct BaselineFile {
+    key: String,
+    cases: BTreeMap<String, CachedCase>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BaselineMode {
+    Reuse,
+    Refresh,
+    Off,
+}
+
+/// Cache for the cases that run no Settle code. A Settle change cannot move
+/// them, so an A/B run measured the same Postgres work on both sides.
+///
+/// A missing case runs `PG_BASELINE_RUNS` times (default 3) and its median
+/// goes to `target/tmp/pg_baseline/<bench>.json`; later runs reuse it.
+/// `PG_BASELINE=refresh` measures every case again, `PG_BASELINE=off` runs
+/// each case once and keeps nothing.
+///
+/// The key is the bench's config and `version`, not its source: the two
+/// sides of an A/B can differ in their Settle code and still share one
+/// baseline. Bump `version` when the SQL or the workload of a case changes.
+pub struct PgBaseline {
+    path: PathBuf,
+    mode: BaselineMode,
+    runs: usize,
+    file: BaselineFile,
+}
+
+impl PgBaseline {
+    pub fn open(bench: &str, version: u32, config: &str) -> anyhow::Result<Self> {
+        let mode = match std::env::var("PG_BASELINE").as_deref() {
+            Err(_) | Ok("") | Ok("reuse") => BaselineMode::Reuse,
+            Ok("refresh") => BaselineMode::Refresh,
+            Ok("off") => BaselineMode::Off,
+            Ok(other) => anyhow::bail!("PG_BASELINE={other}: expected reuse, refresh or off"),
+        };
+        let runs = match std::env::var("PG_BASELINE_RUNS") {
+            Ok(n) => n.parse()?,
+            Err(_) => 3,
+        };
+        anyhow::ensure!(runs > 0, "PG_BASELINE_RUNS must be at least 1");
+
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("pg_baseline")
+            .join(format!("{bench}.json"));
+        let key = format!("v{version} {config}");
+
+        let stored = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<BaselineFile>(&bytes).ok());
+        let file = match stored {
+            Some(file) if file.key == key && mode == BaselineMode::Reuse => file,
+            _ => BaselineFile {
+                key,
+                cases: BTreeMap::new(),
+            },
+        };
+
+        Ok(Self {
+            path,
+            mode,
+            runs,
+            file,
+        })
+    }
+
+    /// The case `label`: from the cache, or measured by `run`.
+    pub fn case<T: Serialize + DeserializeOwned>(
+        &mut self,
+        label: &str,
+        mut run: impl FnMut() -> anyhow::Result<PgCase<T>>,
+    ) -> anyhow::Result<PgCase<T>> {
+        if self.mode == BaselineMode::Reuse {
+            if let Some(cached) = self.file.cases.get(label) {
+                let age_hours = now_secs().saturating_sub(cached.recorded_at) / 3600;
+                eprintln!(
+                    "  [pg baseline] {label}: cached, median of {} runs, recorded {age_hours} h ago",
+                    cached.runs
+                );
+                return Ok(PgCase {
+                    elapsed: Duration::from_secs_f64(cached.elapsed_secs),
+                    stats: cached.stats,
+                    output: serde_json::from_value(cached.output.clone())?,
+                });
+            }
+        }
+
+        let runs = if self.mode == BaselineMode::Off {
+            1
+        } else {
+            self.runs
+        };
+        let mut measured = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            measured.push(run()?);
+        }
+        measured.sort_by_key(|case| case.elapsed);
+        let all: Vec<String> = measured
+            .iter()
+            .map(|case| format!("{:.3}s", case.elapsed.as_secs_f64()))
+            .collect();
+        let median = measured.swap_remove(runs / 2);
+
+        if self.mode != BaselineMode::Off {
+            eprintln!(
+                "  [pg baseline] {label}: measured {}, median kept",
+                all.join(" ")
+            );
+            self.file.cases.insert(
+                label.to_string(),
+                CachedCase {
+                    elapsed_secs: median.elapsed.as_secs_f64(),
+                    runs,
+                    recorded_at: now_secs(),
+                    stats: median.stats,
+                    output: serde_json::to_value(&median.output)?,
+                },
+            );
+            // Written after each case, so a failed run keeps what it measured.
+            std::fs::create_dir_all(self.path.parent().expect("baseline dir"))?;
+            std::fs::write(&self.path, serde_json::to_vec_pretty(&self.file)?)?;
+        }
+
+        Ok(median)
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ─── Multi-row INSERT/UPSERT helpers ───────────────────────────────────────
