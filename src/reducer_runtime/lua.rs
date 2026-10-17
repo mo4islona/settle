@@ -414,8 +414,9 @@ fn register_json_module(lua: &Lua) -> LuaResult<()> {
 fn lua_table_to_values(table: &mlua::Table, emits: &mut Emits) -> LuaResult<Vec<Value>> {
     let mut values = Vec::new();
     table.for_each(|k: mlua::String, v: LuaValue| {
-        let id = emits.column(&k.to_str()?);
-        set_at(&mut values, id, lua_to_value(&v));
+        if let Some(id) = emits.column(&k.to_str()?) {
+            set_at(&mut values, id, lua_to_value(&v));
+        }
         Ok(())
     })?;
     Ok(values)

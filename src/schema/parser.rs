@@ -1734,6 +1734,28 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
     let reducer_names: Vec<&str> = schema.reducers.iter().map(|r| r.name.as_str()).collect();
     let module_names: Vec<&str> = schema.modules.iter().map(|m| m.name.as_str()).collect();
 
+    // A stored row holds its column count in a u16, and a column position
+    // is a u16.
+    let max_columns = u16::MAX as usize;
+    for table in &schema.tables {
+        if table.columns.len() > max_columns {
+            return Err(Error::Schema(format!(
+                "table '{}': {} columns, at most {max_columns} are supported",
+                table.name,
+                table.columns.len()
+            )));
+        }
+    }
+    for reducer in &schema.reducers {
+        if reducer.state.len() > max_columns {
+            return Err(Error::Schema(format!(
+                "reducer '{}': {} STATE fields, at most {max_columns} are supported",
+                reducer.name,
+                reducer.state.len()
+            )));
+        }
+    }
+
     // Validate module name uniqueness
     {
         let mut seen = std::collections::HashSet::new();
@@ -2232,6 +2254,36 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("reducer 'r': SET state.total is not a STATE field"),
+            "{err}"
+        );
+    }
+
+    /// A stored row holds its column count, and a column position, in a u16.
+    #[test]
+    fn validation_rejects_more_columns_than_a_u16_holds() {
+        let columns = |n: usize| {
+            (0..n)
+                .map(|i| ColumnDef {
+                    name: format!("c{i}"),
+                    column_type: ColumnType::UInt64,
+                })
+                .collect()
+        };
+        let schema = |n: usize| Schema {
+            tables: vec![TableDef {
+                name: "wide".to_string(),
+                columns: columns(n),
+                virtual_table: false,
+            }],
+            modules: vec![],
+            reducers: vec![],
+            materialized_views: vec![],
+        };
+
+        validate_schema(&schema(u16::MAX as usize)).unwrap();
+        let err = validate_schema(&schema(u16::MAX as usize + 1)).unwrap_err();
+        assert!(
+            err.to_string().contains("table 'wide': 65536 columns"),
             "{err}"
         );
     }

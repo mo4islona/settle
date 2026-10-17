@@ -11,6 +11,9 @@ pub type BlockNumber = u64;
 /// Column index within a ColumnRegistry.
 pub type ColumnId = u16;
 
+/// The most columns that a registry holds: one per `ColumnId`.
+pub const MAX_COLUMNS: usize = ColumnId::MAX as usize + 1;
+
 /// Maps column names to integer indices and vice versa.
 /// Created once per table/pipeline stage; shared via Arc across all Rows.
 #[derive(Debug, Clone, Default)]
@@ -22,6 +25,7 @@ pub struct ColumnRegistry {
 
 impl ColumnRegistry {
     pub fn new(names: Vec<String>) -> Self {
+        debug_assert!(names.len() <= MAX_COLUMNS);
         let indices = names
             .iter()
             .enumerate()
@@ -47,14 +51,15 @@ impl ColumnRegistry {
     }
 
     /// The position of `name`, added at the end if the registry lacks it.
-    pub fn get_or_push(&mut self, name: &str) -> ColumnId {
+    /// None if the registry is full.
+    pub fn get_or_push(&mut self, name: &str) -> Option<ColumnId> {
         if let Some(id) = self.get_id(name) {
-            return id;
+            return Some(id);
         }
-        let id = self.names.len() as ColumnId;
+        let id = ColumnId::try_from(self.names.len()).ok()?;
         self.names.push(name.to_string());
         self.indices.insert(name.to_string(), id);
-        id
+        Some(id)
     }
 }
 

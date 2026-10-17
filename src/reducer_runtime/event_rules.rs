@@ -77,7 +77,9 @@ impl ReducerRuntime for EventRulesRuntime {
                         locals: &locals,
                     };
                     let val = eval_expr(expr, &ctx);
-                    set_at(&mut output, emits.column(name), val);
+                    if let Some(id) = emits.column(name) {
+                        set_at(&mut output, id, val);
+                    }
                 }
 
                 matched = true;
@@ -94,7 +96,9 @@ impl ReducerRuntime for EventRulesRuntime {
                     locals: &no_locals,
                 };
                 let val = eval_expr(expr, &ctx);
-                set_at(&mut output, emits.column(name), val);
+                if let Some(id) = emits.column(name) {
+                    set_at(&mut output, id, val);
+                }
             }
         }
 

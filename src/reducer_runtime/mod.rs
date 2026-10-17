@@ -6,8 +6,8 @@ pub mod lua;
 
 use std::sync::Arc;
 
-use crate::error::Result;
-use crate::types::{ColumnId, ColumnRegistry, Row, RowMap, Value};
+use crate::error::{Error, Result};
+use crate::types::{ColumnId, ColumnRegistry, MAX_COLUMNS, Row, RowMap, Value};
 
 /// The state of one group: a value per STATE field of the reducer, in the
 /// order of `fields`.
@@ -43,6 +43,8 @@ pub struct Emits {
     rows: Vec<(usize, Vec<Value>)>,
     /// The input row that the next emit comes from.
     source: usize,
+    /// The first column that found no room, which fails the block.
+    overflow: Option<String>,
 }
 
 impl Emits {
@@ -54,13 +56,18 @@ impl Emits {
         }
     }
 
-    /// The position of column `name`, added on first use.
-    pub fn column(&mut self, name: &str) -> ColumnId {
-        match self.columns.get_id(name) {
-            Some(id) => id,
-            // Rows taken before keep the old registry, which has fewer columns.
-            None => Arc::make_mut(&mut self.columns).get_or_push(name),
+    /// The position of column `name`, added on first use. None once the
+    /// emits use `MAX_COLUMNS` names: the engine then fails the block.
+    pub fn column(&mut self, name: &str) -> Option<ColumnId> {
+        if let Some(id) = self.columns.get_id(name) {
+            return Some(id);
         }
+        // Rows taken before keep the old registry, which has fewer columns.
+        let id = Arc::make_mut(&mut self.columns).get_or_push(name);
+        if id.is_none() && self.overflow.is_none() {
+            self.overflow = Some(name.to_string());
+        }
+        id
     }
 
     pub fn columns(&self) -> &Arc<ColumnRegistry> {
@@ -76,9 +83,22 @@ impl Emits {
     pub fn push_named<K: AsRef<str>>(&mut self, fields: impl IntoIterator<Item = (K, Value)>) {
         let mut values = Vec::with_capacity(self.columns.len());
         for (name, value) in fields {
-            set_at(&mut values, self.column(name.as_ref()), value);
+            if let Some(id) = self.column(name.as_ref()) {
+                set_at(&mut values, id, value);
+            }
         }
         self.push(values);
+    }
+
+    /// Err if an emit asked for a column past `MAX_COLUMNS` since the last
+    /// call.
+    pub(crate) fn check(&mut self) -> Result<()> {
+        match self.overflow.take() {
+            None => Ok(()),
+            Some(name) => Err(Error::Reducer(format!(
+                "emit column '{name}' is past the limit of {MAX_COLUMNS} distinct emit columns"
+            ))),
+        }
     }
 
     pub(crate) fn set_source(&mut self, source: usize) {
@@ -211,6 +231,7 @@ pub trait ReducerRuntime: Send {
                     fields,
                 };
                 self.process(state, row, &mut emits)?;
+                emits.check()?;
 
                 let columns = emits.columns().clone();
                 for (_, values) in emits.take() {
@@ -264,5 +285,28 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// Past `MAX_COLUMNS` names a column gets no position, so it cannot
+    /// wrap onto the first one; the block fails.
+    #[test]
+    fn emit_columns_stop_at_the_limit() {
+        let mut emits = Emits::with_columns(&["user".to_string()]);
+        for i in 1..MAX_COLUMNS {
+            assert_eq!(emits.column(&format!("c{i}")), Some(i as ColumnId));
+        }
+        emits.check().unwrap();
+
+        assert_eq!(emits.column("one_more"), None);
+        emits.push_named([
+            ("user", Value::String("alice".into())),
+            ("late", Value::UInt64(1)),
+        ]);
+
+        let err = emits.check().unwrap_err();
+        assert!(err.to_string().contains("emit column 'one_more'"), "{err}");
+        let rows = emits.take();
+        assert_eq!(rows[0].1[0], Value::String("alice".into()));
+        assert_eq!(emits.columns().len(), MAX_COLUMNS);
     }
 }

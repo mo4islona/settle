@@ -313,7 +313,10 @@ impl ReducerEngine {
                 values: state,
                 fields: &self.state_fields,
             };
-            let processed = self.runtime.process(state, row, &mut self.emits);
+            let processed = self
+                .runtime
+                .process(state, row, &mut self.emits)
+                .and_then(|()| self.emits.check());
             touched_keys.insert(group_key_bytes);
             processed?;
         }
@@ -399,7 +402,9 @@ impl ReducerEngine {
             }
         }
 
-        Ok(())
+        // The keys are in `block_groups`: the undo of the failed ingest
+        // restores their states.
+        self.emits.check()
     }
 
     /// Err if an emit names a row that its group does not have.
@@ -1231,7 +1236,14 @@ mod tests {
 
     /// An external reducer `counter` over `events`, grouped by user.
     fn external_counter() -> ReducerEngine {
-        let def = ReducerDef {
+        let def = external_counter_def();
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
+        ReducerEngine::new(def, storage, &reg, &[])
+    }
+
+    fn external_counter_def() -> ReducerDef {
+        ReducerDef {
             name: "counter".to_string(),
             source: "events".to_string(),
             group_by: vec!["user".to_string()],
@@ -1244,10 +1256,7 @@ mod tests {
             body: ReducerBody::External {
                 id: "counter".to_string(),
             },
-        };
-        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
-        ReducerEngine::new(def, storage, &reg, &[])
+        }
     }
 
     fn event(user: &str, amount: f64) -> Row {
@@ -1364,6 +1373,33 @@ mod tests {
                 (1, Some(Value::Null)),
             ]
         );
+    }
+
+    /// A reducer whose emits use more distinct columns than a position holds
+    /// fails the block.
+    #[test]
+    fn emits_past_the_column_limit_fail_the_block() {
+        use crate::reducer_runtime::fn_reducer::FnReducerRuntime;
+        use crate::types::MAX_COLUMNS;
+
+        let runtime = FnReducerRuntime::new(|ctx, _row| {
+            for i in 0..MAX_COLUMNS {
+                ctx.column(&format!("c{i}"));
+            }
+            ctx.emit(HashMap::from([("amount".to_string(), Value::Float64(1.0))]));
+        });
+        let def = ReducerDef {
+            body: ReducerBody::External {
+                id: "wide".to_string(),
+            },
+            ..external_counter_def()
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
+        let mut engine = ReducerEngine::with_runtime(def, storage, &reg, Box::new(runtime));
+
+        let err = engine.process_block(1, &[event("alice", 1.0)]).unwrap_err();
+        assert!(err.to_string().contains("distinct emit columns"), "{err}");
     }
 
     /// An emit that names a row its group lacks fails the block.

@@ -39,8 +39,9 @@ impl<'a> StateCtx<'a> {
         self.emits.push_named(row);
     }
 
-    /// The output position of column `name`, for `emit_values`.
-    pub fn column(&mut self, name: &str) -> ColumnId {
+    /// The output position of column `name`, for `emit_values`. None past
+    /// the limit of distinct emit columns, which fails the block.
+    pub fn column(&mut self, name: &str) -> Option<ColumnId> {
         self.emits.column(name)
     }
 
