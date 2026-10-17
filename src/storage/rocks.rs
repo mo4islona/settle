@@ -127,8 +127,6 @@ fn upper_bound(prefix: &[u8]) -> Vec<u8> {
 pub struct RocksDbConfig {
     /// Compression: "none", "snappy" (default), "zstd", "lz4".
     pub compression: Option<String>,
-    /// Disable automatic background compactions.
-    pub disable_compaction: bool,
     /// Block cache size in bytes. None = RocksDB default (~8MB per CF).
     /// 0 = disable block cache entirely.
     pub cache_size: Option<usize>,
@@ -171,9 +169,6 @@ impl RocksDbBackend {
         let make_opts = || {
             let mut opts = Options::default();
             opts.set_compression_type(comp_type);
-            if config.disable_compaction {
-                opts.set_disable_auto_compactions(true);
-            }
             match &shared_cache {
                 Some(Some(cache)) => {
                     let mut block_opts = BlockBasedOptions::default();
@@ -1061,18 +1056,6 @@ mod tests {
         let b2 = RocksDbBackend::open_with_config(dir2.path(), &config2).unwrap();
         b2.put_raw_rows("t", 1, b"data").unwrap();
         assert_eq!(b2.get_raw_rows("t", 1, 1).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn open_with_compaction_disabled() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = RocksDbConfig {
-            disable_compaction: true,
-            ..Default::default()
-        };
-        let b = RocksDbBackend::open_with_config(dir.path(), &config).unwrap();
-        b.put_raw_rows("t", 1, b"data").unwrap();
-        assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
     }
 
     #[test]

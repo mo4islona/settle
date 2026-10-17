@@ -46,8 +46,6 @@ pub struct SettleConfig {
     pub max_pending_batches: Option<u32>,
     /// Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4".
     pub compression: Option<String>,
-    /// Disable RocksDB automatic background compactions.
-    pub disable_compaction: Option<bool>,
     /// Block cache size in bytes. Omit for RocksDB default (~8MB per CF), 0 to disable.
     /// Capped at the target's `usize::MAX` (≈18 EB on 64-bit, ≈4 GB on 32-bit);
     /// values above that are rejected. JS `number` precision is exact only up to
@@ -158,7 +156,6 @@ impl Settle {
             cfg = cfg.max_pending_batches(max as usize);
         }
         cfg.compression = config.compression;
-        cfg.disable_compaction = config.disable_compaction.unwrap_or(false);
         cfg.cache_size = match config.cache_size {
             Some(s) if s < 0 => {
                 return Err(Error::new(
