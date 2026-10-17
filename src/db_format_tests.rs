@@ -199,6 +199,35 @@ fn stamp_is_written_with_the_first_commit() {
     assert!(storage.get_meta("layout:mv:totals").unwrap().is_some());
 }
 
+/// Before the first ack, the stamp is only in the journal. Open must check
+/// the layouts that the journal restores, and must not overwrite them: with
+/// `a` and `b` swapped, the row of block 1 would read as a = 100.
+#[test]
+fn layouts_restored_from_the_journal_are_checked() {
+    let storage = Arc::new(MemoryBackend::new());
+    let open_at = |schema: &str, applied| {
+        Settle::open(Config::new(schema).storage(storage.clone()).applied_sequence(applied))
+    };
+
+    let sequence = {
+        let mut db = open_at(SCHEMA, 0).unwrap();
+        let rows = vec![("transfers".to_string(), 1, vec![transfer(1, 100)])];
+        let batch = crate::test_helpers::ingest_with_finalized_no_ack(&mut db, rows, 0).unwrap();
+        batch.unwrap().sequence
+    };
+    assert_eq!(storage.get_meta("format_version").unwrap(), None);
+
+    let swapped = SCHEMA.replace("a UInt64,\n        b UInt64", "b UInt64,\n        a UInt64");
+    match open_at(&swapped, sequence) {
+        Err(Error::IncompatibleStorage(msg)) => assert!(msg.contains("table 'transfers'"), "{msg}"),
+        other => panic!("unexpected: {:?}", other.err()),
+    }
+
+    let mut db = open_at(SCHEMA, sequence).unwrap();
+    let batch = ingest(&mut db, 2, 10, 0, 0);
+    assert_eq!(total_a(&batch), Value::UInt64(11));
+}
+
 /// A call that returns no batch commits at once, with the stamp.
 #[test]
 fn stamp_is_written_with_a_heartbeat() {
