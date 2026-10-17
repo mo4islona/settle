@@ -84,6 +84,17 @@ impl Row {
         row
     }
 
+    /// `from_map` that moves the values out of the map.
+    pub fn from_owned_map(registry: Arc<ColumnRegistry>, map: HashMap<String, Value>) -> Self {
+        let mut row = Self::new(registry);
+        for (k, v) in map {
+            if let Some(id) = row.registry.get_id(&k) {
+                row.values[id as usize] = v;
+            }
+        }
+        row
+    }
+
     /// Look up a column value by name. Returns None for unknown columns or Null values.
     pub fn get(&self, name: &str) -> Option<&Value> {
         let id = self.registry.get_id(name)?;
