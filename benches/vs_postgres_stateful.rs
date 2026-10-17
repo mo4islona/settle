@@ -27,7 +27,7 @@ mod common;
 
 use common::{
     build_multi_insert, gen_trade, print_result_split, row_f64, row_i64, row_str, split_blocks,
-    PgRuntime, BATCH_SIZE, BLOCKS_PER_BATCH, ROWS_PER_BLOCK,
+    PgBaseline, PgCase, PgRuntime, BATCH_SIZE, BLOCKS_PER_BATCH, ROWS_PER_BLOCK,
 };
 
 // DISCLAIMER: `CREATE VIRTUAL TABLE` означает что Settle НЕ персистит raw
@@ -610,7 +610,7 @@ fn pg_apply(pg: &PgRuntime, group: &[Applied]) -> anyhow::Result<()> {
 
 // ─── Correctness check (3 tables) ──────────────────────────────────────────
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct PgState {
     pos_count: i64,
     sum_qty: f64,
@@ -663,7 +663,10 @@ fn check_pg_state(
     label: &str,
     baseline: &mut Option<PgState>,
 ) -> anyhow::Result<()> {
-    let actual = read_pg_state(pg)?;
+    check_state(read_pg_state(pg)?, label, baseline)
+}
+
+fn check_state(actual: PgState, label: &str, baseline: &mut Option<PgState>) -> anyhow::Result<()> {
     let status = if let Some(exp) = baseline {
         let ok = exp.pos_count == actual.pos_count
             && (exp.sum_qty - actual.sum_qty).abs() < 0.1
@@ -903,41 +906,64 @@ fn run_settle_pg_pipelined(
 fn main() -> anyhow::Result<()> {
     let rows: Vec<RowMap> = (0..TOTAL_ROWS).map(|i| gen_trade(i, NUM_USERS)).collect();
 
-    eprintln!("workload: vs_postgres_stateful (per-(user,token) position + per-(user,day) PnL + per-user total)");
-    eprintln!(
-        "  config: {TOTAL_ROWS} rows, {NUM_USERS} users, 10 tokens, 20 days, \
+    let config = format!(
+        "{TOTAL_ROWS} rows, {NUM_USERS} users, 10 tokens, 20 days, \
          {ROWS_PER_BLOCK} rows/block, {BLOCKS_PER_BATCH} blocks/batch, {} batches",
         TOTAL_ROWS / BATCH_SIZE
     );
+    eprintln!(
+        "workload: vs_postgres_stateful (per-(user,token) position + per-(user,day) PnL + per-user total)"
+    );
+    eprintln!("  config: {config}");
+    let mut pg_baseline = PgBaseline::open("vs_postgres_stateful", 1, &config)?;
 
     let mut baseline: Option<PgState> = None;
 
     // The floor: every variant writes these trades, with no MV in PG.
-    {
+    let case = pg_baseline.case("pg_raw_only", || {
         let pg = PgRuntime::start()?;
         pg.batch_execute(PG_SCHEMA)?;
         pg.take_stats();
         let t = Instant::now();
         run_pg_raw_only(&pg, &rows)?;
         let elapsed = t.elapsed();
-        print_result_split("pg_raw_only", TOTAL_ROWS, elapsed, Duration::ZERO, pg.take_stats());
-    }
+        Ok(PgCase {
+            elapsed,
+            stats: pg.take_stats(),
+            output: (),
+        })
+    })?;
+    print_result_split(
+        "pg_raw_only",
+        TOTAL_ROWS,
+        case.elapsed,
+        Duration::ZERO,
+        case.stats,
+    );
 
     // x4 commits as often as the Settle `x4` rows below.
     for batches_per_tx in [1, 4] {
-        let pg = PgRuntime::start()?;
-        pg.batch_execute(PG_SCHEMA)?;
-        pg.take_stats();
-        let t = Instant::now();
-        run_pg_only(&pg, &rows, batches_per_tx * BATCH_SIZE)?;
-        let elapsed = t.elapsed();
-
         let label = match batches_per_tx {
             1 => "pg_only_smart".to_string(),
             n => format!("pg_only_smart[x{n}]"),
         };
-        print_result_split(&label, TOTAL_ROWS, elapsed, Duration::ZERO, pg.take_stats());
-        check_pg_state(&pg, &label, &mut baseline)?;
+        let case = pg_baseline.case(&label, || {
+            let pg = PgRuntime::start()?;
+            pg.batch_execute(PG_SCHEMA)?;
+            pg.take_stats();
+            let t = Instant::now();
+            run_pg_only(&pg, &rows, batches_per_tx * BATCH_SIZE)?;
+            let elapsed = t.elapsed();
+            let stats = pg.take_stats();
+            Ok(PgCase {
+                elapsed,
+                stats,
+                output: read_pg_state(&pg)?,
+            })
+        })?;
+
+        print_result_split(&label, TOTAL_ROWS, case.elapsed, Duration::ZERO, case.stats);
+        check_state(case.output, &label, &mut baseline)?;
     }
 
     // None: ack each batch before the next ingest.
