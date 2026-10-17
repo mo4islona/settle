@@ -178,15 +178,17 @@ fn replay_after_crash_matches_clean_run() {
     let clean_mv = mv_record_for(&clean_final_batch, ASSET).unwrap();
     let crash_mv = mv_record_for(&crash_final_batch, ASSET).unwrap();
     assert_eq!(
-        clean_mv.values, crash_mv.values,
+        clean_mv.values_map(),
+        crash_mv.values_map(),
         "final MV values must match bit-for-bit"
     );
     assert_eq!(
-        clean_mv.prev_values, crash_mv.prev_values,
+        clean_mv.prev_map(),
+        crash_mv.prev_map(),
         "prev_values must match bit-for-bit"
     );
     assert_eq!(clean_mv.operation, crash_mv.operation);
-    assert_eq!(clean_mv.key, crash_mv.key);
+    assert_eq!(clean_mv.key_map(), crash_mv.key_map());
 }
 
 /// Sanity: explicit no-data IngestInput with the same finalized head as

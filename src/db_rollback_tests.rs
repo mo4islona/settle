@@ -24,7 +24,7 @@ fn rollback_produces_compensating_changes() {
     assert_eq!(mv_records.len(), 1);
     assert_eq!(mv_records[0].operation, ChangeOp::Update);
     assert_eq!(
-        mv_records[0].values.get("total_volume"),
+        mv_records[0].get("total_volume"),
         Some(&Value::Float64(100.0))
     );
 
@@ -53,7 +53,7 @@ fn finalize_and_rollback() {
     assert_eq!(mv_records.len(), 1);
     // total should be 100 + 200 = 300
     assert_eq!(
-        mv_records[0].values.get("total_volume"),
+        mv_records[0].get("total_volume"),
         Some(&Value::Float64(300.0))
     );
 }
@@ -100,14 +100,11 @@ fn full_pipeline_rollback_and_reingest() {
     .unwrap();
     let mv_records: Vec<_> = batch.records_for("position_summary").iter().collect();
     assert_eq!(mv_records.len(), 1);
-    assert_eq!(
-        mv_records[0].values.get("trade_count"),
-        Some(&Value::UInt64(3))
-    );
+    assert_eq!(mv_records[0].get("trade_count"), Some(&Value::UInt64(3)));
 
     // position_size after: 10 + 5 - 3 = 12
     assert_eq!(
-        mv_records[0].values.get("current_position"),
+        mv_records[0].get("current_position"),
         Some(&Value::Float64(12.0))
     );
 }
@@ -166,7 +163,7 @@ fn full_rollback_emits_delete_for_mv_group() {
         .collect();
     assert_eq!(mv_inserts.len(), 1);
     assert_eq!(
-        mv_inserts[0].values.get("total_volume"),
+        mv_inserts[0].get("total_volume"),
         Some(&Value::Float64(500.0))
     );
 
@@ -185,7 +182,7 @@ fn full_rollback_emits_delete_for_mv_group() {
         "expected Delete change for fully rolled-back MV group"
     );
     assert_eq!(
-        mv_deletes[0].key.get("wallet"),
+        mv_deletes[0].key("wallet"),
         Some(&Value::String("alice".to_string()))
     );
 }
@@ -241,13 +238,10 @@ fn partial_rollback_emits_update_not_delete() {
     assert_eq!(mv_records.len(), 1);
     assert_eq!(mv_records[0].operation, ChangeOp::Update);
     assert_eq!(
-        mv_records[0].values.get("total_volume"),
+        mv_records[0].get("total_volume"),
         Some(&Value::Float64(100.0))
     );
-    assert_eq!(
-        mv_records[0].values.get("tx_count"),
-        Some(&Value::UInt64(1))
-    );
+    assert_eq!(mv_records[0].get("tx_count"), Some(&Value::UInt64(1)));
 }
 
 #[test]
@@ -428,24 +422,16 @@ fn crash_recovery_replays_unfinalized_blocks() {
         assert_eq!(mv_records.len(), 1);
 
         // trade_count: 3 replayed + 1 new = 4
-        assert_eq!(
-            mv_records[0].values.get("trade_count"),
-            Some(&Value::UInt64(4))
-        );
+        assert_eq!(mv_records[0].get("trade_count"), Some(&Value::UInt64(4)));
 
         // current_position: 18 - 5 = 13
         assert_eq!(
-            mv_records[0].values.get("current_position"),
+            mv_records[0].get("current_position"),
             Some(&Value::Float64(13.0))
         );
 
         // total_pnl: 0 + 0 + 0 + 5*(2300 - 37100/18) ≈ 1194.44
-        let total_pnl = mv_records[0]
-            .values
-            .get("total_pnl")
-            .unwrap()
-            .as_f64()
-            .unwrap();
+        let total_pnl = mv_records[0].get("total_pnl").unwrap().as_f64().unwrap();
         assert!((total_pnl - 1194.44).abs() < 1.0);
     }
 }
@@ -573,7 +559,7 @@ fn ingest_auto_rollback_on_fork() {
     assert_eq!(mv_records[0].operation, ChangeOp::Update);
     // After rolling back block 2's 200.0, total should be back to 100.0
     assert_eq!(
-        mv_records[0].values.get("total_volume"),
+        mv_records[0].get("total_volume"),
         Some(&Value::Float64(100.0))
     );
 }
@@ -719,7 +705,7 @@ fn ingest_auto_rollback_full_when_no_common_ancestor() {
     let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
     let btc = mv_records
         .iter()
-        .find(|r| r.key.get("pool") == Some(&Value::String("BTC".into())));
+        .find(|r| r.key("pool") == Some(&Value::String("BTC".into())));
     assert!(btc.is_some(), "BTC must appear after re-ingest");
 }
 
@@ -910,7 +896,7 @@ fn record_for<'a>(batch: &'a ChangeBatch, table: &str, key: &str, value: &str) -
     batch
         .records_for(table)
         .iter()
-        .find(|r| r.key.get(key) == Some(&Value::String(value.into())))
+        .find(|r| r.key(key) == Some(&Value::String(value.into())))
         .unwrap()
 }
 
@@ -934,8 +920,8 @@ fn finality_only_ingest_persists_mv_group() {
         .unwrap()
         .unwrap();
     let eth = record_for(&batch, "pool_volume", "pool", "ETH");
-    assert_eq!(eth.values.get("total_volume"), Some(&Value::Float64(20.0)));
-    assert_eq!(eth.values.get("swap_count"), Some(&Value::UInt64(2)));
+    assert_eq!(eth.get("total_volume"), Some(&Value::Float64(20.0)));
+    assert_eq!(eth.get("swap_count"), Some(&Value::UInt64(2)));
 }
 
 /// Same with a reducer in front of the MV.
@@ -963,13 +949,10 @@ fn finality_only_ingest_persists_reducer_and_mv_state() {
     .unwrap()
     .unwrap();
     let alice = record_for(&batch, "position_summary", "user", "alice");
-    assert_eq!(alice.values.get("trade_count"), Some(&Value::UInt64(2)));
-    assert_eq!(
-        alice.values.get("current_position"),
-        Some(&Value::Float64(5.0))
-    );
+    assert_eq!(alice.get("trade_count"), Some(&Value::UInt64(2)));
+    assert_eq!(alice.get("current_position"), Some(&Value::Float64(5.0)));
     // 5 * (2100 - 2000)
-    let pnl = alice.values.get("total_pnl").and_then(|v| v.as_f64()).unwrap();
+    let pnl = alice.get("total_pnl").and_then(|v| v.as_f64()).unwrap();
     assert!((pnl - 500.0).abs() < 1e-9, "total_pnl = {pnl}");
 }
 
@@ -1002,5 +985,5 @@ fn checkpoint_persists_mv_group_finalized_during_deferral() {
         .unwrap()
         .unwrap();
     let eth = record_for(&batch, "pool_volume", "pool", "ETH");
-    assert_eq!(eth.values.get("total_volume"), Some(&Value::Float64(20.0)));
+    assert_eq!(eth.get("total_volume"), Some(&Value::Float64(20.0)));
 }

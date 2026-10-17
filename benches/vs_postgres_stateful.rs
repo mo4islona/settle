@@ -536,24 +536,22 @@ fn pg_upsert_total_statement(pg: &PgRuntime, records: &[&ChangeRecord]) -> anyho
 }
 
 fn key_str(r: &ChangeRecord, col: &str) -> String {
-    r.key
-        .get(col)
-        .or_else(|| r.values.get(col))
+    r.key(col)
+        .or_else(|| r.get(col))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
 }
 
 fn key_i64(r: &ChangeRecord, col: &str) -> i64 {
-    r.key
-        .get(col)
-        .or_else(|| r.values.get(col))
+    r.key(col)
+        .or_else(|| r.get(col))
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
 }
 
 fn val_f64(r: &ChangeRecord, col: &str) -> f64 {
-    r.values.get(col).and_then(|v| v.as_f64()).unwrap_or(0.0)
+    r.get(col).and_then(|v| v.as_f64()).unwrap_or(0.0)
 }
 
 /// The records of `table` over `batches`, one per key: the last one. Each
@@ -574,7 +572,7 @@ fn last_per_key<'a>(
     for record in batches.iter().flat_map(|b| b.records_for(table)) {
         let key: Vec<Value> = key_cols
             .iter()
-            .map(|col| record.key.get(*col).cloned().unwrap_or(Value::Null))
+            .map(|col| record.key(*col).cloned().unwrap_or(Value::Null))
             .collect();
         match index.get(&key) {
             Some(&i) => merged[i] = record,

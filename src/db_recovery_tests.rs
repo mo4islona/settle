@@ -257,8 +257,8 @@ fn total(batch: &ChangeBatch, view: &str, pool: &str) -> Value {
     batch
         .records_for(view)
         .iter()
-        .find(|r| r.key.get("pool") == Some(&Value::String(pool.into())))
-        .and_then(|r| r.values.get("total").cloned())
+        .find(|r| r.key("pool") == Some(&Value::String(pool.into())))
+        .and_then(|r| r.get("total").cloned())
         .unwrap()
 }
 
@@ -291,7 +291,11 @@ fn reopen_does_not_restore_a_group_without_data() {
         let records = batch.records_for("pool_1h");
         assert_eq!(records.len(), 1, "amount {amount}");
         assert_eq!(records[0].operation, ChangeOp::Insert, "amount {amount}");
-        assert_eq!(records[0].values["total"], Value::UInt64(amount), "amount {amount}");
+        assert_eq!(
+            records[0].get("total"),
+            Some(&Value::UInt64(amount)),
+            "amount {amount}"
+        );
     }
 }
 
@@ -756,10 +760,10 @@ impl Target {
     fn apply(&mut self, batch: &ChangeBatch) {
         for (table, records) in &batch.tables {
             for record in records {
-                let key = (table.clone(), sorted_debug(&record.key));
+                let key = (table.clone(), sorted_debug(&record.key_map()));
                 match record.operation {
                     ChangeOp::Insert | ChangeOp::Update => {
-                        self.0.insert(key, sorted_debug(&record.values));
+                        self.0.insert(key, sorted_debug(&record.values_map()));
                     }
                     ChangeOp::Delete => {
                         self.0.remove(&key);

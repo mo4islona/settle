@@ -121,17 +121,17 @@ fn simple_mv_insert_changes() {
 
     let eth = changes
         .iter()
-        .find(|d| d.key.get("pool") == Some(&Value::String("ETH/USDC".into())))
+        .find(|d| d.key("pool") == Some(&Value::String("ETH/USDC".into())))
         .unwrap();
-    assert_eq!(eth.values.get("total_volume"), Some(&Value::Float64(30.0)));
-    assert_eq!(eth.values.get("swap_count"), Some(&Value::UInt64(2)));
+    assert_eq!(eth.get("total_volume"), Some(&Value::Float64(30.0)));
+    assert_eq!(eth.get("swap_count"), Some(&Value::UInt64(2)));
 
     let btc = changes
         .iter()
-        .find(|d| d.key.get("pool") == Some(&Value::String("BTC/USDC".into())))
+        .find(|d| d.key("pool") == Some(&Value::String("BTC/USDC".into())))
         .unwrap();
-    assert_eq!(btc.values.get("total_volume"), Some(&Value::Float64(5.0)));
-    assert_eq!(btc.values.get("swap_count"), Some(&Value::UInt64(1)));
+    assert_eq!(btc.get("total_volume"), Some(&Value::Float64(5.0)));
+    assert_eq!(btc.get("swap_count"), Some(&Value::UInt64(1)));
 }
 
 #[test]
@@ -153,12 +153,9 @@ fn mv_update_changes_on_second_block() {
     let changes2 = mv.process_block(1001, &rows2);
     assert_eq!(changes2.len(), 1);
     assert_eq!(changes2[0].operation, ChangeOp::Update);
+    assert_eq!(changes2[0].get("total_volume"), Some(&Value::Float64(30.0)));
     assert_eq!(
-        changes2[0].values.get("total_volume"),
-        Some(&Value::Float64(30.0))
-    );
-    assert_eq!(
-        changes2[0].prev_values.as_ref().unwrap().get("total_volume"),
+        changes2[0].prev("total_volume"),
         Some(&Value::Float64(10.0))
     );
 }
@@ -185,14 +182,8 @@ fn mv_rollback_produces_update_change() {
     let changes = mv.rollback(1000);
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].operation, ChangeOp::Update);
-    assert_eq!(
-        changes[0].values.get("total_volume"),
-        Some(&Value::Float64(10.0))
-    );
-    assert_eq!(
-        changes[0].prev_values.as_ref().unwrap().get("total_volume"),
-        Some(&Value::Float64(30.0))
-    );
+    assert_eq!(changes[0].get("total_volume"), Some(&Value::Float64(10.0)));
+    assert_eq!(changes[0].prev("total_volume"), Some(&Value::Float64(30.0)));
 }
 
 #[test]
@@ -263,10 +254,7 @@ fn mv_finalize_then_rollback() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].operation, ChangeOp::Update);
     // Finalized sum: 10+20=30, block 1002 removed
-    assert_eq!(
-        changes[0].values.get("total_volume"),
-        Some(&Value::Float64(30.0))
-    );
+    assert_eq!(changes[0].get("total_volume"), Some(&Value::Float64(30.0)));
 }
 
 #[test]
@@ -325,7 +313,7 @@ fn ohlcv_candle_end_to_end() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].operation, ChangeOp::Update);
 
-    let vals = &changes[0].values;
+    let vals = &changes[0];
     assert_eq!(vals.get("open"), Some(&Value::Float64(100.0)));
     assert_eq!(vals.get("high"), Some(&Value::Float64(110.0))); // was 200, now 110
     assert_eq!(vals.get("low"), Some(&Value::Float64(90.0)));
@@ -429,7 +417,7 @@ fn full_cycle_ingest_rollback_reingest() {
     let rollback_changes = mv.rollback(1001);
     assert_eq!(rollback_changes.len(), 1);
     assert_eq!(
-        rollback_changes[0].values.get("total_volume"),
+        rollback_changes[0].get("total_volume"),
         Some(&Value::Float64(30.0))
     );
 
@@ -444,7 +432,7 @@ fn full_cycle_ingest_rollback_reingest() {
     assert_eq!(new_changes.len(), 1);
     assert_eq!(new_changes[0].operation, ChangeOp::Update);
     assert_eq!(
-        new_changes[0].values.get("total_volume"),
+        new_changes[0].get("total_volume"),
         Some(&Value::Float64(35.0))
     );
 }
@@ -561,11 +549,8 @@ fn finalize_persists_group_when_finality_catches_up() {
     let changes = mv.process_block(2, &[pool_row("ETH/USDC", 10.0)]);
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].operation, ChangeOp::Update);
-    assert_eq!(
-        changes[0].values.get("total_volume"),
-        Some(&Value::Float64(20.0))
-    );
-    assert_eq!(changes[0].values.get("swap_count"), Some(&Value::UInt64(2)));
+    assert_eq!(changes[0].get("total_volume"), Some(&Value::Float64(20.0)));
+    assert_eq!(changes[0].get("swap_count"), Some(&Value::UInt64(2)));
 }
 
 /// Same as above, but the finalize that reaches the block is deferred
@@ -591,10 +576,7 @@ fn checkpoint_persists_group_finalized_by_deferred_finalize() {
 
     let mut mv = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types());
     let changes = mv.process_block(2, &[pool_row("ETH/USDC", 10.0)]);
-    assert_eq!(
-        changes[0].values.get("total_volume"),
-        Some(&Value::Float64(20.0))
-    );
+    assert_eq!(changes[0].get("total_volume"), Some(&Value::Float64(20.0)));
 }
 
 /// A finalize writes exactly the groups of the blocks it finalizes: a group

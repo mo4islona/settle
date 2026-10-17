@@ -73,13 +73,10 @@ fn external_reducer_full_pipeline() {
     .unwrap();
     let mv = batch.records_for("position_summary");
     assert_eq!(mv.len(), 1);
-    assert_eq!(mv[0].values.get("trade_count"), Some(&Value::UInt64(2)));
-    assert_eq!(
-        mv[0].values.get("current_position"),
-        Some(&Value::Float64(5.0))
-    );
+    assert_eq!(mv[0].get("trade_count"), Some(&Value::UInt64(2)));
+    assert_eq!(mv[0].get("current_position"), Some(&Value::Float64(5.0)));
 
-    let pnl = mv[0].values.get("total_pnl").unwrap().as_f64().unwrap();
+    let pnl = mv[0].get("total_pnl").unwrap().as_f64().unwrap();
     assert!((pnl - 1000.0).abs() < 0.01); // 5*(2200-2000)
 }
 
@@ -117,11 +114,8 @@ fn external_reducer_rollback() {
     .unwrap();
     let mv = batch.records_for("position_summary");
     assert_eq!(mv.len(), 1);
-    assert_eq!(mv[0].values.get("trade_count"), Some(&Value::UInt64(2)));
-    assert_eq!(
-        mv[0].values.get("current_position"),
-        Some(&Value::Float64(7.0))
-    );
+    assert_eq!(mv[0].get("trade_count"), Some(&Value::UInt64(2)));
+    assert_eq!(mv[0].get("current_position"), Some(&Value::Float64(7.0)));
 }
 
 #[test]
@@ -165,27 +159,24 @@ fn external_reducer_matches_event_rules() {
     assert_eq!(er_mv.len(), fn_mv.len());
 
     for er_rec in er_mv.iter() {
-        let key = er_rec.key.get("user").unwrap();
-        let fn_rec = fn_mv
-            .iter()
-            .find(|r| r.key.get("user") == Some(key))
-            .unwrap();
+        let key = er_rec.key("user").unwrap();
+        let fn_rec = fn_mv.iter().find(|r| r.key("user") == Some(key)).unwrap();
 
-        let er_pnl = er_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
-        let fn_pnl = fn_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
+        let er_pnl = er_rec.get("total_pnl").unwrap().as_f64().unwrap();
+        let fn_pnl = fn_rec.get("total_pnl").unwrap().as_f64().unwrap();
         assert!(
             (er_pnl - fn_pnl).abs() < 0.01,
             "PnL mismatch for {key:?}: EventRules={er_pnl}, FnReducer={fn_pnl}"
         );
 
         assert_eq!(
-            er_rec.values.get("current_position"),
-            fn_rec.values.get("current_position"),
+            er_rec.get("current_position"),
+            fn_rec.get("current_position"),
             "position mismatch for {key:?}"
         );
         assert_eq!(
-            er_rec.values.get("trade_count"),
-            fn_rec.values.get("trade_count"),
+            er_rec.get("trade_count"),
+            fn_rec.get("trade_count"),
             "trade_count mismatch for {key:?}"
         );
     }
@@ -226,24 +217,18 @@ fn external_reducer_multi_group_rollback() {
 
     let alice = mv
         .iter()
-        .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+        .find(|r| r.key("user") == Some(&Value::String("alice".into())))
         .unwrap();
     let bob = mv
         .iter()
-        .find(|r| r.key.get("user") == Some(&Value::String("bob".into())))
+        .find(|r| r.key("user") == Some(&Value::String("bob".into())))
         .unwrap();
 
     // After rollback: only block 1000 data remains
-    assert_eq!(
-        alice.values.get("current_position"),
-        Some(&Value::Float64(10.0))
-    );
-    assert_eq!(
-        bob.values.get("current_position"),
-        Some(&Value::Float64(5.0))
-    );
-    assert_eq!(alice.values.get("trade_count"), Some(&Value::UInt64(1)));
-    assert_eq!(bob.values.get("trade_count"), Some(&Value::UInt64(1)));
+    assert_eq!(alice.get("current_position"), Some(&Value::Float64(10.0)));
+    assert_eq!(bob.get("current_position"), Some(&Value::Float64(5.0)));
+    assert_eq!(alice.get("trade_count"), Some(&Value::UInt64(1)));
+    assert_eq!(bob.get("trade_count"), Some(&Value::UInt64(1)));
 }
 
 /// External reducer crash recovery: after restart, set_reducer_runtime
@@ -356,10 +341,9 @@ fn external_reducer_crash_recovery() {
         // trade_count should reflect all trades including replayed block 1001
         let alice_rec = mv_records
             .iter()
-            .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+            .find(|r| r.key("user") == Some(&Value::String("alice".into())))
             .expect("alice should have an MV record");
         let trade_count = alice_rec
-            .values
             .get("trade_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
@@ -480,10 +464,9 @@ fn replay_reducer_catches_up_existing_external() {
         let alice = batch
             .records_for("position_summary")
             .iter()
-            .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+            .find(|r| r.key("user") == Some(&Value::String("alice".into())))
             .expect("alice should have MV record");
         let trade_count = alice
-            .values
             .get("trade_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
@@ -656,10 +639,9 @@ fn external_runtime_replay_uses_real_external_runtime() {
         let mv_records: Vec<_> = batch.records_for("position_summary").to_vec();
         let alice = mv_records
             .iter()
-            .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+            .find(|r| r.key("user") == Some(&Value::String("alice".into())))
             .expect("alice should have an MV record");
         let trade_count = alice
-            .values
             .get("trade_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);

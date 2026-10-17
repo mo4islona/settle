@@ -173,19 +173,6 @@ impl Serialize for PlainValueRef<'_> {
     }
 }
 
-/// Wrapper for serializing HashMap<String, Value> with plain values.
-struct PlainMapRef<'a>(&'a HashMap<String, Value>);
-
-impl Serialize for PlainMapRef<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (k, v) in self.0 {
-            map.serialize_entry(k, &PlainValueRef(v))?;
-        }
-        map.end()
-    }
-}
-
 struct BatchRef<'a>(&'a ChangeBatch);
 
 impl Serialize for BatchRef<'_> {
@@ -260,7 +247,7 @@ struct RecordRef<'a>(&'a ChangeRecord);
 impl Serialize for RecordRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(5))?;
-        map.serialize_entry("table", &self.0.table)?;
+        map.serialize_entry("table", self.0.table())?;
         map.serialize_entry(
             "operation",
             match self.0.operation {
@@ -269,9 +256,25 @@ impl Serialize for RecordRef<'_> {
                 ChangeOp::Delete => "delete",
             },
         )?;
-        map.serialize_entry("key", &PlainMapRef(&self.0.key))?;
-        map.serialize_entry("values", &PlainMapRef(&self.0.values))?;
-        map.serialize_entry("prevValues", &self.0.prev_values.as_ref().map(PlainMapRef))?;
+        map.serialize_entry("key", &PlainColumns(self.0.key_values()))?;
+        map.serialize_entry("values", &PlainColumns(self.0.values()))?;
+        map.serialize_entry("prevValues", &self.0.prev_values().map(PlainColumns))?;
+        map.end()
+    }
+}
+
+/// `(name, value)` pairs as a map of plain values.
+struct PlainColumns<I>(I);
+
+impl<'a, I> Serialize for PlainColumns<I>
+where
+    I: ExactSizeIterator<Item = (&'a str, &'a Value)> + Clone,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, value) in self.0.clone() {
+            map.serialize_entry(name, &PlainValueRef(value))?;
+        }
         map.end()
     }
 }
@@ -293,7 +296,12 @@ pub fn encode_batch_to_json_value(batch: &ChangeBatch) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use smallvec::smallvec;
+
     use super::*;
+    use crate::types::ChangeSchema;
 
     /// Encode a value as msgpack bytes (using serde_json::Value as proxy).
     fn encode_json_as_msgpack(val: &serde_json::Value) -> Vec<u8> {
@@ -431,16 +439,20 @@ mod tests {
             }),
             tables: HashMap::from([(
                 "swaps".into(),
-                vec![ChangeRecord {
-                    table: "swaps".into(),
-                    operation: ChangeOp::Insert,
-                    key: HashMap::from([("block_number".into(), Value::UInt64(1000))]),
-                    values: HashMap::from([
-                        ("pool".into(), Value::String("ETH/USDC".into())),
-                        ("amount".into(), Value::Float64(100.5)),
+                vec![ChangeRecord::new(
+                    ChangeOp::Insert,
+                    Arc::new(ChangeSchema::raw_table(
+                        "swaps",
+                        &["block_number".into(), "pool".into(), "amount".into()],
+                    )),
+                    smallvec![Value::UInt64(1000), Value::UInt64(0)],
+                    Box::from([
+                        Value::UInt64(1000),
+                        Value::String("ETH/USDC".into()),
+                        Value::Float64(100.5),
                     ]),
-                    prev_values: None,
-                }],
+                    None,
+                )],
             )]),
             perf: vec![],
         };
@@ -472,13 +484,16 @@ mod tests {
             latest_head: None,
             tables: HashMap::from([(
                 "volume".into(),
-                vec![ChangeRecord {
-                    table: "volume".into(),
-                    operation: ChangeOp::Update,
-                    key: HashMap::from([("pool".into(), Value::String("ETH".into()))]),
-                    values: HashMap::from([("total".into(), Value::Float64(300.0))]),
-                    prev_values: Some(HashMap::from([("total".into(), Value::Float64(200.0))])),
-                }],
+                vec![ChangeRecord::new(
+                    ChangeOp::Update,
+                    Arc::new(ChangeSchema::mv(
+                        "volume",
+                        [("pool".into(), true), ("total".into(), false)],
+                    )),
+                    smallvec![Value::String("ETH".into())],
+                    Box::from([Value::Float64(300.0)]),
+                    Some(Box::from([Value::Float64(200.0)])),
+                )],
             )]),
             perf: vec![],
         };
@@ -488,6 +503,10 @@ mod tests {
 
         assert_eq!(decoded["tables"]["volume"][0]["operation"], "update");
         assert_eq!(decoded["tables"]["volume"][0]["prevValues"]["total"], 200.0);
+        // An MV row carries its GROUP BY columns in both key and values.
+        assert_eq!(decoded["tables"]["volume"][0]["key"]["pool"], "ETH");
+        assert_eq!(decoded["tables"]["volume"][0]["values"]["pool"], "ETH");
+        assert_eq!(decoded["tables"]["volume"][0]["prevValues"]["pool"], "ETH");
         assert!(decoded["finalizedHead"].is_null());
     }
 
