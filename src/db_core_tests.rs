@@ -37,7 +37,7 @@ fn simple_ingest_and_flush() {
     assert_eq!(mv_records.len(), 1);
     assert_eq!(mv_records[0].operation, ChangeOp::Insert);
     assert_eq!(
-        mv_records[0].values.get("total_volume"),
+        mv_records[0].get("total_volume"),
         Some(&Value::Float64(300.0))
     );
 }
@@ -61,7 +61,7 @@ fn multiple_blocks_merge_in_buffer() {
     assert_eq!(mv_records.len(), 1);
     assert_eq!(mv_records[0].operation, ChangeOp::Insert);
     assert_eq!(
-        mv_records[0].values.get("total_volume"),
+        mv_records[0].get("total_volume"),
         Some(&Value::Float64(300.0))
     );
 }
@@ -94,23 +94,15 @@ fn full_pipeline_with_reducer() {
     assert_eq!(mv_records.len(), 1);
 
     // trade_count should be 2
-    assert_eq!(
-        mv_records[0].values.get("trade_count"),
-        Some(&Value::UInt64(2))
-    );
+    assert_eq!(mv_records[0].get("trade_count"), Some(&Value::UInt64(2)));
     // current_position = last(position_size) = 5.0
     assert_eq!(
-        mv_records[0].values.get("current_position"),
+        mv_records[0].get("current_position"),
         Some(&Value::Float64(5.0))
     );
 
     // total_pnl: trade 1 = 0 (buy), trade 2 = 5*(2200-2000) = 1000
-    let total_pnl = mv_records[0]
-        .values
-        .get("total_pnl")
-        .unwrap()
-        .as_f64()
-        .unwrap();
+    let total_pnl = mv_records[0].get("total_pnl").unwrap().as_f64().unwrap();
     assert!((total_pnl - 1000.0).abs() < 0.01);
 }
 

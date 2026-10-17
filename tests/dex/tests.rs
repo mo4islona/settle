@@ -45,7 +45,7 @@ fn find_record_by_key<'a>(
     batch
         .records_for(table)
         .iter()
-        .find(|r| r.key.get(key_col) == Some(key_val))
+        .find(|r| r.key(key_col) == Some(key_val))
 }
 
 /// Collect all flushed batches, applying each to a mock target.
@@ -118,7 +118,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
         assert!(rec.is_some(), "missing position_summary for {user}");
         let rec = rec.unwrap();
         assert_eq!(
-            rec.values.get("trade_count"),
+            rec.get("trade_count"),
             Some(&Value::UInt64(100)),
             "wrong trade_count for {user}"
         );
@@ -131,12 +131,12 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
         assert!(rec.is_some(), "missing volume_by_pool for {pool}");
         let rec = rec.unwrap();
         assert_eq!(
-            rec.values.get("swap_count"),
+            rec.get("swap_count"),
             Some(&Value::UInt64(100)),
             "wrong swap_count for {pool}"
         );
         // sum of 101+102+...+200 = 100*150.5 = 15050
-        let total_volume = rec.values.get("total_volume").unwrap().as_f64().unwrap();
+        let total_volume = rec.get("total_volume").unwrap().as_f64().unwrap();
         assert!(
             (total_volume - 15050.0).abs() < 0.01,
             "wrong total_volume for {pool}: {total_volume}"
@@ -160,7 +160,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
         );
         let rec = rec.unwrap();
         assert_eq!(
-            rec.values.get("trade_count"),
+            rec.get("trade_count"),
             Some(&Value::UInt64(75)),
             "wrong rollback trade_count for {user}"
         );
@@ -173,12 +173,12 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
         assert!(rec.is_some(), "missing rollback volume for {pool}");
         let rec = rec.unwrap();
         assert_eq!(
-            rec.values.get("swap_count"),
+            rec.get("swap_count"),
             Some(&Value::UInt64(75)),
             "wrong rollback swap_count for {pool}"
         );
         // sum of 101+102+...+175 = 75*138 = 10350
-        let total_volume = rec.values.get("total_volume").unwrap().as_f64().unwrap();
+        let total_volume = rec.get("total_volume").unwrap().as_f64().unwrap();
         assert!(
             (total_volume - 10350.0).abs() < 0.01,
             "wrong rollback total_volume for {pool}: {total_volume}"
@@ -227,7 +227,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
         assert!(rec.is_some(), "missing final position_summary for {user}");
         let rec = rec.unwrap();
         assert_eq!(
-            rec.values.get("trade_count"),
+            rec.get("trade_count"),
             Some(&Value::UInt64(100)),
             "wrong final trade_count for {user}"
         );
@@ -240,7 +240,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
         assert!(rec.is_some(), "missing final volume for {pool}");
         let rec = rec.unwrap();
         assert_eq!(
-            rec.values.get("swap_count"),
+            rec.get("swap_count"),
             Some(&Value::UInt64(100)),
             "wrong final swap_count for {pool}"
         );
@@ -248,7 +248,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
         // Original blocks 1-75: sum(101..175) = 75*138 = 10350
         // Re-ingested blocks 76-100: sum(200+76*2 .. 200+100*2) = sum(352,354,...,400) = 25*376 = 9400
         let expected_volume = 10350.0 + 9400.0;
-        let total_volume = rec.values.get("total_volume").unwrap().as_f64().unwrap();
+        let total_volume = rec.get("total_volume").unwrap().as_f64().unwrap();
         assert!(
             (total_volume - expected_volume).abs() < 0.01,
             "wrong final total_volume for {pool}: {total_volume}, expected {expected_volume}"
@@ -291,7 +291,7 @@ fn rollback_to_finalized_boundary() {
     assert_eq!(db.latest_block(), 30);
     let pos = find_records(&batch, "position_summary");
     assert_eq!(pos.len(), 1);
-    assert_eq!(pos[0].values.get("trade_count"), Some(&Value::UInt64(30)));
+    assert_eq!(pos[0].get("trade_count"), Some(&Value::UInt64(30)));
 }
 
 #[test]
@@ -338,13 +338,13 @@ fn multi_user_pnl_correctness() {
     )
     .unwrap();
 
-    let alice_pnl = alice_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
+    let alice_pnl = alice_rec.get("total_pnl").unwrap().as_f64().unwrap();
     assert!((alice_pnl - 2500.0).abs() < 0.01, "alice PnL: {alice_pnl}");
     assert_eq!(
-        alice_rec.values.get("current_position"),
+        alice_rec.get("current_position"),
         Some(&Value::Float64(5.0))
     );
-    assert_eq!(alice_rec.values.get("trade_count"), Some(&Value::UInt64(2)));
+    assert_eq!(alice_rec.get("trade_count"), Some(&Value::UInt64(2)));
 
     let bob_rec = find_record_by_key(
         &batch,
@@ -354,12 +354,9 @@ fn multi_user_pnl_correctness() {
     )
     .unwrap();
 
-    let bob_pnl = bob_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
+    let bob_pnl = bob_rec.get("total_pnl").unwrap().as_f64().unwrap();
     assert!((bob_pnl - (-600.0)).abs() < 0.01, "bob PnL: {bob_pnl}");
-    assert_eq!(
-        bob_rec.values.get("current_position"),
-        Some(&Value::Float64(2.0))
-    );
+    assert_eq!(bob_rec.get("current_position"), Some(&Value::Float64(2.0)));
 }
 
 #[test]

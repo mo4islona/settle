@@ -78,7 +78,8 @@ db.finalize(block_number - 10);
 if let Some(batch) = db.flush() {
 for (table, records) in & batch.tables {
 for record in records {
-// record.operation, record.key, record.values, record.prev_values
+// record.operation, record.get("balance"), record.key("user"), record.prev("balance");
+// record.values() iterates (name, value) in schema order
 }
 }
 db.ack(batch.sequence);

@@ -91,18 +91,17 @@ fn find_by_key<'a>(
     batch
         .records_for(table)
         .iter()
-        .find(|r| key_checks.iter().all(|(k, v)| r.key.get(*k) == Some(*v)))
+        .find(|r| key_checks.iter().all(|(k, v)| r.key(*k) == Some(*v)))
 }
 
 fn get_val<'a>(record: &'a ChangeRecord, col: &str) -> &'a Value {
     record
-        .values
         .get(col)
-        .or_else(|| record.key.get(col))
+        .or_else(|| record.key(col))
         .unwrap_or_else(|| {
             panic!(
                 "missing column '{col}' in record for table '{}'",
-                record.table
+                record.table()
             )
         })
 }
@@ -184,7 +183,7 @@ fn cross_price_via_eth() {
     let uni_candle = batch
         .records_for("candles_5m")
         .iter()
-        .find(|r| r.key.get("pool") == Some(&pool_val))
+        .find(|r| r.key("pool") == Some(&pool_val))
         .expect("missing UNI candle");
 
     // UNI price should be $10 (cross-calculated via ETH)
@@ -246,7 +245,7 @@ fn cross_price_both_directions() {
     let uni_candle = batch
         .records_for("candles_5m")
         .iter()
-        .find(|r| r.key.get("pool") == Some(&uni_pool))
+        .find(|r| r.key("pool") == Some(&uni_pool))
         .expect("missing UNI candle");
     assert_approx(
         get_val(uni_candle, "open").as_f64().unwrap(),
@@ -257,7 +256,7 @@ fn cross_price_both_directions() {
     let link_candle = batch
         .records_for("candles_5m")
         .iter()
-        .find(|r| r.key.get("pool") == Some(&link_pool))
+        .find(|r| r.key("pool") == Some(&link_pool))
         .expect("missing LINK candle");
     assert_approx(
         get_val(link_candle, "open").as_f64().unwrap(),
@@ -311,7 +310,7 @@ fn eth_price_update_propagation() {
     let uni_candle = batch
         .records_for("candles_5m")
         .iter()
-        .find(|r| r.key.get("pool") == Some(&uni_pool))
+        .find(|r| r.key("pool") == Some(&uni_pool))
         .expect("missing UNI candle");
 
     assert_approx(get_val(uni_candle, "open").as_f64().unwrap(), 10.0, "open");
@@ -372,7 +371,7 @@ fn ohlc_multiple_windows_cross_priced() {
     let uni_candles: Vec<_> = batch
         .records_for("candles_5m")
         .iter()
-        .filter(|r| r.key.get("pool") == Some(&uni_pool))
+        .filter(|r| r.key("pool") == Some(&uni_pool))
         .collect();
 
     assert_eq!(uni_candles.len(), 2, "should produce 2 time windows");
@@ -630,7 +629,7 @@ fn usdt_pricing() {
     let uni_candle = batch
         .records_for("candles_5m")
         .iter()
-        .find(|r| r.key.get("pool") == Some(&uni_pool))
+        .find(|r| r.key("pool") == Some(&uni_pool))
         .expect("missing UNI candle");
 
     assert_approx(
@@ -705,7 +704,7 @@ fn rollback_restores_cross_prices() {
     let uni_candle = batch
         .records_for("candles_5m")
         .iter()
-        .find(|r| r.key.get("pool") == Some(&uni_pool))
+        .find(|r| r.key("pool") == Some(&uni_pool))
         .expect("missing UNI candle after rollback");
 
     // After rollback: UNI trades at $10 (block 2) and $11 (block 4)
@@ -894,14 +893,14 @@ fn full_scenario_with_cross_pricing() {
         batch1
             .records_for("candles_5m")
             .iter()
-            .any(|r| r.key.get("pool") == Some(&uni_pool)),
+            .any(|r| r.key("pool") == Some(&uni_pool)),
         "missing UNI candle"
     );
     assert!(
         batch1
             .records_for("candles_5m")
             .iter()
-            .any(|r| r.key.get("pool") == Some(&link_pool)),
+            .any(|r| r.key("pool") == Some(&link_pool)),
         "missing LINK candle"
     );
 
@@ -910,14 +909,14 @@ fn full_scenario_with_cross_pricing() {
         batch1
             .records_for("wallet_summary")
             .iter()
-            .any(|r| r.key.get("sender") == Some(&Value::String("alice".into()))),
+            .any(|r| r.key("sender") == Some(&Value::String("alice".into()))),
         "missing alice summary"
     );
     assert!(
         batch1
             .records_for("wallet_summary")
             .iter()
-            .any(|r| r.key.get("sender") == Some(&Value::String("bob".into()))),
+            .any(|r| r.key("sender") == Some(&Value::String("bob".into()))),
         "missing bob summary"
     );
 
@@ -973,11 +972,11 @@ fn full_scenario_with_cross_pricing() {
     let has_uni = final_batch
         .records_for("candles_5m")
         .iter()
-        .any(|r| r.key.get("pool") == Some(&uni_pool));
+        .any(|r| r.key("pool") == Some(&uni_pool));
     let has_link = final_batch
         .records_for("candles_5m")
         .iter()
-        .any(|r| r.key.get("pool") == Some(&link_pool));
+        .any(|r| r.key("pool") == Some(&link_pool));
     assert!(has_uni || has_link, "should have candles after re-ingest");
 
     println!(
@@ -1031,7 +1030,7 @@ fn cross_price_without_eth_reference() {
         let uni_pool = Value::String(POOL_UNI_WETH.to_string());
         let uni_candles: Vec<_> = candles
             .iter()
-            .filter(|r| r.key.get("pool") == Some(&uni_pool))
+            .filter(|r| r.key("pool") == Some(&uni_pool))
             .collect();
         assert!(
             uni_candles.is_empty(),

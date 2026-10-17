@@ -1196,7 +1196,11 @@ impl SettleEngine {
         // Group records by table name
         let mut tables: HashMap<String, Vec<ChangeRecord>> = HashMap::new();
         for record in records {
-            tables.entry(record.table.clone()).or_default().push(record);
+            if let Some(vec) = tables.get_mut(record.table()) {
+                vec.push(record);
+            } else {
+                tables.insert(record.table().to_string(), vec![record]);
+            }
         }
         ChangeBatch {
             sequence: self.sequence,
@@ -1728,16 +1732,16 @@ mod tests {
         let (changes, _) = engine.process_batch("swaps", 1000, rows).unwrap();
 
         // Should have: 2 raw inserts + 1 MV insert
-        let raw_changes: Vec<_> = changes.iter().filter(|d| d.table == "swaps").collect();
-        let mv_changes: Vec<_> = changes.iter().filter(|d| d.table == "pool_volume").collect();
+        let raw_changes: Vec<_> = changes.iter().filter(|d| d.table() == "swaps").collect();
+        let mv_changes: Vec<_> = changes
+            .iter()
+            .filter(|d| d.table() == "pool_volume")
+            .collect();
 
         assert_eq!(raw_changes.len(), 2);
         assert_eq!(mv_changes.len(), 1);
         assert_eq!(mv_changes[0].operation, ChangeOp::Insert);
-        assert_eq!(
-            mv_changes[0].values.get("total"),
-            Some(&Value::Float64(300.0))
-        );
+        assert_eq!(mv_changes[0].get("total"), Some(&Value::Float64(300.0)));
     }
 
     #[test]
@@ -1757,14 +1761,11 @@ mod tests {
         // Raw insert + MV insert (position_summary)
         let mv_changes: Vec<_> = changes
             .iter()
-            .filter(|d| d.table == "position_summary")
+            .filter(|d| d.table() == "position_summary")
             .collect();
         assert_eq!(mv_changes.len(), 1);
         assert_eq!(mv_changes[0].operation, ChangeOp::Insert);
-        assert_eq!(
-            mv_changes[0].values.get("trade_count"),
-            Some(&Value::UInt64(1))
-        );
+        assert_eq!(mv_changes[0].get("trade_count"), Some(&Value::UInt64(1)));
     }
 
     #[test]
@@ -1800,16 +1801,16 @@ mod tests {
         let changes = engine.rollback(1000).unwrap();
 
         // MV should update back to 100
-        let mv_changes: Vec<_> = changes.iter().filter(|d| d.table == "pool_volume").collect();
+        let mv_changes: Vec<_> = changes
+            .iter()
+            .filter(|d| d.table() == "pool_volume")
+            .collect();
         assert_eq!(mv_changes.len(), 1);
         assert_eq!(mv_changes[0].operation, ChangeOp::Update);
-        assert_eq!(
-            mv_changes[0].values.get("total"),
-            Some(&Value::Float64(100.0))
-        );
+        assert_eq!(mv_changes[0].get("total"), Some(&Value::Float64(100.0)));
 
         // Raw table should emit delete change
-        let raw_changes: Vec<_> = changes.iter().filter(|d| d.table == "swaps").collect();
+        let raw_changes: Vec<_> = changes.iter().filter(|d| d.table() == "swaps").collect();
         assert_eq!(raw_changes.len(), 1);
         assert_eq!(raw_changes[0].operation, ChangeOp::Delete);
     }
@@ -1848,13 +1849,13 @@ mod tests {
 
         // Rollback to 1000 should only remove block 1001
         let changes = engine.rollback(1000).unwrap();
-        let mv_changes: Vec<_> = changes.iter().filter(|d| d.table == "pool_volume").collect();
+        let mv_changes: Vec<_> = changes
+            .iter()
+            .filter(|d| d.table() == "pool_volume")
+            .collect();
         assert_eq!(mv_changes.len(), 1);
         // After finalize(1000) + rollback(1001→1000): total should be 100
-        assert_eq!(
-            mv_changes[0].values.get("total"),
-            Some(&Value::Float64(100.0))
-        );
+        assert_eq!(mv_changes[0].get("total"), Some(&Value::Float64(100.0)));
     }
 
     #[test]
@@ -1935,8 +1936,8 @@ mod tests {
             .process_batch_deferred("swaps", 4, swap(200.0), &mut StorageWriteBatch::new())
             .unwrap();
         let changes = engine.take_changes();
-        let mv = changes.iter().find(|c| c.table == "pool_volume").unwrap();
-        assert_eq!(mv.values.get("total"), Some(&Value::Float64(300.0)));
+        let mv = changes.iter().find(|c| c.table() == "pool_volume").unwrap();
+        assert_eq!(mv.get("total"), Some(&Value::Float64(300.0)));
     }
 
     #[test]
@@ -1986,14 +1987,11 @@ mod tests {
         // MV should get updated with new trade data
         let mv_changes: Vec<_> = changes
             .iter()
-            .filter(|d| d.table == "position_summary")
+            .filter(|d| d.table() == "position_summary")
             .collect();
         assert_eq!(mv_changes.len(), 1);
         assert_eq!(mv_changes[0].operation, ChangeOp::Update);
-        assert_eq!(
-            mv_changes[0].values.get("trade_count"),
-            Some(&Value::UInt64(3))
-        );
+        assert_eq!(mv_changes[0].get("trade_count"), Some(&Value::UInt64(3)));
     }
 
     #[test]
@@ -2103,10 +2101,10 @@ mod tests {
             .unwrap();
 
         // Should have: events insert + summary insert (doubled=20)
-        let summary_changes: Vec<_> = changes.iter().filter(|d| d.table == "summary").collect();
+        let summary_changes: Vec<_> = changes.iter().filter(|d| d.table() == "summary").collect();
         assert_eq!(summary_changes.len(), 1);
         assert_eq!(
-            summary_changes[0].values.get("latest_doubled"),
+            summary_changes[0].get("latest_doubled"),
             Some(&Value::Float64(20.0))
         );
 
@@ -2122,10 +2120,10 @@ mod tests {
             )
             .unwrap();
 
-        let summary2: Vec<_> = changes2.iter().filter(|d| d.table == "summary").collect();
+        let summary2: Vec<_> = changes2.iter().filter(|d| d.table() == "summary").collect();
         assert_eq!(summary2.len(), 1);
         assert_eq!(
-            summary2[0].values.get("latest_doubled"),
+            summary2[0].get("latest_doubled"),
             Some(&Value::Float64(30.0))
         );
 
@@ -2133,7 +2131,7 @@ mod tests {
         let rollback_changes = engine.rollback(1000).unwrap();
         let summary_rb: Vec<_> = rollback_changes
             .iter()
-            .filter(|d| d.table == "summary")
+            .filter(|d| d.table() == "summary")
             .collect();
         assert!(
             !summary_rb.is_empty(),
@@ -2152,10 +2150,10 @@ mod tests {
             )
             .unwrap();
 
-        let summary3: Vec<_> = changes3.iter().filter(|d| d.table == "summary").collect();
+        let summary3: Vec<_> = changes3.iter().filter(|d| d.table() == "summary").collect();
         assert_eq!(summary3.len(), 1);
         assert_eq!(
-            summary3[0].values.get("latest_doubled"),
+            summary3[0].get("latest_doubled"),
             Some(&Value::Float64(60.0))
         );
     }
@@ -2232,14 +2230,17 @@ mod tests {
             ("amount".to_string(), Value::Float64(50.0)),
         ])];
         let (changes, _) = engine2.process_batch("events", 1002, rows3).unwrap();
-        let mv_changes: Vec<_> = changes.iter().filter(|d| d.table == "pool_totals").collect();
+        let mv_changes: Vec<_> = changes
+            .iter()
+            .filter(|d| d.table() == "pool_totals")
+            .collect();
         assert!(
             !mv_changes.is_empty(),
             "MV should produce changes after replay"
         );
         // Total should be 100 + 200 + 50 = 350
         assert_eq!(
-            mv_changes.last().unwrap().values.get("total"),
+            mv_changes.last().unwrap().get("total"),
             Some(&Value::Float64(350.0))
         );
     }
@@ -2291,11 +2292,11 @@ mod tests {
             changes.extend(engine.process_batch("b", 41, row(0.5)).unwrap().0);
             changes
                 .into_iter()
-                .filter(|c| c.table.ends_with("_view"))
+                .filter(|c| c.table().ends_with("_view"))
                 .map(|c| {
                     let prev: Option<BTreeMap<_, _>> =
-                        c.prev_values.map(|p| p.into_iter().collect());
-                    format!("{} {prev:?}", c.table)
+                        c.prev_map().map(|p| p.into_iter().collect());
+                    format!("{} {prev:?}", c.table())
                 })
                 .collect::<Vec<_>>()
         };
@@ -2549,12 +2550,11 @@ mod tests {
         // mv_b SUM(total) = 100 (block 1000) + 150 (block 1001) = 250.
         // If counter_b were double-replayed, block 1000 state = 200,
         // block 1001 state = 250, SUM = 200 + 250 = 450.
-        let mv_b: Vec<_> = changes.iter().filter(|d| d.table == "mv_b").collect();
+        let mv_b: Vec<_> = changes.iter().filter(|d| d.table() == "mv_b").collect();
         assert!(!mv_b.is_empty(), "mv_b should have changes");
         let sum_b = mv_b
             .last()
             .unwrap()
-            .values
             .get("sum_b")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);

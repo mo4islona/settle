@@ -207,14 +207,14 @@ fn fork_rolls_back_unacked_batches() {
     let deleted: Vec<_> = fork
         .records_for("trades")
         .iter()
-        .map(|r| (r.operation.clone(), r.key.get("block_number").cloned()))
+        .map(|r| (r.operation.clone(), r.key("block_number").cloned()))
         .collect();
     assert_eq!(deleted, vec![(ChangeOp::Delete, Some(Value::UInt64(3)))]);
 
     let new_block = vec![("trades".into(), 3, vec![make_trade("alice", "sell", 4.0, 2300.0)])];
     let batch = ingest_with_finalized_no_ack(&mut db, new_block, 2).unwrap().unwrap();
     let summary = &batch.records_for("position_summary")[0];
-    assert_eq!(summary.values.get("current_position"), Some(&Value::Float64(16.0)));
+    assert_eq!(summary.get("current_position"), Some(&Value::Float64(16.0)));
 }
 
 /// The reducer fails on an amount of 13.
@@ -272,6 +272,6 @@ fn failed_ingest_restores_state_from_unacked_checkpoint() {
     let batch = ingest_with_finalized_no_ack(&mut db, pool_rows(&[(4, 5), (5, 7)]), 3)
         .unwrap()
         .unwrap();
-    let total = batch.records_for("pool_total")[0].values.get("total").cloned();
+    let total = batch.records_for("pool_total")[0].get("total").cloned();
     assert_eq!(total, Some(Value::Int64(18)));
 }

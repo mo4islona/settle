@@ -61,7 +61,10 @@ fn ingest(db: &mut Settle, block: BlockNumber, a: u64, b: u64, finalized: BlockN
 }
 
 fn total_a(batch: &ChangeBatch) -> Value {
-    batch.records_for("totals")[0].values["total_a"].clone()
+    batch.records_for("totals")[0]
+        .get("total_a")
+        .unwrap()
+        .clone()
 }
 
 /// Block 1 stays unfinalized, so a reopen replays its raw row.
@@ -160,7 +163,7 @@ fn logic_aliases_and_new_objects_may_change() {
     let mut db = open(&changed, &storage).unwrap();
     let batch = ingest(&mut db, 2, 10, 0, 0);
     let totals = &batch.records_for("totals")[0];
-    assert_eq!(totals.values["total_a_renamed"], Value::UInt64(11));
+    assert_eq!(totals.get("total_a_renamed"), Some(&Value::UInt64(11)));
 }
 
 #[test]

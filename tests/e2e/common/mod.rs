@@ -68,31 +68,25 @@ pub fn mv_record_for<'a>(batch: &'a ChangeBatch, asset: &str) -> Option<&'a Chan
     batch
         .records_for("token_summary")
         .iter()
-        .find(|r| r.key.get("asset_id") == Some(&Value::String(asset.to_string())))
+        .find(|r| r.key("asset_id") == Some(&Value::String(asset.to_string())))
 }
 
 pub fn total_volume(r: &ChangeRecord) -> u64 {
-    numeric(r.values.get("total_volume"), "total_volume")
+    numeric(r.get("total_volume"), "total_volume")
 }
 
 pub fn trade_count(r: &ChangeRecord) -> u64 {
-    numeric(r.values.get("trade_count"), "trade_count")
+    numeric(r.get("trade_count"), "trade_count")
 }
 
 pub fn prev_total_volume(r: &ChangeRecord) -> u64 {
-    let prev = r
-        .prev_values
-        .as_ref()
-        .expect("record has no prev_values");
-    numeric(prev.get("total_volume"), "prev.total_volume")
+    assert!(r.has_prev(), "record has no prev_values");
+    numeric(r.prev("total_volume"), "prev.total_volume")
 }
 
 pub fn prev_trade_count(r: &ChangeRecord) -> u64 {
-    let prev = r
-        .prev_values
-        .as_ref()
-        .expect("record has no prev_values");
-    numeric(prev.get("trade_count"), "prev.trade_count")
+    assert!(r.has_prev(), "record has no prev_values");
+    numeric(r.prev("trade_count"), "prev.trade_count")
 }
 
 fn numeric(v: Option<&Value>, label: &str) -> u64 {

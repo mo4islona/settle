@@ -289,9 +289,8 @@ fn pg_upsert_balances_from_changes(
     let from_buf: Vec<String> = records
         .iter()
         .map(|r| {
-            r.values
-                .get("from_addr")
-                .or_else(|| r.key.get("from_addr"))
+            r.get("from_addr")
+                .or_else(|| r.key("from_addr"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string()
@@ -299,12 +298,7 @@ fn pg_upsert_balances_from_changes(
         .collect();
     let val_buf: Vec<f64> = records
         .iter()
-        .map(|r| {
-            r.values
-                .get("balance")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0)
-        })
+        .map(|r| r.get("balance").and_then(|v| v.as_f64()).unwrap_or(0.0))
         .collect();
     let sql = "INSERT INTO balances (from_addr, balance) \
                SELECT * FROM unnest($1::text[], $2::float8[]) \

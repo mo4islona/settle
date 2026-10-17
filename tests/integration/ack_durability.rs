@@ -757,16 +757,16 @@ fn replay_reducer_does_not_double_accumulate() {
     let mv = batch
         .records_for("token_summary")
         .iter()
-        .find(|r| r.key.get("asset_id") == Some(&Value::String(ASSET.to_string())))
+        .find(|r| r.key("asset_id") == Some(&Value::String(ASSET.to_string())))
         .expect("token_summary record for asset_a")
         .clone();
-    let total = match mv.values.get("total_volume") {
+    let total = match mv.get("total_volume") {
         Some(Value::UInt64(n)) => *n,
         Some(Value::Int64(n)) => *n as u64,
         Some(Value::Float64(f)) => *f as u64,
         other => panic!("unexpected total_volume type: {other:?}"),
     };
-    let count = match mv.values.get("trade_count") {
+    let count = match mv.get("trade_count") {
         Some(Value::UInt64(n)) => *n,
         Some(Value::Int64(n)) => *n as u64,
         Some(Value::Float64(f)) => *f as u64,
@@ -886,10 +886,10 @@ fn register_reducer_rejects_duplicate_name() {
     let mv = batch
         .records_for("token_summary")
         .iter()
-        .find(|r| r.key.get("asset_id") == Some(&Value::String(ASSET.to_string())))
+        .find(|r| r.key("asset_id") == Some(&Value::String(ASSET.to_string())))
         .expect("token_summary record")
         .clone();
-    let count = match mv.values.get("trade_count") {
+    let count = match mv.get("trade_count") {
         Some(Value::UInt64(n)) => *n,
         Some(Value::Int64(n)) => *n as u64,
         Some(Value::Float64(f)) => *f as u64,

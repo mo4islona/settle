@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -88,13 +89,13 @@ impl ChangeBuffer {
         let mut merged: Vec<ChangeRecord> = Vec::with_capacity(self.pending.len());
 
         for record in self.pending.drain(..) {
-            let key_hash = hash_change_key(&record.table, &record.key);
+            let key_hash = hash_change_key(record.table(), &record.key);
 
             let match_idx = index.get(&key_hash).and_then(|bucket| {
                 bucket
                     .iter()
                     .copied()
-                    .find(|&idx| merged[idx].table == record.table && merged[idx].key == record.key)
+                    .find(|&idx| same_row(&merged[idx], &record))
             });
 
             if let Some(idx) = match_idx {
@@ -102,7 +103,7 @@ impl ChangeBuffer {
                     // Records cancel out — mark as cancelled and remove from bucket
                     merged[idx].operation = ChangeOp::Delete;
                     merged[idx].prev_values = None;
-                    merged[idx].values.clear();
+                    merged[idx].values = Box::default();
                     if let Some(bucket) = index.get_mut(&key_hash) {
                         bucket.retain(|i| *i != idx);
                         if bucket.is_empty() {
@@ -120,11 +121,10 @@ impl ChangeBuffer {
         // Filter out cancelled records and group by table
         let mut tables: HashMap<String, Vec<ChangeRecord>> = HashMap::new();
         for record in merged.into_iter().filter(|r| !is_cancelled(r)) {
-            if let Some(vec) = tables.get_mut(&record.table) {
+            if let Some(vec) = tables.get_mut(record.table()) {
                 vec.push(record);
             } else {
-                let table = record.table.clone();
-                tables.insert(table, vec![record]);
+                tables.insert(record.table().to_string(), vec![record]);
             }
         }
 
@@ -211,66 +211,63 @@ fn is_cancelled(record: &ChangeRecord) -> bool {
         && record.values.is_empty()
 }
 
-fn hash_change_key(table: &str, key: &HashMap<String, Value>) -> u64 {
+fn same_row(a: &ChangeRecord, b: &ChangeRecord) -> bool {
+    let same_table = Arc::ptr_eq(&a.schema, &b.schema) || a.table() == b.table();
+    same_table && a.key == b.key
+}
+
+fn hash_change_key(table: &str, key: &[Value]) -> u64 {
     use core::hash::{Hash, Hasher};
     use rustc_hash::FxHasher;
-    // FxHash, not SipHash: this runs per key-field per emit on the flush hot
-    // path. The hash only feeds an internal dedup index whose buckets re-check key equality in `flush()`,
-    // so collision resistance is irrelevant here — speed is what matters.
+    // FxHash, not SipHash: this runs per emit on the flush hot path. The hash
+    // only feeds an internal dedup index whose buckets re-check key equality
+    // in `flush()`, so collision resistance is irrelevant here.
     let mut hasher = FxHasher::default();
     table.hash(&mut hasher);
-    // Order-independent hash: XOR + rotate for better mixing than wrapping_add.
-    // Still commutative — collisions are handled by key equality check in flush().
-    let mut combined: u64 = 0;
-    for (k, v) in key {
-        let mut field_hasher = FxHasher::default();
-        k.hash(&mut field_hasher);
-        v.hash(&mut field_hasher);
-        combined ^= field_hasher.finish().rotate_left(5);
-    }
-    hasher.write_u64(combined);
+    key.hash(&mut hasher);
     hasher.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChangeOp;
+    use crate::types::{ChangeOp, ChangeSchema};
+    use smallvec::smallvec;
+
+    fn schema(table: &str) -> Arc<ChangeSchema> {
+        Arc::new(ChangeSchema::mv(
+            table,
+            [("id".to_string(), true), ("data".to_string(), false)],
+        ))
+    }
+
+    fn record(
+        table: &str,
+        operation: ChangeOp,
+        key_val: &str,
+        data: Option<&str>,
+        prev: Option<&str>,
+    ) -> ChangeRecord {
+        let text = |s: &str| -> Box<[Value]> { Box::from([Value::String(s.to_string())]) };
+        ChangeRecord::new(
+            operation,
+            schema(table),
+            smallvec![Value::String(key_val.to_string())],
+            data.map(text).unwrap_or_default(),
+            prev.map(text),
+        )
+    }
 
     fn make_insert(table: &str, key_val: &str, data: &str) -> ChangeRecord {
-        ChangeRecord {
-            table: table.to_string(),
-            operation: ChangeOp::Insert,
-            key: HashMap::from([("id".to_string(), Value::String(key_val.to_string()))]),
-            values: HashMap::from([("data".to_string(), Value::String(data.to_string()))]),
-            prev_values: None,
-        }
+        record(table, ChangeOp::Insert, key_val, Some(data), None)
     }
 
     fn make_update(table: &str, key_val: &str, data: &str, prev: &str) -> ChangeRecord {
-        ChangeRecord {
-            table: table.to_string(),
-            operation: ChangeOp::Update,
-            key: HashMap::from([("id".to_string(), Value::String(key_val.to_string()))]),
-            values: HashMap::from([("data".to_string(), Value::String(data.to_string()))]),
-            prev_values: Some(HashMap::from([(
-                "data".to_string(),
-                Value::String(prev.to_string()),
-            )])),
-        }
+        record(table, ChangeOp::Update, key_val, Some(data), Some(prev))
     }
 
     fn make_delete(table: &str, key_val: &str) -> ChangeRecord {
-        ChangeRecord {
-            table: table.to_string(),
-            operation: ChangeOp::Delete,
-            key: HashMap::from([("id".to_string(), Value::String(key_val.to_string()))]),
-            values: HashMap::new(),
-            prev_values: Some(HashMap::from([(
-                "data".to_string(),
-                Value::String("old".to_string()),
-            )])),
-        }
+        record(table, ChangeOp::Delete, key_val, None, Some("old"))
     }
 
     #[test]
@@ -354,11 +351,8 @@ mod tests {
         assert_eq!(records.len(), 1);
         // Net effect: Insert with latest values
         assert_eq!(records[0].operation, ChangeOp::Insert);
-        assert_eq!(
-            records[0].values.get("data"),
-            Some(&Value::String("b".into()))
-        );
-        assert!(records[0].prev_values.is_none());
+        assert_eq!(records[0].get("data"), Some(&Value::String("b".into())));
+        assert!(records[0].prev_values().is_none());
     }
 
     #[test]
@@ -371,16 +365,7 @@ mod tests {
             vec![],
         );
         buffer.push(
-            vec![ChangeRecord {
-                table: "t".to_string(),
-                operation: ChangeOp::Delete,
-                key: HashMap::from([("id".to_string(), Value::String("1".to_string()))]),
-                values: HashMap::new(),
-                prev_values: Some(HashMap::from([(
-                    "data".to_string(),
-                    Value::String("a".to_string()),
-                )])),
-            }],
+            vec![record("t", ChangeOp::Delete, "1", None, Some("a"))],
             cursor(0),
             cursor(1001),
             vec![],
@@ -411,15 +396,9 @@ mod tests {
         let records = batch.records_for("t");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation, ChangeOp::Update);
-        assert_eq!(
-            records[0].values.get("data"),
-            Some(&Value::String("c".into()))
-        );
+        assert_eq!(records[0].get("data"), Some(&Value::String("c".into())));
         // prev_values should be from the first update
-        assert_eq!(
-            records[0].prev_values.as_ref().unwrap().get("data"),
-            Some(&Value::String("a".into()))
-        );
+        assert_eq!(records[0].prev("data"), Some(&Value::String("a".into())));
     }
 
     #[test]
@@ -438,10 +417,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         // Delete then Insert = Update
         assert_eq!(records[0].operation, ChangeOp::Update);
-        assert_eq!(
-            records[0].values.get("data"),
-            Some(&Value::String("new".into()))
-        );
+        assert_eq!(records[0].get("data"), Some(&Value::String("new".into())));
     }
 
     /// Issue #1: Delete→Insert merge must preserve the original prev_values from the Delete,
@@ -463,17 +439,11 @@ mod tests {
         let records = batch.records_for("t");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation, ChangeOp::Update);
-        assert_eq!(
-            records[0].values.get("data"),
-            Some(&Value::String("new".into()))
-        );
+        assert_eq!(records[0].get("data"), Some(&Value::String("new".into())));
         // prev_values must be the original deleted row's data, NOT empty
-        let prev = records[0]
-            .prev_values
-            .as_ref()
-            .expect("prev_values must be Some");
+        assert!(records[0].has_prev(), "prev_values must be Some");
         assert_eq!(
-            prev.get("data"),
+            records[0].prev("data"),
             Some(&Value::String("old".into())),
             "prev_values should contain the original deleted row data, not an empty map"
         );
@@ -491,16 +461,7 @@ mod tests {
             vec![],
         );
         buffer.push(
-            vec![ChangeRecord {
-                table: "t".to_string(),
-                operation: ChangeOp::Delete,
-                key: HashMap::from([("id".to_string(), Value::String("1".to_string()))]),
-                values: HashMap::new(),
-                prev_values: Some(HashMap::from([(
-                    "data".to_string(),
-                    Value::String("a".to_string()),
-                )])),
-            }],
+            vec![record("t", ChangeOp::Delete, "1", None, Some("a"))],
             cursor(0),
             cursor(1001),
             vec![],
@@ -522,12 +483,9 @@ mod tests {
             ChangeOp::Insert,
             "Insert→Delete→Insert should produce a net Insert, not Update"
         );
-        assert_eq!(
-            records[0].values.get("data"),
-            Some(&Value::String("b".into()))
-        );
+        assert_eq!(records[0].get("data"), Some(&Value::String("b".into())));
         assert!(
-            records[0].prev_values.is_none(),
+            records[0].prev_values().is_none(),
             "A net Insert should have no prev_values"
         );
     }
@@ -560,10 +518,7 @@ mod tests {
         let records = batch.records_for("t");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation, ChangeOp::Insert);
-        assert_eq!(
-            records[0].values.get("data"),
-            Some(&Value::String("c".into()))
-        );
+        assert_eq!(records[0].get("data"), Some(&Value::String("c".into())));
     }
 
     #[test]

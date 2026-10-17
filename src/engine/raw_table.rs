@@ -1,26 +1,32 @@
-use std::collections::HashMap;
 use std::sync::Arc;
+
+use smallvec::smallvec;
 
 use crate::error::Result;
 use crate::schema::ast::TableDef;
 use crate::storage::{self, PendingWrites, StorageBackend, StorageWriteBatch};
-use crate::types::{BlockNumber, ColumnRegistry, ChangeOp, ChangeRecord, Row, RowMap, Value};
+use crate::types::{
+    BlockNumber, ChangeOp, ChangeRecord, ChangeSchema, ColumnRegistry, Row, RowMap, Value,
+};
 
 /// Manages ingestion, storage, and rollback for a single raw table.
 pub struct RawTableEngine {
     def: TableDef,
     storage: Arc<dyn StorageBackend>,
     registry: Arc<ColumnRegistry>,
+    change_schema: Arc<ChangeSchema>,
 }
 
 impl RawTableEngine {
     pub fn new(def: TableDef, storage: Arc<dyn StorageBackend>) -> Self {
         let names: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+        let change_schema = Arc::new(ChangeSchema::raw_table(&def.name, &names));
         let registry = Arc::new(ColumnRegistry::new(names));
         Self {
             def,
             storage,
             registry,
+            change_schema,
         }
     }
 
@@ -48,25 +54,31 @@ impl RawTableEngine {
         let encoded = storage::encode_rows_from_maps(row_maps, &self.registry);
         self.storage.put_raw_rows(&self.def.name, block, &encoded)?;
 
-        let changes = row_maps
+        Ok(self.insert_changes(block, row_maps))
+    }
+
+    /// One Insert per row, with the columns in schema order.
+    fn insert_changes(&self, block: BlockNumber, row_maps: &[RowMap]) -> Vec<ChangeRecord> {
+        let columns = self.registry.names();
+
+        row_maps
             .iter()
             .enumerate()
-            .map(|(idx, values)| {
-                let mut key = HashMap::new();
-                key.insert("block_number".to_string(), Value::UInt64(block));
-                key.insert("_row_index".to_string(), Value::UInt64(idx as u64));
+            .map(|(idx, row)| {
+                let values = columns
+                    .iter()
+                    .map(|name| row.get(name).cloned().unwrap_or(Value::Null))
+                    .collect();
 
-                ChangeRecord {
-                    table: self.def.name.clone(),
-                    operation: ChangeOp::Insert,
-                    key,
-                    values: values.clone(),
-                    prev_values: None,
-                }
+                ChangeRecord::new(
+                    ChangeOp::Insert,
+                    self.change_schema.clone(),
+                    smallvec![Value::UInt64(block), Value::UInt64(idx as u64)],
+                    values,
+                    None,
+                )
             })
-            .collect();
-
-        Ok(changes)
+            .collect()
     }
 
     /// Ingest rows without creating change records (for virtual tables).
@@ -100,25 +112,7 @@ impl RawTableEngine {
             return Ok(Vec::new());
         }
 
-        let changes = row_maps
-            .iter()
-            .enumerate()
-            .map(|(idx, values)| {
-                let mut key = HashMap::new();
-                key.insert("block_number".to_string(), Value::UInt64(block));
-                key.insert("_row_index".to_string(), Value::UInt64(idx as u64));
-
-                ChangeRecord {
-                    table: self.def.name.clone(),
-                    operation: ChangeOp::Insert,
-                    key,
-                    values: values.clone(),
-                    prev_values: None,
-                }
-            })
-            .collect();
-
-        Ok(changes)
+        Ok(self.insert_changes(block, row_maps))
     }
 
     /// Roll back all rows where block_number > fork_point.
@@ -157,17 +151,13 @@ impl RawTableEngine {
         for (block, data) in rolled_back {
             let rows = storage::decode_rows(&data, &self.registry)?;
             for (idx, row) in rows.into_iter().enumerate() {
-                let mut key = HashMap::new();
-                key.insert("block_number".to_string(), Value::UInt64(block));
-                key.insert("_row_index".to_string(), Value::UInt64(idx as u64));
-
-                changes.push(ChangeRecord {
-                    table: self.def.name.clone(),
-                    operation: ChangeOp::Delete,
-                    key,
-                    values: row.to_map(),
-                    prev_values: None,
-                });
+                changes.push(ChangeRecord::new(
+                    ChangeOp::Delete,
+                    self.change_schema.clone(),
+                    smallvec![Value::UInt64(block), Value::UInt64(idx as u64)],
+                    row.into_values().into(),
+                    None,
+                ));
             }
         }
 
@@ -196,6 +186,8 @@ impl RawTableEngine {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::schema::ast::ColumnDef;
     use crate::storage::memory::MemoryBackend;
@@ -239,22 +231,13 @@ mod tests {
 
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].operation, ChangeOp::Insert);
-        assert_eq!(changes[0].table, "trades");
-        assert_eq!(
-            changes[0].key.get("block_number"),
-            Some(&Value::UInt64(1000))
-        );
-        assert_eq!(changes[0].key.get("_row_index"), Some(&Value::UInt64(0)));
-        assert_eq!(
-            changes[0].values.get("user"),
-            Some(&Value::String("alice".into()))
-        );
+        assert_eq!(changes[0].table(), "trades");
+        assert_eq!(changes[0].key("block_number"), Some(&Value::UInt64(1000)));
+        assert_eq!(changes[0].key("_row_index"), Some(&Value::UInt64(0)));
+        assert_eq!(changes[0].get("user"), Some(&Value::String("alice".into())));
 
-        assert_eq!(changes[1].key.get("_row_index"), Some(&Value::UInt64(1)));
-        assert_eq!(
-            changes[1].values.get("user"),
-            Some(&Value::String("bob".into()))
-        );
+        assert_eq!(changes[1].key("_row_index"), Some(&Value::UInt64(1)));
+        assert_eq!(changes[1].get("user"), Some(&Value::String("bob".into())));
     }
 
     #[test]
@@ -301,20 +284,51 @@ mod tests {
         assert_eq!(changes.len(), 3);
         for d in &changes {
             assert_eq!(d.operation, ChangeOp::Delete);
-            assert_eq!(d.table, "trades");
+            assert_eq!(d.table(), "trades");
         }
 
         // Verify bob's row is in the changes
         assert!(
             changes
                 .iter()
-                .any(|d| d.values.get("user") == Some(&Value::String("bob".into())))
+                .any(|d| d.get("user") == Some(&Value::String("bob".into())))
         );
 
         // Verify storage only has block 1000
         let remaining = engine.get_rows(1000, 1010, usize::MAX).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, 1000);
+    }
+
+    /// An Insert and the Delete that undoes it carry the same columns: those
+    /// of the schema, in its order, with Null where the row has none.
+    #[test]
+    fn insert_and_its_rollback_delete_carry_the_schema_columns() {
+        let storage = Arc::new(MemoryBackend::new());
+        let engine = RawTableEngine::new(test_table_def(), storage);
+
+        let row = HashMap::from([
+            ("user".to_string(), Value::String("alice".into())),
+            ("extra".to_string(), Value::UInt64(7)),
+        ]);
+        engine.ingest(1000, &[make_row_map("bob", 1.0)]).unwrap();
+        let insert = engine.ingest(1001, &[row]).unwrap().remove(0);
+        let delete = engine.rollback(1000).unwrap().remove(0);
+
+        let columns = |r: &ChangeRecord| {
+            r.values()
+                .map(|(name, value)| (name.to_string(), value.clone()))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            ("block_number".to_string(), Value::Null),
+            ("user".to_string(), Value::String("alice".into())),
+            ("amount".to_string(), Value::Null),
+        ];
+        assert_eq!(columns(&insert), expected);
+        assert_eq!(columns(&delete), expected);
+        assert_eq!(insert.get("extra"), None);
+        assert_eq!(delete.key_map(), insert.key_map());
     }
 
     #[test]
@@ -345,7 +359,7 @@ mod tests {
         let rollback_changes = engine.rollback(1001).unwrap();
         assert_eq!(rollback_changes.len(), 1);
         assert_eq!(
-            rollback_changes[0].values.get("user"),
+            rollback_changes[0].get("user"),
             Some(&Value::String("carol".into()))
         );
 
@@ -353,7 +367,7 @@ mod tests {
         let new_changes = engine.ingest(1002, &[make_row_map("eve", 50.0)]).unwrap();
         assert_eq!(new_changes.len(), 1);
         assert_eq!(
-            new_changes[0].values.get("user"),
+            new_changes[0].get("user"),
             Some(&Value::String("eve".into()))
         );
 

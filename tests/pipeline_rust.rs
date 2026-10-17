@@ -125,21 +125,25 @@ fn market_stats_reducer_and_token_summary_view() {
         .get("token_summary")
         .expect("token_summary records present");
     assert!(
-        view_records.iter().any(|r| matches!(r.values.get("asset_id"), Some(Value::String(s)) if s == "A")),
+        view_records
+            .iter()
+            .any(|r| matches!(r.get("asset_id"), Some(Value::String(s)) if s == "A")),
         "view must contain asset A"
     );
     assert!(
-        view_records.iter().any(|r| matches!(r.values.get("asset_id"), Some(Value::String(s)) if s == "B")),
+        view_records
+            .iter()
+            .any(|r| matches!(r.get("asset_id"), Some(Value::String(s)) if s == "B")),
         "view must contain asset B"
     );
 
     // event_count for asset A == 2; for asset B == 1.
     for r in view_records {
-        let asset = match r.values.get("asset_id") {
+        let asset = match r.get("asset_id") {
             Some(Value::String(s)) => s.clone(),
             _ => continue,
         };
-        let count = r.values.get("event_count").and_then(Value::as_u64).unwrap_or(0);
+        let count = r.get("event_count").and_then(Value::as_u64).unwrap_or(0);
         match asset.as_str() {
             "A" => assert_eq!(count, 2, "asset A should have count=2"),
             "B" => assert_eq!(count, 1, "asset B should have count=1"),
