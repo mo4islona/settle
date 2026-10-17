@@ -189,9 +189,9 @@ names with FxHash.
 The scale cases have one row per block. Their engine code got cheaper, but glibc
 spends more in `malloc` and `free` (+2.8M self on `sum_2k`, with the same number
 of allocated blocks). The wall clock with mimalloc does not show it: in
-`throughput`, which ingests rows by name, every case is faster, median of three
-alternating rounds: raw ingestion +18%, raw + MV +12%, full pipelines +10% to
-+18%, Polymarket +3% to +9%.
+`throughput`, which ingests rows by name, every case takes less time, median of
+three alternating rounds: raw ingestion −15%, raw + MV −11%, full pipelines −9%
+to −15%, Polymarket −3% to −8%.
 
 Each case leaves its profiles under `target/gungraun/settle/instructions/ingest/<mode>.<workload>/`.
 `callgrind_annotate --inclusive=yes callgrind.<mode>.<workload>.out` shows where
