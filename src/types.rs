@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -15,7 +16,8 @@ pub type ColumnId = u16;
 #[derive(Debug, Clone)]
 pub struct ColumnRegistry {
     names: Vec<String>,
-    indices: HashMap<String, ColumnId>,
+    /// FxHash: the keys are schema names, and each input column looks one up.
+    indices: FxHashMap<String, ColumnId>,
 }
 
 impl ColumnRegistry {
