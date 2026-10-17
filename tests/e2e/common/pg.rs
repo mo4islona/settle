@@ -53,6 +53,10 @@ pub async fn start_pg() -> PgFixture {
         )
         .await
         .expect("create token_summary table");
+    client
+        .batch_execute("CREATE TABLE settle_sequence (sequence BIGINT NOT NULL)")
+        .await
+        .expect("create settle_sequence table");
 
     PgFixture {
         _container: container,
@@ -61,9 +65,9 @@ pub async fn start_pg() -> PgFixture {
 }
 
 /// Apply a single `ChangeBatch` to Postgres atomically: one transaction per
-/// batch, idempotent upserts for Insert/Update, deletes for Delete. Either
-/// the whole batch lands or nothing does — satisfies the caller-contract
-/// documented in the durability spec.
+/// batch, idempotent upserts for Insert/Update, deletes for Delete, and the
+/// batch's sequence. Either the whole batch lands or nothing does — satisfies
+/// the caller-contract documented in the durability spec.
 pub async fn apply_batch(client: &mut Client, batch: &ChangeBatch) -> Result<(), tokio_postgres::Error> {
     let tx = client.transaction().await?;
     if let Some(records) = batch.tables.get("token_summary") {
@@ -96,7 +100,23 @@ pub async fn apply_batch(client: &mut Client, batch: &ChangeBatch) -> Result<(),
             }
         }
     }
+    tx.execute("DELETE FROM settle_sequence", &[]).await?;
+    tx.execute(
+        "INSERT INTO settle_sequence (sequence) VALUES ($1)",
+        &[&(batch.sequence as i64)],
+    )
+    .await?;
     tx.commit().await
+}
+
+/// The sequence of the newest batch that `apply_batch` committed; 0 before
+/// the first.
+pub async fn applied_sequence(client: &Client) -> u64 {
+    client
+        .query_opt("SELECT sequence FROM settle_sequence", &[])
+        .await
+        .expect("query settle_sequence")
+        .map_or(0, |r| r.get::<_, i64>(0) as u64)
 }
 
 pub async fn pg_row(client: &Client, asset: &str) -> Option<(i64, i64)> {

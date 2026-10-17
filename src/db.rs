@@ -13,7 +13,7 @@ use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
 #[cfg(feature = "rocksdb")]
 use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
-use crate::storage::{PendingWrites, StorageBackend, StorageWriteBatch, format};
+use crate::storage::{PendingWrites, StorageBackend, StorageWriteBatch, format, journal};
 use crate::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, RowMap, Value};
 
 /// Configuration for opening a Settle instance.
@@ -45,7 +45,8 @@ pub struct Config {
     /// `ingest()` wait for the ack of the batch before it. A call that
     /// returns no batch while batches wait takes a place too: its writes wait
     /// with the newest batch. Each batch reaches disk only when it is acked,
-    /// and in sequence order, so a reopen goes back to the last acked batch.
+    /// and in sequence order, so a reopen goes back to the last acked batch
+    /// (with the journal, to the applied sequence).
     /// The target must apply every batch, in sequence order, also across a
     /// fork: a fork's compensating batch undoes all the batches before it.
     pub max_pending_batches: usize,
@@ -59,6 +60,14 @@ pub struct Config {
     pub backfill_checkpoint_interval: u64,
     /// Build the `ChangeBatch::perf` timing tree on ingest. Default `true`.
     pub collect_perf: bool,
+    /// The sequence of the newest change batch that the target applied, as
+    /// the target stored it with the data of that batch; 0 before the first.
+    /// Set, it turns on the journal: each batch that `ingest()` or
+    /// `handle_fork()` returns is on disk first, and open brings storage to
+    /// the state after this batch, acked or not. Unset, open goes back to the
+    /// last acked batch, so a fork of blocks that the target applied but did
+    /// not ack leaves their changes in the target.
+    pub applied_sequence: Option<u64>,
 }
 
 impl Config {
@@ -77,6 +86,7 @@ impl Config {
             max_pending_batches: 2,
             backfill_checkpoint_interval: 1,
             collect_perf: true,
+            applied_sequence: None,
         }
     }
 
@@ -94,6 +104,7 @@ impl Config {
             max_pending_batches: 2,
             backfill_checkpoint_interval: 1,
             collect_perf: true,
+            applied_sequence: None,
         }
     }
 
@@ -167,6 +178,12 @@ impl Config {
         self.collect_perf = on;
         self
     }
+
+    /// See [`Config::applied_sequence`].
+    pub fn applied_sequence(mut self, sequence: u64) -> Self {
+        self.applied_sequence = Some(sequence);
+        self
+    }
 }
 
 /// Sentinel value (SQLite convention) — passing this as `data_dir` is
@@ -196,6 +213,68 @@ const META_LATEST_BLOCK: &str = "latest_block";
 const META_FINALIZED_BLOCK: &str = "finalized_block";
 const META_BLOCK_HASHES: &str = "block_hashes";
 const META_NEXT_SEQUENCE: &str = "next_sequence";
+
+fn meta_u64(storage: &dyn StorageBackend, key: &str) -> Result<Option<u64>> {
+    let Some(bytes) = storage.get_meta(key)? else {
+        return Ok(None);
+    };
+    let bytes = bytes
+        .try_into()
+        .map_err(|_| Error::Storage(format!("corrupt {key} metadata")))?;
+    Ok(Some(u64::from_be_bytes(bytes)))
+}
+
+/// Bring storage to the state after batch `applied`, the newest batch that
+/// the target applied: commit the journaled batches up to it, in order, and
+/// drop the others.
+fn recover_journal(storage: &dyn StorageBackend, applied: Option<u64>) -> Result<()> {
+    let parts = storage.journal()?;
+
+    let Some(applied) = applied else {
+        return match parts.first() {
+            Some(first) => Err(Error::InvalidOperation(format!(
+                "the database holds change batches from sequence {} that were returned and \
+                 not acked: open it with the applied sequence of the target",
+                first.sequence
+            ))),
+            None => Ok(()),
+        };
+    };
+
+    // The newest batch whose writes are on disk; 0 before the first.
+    let committed = meta_u64(storage, META_NEXT_SEQUENCE)?.map_or(0, |next| next.saturating_sub(1));
+    if applied < committed {
+        return Err(Error::InvalidOperation(format!(
+            "the target applied batch {applied}, but batch {committed} is acked: the target \
+             lost batches that it applied, or does not store their sequence"
+        )));
+    }
+
+    let journaled: std::collections::HashSet<u64> = parts
+        .iter()
+        .filter(|p| p.part == 0)
+        .map(|p| p.sequence)
+        .collect();
+    if let Some(missing) = (committed + 1..=applied).find(|s| !journaled.contains(s)) {
+        return Err(Error::InvalidOperation(format!(
+            "the target applied batch {applied}, but the database has no record of batch \
+             {missing}"
+        )));
+    }
+
+    let mut recovery = StorageWriteBatch::new();
+    for part in &parts {
+        if part.sequence > committed && part.sequence <= applied {
+            recovery.ops.extend(journal::decode(&part.entry)?.ops);
+        }
+        recovery.delete_journal(part.sequence, part.part);
+    }
+    if recovery.ops.is_empty() {
+        return Ok(());
+    }
+    storage.commit(&recovery)?;
+    storage.sync()
+}
 
 /// Whether the database holds data: every commit of an ingest or a fork
 /// writes one of these keys. Versions before format 2 wrote `block_hashes`.
@@ -273,6 +352,9 @@ pub struct Settle {
     /// carries them until one commits; each unacked batch holds all of them,
     /// as they grow only while no batch waits.
     stamp: format::Stamp,
+    /// Whether returned batches go to the journal. See
+    /// [`Config::applied_sequence`].
+    journal: bool,
 }
 
 impl Settle {
@@ -304,25 +386,16 @@ impl Settle {
         };
 
         let stamp = format::check(storage.as_ref(), &schema, has_data(storage.as_ref())?)?;
+        recover_journal(storage.as_ref(), config.applied_sequence)?;
 
         let mut engine = SettleEngine::new(&schema, storage.clone())?;
         engine.set_collect_perf(config.collect_perf);
 
         // Restore persisted state
-        if let Some(bytes) = storage.get_meta(META_LATEST_BLOCK)? {
-            let block = u64::from_be_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| Error::Storage("corrupt latest_block metadata".into()))?,
-            );
+        if let Some(block) = meta_u64(storage.as_ref(), META_LATEST_BLOCK)? {
             engine.set_latest_block(block);
         }
-        if let Some(bytes) = storage.get_meta(META_FINALIZED_BLOCK)? {
-            let block = u64::from_be_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| Error::Storage("corrupt finalized_block metadata".into()))?,
-            );
+        if let Some(block) = meta_u64(storage.as_ref(), META_FINALIZED_BLOCK)? {
             engine.set_finalized_block(block);
         }
         engine.restore_block_hashes(storage.get_block_hashes()?.into_iter().collect());
@@ -338,12 +411,7 @@ impl Settle {
 
         let mut buffer = ChangeBuffer::new(config.max_buffer_size);
         // Restore monotonic sequence across restart. Default 1 on fresh DB.
-        if let Some(bytes) = storage.get_meta(META_NEXT_SEQUENCE)? {
-            let seq = u64::from_be_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| Error::Storage("corrupt next_sequence metadata".into()))?,
-            );
+        if let Some(seq) = meta_u64(storage.as_ref(), META_NEXT_SEQUENCE)? {
             buffer.set_next_sequence(seq);
         }
 
@@ -359,6 +427,7 @@ impl Settle {
             runtimes_attached: std::collections::HashSet::new(),
             backfill_checkpoint_interval: config.backfill_checkpoint_interval,
             stamp,
+            journal: config.applied_sequence.is_some(),
         })
     }
 
@@ -574,8 +643,13 @@ impl Settle {
 
         // One sync covers every commit before it. The batches have left the
         // queue, so a retried ack would not sync them; and a failed fsync
-        // can lose writes that a second one then reports as synced.
-        if committed && let Err(e) = self.storage.sync() {
+        // can lose writes that a second one then reports as synced. With the
+        // journal, each acked batch is on disk already, and the sync of the
+        // next journal write covers the commit.
+        if committed
+            && !self.journal
+            && let Err(e) = self.storage.sync()
+        {
             let reason = e.to_string();
             self.poisoned = Some(format!("sync after ack failed: {reason}"));
             self.sync_failed = Some(reason.clone());
@@ -737,7 +811,7 @@ impl Settle {
                 })
             }
             Some(batch) => {
-                self.push_pending(batch.sequence, write_batch);
+                self.push_pending(batch.sequence, write_batch)?;
                 Ok(ForkResult {
                     cursor,
                     batch: Some(batch),
@@ -946,7 +1020,7 @@ impl Settle {
             }
             Some(batch) => {
                 // Stash for ack. storage.commit is deferred.
-                self.push_pending(batch.sequence, write_batch);
+                self.push_pending(batch.sequence, write_batch)?;
                 Ok(Some(batch))
             }
         }
@@ -1085,13 +1159,46 @@ impl Settle {
             })
     }
 
-    fn push_pending(&mut self, sequence: u64, write_batch: StorageWriteBatch) {
+    /// Queue a batch for its ack. With the journal, the batch is on disk
+    /// before the caller gets it: the target can apply it at once.
+    fn push_pending(&mut self, sequence: u64, mut write_batch: StorageWriteBatch) -> Result<()> {
+        if self.journal {
+            self.write_journal(sequence, 0, &write_batch, true)?;
+            write_batch.delete_journal(sequence, 0);
+        }
+
         self.pending.push_back(PendingAck {
             sequence,
             write_batch,
             joined: 0,
             since: Instant::now(),
         });
+        Ok(())
+    }
+
+    /// Store a journal part. A failure poisons the instance: the engine
+    /// state is already past disk, and the caller does not get the batch.
+    fn write_journal(
+        &mut self,
+        sequence: u64,
+        part: u64,
+        writes: &StorageWriteBatch,
+        sync: bool,
+    ) -> Result<()> {
+        let mut batch = StorageWriteBatch::new();
+        batch.put_journal(sequence, part, journal::encode(writes));
+        if let Err(e) = self.storage.commit(&batch) {
+            self.poisoned = Some(format!("journal write of batch {sequence} failed: {e}"));
+            return Err(e);
+        }
+
+        if sync && let Err(e) = self.storage.sync() {
+            let reason = e.to_string();
+            self.poisoned = Some(format!("sync of the journal failed: {reason}"));
+            self.sync_failed = Some(reason.clone());
+            return Err(Error::SyncFailed(reason));
+        }
+        Ok(())
     }
 
     /// Commit the writes of a call that returned no batch. Behind unacked
@@ -1099,8 +1206,20 @@ impl Settle {
     /// take a place in the queue, and commit with its ack. A failed commit
     /// poisons the instance: the engine state is already past disk.
     fn commit_without_batch(&mut self, write_batch: StorageWriteBatch, call: &str) -> Result<()> {
-        if let Some(newest) = self.pending.back_mut() {
+        if let Some(newest) = self.pending.back() {
+            let sequence = newest.sequence;
+            let part = newest.joined as u64 + 1;
+            // No sync: this call returns nothing to apply, and the sync of
+            // the next batch covers the write.
+            if self.journal {
+                self.write_journal(sequence, part, &write_batch, false)?;
+            }
+
+            let newest = self.pending.back_mut().expect("checked above");
             newest.write_batch.ops.extend(write_batch.ops);
+            if self.journal {
+                newest.write_batch.delete_journal(sequence, part);
+            }
             newest.joined += 1;
             return Ok(());
         }

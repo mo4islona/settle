@@ -164,6 +164,7 @@ impl StorageBackend for FailingStorage {
     fn put_meta(&self, k: &str, v: &[u8]) -> Result<()> { self.inner.put_meta(k, v) }
     fn get_meta(&self, k: &str) -> Result<Option<Vec<u8>>> { self.inner.get_meta(k) }
     fn get_block_hashes(&self) -> Result<Vec<(BlockNumber, String)>> { self.inner.get_block_hashes() }
+    fn journal(&self) -> Result<Vec<crate::storage::journal::JournalPart>> { self.inner.journal() }
     fn list_reducer_group_keys(&self, r: &str) -> Result<Vec<Vec<u8>>> { self.inner.list_reducer_group_keys(r) }
     fn commit(&self, batch: &StorageWriteBatch) -> Result<()> {
         let left = self.commits_before_failure.load(Ordering::SeqCst);

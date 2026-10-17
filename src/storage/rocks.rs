@@ -9,6 +9,7 @@ use rocksdb::{
 use crate::error::{Error, Result};
 use crate::types::BlockNumber;
 
+use super::journal::JournalPart;
 use super::{BatchOp, StorageBackend, StorageWriteBatch};
 
 const CF_RAW: &str = "raw";
@@ -32,9 +33,22 @@ fn to_err(e: rocksdb::Error) -> Error {
 // CF_REDUCER_SNAP:  {reducer}\0{gk_len_be2}{group_key}{block_be8}
 // CF_REDUCER_FIN:   {reducer}\0{group_key}
 // CF_MV:            {view}\0{group_key}
-// CF_META:          {key}
+// CF_META:          {key}, and journal\0{sequence_be8}{part_be8}
 // CF_BLOCK_HASH:    {block_be8}
 // ---------------------------------------------------------------------------
+
+/// Meta keys are names without a NUL, so the journal keys do not mix with
+/// them. Not a column family of its own: a version without it could then
+/// not open the database to report the format version.
+const JOURNAL_PREFIX: &[u8] = b"journal\0";
+
+fn journal_key(sequence: u64, part: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(JOURNAL_PREFIX.len() + 16);
+    k.extend_from_slice(JOURNAL_PREFIX);
+    k.extend_from_slice(&sequence.to_be_bytes());
+    k.extend_from_slice(&part.to_be_bytes());
+    k
+}
 
 fn raw_key(table: &str, block: BlockNumber) -> Vec<u8> {
     let mut k = Vec::with_capacity(table.len() + 1 + 8);
@@ -597,9 +611,48 @@ impl StorageBackend for RocksDbBackend {
                     let cf = self.db.cf_handle(CF_BLOCK_HASH).expect("block_hash CF");
                     wb.delete_cf(cf, block.to_be_bytes());
                 }
+                BatchOp::PutJournal {
+                    sequence,
+                    part,
+                    entry,
+                } => {
+                    let cf = self.db.cf_handle(CF_META).expect("meta CF");
+                    wb.put_cf(cf, journal_key(*sequence, *part), entry);
+                }
+                BatchOp::DeleteJournal { sequence, part } => {
+                    let cf = self.db.cf_handle(CF_META).expect("meta CF");
+                    wb.delete_cf(cf, journal_key(*sequence, *part));
+                }
             }
         }
         self.db.write(wb).map_err(to_err)
+    }
+
+    fn journal(&self) -> Result<Vec<JournalPart>> {
+        let cf = self.db.cf_handle(CF_META).expect("meta CF");
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_upper_bound(upper_bound(JOURNAL_PREFIX));
+
+        let mut parts = Vec::new();
+        let iter = self.db.iterator_cf_opt(
+            cf,
+            opts,
+            IteratorMode::From(JOURNAL_PREFIX, Direction::Forward),
+        );
+        for item in iter {
+            let (key, entry) = item.map_err(to_err)?;
+            let numbers = key
+                .strip_prefix(JOURNAL_PREFIX)
+                .filter(|n| n.len() == 16)
+                .ok_or_else(|| Error::Storage("corrupt journal key".into()))?;
+            let (sequence, part) = numbers.split_at(8);
+            parts.push(JournalPart {
+                sequence: u64::from_be_bytes(sequence.try_into().expect("8 bytes")),
+                part: u64::from_be_bytes(part.try_into().expect("8 bytes")),
+                entry: entry.into_vec(),
+            });
+        }
+        Ok(parts)
     }
 
     /// A commit is in the OS page cache on return; this syncs the WAL, which
@@ -1020,5 +1073,32 @@ mod tests {
         let b = RocksDbBackend::open_with_config(dir.path(), &config).unwrap();
         b.put_raw_rows("t", 1, b"data").unwrap();
         assert_eq!(b.get_raw_rows("t", 1, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn journal_keys_do_not_mix_with_meta_keys() {
+        let (db, _dir) = test_backend();
+
+        let mut batch = StorageWriteBatch::new();
+        batch.put_meta("journal", b"meta");
+        batch.put_meta("next_sequence", &3u64.to_be_bytes());
+        batch.put_journal(3, 0, vec![1]);
+        batch.put_journal(2, 1, vec![2]);
+        batch.put_journal(2, 0, vec![3]);
+        batch.put_journal(256, 0, vec![4]);
+        db.commit(&batch).unwrap();
+
+        let mut batch = StorageWriteBatch::new();
+        batch.delete_journal(3, 0);
+        db.commit(&batch).unwrap();
+
+        let parts: Vec<_> = db
+            .journal()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.sequence, p.part, p.entry))
+            .collect();
+        assert_eq!(parts, vec![(2, 0, vec![3]), (2, 1, vec![2]), (256, 0, vec![4])]);
+        assert_eq!(db.get_meta("journal").unwrap(), Some(b"meta".to_vec()));
     }
 }
