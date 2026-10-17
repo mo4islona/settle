@@ -305,7 +305,7 @@ impl Settle {
 
         let stamp = format::check(storage.as_ref(), &schema, has_data(storage.as_ref())?)?;
 
-        let mut engine = SettleEngine::new(&schema, storage.clone());
+        let mut engine = SettleEngine::new(&schema, storage.clone())?;
         engine.set_collect_perf(config.collect_perf);
 
         // Restore persisted state
@@ -452,20 +452,15 @@ impl Settle {
         }
         self.engine.set_reducer_runtime(name, runtime);
         self.runtimes_attached.insert(name.to_string());
+        self.replay_reducer_chain(name)
+    }
 
-        // Replay only this reducer and its downstream MVs. Reset their
-        // in-memory state to the finalized baseline first — otherwise the
-        // replay applies on top of state already populated by prior ingests,
-        // doubling every emit / aggregate contribution.
+    /// Rebuild the unfinalized state of `name` and of what feeds it or
+    /// depends on it, from the raw rows. See `SettleEngine::replay_reducer_chain`.
+    fn replay_reducer_chain(&mut self, name: &str) -> Result<()> {
         let finalized = self.engine.finalized_block();
         let latest = self.engine.latest_block();
-        if latest > finalized {
-            self.engine
-                .reset_reducer_branch_for_replay(name, finalized)?;
-            self.engine
-                .replay_unfinalized_for(finalized + 1, latest, name)?;
-        }
-        Ok(())
+        self.engine.replay_reducer_chain(name, finalized, latest)
     }
 
     /// Register a *new* external reducer definition. The reducer is added
@@ -494,37 +489,18 @@ impl Settle {
         self.engine.add_reducer(def, self.storage.clone())?;
         self.stamp.extend(stamp);
 
-        // Newly-added reducer starts with empty state — replay rebuilds it
-        // from the unfinalized range without any double-counting risk.
-        let finalized = self.engine.finalized_block();
-        let latest = self.engine.latest_block();
-        if latest > finalized {
-            self.engine
-                .replay_unfinalized_for(finalized + 1, latest, &name)?;
-        }
-        Ok(())
+        self.replay_reducer_chain(&name)
     }
 
-    /// Replay unfinalized blocks for a specific reducer and its downstream MVs.
-    /// Used after installing an external reducer's JS callback.
+    /// Replay unfinalized blocks for a specific reducer, the reducers that
+    /// feed it, and the reducers and MVs that depend on it. Used after
+    /// installing an external reducer's JS callback.
     ///
     /// Returns `Err(PendingAck)` if an unacked batch is in flight.
     pub fn replay_reducer(&mut self, name: &str) -> Result<()> {
         self.guard_not_poisoned()?;
         self.guard_no_pending()?;
-        let finalized = self.engine.finalized_block();
-        let latest = self.engine.latest_block();
-        if latest > finalized {
-            // Reset reducer + downstream MVs to finalized baseline BEFORE
-            // replaying. Without this, a replay called after the reducer
-            // already processed the unfinalized range would double every
-            // emit and aggregate contribution.
-            self.engine
-                .reset_reducer_branch_for_replay(name, finalized)?;
-            self.engine
-                .replay_unfinalized_for(finalized + 1, latest, name)?;
-        }
-        Ok(())
+        self.replay_reducer_chain(name)
     }
 
     /// Check if a reducer with the given name already exists in the engine.
@@ -785,8 +761,11 @@ impl Settle {
     /// below the currently committed finalized block (finality is monotonic;
     /// going above `latest_block` is allowed for gappy chains like Solana).
     ///
-    /// If the rollback chain shows a fork, the ingest rolls it back first and
-    /// the batch carries the compensating changes. An input error is found
+    /// If a hash in the rollback chain or the finalized head differs from the
+    /// stored hash of a block up to the latest one, the ingest rolls back to
+    /// the highest supplied block below it whose hash matches, and the batch
+    /// carries the compensating changes. Blocks that the chain leaves out are
+    /// not evidence of a fork. An input error is found
     /// before that rollback. A reducer error after it poisons the instance:
     /// ack the batches that the target applied, drop and reopen, and the next
     /// ingest detects the fork again.
@@ -829,8 +808,9 @@ impl Settle {
         let mut pending_changes: Vec<ChangeRecord> = Vec::new();
         let mut block_perf: Vec<PerfNode> = Vec::new();
 
-        let fork_point = self.detect_fork(&input);
-        let recovery_block = fork_point.unwrap_or_else(|| self.engine.latest_block());
+        let fork_point = self.detect_fork(&input)?;
+        // The latest block once the fork is rolled back; None on an empty database.
+        let recovery_block = fork_point.or(self.engine.latest_block_if_any());
 
         // Checked before the fork rollback, which cannot be undone: a bad
         // input then leaves the instance as it was.
@@ -867,8 +847,8 @@ impl Settle {
                 return Err(e);
             }
 
-            // Undo in-memory state to recovery_block (0 for a fresh DB). The
-            // undo stays in-memory only: raw rows from this ingest were never
+            // Undo in-memory state to recovery_block. The undo stays
+            // in-memory only: raw rows from this ingest were never
             // committed (they live in `write_batch`, dropped below), so
             // storage has no `> recovery_block` rows to delete on disk, and no
             // separate commit can fail half-way. Not a chain rollback: on
@@ -972,62 +952,60 @@ impl Settle {
         }
     }
 
-    /// The fork point if the input's rollback chain shows that blocks above
-    /// it are no longer canonical, else None.
+    /// The fork point if the input's chain shows that blocks we hold are no
+    /// longer canonical, else None.
     ///
-    /// The chain is sorted DESC (newest first) so the HIGHEST common ancestor
-    /// wins — preventing catastrophic deep rollbacks when the caller sends
-    /// blocks in ascending order.
-    ///
-    /// IMPORTANT: no fork when the chain is advancing (rollbackChain or
-    /// finalizedHead contains blocks above current_latest). In that case, the
-    /// caller is providing new unseen blocks, not a rollback signal. External
-    /// fork handling (e.g. 409 in pipes-sdk) runs before ingest() is called.
-    fn detect_fork(&self, input: &IngestInput) -> Option<BlockNumber> {
-        let current_latest = self.engine.latest_block();
-        if current_latest == 0 {
-            return None;
-        }
+    /// The evidence is a supplied hash that differs from the stored hash of
+    /// the same block, up to the latest block. A chain that leaves blocks out
+    /// shows nothing about them: an empty chain, or one that only extends
+    /// past the latest block, is no fork. The fork point is the highest
+    /// supplied block below the lowest conflict whose hash matches, else 0;
+    /// Err if that is below finality.
+    fn detect_fork(&self, input: &IngestInput) -> Result<Option<BlockNumber>> {
+        let Some(current_latest) = self.engine.latest_block_if_any() else {
+            return Ok(None);
+        };
 
-        let mut sorted_chain: Vec<_> = input.rollback_chain.iter().collect();
-        sorted_chain.sort_unstable_by_key(|c| std::cmp::Reverse(c.number));
-
-        // Resolve-fork-cursor would fall through to an old finalized anchor
-        // and trigger a spurious rollback.
-        let advancing = sorted_chain
-            .first()
-            .is_some_and(|c| c.number > current_latest)
-            || input.finalized_head.number > current_latest;
-        if advancing {
-            return None;
-        }
-
-        let new_chain: Vec<(BlockNumber, &str)> = sorted_chain
+        let supplied: Vec<(BlockNumber, &str)> = input
+            .rollback_chain
             .iter()
+            .chain(std::iter::once(&input.finalized_head))
             .map(|c| (c.number, c.hash.as_str()))
-            .chain(std::iter::once((
-                input.finalized_head.number,
-                input.finalized_head.hash.as_str(),
-            )))
             .collect();
+        let Some(conflict) = self.engine.lowest_hash_conflict(&supplied, current_latest) else {
+            return Ok(None);
+        };
 
-        // Use `_bounded` so a stale future hash can't push the resolved fork
-        // point above latest and cause silent skips. No common ancestor means
-        // a full rollback.
+        let mut ancestors: Vec<(BlockNumber, &str)> = supplied
+            .into_iter()
+            .filter(|&(n, _)| n < conflict)
+            .collect();
+        ancestors.sort_unstable_by_key(|&(n, _)| std::cmp::Reverse(n));
+
+        // `_bounded`: no match below finality or above the latest block.
         let fork_point = self
             .engine
-            .resolve_fork_cursor_bounded(&new_chain)
+            .resolve_fork_cursor_bounded(&ancestors)
             .map_or(0, |c| c.number);
-        (fork_point < current_latest).then_some(fork_point)
+
+        let finalized = self.engine.finalized_block();
+        if fork_point < finalized {
+            return Err(Error::InvalidOperation(format!(
+                "the hash of block {conflict} differs from the stored one, and the chain \
+                 holds no common ancestor at or above finalized block {finalized} — \
+                 finalized state is irreversible"
+            )));
+        }
+        Ok((fork_point < current_latest).then_some(fork_point))
     }
 
     /// Check the input rows and group them by table (in name order, for a
     /// deterministic processing order) and by block. `latest` is the latest
-    /// block once a detected fork is rolled back.
+    /// block once a detected fork is rolled back, None on an empty database.
     fn group_input_rows(
         &self,
         data: std::collections::HashMap<String, Vec<RowMap>>,
-        latest: BlockNumber,
+        latest: Option<BlockNumber>,
     ) -> Result<Vec<(String, BTreeMap<BlockNumber, Vec<RowMap>>)>> {
         // Dedup guard: reject any block at or below the current
         // (post-fork-detection) latest. Re-ingesting an already-processed
@@ -1036,7 +1014,7 @@ impl Settle {
         // state back BEFORE feeding new-chain data — relying on ingest()'s
         // in-line fork detection to also delete duplicate content at the
         // fork point is not supported.
-        if latest > 0 {
+        if let Some(latest) = latest {
             let min_input = data
                 .values()
                 .flat_map(|rows| {

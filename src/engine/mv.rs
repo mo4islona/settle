@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::error::{Error, Result};
 use crate::schema::ast::{AggFunc, MVDef, SelectExpr, SelectItem, SlidingWindowDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
 use crate::types::{
@@ -181,11 +182,13 @@ pub struct MVEngine {
 }
 
 impl MVEngine {
+    /// Build the view and load its stored state: Err if storage fails or
+    /// holds state that this view cannot read.
     pub fn new(
         def: MVDef,
         storage: Arc<dyn StorageBackend>,
         source_column_types: &HashMap<String, ColumnType>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut output_columns = Vec::new();
         let mut agg_funcs = Vec::new();
         let mut agg_index = 0usize;
@@ -299,43 +302,66 @@ impl MVEngine {
             emit_order: Vec::new(),
         };
         if mv.sliding_window.is_some() {
-            mv.restore_window();
+            mv.restore_window()?;
         } else {
-            mv.restore_groups();
+            mv.restore_groups()?;
         }
-        mv
+        Ok(mv)
     }
 
     /// Load the finalized state of each group.
-    fn restore_groups(&mut self) {
-        let Ok(group_keys) = self.storage.list_mv_group_keys(&self.def.name) else {
-            return;
-        };
-        for gk_bytes in group_keys {
-            if let Ok(Some(state_bytes)) = self.storage.get_mv_state(&self.def.name, &gk_bytes)
-                && let Some(aggs) = deserialize_mv_group(&state_bytes, &self.agg_funcs)
-            {
-                self.groups.insert(storage::decode_group_key(&gk_bytes), aggs);
-            }
+    fn restore_groups(&mut self) -> Result<()> {
+        for key in self.storage.list_mv_group_keys(&self.def.name)? {
+            let group_key = storage::decode_group_key(&key)
+                .map_err(|e| self.unreadable(format!("group key: {e}")))?;
+            let aggs = self
+                .storage
+                .get_mv_state(&self.def.name, &key)?
+                .and_then(|bytes| deserialize_mv_group(&bytes, &self.agg_funcs))
+                .ok_or_else(|| self.unreadable(format!("state of group {group_key:?}")))?;
+            self.groups.insert(group_key, aggs);
         }
+        Ok(())
     }
 
     /// Load the window as of the durable block, which `write_checkpoint`
     /// stores block by block.
-    fn restore_window(&mut self) {
-        let Ok(keys) = self.storage.list_mv_group_keys(&self.def.name) else {
-            return;
-        };
-        for key in keys {
-            let Ok(Some(record)) = self.storage.get_mv_state(&self.def.name, &key) else {
-                continue;
-            };
-            let Some(block) = key.try_into().ok().map(BlockNumber::from_be_bytes) else {
-                continue;
-            };
-            self.read_window_record(block, &record);
+    fn restore_window(&mut self) -> Result<()> {
+        for key in self.storage.list_mv_group_keys(&self.def.name)? {
+            let block = <[u8; 8]>::try_from(key.as_slice())
+                .map(BlockNumber::from_be_bytes)
+                .map_err(|_| self.unreadable(format!("window key {key:?}")))?;
+            let record = self.storage.get_mv_state(&self.def.name, &key)?;
+            record
+                .and_then(|record| self.read_window_record(block, &record))
+                .ok_or_else(|| self.unreadable(format!("window record of block {block}")))?;
         }
         self.current_watermark = self.block_times.max_ts().unwrap_or(0);
+        Ok(())
+    }
+
+    /// Drop all in-memory state and load the stored state again.
+    pub fn reload(&mut self) -> Result<()> {
+        self.groups.clear();
+        self.block_groups.clear();
+        self.block_times = BlockTimes::default();
+        self.current_watermark = 0;
+        self.expired.clear();
+        self.unstored.clear();
+        self.window_writes.clear();
+        self.removed_groups.clear();
+        self.pending_durable.clear();
+        self.ingest_touched = Touched::default();
+
+        if self.sliding_window.is_some() {
+            self.restore_window()
+        } else {
+            self.restore_groups()
+        }
+    }
+
+    fn unreadable(&self, what: String) -> Error {
+        Error::Storage(format!("unreadable state of MV '{}': {what}", self.def.name))
     }
 
     /// Add the block of a record that `window_record` wrote.
@@ -346,7 +372,7 @@ impl MVEngine {
         self.block_times.insert(block, ts);
 
         for _ in 0..group_count {
-            let group_key = storage::decode_group_key(read_slice(record, &mut pos)?);
+            let group_key = storage::decode_group_key(read_slice(record, &mut pos)?).ok()?;
             if !self.groups.contains_key(&group_key) {
                 let aggs = self.create_agg_vec();
                 self.groups.insert(group_key.clone(), aggs);
@@ -361,7 +387,7 @@ impl MVEngine {
             }
             self.block_groups.entry(block).or_default().insert(group_key);
         }
-        Some(())
+        (pos == record.len()).then_some(())
     }
 
     pub fn name(&self) -> &str {
@@ -974,20 +1000,22 @@ fn deserialize_mv_group(
         let end = pos.checked_add(len)?;
         let blob = bytes.get(pos..end)?;
         pos = end;
-        aggs.push(restore_agg(func, blob));
+        aggs.push(restore_agg(func, blob)?);
     }
-    match *bytes.get(pos)? {
+    let prev_flag = *bytes.get(pos)?;
+    pos += 1;
+    match prev_flag {
         0 => {}
         1 => {
-            pos += 1;
             let len = read_u32(bytes, &mut pos)?;
             let end = pos.checked_add(len)?;
             let pb = bytes.get(pos..end)?;
             rmp_serde::from_slice::<HashMap<String, Value>>(pb).ok()?;
+            pos = end;
         }
         _ => return None,
     }
-    Some(aggs)
+    (pos == bytes.len()).then_some(aggs)
 }
 
 // A sliding window is stored as of the last finality advance, one record per

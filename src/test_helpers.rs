@@ -115,32 +115,13 @@ pub fn ingest_with_finalized_no_ack(
     })
 }
 
-/// Roll the engine back to `fork_point`. Auto-acks any produced batch so
-/// subsequent reads see the rolled-back state.
+/// Roll the engine back to `fork_point` with `handle_fork`. Auto-acks any
+/// produced batch so subsequent reads see the rolled-back state.
 ///
-/// For `fork_point > 0`, calls `handle_fork(vec![cursor(fork_point)])` —
-/// the fork point must be a block whose hash was previously stored by one
-/// of the `ingest_*` helpers above (deterministic `block_hash(n)`).
-///
-/// For `fork_point == 0`, "drop everything" semantics — handled via an
-/// `ingest()` call with no data and `finalized_head = cursor(0)`. The
-/// engine's fork detection then sees no common ancestor and falls back
-/// to a full rollback. `handle_fork` itself errors on this case.
+/// The fork point must be a block whose hash was previously stored by one
+/// of the `ingest_*` helpers above (deterministic `block_hash(n)`): for
+/// block 0, an ingest with finalized head 0.
 pub fn rollback_to(db: &mut Settle, fork_point: BlockNumber) -> Result<ForkResult> {
-    if fork_point == 0 {
-        let batch = db.ingest(IngestInput {
-            data: HashMap::new(),
-            rollback_chain: vec![],
-            finalized_head: cursor(0),
-        })?;
-        if let Some(ref b) = batch {
-            db.ack(b.sequence)?;
-        }
-        return Ok(ForkResult {
-            cursor: cursor(0),
-            batch,
-        });
-    }
     let result = db.handle_fork(vec![cursor(fork_point)])?;
     if let Some(ref b) = result.batch {
         db.ack(b.sequence)?;

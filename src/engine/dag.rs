@@ -193,8 +193,9 @@ pub struct SettleEngine {
 }
 
 impl SettleEngine {
-    /// Build the engine from a parsed schema and storage backend.
-    pub fn new(schema: &Schema, storage: Arc<dyn StorageBackend>) -> Self {
+    /// Build the engine from a parsed schema and storage backend, with the
+    /// stored state of every MV loaded.
+    pub fn new(schema: &Schema, storage: Arc<dyn StorageBackend>) -> Result<Self> {
         let mut raw_tables = HashMap::new();
         let mut reducers = HashMap::new();
         let mut mvs = HashMap::new();
@@ -277,7 +278,7 @@ impl SettleEngine {
                 .unwrap_or_default();
             mvs.insert(
                 mv_def.name.clone(),
-                MVEngine::new(mv_def.clone(), storage.clone(), &source_col_types),
+                MVEngine::new(mv_def.clone(), storage.clone(), &source_col_types)?,
             );
         }
 
@@ -327,7 +328,7 @@ impl SettleEngine {
 
         let defer_allowed = compute_defer_allowed(&branches, &reducers, &mvs);
 
-        Self {
+        Ok(Self {
             raw_tables,
             reducers,
             mvs,
@@ -346,7 +347,7 @@ impl SettleEngine {
             collect_perf: true,
             block_hashes: BTreeMap::new(),
             hash_changes: BTreeSet::new(),
-        }
+        })
     }
 
     /// Add an external reducer to the pipeline.
@@ -691,108 +692,99 @@ impl SettleEngine {
         self.replay_unfinalized_inner(from_block, to_block, None)
     }
 
-    /// Replay only a specific reducer and its direct downstream MVs.
-    /// Note: only 1 level of MV depth (MV→MV chaining is not supported).
-    /// Reset the named reducer and its downstream MVs to their in-memory
-    /// state at `fork_point` (typically `finalized_block`). Called before
-    /// `replay_unfinalized_for` so the replay rebuilds state from a clean
-    /// baseline instead of accumulating on top of already-processed blocks.
+    /// Rebuild the unfinalized state of `reducer_name` from the raw rows of
+    /// the blocks above `finalized` up to `latest`, after its runtime
+    /// changed. The replay runs the reducers upstream of it, which produce
+    /// its input, and the reducers and MVs downstream, which consume its
+    /// output. Each of them first goes back to its state at `finalized`, so
+    /// that no block counts twice.
     ///
-    /// Without this reset, calling `replay_reducer` (or `set_reducer_runtime`)
-    /// after the reducer has already processed unfinalized blocks would
-    /// double-count: every emit fires twice, every aggregation tracks two
-    /// contributions per block.
-    ///
-    /// Does NOT touch raw-table storage — this is a pure in-memory reset of
-    /// the reducer + downstream MV state.
-    pub fn reset_reducer_branch_for_replay(
+    /// An external reducer without a callback produces nothing: the replay
+    /// that its callback starts rebuilds what depends on it.
+    pub fn replay_reducer_chain(
         &mut self,
         reducer_name: &str,
-        fork_point: BlockNumber,
+        finalized: BlockNumber,
+        latest: BlockNumber,
     ) -> Result<()> {
-        // Reset the reducer itself (covers both branch-hosted and HashMap-hosted).
-        let none_pending = PendingWrites::default();
-        if let Some(idx) = self.branch_index.get(reducer_name).copied() {
-            self.branches[idx].reducer.rollback(fork_point, &none_pending)?;
-        } else if let Some(reducer) = self.reducers.get_mut(reducer_name) {
-            reducer.rollback(fork_point, &none_pending)?;
-        } else {
+        if !self.has_reducer(reducer_name) {
             return Err(Error::InvalidOperation(format!(
-                "reset_reducer_branch_for_replay: unknown reducer '{reducer_name}'"
+                "replay: unknown reducer '{reducer_name}'"
             )));
         }
+        if latest <= finalized {
+            return Ok(());
+        }
 
-        // Reset MVs that source from this reducer. `mv.rollback` returns
-        // compensating change records, which we discard — replay will
-        // re-emit them via `process_block`.
-        let mv_names: Vec<String> = self
-            .pipeline
-            .iter()
-            .filter_map(|node| {
-                if let PipelineNode::MV(name) = node {
-                    let source = if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
-                        self.branches[bi].mv_entries[mi].1.source().to_string()
-                    } else if let Some(mv) = self.mvs.get(name) {
-                        mv.source().to_string()
-                    } else {
-                        return None;
-                    };
-                    if source == reducer_name {
-                        Some(name.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut upstream = Vec::new();
+        let mut source = self.reducer_source(reducer_name);
+        while let Some(name) = source.filter(|s| self.has_reducer(s)) {
+            upstream.push(name.to_string());
+            source = self.reducer_source(name);
+        }
 
-        for name in &mv_names {
-            if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
-                let _ = self.branches[bi].mv_entries[mi].1.rollback(fork_point);
-            } else if let Some(mv) = self.mvs.get_mut(name) {
-                let _ = mv.rollback(fork_point);
+        // The pipeline lists each reducer after its source.
+        let mut downstream: Vec<String> = vec![reducer_name.to_string()];
+        for node in &self.pipeline {
+            if let PipelineNode::Reducer(name) = node
+                && self
+                    .reducer_source(name)
+                    .is_some_and(|s| downstream.iter().any(|d| d == s))
+            {
+                downstream.push(name.clone());
             }
         }
 
-        Ok(())
-    }
-
-    pub fn replay_unfinalized_for(
-        &mut self,
-        from_block: BlockNumber,
-        to_block: BlockNumber,
-        reducer_name: &str,
-    ) -> Result<()> {
-        // Find MV names that source from this reducer
-        let mv_names: HashSet<String> = self
+        let views: Vec<String> = self
             .pipeline
             .iter()
-            .filter_map(|node| {
-                if let PipelineNode::MV(name) = node {
-                    let source = if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
-                        self.branches[bi].mv_entries[mi].1.source().to_string()
-                    } else if let Some(mv) = self.mvs.get(name) {
-                        mv.source().to_string()
-                    } else {
-                        return None;
-                    };
-                    if source == reducer_name {
-                        Some(name.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+            .filter_map(|node| match node {
+                PipelineNode::MV(name) => Some(name),
+                _ => None,
             })
+            .filter(|name| {
+                self.mv_source(name)
+                    .is_some_and(|s| downstream.iter().any(|d| d == s))
+            })
+            .cloned()
             .collect();
 
-        let mut filter = HashSet::new();
-        filter.insert(reducer_name.to_string());
-        filter.extend(mv_names);
-        self.replay_unfinalized_inner(from_block, to_block, Some(&filter))
+        let none_pending = PendingWrites::default();
+        for name in upstream.iter().chain(&downstream) {
+            if let Some(&i) = self.branch_index.get(name) {
+                self.branches[i].reducer.rollback(finalized, &none_pending)?;
+            } else if let Some(reducer) = self.reducers.get_mut(name) {
+                reducer.rollback(finalized, &none_pending)?;
+            }
+        }
+        // The compensating records of these rollbacks go nowhere: the
+        // target already holds the state that the replay rebuilds.
+        for name in &views {
+            if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
+                self.branches[bi].mv_entries[mi].1.rollback(finalized);
+            } else if let Some(mv) = self.mvs.get_mut(name) {
+                mv.rollback(finalized);
+            }
+        }
+
+        let nodes: HashSet<String> = upstream.into_iter().chain(downstream).chain(views).collect();
+        self.replay_unfinalized_inner(finalized + 1, latest, Some(&nodes))
+    }
+
+    fn reducer_source(&self, name: &str) -> Option<&str> {
+        if let Some(&i) = self.branch_index.get(name) {
+            Some(self.branches[i].reducer.source())
+        } else {
+            self.reducers.get(name).map(|r| r.source())
+        }
+    }
+
+    fn mv_source(&self, name: &str) -> Option<&str> {
+        if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
+            Some(self.branches[bi].mv_entries[mi].1.source())
+        } else {
+            self.mvs.get(name).map(|mv| mv.source())
+        }
     }
 
     fn replay_unfinalized_inner(
@@ -1008,7 +1000,8 @@ impl SettleEngine {
     }
 
     /// Undo the in-memory effects of a failed ingest, back to `block`: the
-    /// latest block before the ingest processed anything.
+    /// latest block before the ingest processed anything, None if there was
+    /// none.
     ///
     /// This is not a chain reorg, so the finality bound of `rollback` does
     /// not apply: the undone blocks were never finalized, and on gappy chains
@@ -1017,8 +1010,32 @@ impl SettleEngine {
     /// include the finalized head. Raw-row deletions go to a throwaway batch:
     /// the ingest's raw rows were never committed. `pending` holds the write
     /// batches of earlier ingests that are not committed yet.
-    pub fn undo_ingest(&mut self, block: BlockNumber, pending: &PendingWrites) -> Result<()> {
+    pub fn undo_ingest(
+        &mut self,
+        block: Option<BlockNumber>,
+        pending: &PendingWrites,
+    ) -> Result<()> {
         self.discard_changes();
+
+        // A rollback keeps its target block, so it cannot undo block 0. With
+        // no block before the ingest, storage holds no derived state and no
+        // batch waits: the stored state is the state to go back to.
+        let Some(block) = block else {
+            for branch in &mut self.branches {
+                branch.reducer.reload();
+                for (_, mv) in &mut branch.mv_entries {
+                    mv.reload()?;
+                }
+            }
+            for reducer in self.reducers.values_mut() {
+                reducer.reload();
+            }
+            for mv in self.mvs.values_mut() {
+                mv.reload()?;
+            }
+            self.latest_block = None;
+            return Ok(());
+        };
 
         if block > self.latest_block() {
             return Ok(());
@@ -1308,6 +1325,26 @@ impl SettleEngine {
             .into_iter()
             .map(|block| (block, self.block_hashes.get(&block).map(String::as_str)))
             .collect()
+    }
+
+    /// The lowest block up to `up_to` whose stored hash differs from the
+    /// supplied one: a block that is no longer canonical.
+    pub fn lowest_hash_conflict(
+        &self,
+        supplied: &[(BlockNumber, &str)],
+        up_to: BlockNumber,
+    ) -> Option<BlockNumber> {
+        supplied
+            .iter()
+            .filter(|&&(number, hash)| {
+                number <= up_to
+                    && self
+                        .block_hashes
+                        .get(&number)
+                        .is_some_and(|stored| stored != hash)
+            })
+            .map(|&(number, _)| number)
+            .min()
     }
 
     /// Find the highest block in `previous_blocks` whose hash matches
@@ -1716,7 +1753,7 @@ mod tests {
     #[test]
     fn raw_table_to_mv_direct() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage).unwrap();
 
         let rows = vec![
             HashMap::from([
@@ -1747,7 +1784,7 @@ mod tests {
     #[test]
     fn full_pipeline_raw_reducer_mv() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&dex_schema(), storage);
+        let mut engine = SettleEngine::new(&dex_schema(), storage).unwrap();
 
         // Block 1000: alice buys 10 @ 2000
         let (changes, _) = engine
@@ -1771,7 +1808,7 @@ mod tests {
     #[test]
     fn pipeline_rollback() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage).unwrap();
 
         // Block 1000
         let _ = engine
@@ -1818,7 +1855,7 @@ mod tests {
     #[test]
     fn pipeline_finalize() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage).unwrap();
 
         let _ = engine
             .process_batch(
@@ -1865,7 +1902,7 @@ mod tests {
         // to == finalized is allowed (removes the unfinalized tail); below is an
         // error, regardless of which blocks still have retained hashes.
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage).unwrap();
         for (b, amt) in [(1000u64, 100.0), (1001, 200.0), (1002, 300.0)] {
             engine
                 .process_batch(
@@ -1898,7 +1935,7 @@ mod tests {
         // A failed ingest that processed block 4 is undone back to 3, which is
         // below finality, and the finalized head hash survives the undo.
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage.clone());
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage.clone()).unwrap();
         let swap = |amount: f64| {
             vec![HashMap::from([
                 ("pool".to_string(), Value::String("ETH/USDC".into())),
@@ -1926,7 +1963,7 @@ mod tests {
             "a chain rollback below finality stays rejected"
         );
         engine
-            .undo_ingest(3, &PendingWrites::default())
+            .undo_ingest(Some(3), &PendingWrites::default())
             .expect("undoing a failed ingest is not bounded by finality");
         assert_eq!(engine.latest_block(), 3);
         assert_eq!(engine.finalized_cursor().map(|c| c.number), Some(100));
@@ -1943,7 +1980,7 @@ mod tests {
     #[test]
     fn full_pipeline_rollback_and_reingest() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&dex_schema(), storage);
+        let mut engine = SettleEngine::new(&dex_schema(), storage).unwrap();
 
         // Block 1000: alice buys 10 @ 2000
         let _ = engine
@@ -1997,7 +2034,7 @@ mod tests {
     #[test]
     fn make_batch_increments_sequence() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage).unwrap();
 
         let batch1 = engine.make_batch(vec![]);
         assert_eq!(batch1.sequence, 1);
@@ -2009,7 +2046,7 @@ mod tests {
     #[test]
     fn unknown_table_returns_error() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage);
+        let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage).unwrap();
 
         let result = engine.process_batch("nonexistent", 1000, vec![]);
         assert!(result.is_err());
@@ -2086,7 +2123,7 @@ mod tests {
         };
 
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&schema, storage);
+        let mut engine = SettleEngine::new(&schema, storage).unwrap();
 
         // Block 1: alice deposits 10
         let (changes, _) = engine
@@ -2210,7 +2247,7 @@ mod tests {
             ("amount".to_string(), Value::Float64(200.0)),
         ])];
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&schema, storage.clone());
+        let mut engine = SettleEngine::new(&schema, storage.clone()).unwrap();
 
         // Process blocks — raw rows go to storage, MV gets data
         let _ = engine.process_batch("events", 1000, rows1).unwrap();
@@ -2218,7 +2255,7 @@ mod tests {
 
         // Simulate crash recovery: create a fresh engine with the same storage
         // that has raw rows but no in-memory MV state.
-        let mut engine2 = SettleEngine::new(&schema, storage);
+        let mut engine2 = SettleEngine::new(&schema, storage).unwrap();
 
         // Replay unfinalized blocks — MV sources directly from raw table
         engine2.replay_unfinalized(1000, 1001).unwrap();
@@ -2274,7 +2311,7 @@ mod tests {
         };
 
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut live = SettleEngine::new(&schema, storage.clone());
+        let mut live = SettleEngine::new(&schema, storage.clone()).unwrap();
         for block in 1..=40 {
             live.process_batch("a", block, row(block as f64)).unwrap();
             if block % 7 == 0 {
@@ -2283,7 +2320,7 @@ mod tests {
             }
         }
 
-        let mut replayed = SettleEngine::new(&schema, storage);
+        let mut replayed = SettleEngine::new(&schema, storage).unwrap();
         replayed.replay_unfinalized(1, 40).unwrap();
 
         // The changes of one more block carry each view's state before it.
@@ -2349,7 +2386,7 @@ mod tests {
         };
 
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&schema, storage.clone());
+        let mut engine = SettleEngine::new(&schema, storage.clone()).unwrap();
 
         // Dynamically add a reducer that the MV sources from
         let reducer_def = ReducerDef {
@@ -2402,10 +2439,10 @@ mod tests {
         );
     }
 
-    /// replay_unfinalized_for must replay ONLY the target reducer,
+    /// replay_reducer_chain must replay ONLY the target reducer,
     /// not double-process other reducers that were already replayed.
     #[test]
-    fn replay_unfinalized_for_does_not_double_replay() {
+    fn replay_reducer_chain_does_not_double_replay() {
         // Schema with two reducers: counter_a and counter_b, each with an MV
         let schema = Schema {
             modules: vec![],
@@ -2520,7 +2557,7 @@ mod tests {
         };
 
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut engine = SettleEngine::new(&schema, storage.clone());
+        let mut engine = SettleEngine::new(&schema, storage.clone()).unwrap();
 
         // Process block 1000
         let rows = vec![RowMap::from([
@@ -2530,13 +2567,11 @@ mod tests {
         engine.process_batch("events", 1000, rows).unwrap();
 
         // Full replay (simulates open() recovery) — both reducers see block 1000
-        let mut engine2 = SettleEngine::new(&schema, storage.clone());
+        let mut engine2 = SettleEngine::new(&schema, storage.clone()).unwrap();
         engine2.replay_unfinalized(1000, 1000).unwrap();
 
-        // Now replay_for counter_a ONLY — counter_b must NOT be double-replayed
-        engine2
-            .replay_unfinalized_for(1000, 1000, "counter_a")
-            .unwrap();
+        // Now replay counter_a ONLY — neither reducer may count block 1000 twice
+        engine2.replay_reducer_chain("counter_a", 999, 1000).unwrap();
 
         // Process block 1001 to get changes
         let rows2 = vec![RowMap::from([
@@ -2561,6 +2596,13 @@ mod tests {
         assert!(
             (sum_b - 250.0).abs() < 0.01,
             "counter_b NOT double-replayed: expected 250, got {sum_b}"
+        );
+
+        let mv_a: Vec<_> = changes.iter().filter(|d| d.table() == "mv_a").collect();
+        let sum_a = mv_a.last().unwrap().get("sum_a").and_then(|v| v.as_f64()).unwrap();
+        assert!(
+            (sum_a - 250.0).abs() < 0.01,
+            "counter_a NOT double-replayed: expected 250, got {sum_a}"
         );
     }
 }

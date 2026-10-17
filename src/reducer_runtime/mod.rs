@@ -15,8 +15,9 @@ use crate::types::{Row, RowMap, Value};
 pub struct GroupBatch {
     pub state: HashMap<String, Value>,
     pub rows: Vec<Row>,
-    /// Output rows produced by the runtime. Filled during `process_grouped`.
-    pub emits: Vec<RowMap>,
+    /// Output rows produced by the runtime, each with the index in `rows` of
+    /// the row that emitted it. Filled during `process_grouped`.
+    pub emits: Vec<(usize, RowMap)>,
 }
 
 /// Trait for reducer process logic runtimes.
@@ -46,9 +47,9 @@ pub trait ReducerRuntime: Send {
         false
     }
 
-    /// Whether `process_grouped` calls into a host (JS) context that must be
-    /// installed on the calling thread.
-    fn needs_host_context(&self) -> bool {
+    /// Whether `process_grouped` needs a host (JS) callback that the
+    /// callback context on the calling thread does not hold.
+    fn missing_host_callback(&self) -> bool {
         false
     }
 
@@ -58,9 +59,9 @@ pub trait ReducerRuntime: Send {
     /// External (host-language) reducers override this for batch callbacks.
     fn process_grouped(&self, groups: &mut [GroupBatch]) -> Result<()> {
         for group in groups.iter_mut() {
-            for row in &group.rows {
+            for (index, row) in group.rows.iter().enumerate() {
                 let emits = self.process(&mut group.state, row)?;
-                group.emits.extend(emits);
+                group.emits.extend(emits.into_iter().map(|emit| (index, emit)));
             }
         }
         Ok(())

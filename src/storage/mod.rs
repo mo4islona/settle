@@ -206,8 +206,8 @@ pub fn encode_group_key(key: &[Value]) -> GroupKeyBytes {
 }
 
 /// Decode a group key from storage bytes.
-pub fn decode_group_key(bytes: &[u8]) -> GroupKey {
-    decode_values(bytes).into_iter().collect()
+pub fn decode_group_key(bytes: &[u8]) -> Result<GroupKey> {
+    Ok(decode_values(bytes)?.into_iter().collect())
 }
 
 /// Encode reducer state (RowMap) to bytes.
@@ -239,19 +239,23 @@ pub fn write_values(buf: &mut Vec<u8>, values: &[Value]) {
 }
 
 /// Decode a positional list of `Value`s encoded by [`encode_values`].
-pub fn decode_values(bytes: &[u8]) -> Vec<Value> {
+pub fn decode_values(bytes: &[u8]) -> Result<Vec<Value>> {
     let mut pos = 0usize;
-    let n = u32::from_le_bytes(
-        read_bytes(bytes, &mut pos, 4)
-            .expect("decode_values: missing length header")
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let mut out = Vec::with_capacity(n);
+    let n = u32::from_le_bytes(read_bytes(bytes, &mut pos, 4)?.try_into().unwrap()) as usize;
+
+    // Each value takes at least one byte: a corrupt count must not allocate.
+    let mut out = Vec::with_capacity(n.min(bytes.len()));
     for _ in 0..n {
-        out.push(decode_value(bytes, &mut pos).expect("decode_values: malformed value"));
+        out.push(decode_value(bytes, &mut pos)?);
     }
-    out
+
+    if pos != bytes.len() {
+        return Err(Error::Storage(format!(
+            "{} trailing bytes after {n} encoded values",
+            bytes.len() - pos
+        )));
+    }
+    Ok(out)
 }
 
 // --- Custom binary row encoding ---
