@@ -6,7 +6,7 @@ use std::time::Duration;
 use web_time::Instant;
 
 use crate::change::ChangeBuffer;
-use crate::engine::dag::SettleEngine;
+use crate::engine::dag::{DEFAULT_RAW_RETENTION_BLOCKS, SettleEngine};
 use crate::engine::perf;
 use crate::error::{Error, Result};
 use crate::schema::parser::parse_schema;
@@ -58,6 +58,12 @@ pub struct Config {
     pub backfill_checkpoint_interval: u64,
     /// Build the `ChangeBatch::perf` timing tree on ingest. Default `true`.
     pub collect_perf: bool,
+    /// How many blocks below the durable block keep their raw rows on disk.
+    /// Default 1,000. A reopen replays only the raw rows above the durable
+    /// block, and a rollback only those above finality, so older rows are
+    /// deleted, in steps of a tenth of this margin. `u64::MAX` keeps every
+    /// raw row.
+    pub raw_retention_blocks: u64,
     /// The sequence of the newest change batch that the target applied, as
     /// the target stored it with the data of that batch; 0 before the first.
     /// Set, it turns on the journal: each batch that `ingest()` or
@@ -83,6 +89,7 @@ impl Config {
             max_pending_batches: 2,
             backfill_checkpoint_interval: 1,
             collect_perf: true,
+            raw_retention_blocks: DEFAULT_RAW_RETENTION_BLOCKS,
             applied_sequence: None,
         }
     }
@@ -100,6 +107,7 @@ impl Config {
             max_pending_batches: 2,
             backfill_checkpoint_interval: 1,
             collect_perf: true,
+            raw_retention_blocks: DEFAULT_RAW_RETENTION_BLOCKS,
             applied_sequence: None,
         }
     }
@@ -166,6 +174,12 @@ impl Config {
     /// Off, ingest reads no clock and `perf` stays empty.
     pub fn collect_perf(mut self, on: bool) -> Self {
         self.collect_perf = on;
+        self
+    }
+
+    /// See [`Config::raw_retention_blocks`].
+    pub fn raw_retention_blocks(mut self, blocks: u64) -> Self {
+        self.raw_retention_blocks = blocks;
         self
     }
 
@@ -384,6 +398,7 @@ impl Settle {
 
         let mut engine = SettleEngine::new(&schema, storage.clone())?;
         engine.set_collect_perf(config.collect_perf);
+        engine.set_raw_retention_blocks(config.raw_retention_blocks);
 
         // Restore persisted state
         if let Some(block) = meta_u64(storage.as_ref(), META_LATEST_BLOCK)? {

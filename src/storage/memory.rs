@@ -334,6 +334,21 @@ impl StorageBackend for MemoryBackend {
                         }
                     }
                 }
+                BatchOp::DeleteRawRows {
+                    table,
+                    from_block,
+                    to_block,
+                } if from_block <= to_block => {
+                    let keys: Vec<_> = inner
+                        .raw
+                        .range((table.clone(), *from_block)..=(table.clone(), *to_block))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for k in keys {
+                        inner.raw.remove(&k);
+                    }
+                }
+                BatchOp::DeleteRawRows { .. } => {}
                 BatchOp::PutBlockHash { block, hash } => {
                     inner.block_hashes.insert(*block, hash.clone());
                 }

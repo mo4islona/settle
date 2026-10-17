@@ -27,6 +27,7 @@ const PUT_BLOCK_HASH: u8 = 6;
 const DELETE_BLOCK_HASH: u8 = 7;
 const PUT_JOURNAL: u8 = 8;
 const DELETE_JOURNAL: u8 = 9;
+const DELETE_RAW_ROWS: u8 = 10;
 
 pub fn encode(batch: &StorageWriteBatch) -> Vec<u8> {
     let len = batch.ops.iter().map(encoded_len).sum();
@@ -74,6 +75,16 @@ pub fn encode(batch: &StorageWriteBatch) -> Vec<u8> {
                 out.push(DELETE_RAW_ROWS_AFTER);
                 put_bytes(&mut out, table.as_bytes());
                 put_u64(&mut out, *after_block);
+            }
+            BatchOp::DeleteRawRows {
+                table,
+                from_block,
+                to_block,
+            } => {
+                out.push(DELETE_RAW_ROWS);
+                put_bytes(&mut out, table.as_bytes());
+                put_u64(&mut out, *from_block);
+                put_u64(&mut out, *to_block);
             }
             BatchOp::PutBlockHash { block, hash } => {
                 out.push(PUT_BLOCK_HASH);
@@ -138,6 +149,11 @@ pub fn decode(bytes: &[u8]) -> Result<StorageWriteBatch> {
                 table: reader.string()?,
                 after_block: reader.u64()?,
             },
+            DELETE_RAW_ROWS => BatchOp::DeleteRawRows {
+                table: reader.string()?,
+                from_block: reader.u64()?,
+                to_block: reader.u64()?,
+            },
             PUT_BLOCK_HASH => BatchOp::PutBlockHash {
                 block: reader.u64()?,
                 hash: reader.string()?,
@@ -179,6 +195,7 @@ fn encoded_len(op: &BatchOp) -> usize {
         BatchOp::PutMeta { key, value } => 2 * N + key.len() + value.len(),
         BatchOp::DeleteMvState { view, group_key } => 2 * N + view.len() + group_key.len(),
         BatchOp::DeleteRawRowsAfter { table, .. } => 2 * N + table.len(),
+        BatchOp::DeleteRawRows { table, .. } => 3 * N + table.len(),
         BatchOp::PutBlockHash { hash, .. } => 2 * N + hash.len(),
         BatchOp::DeleteBlockHash { .. } => N,
         BatchOp::PutJournal { entry, .. } => 3 * N + entry.len(),
@@ -239,6 +256,7 @@ mod tests {
         let mut batch = StorageWriteBatch::new();
         batch.delete_raw_rows_after("swaps", 9);
         batch.put_raw_rows("swaps", 10, vec![1, 2, 3]);
+        batch.delete_raw_rows("swaps", 0, 4);
         batch.set_reducer_finalized("running", b"ETH".to_vec(), vec![4]);
         batch.put_mv_state("volume", vec![5, 6], vec![]);
         batch.delete_mv_state("volume", &[7]);

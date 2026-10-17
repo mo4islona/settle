@@ -605,6 +605,20 @@ impl StorageBackend for RocksDbBackend {
                         wb.delete_range_cf(cf, &start, &end);
                     }
                 }
+                BatchOp::DeleteRawRows {
+                    table,
+                    from_block,
+                    to_block,
+                } if from_block <= to_block => {
+                    let cf = self.db.cf_handle(CF_RAW).expect("raw CF");
+                    let start = raw_key(table, *from_block);
+                    let end = match to_block.checked_add(1) {
+                        Some(next) => raw_key(table, next),
+                        None => upper_bound(&raw_table_prefix(table)),
+                    };
+                    wb.delete_range_cf(cf, &start, &end);
+                }
+                BatchOp::DeleteRawRows { .. } => {}
                 BatchOp::PutBlockHash { block, hash } => {
                     let cf = self.db.cf_handle(CF_BLOCK_HASH).expect("block_hash CF");
                     wb.put_cf(cf, block.to_be_bytes(), hash.as_bytes());

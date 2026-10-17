@@ -63,8 +63,10 @@ consistent `(F, L)`; recovery replays `F+1..L`.
 
 Two facts this relies on, both verified in the codebase:
 
-- **Raw rows are never evicted** (`dag.rs`: raw-table finalize is a no-op), so
-  the raw rows for every block ≥ 1 are on disk and replayable.
+- **Raw rows above the durable block are never evicted**: a checkpoint deletes
+  only the raw rows `Config::raw_retention_blocks` or more blocks below the
+  durable block it writes (`dag.rs`: `purge_raw_rows`), so the raw rows of
+  every block above the durable one are on disk and replayable.
 - `finalize` couples *persist* with *prune*, but `state_cache` (reducer) and
   `groups` (MV) keep the live value — they are not pruned.
 
@@ -197,7 +199,7 @@ not speed up under `,backfill`; `settle_er` / `settle_mv` do.
         │  memory lost; disk holds:
         ▼
    ┌─────────────────────────────────┐
-   │ raw rows:   blocks 1..700        │   (raw rows never evicted)
+   │ raw rows:   blocks 1..700        │   (raw rows above D never evicted)
    │ derived:    as of D = 0  (empty) │
    │ META_FINALIZED_BLOCK = 0  (= D)  │   ◄── Option A: we stored D
    └─────────────────────────────────┘

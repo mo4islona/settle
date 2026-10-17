@@ -63,6 +63,9 @@ type NodeMut<'a> = &'a mut dyn FinalizeNode;
 /// time, so that every replay in them crosses the boundaries of a read.
 const REPLAY_READ_BLOCKS: usize = if cfg!(test) { 2 } else { 64 };
 
+/// Default of `Config::raw_retention_blocks`.
+pub const DEFAULT_RAW_RETENTION_BLOCKS: u64 = 1_000;
+
 /// The raw rows of one table during replay, read a part at a time.
 struct ReplayCursor {
     table: String,
@@ -174,6 +177,12 @@ pub struct SettleEngine {
     /// None until a checkpoint covers data: `Some(0)` means block 0
     /// is durable, which an empty database must not claim.
     durable_block: Option<BlockNumber>,
+    /// How many blocks below the durable block keep their raw rows. See
+    /// `purge_raw_rows`.
+    raw_retention_blocks: u64,
+    /// The highest block whose raw rows a write batch deletes; None until the
+    /// first purge after open.
+    raw_purged_through: Option<BlockNumber>,
     /// True when the pipeline contains no sliding-window MV and no external
     /// reducer, so backfill persist-deferral is safe. Computed at construction
     /// (and after `add_reducer`). When false, every ingest writes a
@@ -342,6 +351,8 @@ impl SettleEngine {
             latest_block: None,
             finalized_block: 0,
             durable_block: None,
+            raw_retention_blocks: DEFAULT_RAW_RETENTION_BLOCKS,
+            raw_purged_through: None,
             defer_allowed,
             has_finalized: false,
             collect_perf: true,
@@ -1167,7 +1178,44 @@ impl SettleEngine {
         if let Some(latest) = self.latest_block {
             self.durable_block = Some(finalized.min(latest));
         }
+        self.purge_raw_rows(batch);
         self.prune_block_hashes();
+    }
+
+    /// Delete the raw rows that nothing reads any more, in the batch that
+    /// moves the durable block. A reopen replays only the blocks above the
+    /// durable block, and a rollback or a reducer replay only those above
+    /// finality, which is not below it. The rows of `raw_retention_blocks`
+    /// blocks below the durable block stay as a margin. The purge runs in
+    /// steps of a tenth of the margin, so that a checkpoint per block does not
+    /// write a range tombstone per block.
+    fn purge_raw_rows(&mut self, batch: &mut StorageWriteBatch) {
+        let Some(through) = self
+            .durable_block
+            .and_then(|durable| durable.checked_sub(self.raw_retention_blocks))
+        else {
+            return;
+        };
+
+        let step = (self.raw_retention_blocks / 10).max(1);
+        // The first purge after open also deletes what earlier runs left.
+        let from = match self.raw_purged_through {
+            Some(purged) if through < purged.saturating_add(step) => return,
+            Some(purged) => purged + 1,
+            None => 0,
+        };
+
+        let mut tables: Vec<&String> = self.raw_tables.keys().collect();
+        tables.sort();
+        for table in tables {
+            batch.delete_raw_rows(table, from, through);
+        }
+        self.raw_purged_through = Some(through);
+    }
+
+    /// See `Config::raw_retention_blocks`.
+    pub fn set_raw_retention_blocks(&mut self, blocks: u64) {
+        self.raw_retention_blocks = blocks;
     }
 
     /// Every reducer and MV.
