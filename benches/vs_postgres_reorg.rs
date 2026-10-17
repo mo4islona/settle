@@ -71,7 +71,7 @@ use tokio_postgres::types::ToSql;
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{build_multi_insert, print_result_split, PgRuntime, PgStats};
+use common::{build_multi_insert, print_result_split, PgBaseline, PgCase, PgRuntime, PgStats};
 
 // ─── Workload shape ─────────────────────────────────────────────────────────
 //
@@ -1013,7 +1013,29 @@ fn print_pg(label: &str, rows: usize, elapsed: Duration, stats: PgStats) {
     print_result_split(label, rows, elapsed, Duration::ZERO, stats);
 }
 
-fn run_additive_suite(reorg: Reorg) -> anyhow::Result<()> {
+fn pg_additive_case(
+    pg_baseline: &mut PgBaseline,
+    reorg: Reorg,
+    reversible: bool,
+) -> anyhow::Result<PgCase<HashMap<String, (f64, i64)>>> {
+    let kind = if reversible { "reversible" } else { "naive" };
+    pg_baseline.case(&format!("additive {} {kind}", reorg.label()), || {
+        let pg = PgRuntime::start()?;
+        pg.batch_execute(PG_SCHEMA_ADDITIVE)?;
+        pg.take_stats();
+        let t = Instant::now();
+        let _ = run_pg_additive(&pg, reorg, reversible)?;
+        let elapsed = t.elapsed();
+        let stats = pg.take_stats();
+        Ok(PgCase {
+            elapsed,
+            stats,
+            output: pg_read_additive(&pg)?,
+        })
+    })
+}
+
+fn run_additive_suite(pg_baseline: &mut PgBaseline, reorg: Reorg) -> anyhow::Result<()> {
     let total_rows = NUM_BLOCKS * ROWS_PER_BLOCK;
     eprintln!("\n=== ADDITIVE (SUM volume / COUNT) — {} ===", reorg.label());
     eprintln!(
@@ -1021,32 +1043,21 @@ fn run_additive_suite(reorg: Reorg) -> anyhow::Result<()> {
     );
 
     // --- pg_summary_reversible: the competent additive indexer (HEADLINE PG) ---
-    let pg = PgRuntime::start()?;
-    pg.batch_execute(PG_SCHEMA_ADDITIVE)?;
-    pg.take_stats();
-    let t = Instant::now();
-    let _ = run_pg_additive(&pg, reorg, true)?;
-    let elapsed = t.elapsed();
-    let stats_rev = pg.take_stats();
-    print_pg("pg_summary_reversible", total_rows, elapsed, stats_rev);
-    let pg_rev_state = pg_read_additive(&pg)?;
-    drop(pg);
+    let rev = pg_additive_case(pg_baseline, reorg, true)?;
+    print_pg("pg_summary_reversible", total_rows, rev.elapsed, rev.stats);
 
     // --- pg_summary_naive: GROUP-BY-over-survivors (the RIG; NOT the headline) ---
-    let pg = PgRuntime::start()?;
-    pg.batch_execute(PG_SCHEMA_ADDITIVE)?;
-    pg.take_stats();
-    let t = Instant::now();
-    let _ = run_pg_additive(&pg, reorg, false)?;
-    let elapsed = t.elapsed();
-    let stats_naive = pg.take_stats();
-    print_pg("pg_summary_naive(rig)", total_rows, elapsed, stats_naive);
+    let naive = pg_additive_case(pg_baseline, reorg, false)?;
+    print_pg(
+        "pg_summary_naive(rig)",
+        total_rows,
+        naive.elapsed,
+        naive.stats,
+    );
     eprintln!(
         "      ^ naive reorg rows_read={} GROWS with stream length; this is the strawman.",
-        stats_naive.rows_read
+        naive.stats.rows_read
     );
-    let pg_naive_state = pg_read_additive(&pg)?;
-    drop(pg);
 
     // --- settle (mem reference + rocks headline) ---
     for storage in [Storage::Memory, Storage::Rocks] {
@@ -1063,8 +1074,8 @@ fn run_additive_suite(reorg: Reorg) -> anyhow::Result<()> {
         print_result_split(&lbl, total_rows, settle_t, settle_t, PgStats::default());
         eprintln!("    {note}");
         // Cross-engine convergence: settle == reversible PG == naive PG == model.
-        assert_map_eq_f1i1("refmodel vs pg_reversible", &expected, &pg_rev_state)?;
-        assert_map_eq_f1i1("refmodel vs pg_naive", &expected, &pg_naive_state)?;
+        assert_map_eq_f1i1("refmodel vs pg_reversible", &expected, &rev.output)?;
+        assert_map_eq_f1i1("refmodel vs pg_naive", &expected, &naive.output)?;
 
         // FAIRNESS GATE: on additive aggregates settle must NOT beat the
         // competent reversible PG — mechanistically it can't. We only assert
@@ -1072,7 +1083,7 @@ fn run_additive_suite(reorg: Reorg) -> anyhow::Result<()> {
         // allowed to be FASTER only within noise; a large win = contamination).
         if matches!(storage, Storage::Rocks) {
             let settle_s = settle_t.as_secs_f64();
-            let pg_s = elapsed.as_secs_f64();
+            let pg_s = rev.elapsed.as_secs_f64();
             if settle_s < pg_s * 0.75 {
                 eprintln!(
                     "    *** WARNING: settle additive ({settle_s:.3}s) is >25% faster than \
@@ -1090,7 +1101,7 @@ fn run_additive_suite(reorg: Reorg) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_noninvertible_suite(reorg: Reorg) -> anyhow::Result<()> {
+fn run_noninvertible_suite(pg_baseline: &mut PgBaseline, reorg: Reorg) -> anyhow::Result<()> {
     let total_rows = NUM_BLOCKS * ROWS_PER_BLOCK;
     eprintln!(
         "\n=== NON-INVERTIBLE (MAX/MIN/last price = OHLC hi/lo/close) — {} ===",
@@ -1101,27 +1112,33 @@ fn run_noninvertible_suite(reorg: Reorg) -> anyhow::Result<()> {
     );
 
     // --- pg (HEADLINE PG): correct, window-scoped, skip-rescan-when-extremum-survives ---
-    let pg = PgRuntime::start()?;
-    pg.batch_execute(PG_SCHEMA_NONINVERTIBLE)?;
-    pg.take_stats();
-    let t = Instant::now();
-    let (_, rescans) = run_pg_noninvertible(&pg, reorg)?;
-    let elapsed = t.elapsed();
-    let stats = pg.take_stats();
-    print_pg("pg_summary", total_rows, elapsed, stats);
+    let summary = pg_baseline.case(&format!("noninvert {} pg_summary", reorg.label()), || {
+        let pg = PgRuntime::start()?;
+        pg.batch_execute(PG_SCHEMA_NONINVERTIBLE)?;
+        pg.take_stats();
+        let t = Instant::now();
+        let (_, rescans) = run_pg_noninvertible(&pg, reorg)?;
+        let elapsed = t.elapsed();
+        let stats = pg.take_stats();
+        Ok(PgCase {
+            elapsed,
+            stats,
+            output: (rescans, pg_read_noninvertible(&pg)?),
+        })
+    })?;
+    let (rescans, pg_state) = &summary.output;
+    print_pg("pg_summary", total_rows, summary.elapsed, summary.stats);
     eprintln!(
         "      ^ {} asset-rescans triggered; reorg rows_read={} (grows with per-asset history).",
-        rescans, stats.rows_read
+        rescans, summary.stats.rows_read
     );
-    let pg_state = pg_read_noninvertible(&pg)?;
-    drop(pg);
 
     // --- settle (mem reference + rocks headline) ---
     for storage in [Storage::Memory, Storage::Rocks] {
         let (settle_t, mirror, model) = run_settle_noninvertible(storage, reorg)?;
         let expected = model.noninvertible();
         assert_map_eq_f3("settle.mirror vs refmodel", &expected, &mirror)?;
-        assert_map_eq_f3("refmodel vs pg", &expected, &pg_state)?;
+        assert_map_eq_f3("refmodel vs pg", &expected, pg_state)?;
         let lbl = format!("settle_{}[noninvert]", storage.label());
         let note = match storage {
             Storage::Memory => "  (in-memory, NO durability — not comparable to PG)",
@@ -1131,7 +1148,7 @@ fn run_noninvertible_suite(reorg: Reorg) -> anyhow::Result<()> {
         eprintln!("    {note}");
         if matches!(storage, Storage::Rocks) && !matches!(reorg, Reorg::None) {
             let settle_s = settle_t.as_secs_f64();
-            let pg_s = elapsed.as_secs_f64();
+            let pg_s = summary.elapsed.as_secs_f64();
             let ratio = pg_s / settle_s.max(1e-9);
             eprintln!(
                 "    [headline] settle {settle_s:.3}s vs pg {pg_s:.3}s  => settle {ratio:.2}x \
@@ -1143,12 +1160,14 @@ fn run_noninvertible_suite(reorg: Reorg) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    eprintln!("workload: vs_postgres_reorg  (tip indexing with reorgs)");
-    eprintln!(
-        "  config: {NUM_BLOCKS} blocks, {ROWS_PER_BLOCK} rows/block ({} rows), \
+    let config = format!(
+        "{NUM_BLOCKS} blocks, {ROWS_PER_BLOCK} rows/block ({} rows), \
          {NUM_ASSETS} assets, reorg depth D={REORG_DEPTH}, finality window={FINALITY_WINDOW}",
         NUM_BLOCKS * ROWS_PER_BLOCK
     );
+    eprintln!("workload: vs_postgres_reorg  (tip indexing with reorgs)");
+    eprintln!("  config: {config}");
+    let mut pg_baseline = PgBaseline::open("vs_postgres_reorg", 1, &config)?;
     eprintln!(
         "  HEADLINE = settle-rocks vs PG-on-disk. settle-mem is a no-durability reference only."
     );
@@ -1175,14 +1194,14 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("\n############ NON-INVERTIBLE WORKLOAD (the honest win) ############");
     for &reorg in &schedule {
-        run_noninvertible_suite(reorg)?;
+        run_noninvertible_suite(&mut pg_baseline, reorg)?;
     }
 
     eprintln!(
         "\n############ ADDITIVE WORKLOAD (parity — settle does NOT win here) ############"
     );
     for &reorg in &schedule {
-        run_additive_suite(reorg)?;
+        run_additive_suite(&mut pg_baseline, reorg)?;
     }
 
     eprintln!(
