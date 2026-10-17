@@ -19,8 +19,8 @@ fn pnl_fn_runtime() -> crate::reducer_runtime::fn_reducer::FnReducerRuntime {
 
         let mut emit = HashMap::new();
         if side == "buy" {
-            state.insert("quantity".into(), Value::Float64(qty + amount));
-            state.insert("cost_basis".into(), Value::Float64(cost + amount * price));
+            state.set("quantity", Value::Float64(qty + amount));
+            state.set("cost_basis", Value::Float64(cost + amount * price));
             emit.insert("trade_pnl".into(), Value::Float64(0.0));
         } else {
             let avg_cost = if qty > 0.0 { cost / qty } else { 0.0 };
@@ -28,18 +28,15 @@ fn pnl_fn_runtime() -> crate::reducer_runtime::fn_reducer::FnReducerRuntime {
                 "trade_pnl".into(),
                 Value::Float64(amount * (price - avg_cost)),
             );
-            state.insert("quantity".into(), Value::Float64(qty - amount));
-            state.insert(
-                "cost_basis".into(),
-                Value::Float64(cost - amount * avg_cost),
-            );
+            state.set("quantity", Value::Float64(qty - amount));
+            state.set("cost_basis", Value::Float64(cost - amount * avg_cost));
         }
         let new_qty = state
             .get("quantity")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
         emit.insert("position_size".into(), Value::Float64(new_qty));
-        vec![emit]
+        state.emit(emit)
     })
 }
 
@@ -484,14 +481,13 @@ fn replay_reducer_catches_up_existing_external() {
 /// throughout; `callback_installed()` gates replay on the thread-local.
 #[test]
 fn external_runtime_replay_uses_real_external_runtime() {
-    use crate::reducer_runtime::GroupBatch;
-    use crate::reducer_runtime::external::install_test_context;
+    use crate::reducer_runtime::external::{HostGroup, install_test_context};
     use crate::storage::memory::MemoryBackend;
     use std::sync::Arc;
 
     // Rust callback that mirrors pnl_fn_runtime() but operates on GroupBatch.
     let pnl_batch_cb = || {
-        |groups: &mut [GroupBatch]| {
+        |groups: &mut [HostGroup]| {
             for group in groups.iter_mut() {
                 for (index, row) in group.rows.iter().enumerate() {
                     let side = row.get("side").and_then(|v| v.as_str()).unwrap_or("");
@@ -681,7 +677,7 @@ fn chained_schema(upstream_body: &str) -> String {
 
 /// The callback of every external reducer: count the rows of the group,
 /// and emit the count with the amount of the row.
-fn count_rows(groups: &mut [crate::reducer_runtime::GroupBatch]) {
+fn count_rows(groups: &mut [crate::reducer_runtime::external::HostGroup]) {
     for group in groups.iter_mut() {
         for (index, row) in group.rows.iter().enumerate() {
             let n = group.state.get("n").and_then(Value::as_u64).unwrap_or(0) + 1;

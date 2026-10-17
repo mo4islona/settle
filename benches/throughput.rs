@@ -12,7 +12,7 @@ use settle::reducer_runtime::fn_reducer::FnReducerRuntime;
 use settle::schema::parser::parse_schema;
 use settle::storage::memory::MemoryBackend;
 use settle::test_helpers::{ingest_one, rollback_to};
-use settle::types::{ColumnRegistry, RowMap, Value};
+use settle::types::{ColumnRegistry, Row, RowMap, Value};
 
 const RAW_ONLY_SCHEMA: &str = r#"
     CREATE TABLE events (
@@ -169,8 +169,8 @@ fn pnl_fn_runtime() -> FnReducerRuntime {
         let mut emit = HashMap::new();
 
         if side == "buy" {
-            state.insert("quantity".into(), Value::Float64(qty + amount));
-            state.insert("cost_basis".into(), Value::Float64(cost + amount * price));
+            state.set("quantity", Value::Float64(qty + amount));
+            state.set("cost_basis", Value::Float64(cost + amount * price));
             emit.insert("trade_pnl".into(), Value::Float64(0.0));
         } else {
             let avg_cost = if qty > 0.0 { cost / qty } else { 0.0 };
@@ -178,11 +178,8 @@ fn pnl_fn_runtime() -> FnReducerRuntime {
                 "trade_pnl".into(),
                 Value::Float64(amount * (price - avg_cost)),
             );
-            state.insert("quantity".into(), Value::Float64(qty - amount));
-            state.insert(
-                "cost_basis".into(),
-                Value::Float64(cost - amount * avg_cost),
-            );
+            state.set("quantity", Value::Float64(qty - amount));
+            state.set("cost_basis", Value::Float64(cost - amount * avg_cost));
         }
 
         let new_qty = state
@@ -191,7 +188,7 @@ fn pnl_fn_runtime() -> FnReducerRuntime {
             .unwrap_or(0.0);
         emit.insert("position_size".into(), Value::Float64(new_qty));
 
-        vec![emit]
+        state.emit(emit)
     })
 }
 
@@ -478,6 +475,21 @@ fn bench_full_pipeline_fn_reducer(backend: Backend) -> BenchResult {
     }
 }
 
+/// One block of rows by name: each converted to the source columns, as an
+/// ingest by name does.
+fn process_maps(
+    engine: &mut ReducerEngine,
+    block: u64,
+    maps: &[RowMap],
+    registry: &Arc<ColumnRegistry>,
+) {
+    let rows: Vec<Row> = maps
+        .iter()
+        .map(|m| Row::from_map(registry.clone(), m))
+        .collect();
+    engine.process_block(block, &rows).unwrap();
+}
+
 fn bench_reducer_event_rules_only() -> BenchResult {
     let total_rows = 200_000;
     let batch_size = 100;
@@ -493,6 +505,7 @@ fn bench_reducer_event_rules_only() -> BenchResult {
         .map(|c| c.name.clone())
         .collect();
     let source_registry = ColumnRegistry::new(source_names);
+    let registry = Arc::new(source_registry.clone());
     let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]);
 
     let rows: Vec<RowMap> = (0..total_rows)
@@ -516,7 +529,7 @@ fn bench_reducer_event_rules_only() -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        engine.process_block_maps(block as u64, chunk).unwrap();
+        process_maps(&mut engine, block as u64, chunk, &registry);
     }
     let elapsed = start.elapsed();
 
@@ -547,6 +560,7 @@ fn bench_reducer_lua_only() -> BenchResult {
         .map(|c| c.name.clone())
         .collect();
     let source_registry = ColumnRegistry::new(source_names);
+    let registry = Arc::new(source_registry.clone());
     let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]);
 
     let rows: Vec<RowMap> = (0..total_rows)
@@ -570,7 +584,7 @@ fn bench_reducer_lua_only() -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        engine.process_block_maps(block as u64, chunk).unwrap();
+        process_maps(&mut engine, block as u64, chunk, &registry);
     }
     let elapsed = start.elapsed();
 
@@ -601,6 +615,7 @@ fn bench_reducer_fn_only() -> BenchResult {
         .map(|c| c.name.clone())
         .collect();
     let source_registry = ColumnRegistry::new(source_names);
+    let registry = Arc::new(source_registry.clone());
     let mut engine = ReducerEngine::with_runtime(
         reducer_def,
         storage,
@@ -629,7 +644,7 @@ fn bench_reducer_fn_only() -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        engine.process_block_maps(block as u64, chunk).unwrap();
+        process_maps(&mut engine, block as u64, chunk, &registry);
     }
     let elapsed = start.elapsed();
 

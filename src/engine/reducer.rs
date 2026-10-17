@@ -7,12 +7,10 @@ use crate::error::{Error, Result};
 use crate::reducer_runtime::event_rules::EventRulesRuntime;
 #[cfg(feature = "lua")]
 use crate::reducer_runtime::lua::LuaRuntime;
-use crate::reducer_runtime::{GroupBatch, ReducerRuntime};
+use crate::reducer_runtime::{Emits, GroupBatch, GroupState, ReducerRuntime};
 use crate::schema::ast::{ReducerBody, ReducerDef};
 use crate::storage::{self, PendingWrites, StorageBackend, StorageWriteBatch};
-use crate::types::{BlockNumber, ColumnId, ColumnRegistry, GroupKey, Row, RowMap, Value};
-
-type State = HashMap<String, Value>;
+use crate::types::{BlockNumber, ColumnId, ColumnRegistry, GroupKey, Row, Value};
 
 /// Orchestrates a single reducer: state management, snapshots, rollback, and output.
 ///
@@ -24,19 +22,15 @@ pub struct ReducerEngine {
     def: ReducerDef,
     runtime: Box<dyn ReducerRuntime>,
     storage: Arc<dyn StorageBackend>,
+    /// The STATE fields in schema order: the layout of a group's state in
+    /// memory, in snapshots and in storage.
+    state_fields: ColumnRegistry,
     /// Cached default state (computed once from def.state).
-    default_state: State,
-    /// State field names in schema (def.state) order. Used to convert the
-    /// hot `HashMap` state to/from the positional `Vec<Value>` representation
-    /// used by snapshots and finalized storage.
-    state_field_names: Vec<String>,
+    default_state: Vec<Value>,
     /// Current hot state per group key. Never evicted: a miss loads the
     /// stored state, which lacks the checkpoints of unacked batches.
-    state_cache: FxHashMap<Vec<u8>, State>,
-    /// In-memory state snapshots: group_key -> (block -> positional state values).
-    /// Stored positionally (schema field order) so the per-block snapshot clone
-    /// is a cheap `Vec<Value>` copy instead of a full `HashMap` clone with N
-    /// string-key allocations.
+    state_cache: FxHashMap<Vec<u8>, Vec<Value>>,
+    /// In-memory state snapshots: group_key -> (block -> state).
     /// Holds unfinalized blocks for rollback, plus, for each key in
     /// `pending_durable`, its newest finalized snapshot.
     block_snapshots: FxHashMap<Vec<u8>, BTreeMap<BlockNumber, Vec<Value>>>,
@@ -50,49 +44,83 @@ pub struct ReducerEngine {
     /// finalized snapshot, which `write_checkpoint` persists. Under backfill
     /// deferral keys wait here for several finalizations.
     pending_durable: FxHashSet<Vec<u8>>,
-    /// Pre-computed column IDs for group-by columns (resolved against source registry).
-    /// Enables direct Vec indexing instead of HashMap lookups.
+    /// Positions of the group-by columns in `source_registry`.
     group_by_ids: Vec<Option<ColumnId>>,
-    /// Source table's column registry, used for inline RowMap→Row conversion.
+    /// The registry of the source rows that `group_by_ids` refers to. The
+    /// rows of a chained reducer have the emit registry of the reducer
+    /// before it, which grows with new columns.
     source_registry: Arc<ColumnRegistry>,
-    /// When true, this reducer sources from another reducer (not a raw table).
-    /// The source_registry and group_by_ids are rebuilt per-batch from actual input data.
-    chained: bool,
+    /// The output of the current block. Its first columns are the group-by
+    /// columns, which a row takes from its input row if its emit left them
+    /// Null.
+    emits: Emits,
 }
 
 impl ReducerEngine {
     pub fn new(
         def: ReducerDef,
         storage: Arc<dyn StorageBackend>,
-        source_registry: &crate::types::ColumnRegistry,
+        source_registry: &ColumnRegistry,
         modules: &[(String, String)],
     ) -> Self {
-        let runtime: Box<dyn ReducerRuntime> = Self::make_runtime(&def, source_registry, modules);
+        let runtime = Self::make_runtime(&def, source_registry, modules);
+        Self::build(def, storage, source_registry, runtime)
+    }
 
-        // Pre-compute column IDs for group-by columns
-        let group_by_ids: Vec<Option<ColumnId>> = def
+    /// Create a ReducerEngine that sources from another reducer's output,
+    /// whose columns are known only from its rows.
+    pub fn new_chained(
+        def: ReducerDef,
+        storage: Arc<dyn StorageBackend>,
+        modules: &[(String, String)],
+    ) -> Self {
+        let empty_registry = ColumnRegistry::default();
+        let runtime = Self::make_runtime(&def, &empty_registry, modules);
+        Self::build(def, storage, &empty_registry, runtime)
+    }
+
+    /// Create a ReducerEngine with a custom runtime (for FnReducerRuntime / external).
+    pub fn with_runtime(
+        def: ReducerDef,
+        storage: Arc<dyn StorageBackend>,
+        source_registry: &ColumnRegistry,
+        runtime: Box<dyn ReducerRuntime>,
+    ) -> Self {
+        Self::build(def, storage, source_registry, runtime)
+    }
+
+    fn build(
+        def: ReducerDef,
+        storage: Arc<dyn StorageBackend>,
+        source_registry: &ColumnRegistry,
+        runtime: Box<dyn ReducerRuntime>,
+    ) -> Self {
+        let state_fields = ColumnRegistry::new(def.state.iter().map(|f| f.name.clone()).collect());
+        let default_state = def
+            .state
+            .iter()
+            .map(|f| parse_default(&f.default, &f.column_type))
+            .collect();
+        let group_by_ids = def
             .group_by
             .iter()
             .map(|col| source_registry.get_id(col))
             .collect();
-
-        let source_registry = Arc::new(source_registry.clone());
-        let default_state = compute_default_state(&def);
-        let state_field_names = def.state.iter().map(|f| f.name.clone()).collect();
+        let emits = Emits::with_columns(&def.group_by);
 
         Self {
             def,
             runtime,
             storage,
+            state_fields,
             default_state,
-            state_field_names,
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
             pending_durable: FxHashSet::default(),
             group_by_ids,
-            source_registry,
-            chained: false,
+            source_registry: Arc::new(source_registry.clone()),
+            emits,
         }
     }
 
@@ -138,71 +166,6 @@ impl ReducerEngine {
         }
     }
 
-    /// Create a ReducerEngine that sources from another reducer's output.
-    /// The source registry and group_by_ids are built dynamically per-batch
-    /// since the upstream reducer's output columns are not known at construction time.
-    /// Create a ReducerEngine that sources from another reducer's output.
-    /// The source registry and group_by_ids are built dynamically per-batch
-    /// since the upstream reducer's output columns are not known at construction time.
-    pub fn new_chained(
-        def: ReducerDef,
-        storage: Arc<dyn StorageBackend>,
-        modules: &[(String, String)],
-    ) -> Self {
-        let empty_registry = ColumnRegistry::new(vec![]);
-        let runtime = Self::make_runtime(&def, &empty_registry, modules);
-
-        let default_state = compute_default_state(&def);
-        let state_field_names = def.state.iter().map(|f| f.name.clone()).collect();
-
-        Self {
-            def,
-            runtime,
-            storage,
-            default_state,
-            state_field_names,
-            state_cache: FxHashMap::default(),
-            block_snapshots: FxHashMap::default(),
-            block_groups: BTreeMap::new(),
-            pending_durable: FxHashSet::default(),
-            group_by_ids: vec![],
-            source_registry: Arc::new(empty_registry),
-            chained: true,
-        }
-    }
-
-    /// Create a ReducerEngine with a custom runtime (for FnReducerRuntime / external).
-    pub fn with_runtime(
-        def: ReducerDef,
-        storage: Arc<dyn StorageBackend>,
-        source_registry: &ColumnRegistry,
-        runtime: Box<dyn ReducerRuntime>,
-    ) -> Self {
-        let group_by_ids: Vec<Option<ColumnId>> = def
-            .group_by
-            .iter()
-            .map(|col| source_registry.get_id(col))
-            .collect();
-        let source_registry = Arc::new(source_registry.clone());
-        let default_state = compute_default_state(&def);
-        let state_field_names = def.state.iter().map(|f| f.name.clone()).collect();
-
-        Self {
-            def,
-            runtime,
-            storage,
-            default_state,
-            state_field_names,
-            state_cache: FxHashMap::default(),
-            block_snapshots: FxHashMap::default(),
-            block_groups: BTreeMap::new(),
-            pending_durable: FxHashSet::default(),
-            group_by_ids,
-            source_registry,
-            chained: false,
-        }
-    }
-
     pub fn name(&self) -> &str {
         &self.def.name
     }
@@ -240,20 +203,68 @@ impl ReducerEngine {
     ///   No extra allocations. Used by Lua and EventRules.
     /// - **Batched**: groups rows by key, calls `process_grouped()` once per block.
     ///   Used by external (host-language) reducers to minimize FFI overhead.
-    pub fn process_block(&mut self, block: BlockNumber, rows: &[Row]) -> Result<Vec<RowMap>> {
-        if self.runtime.use_batched_processing() {
+    pub fn process_block(&mut self, block: BlockNumber, rows: &[Row]) -> Result<Vec<Row>> {
+        if let Some(first) = rows.first() {
+            self.resolve_source(first.registry());
+        }
+
+        let processed = if self.runtime.use_batched_processing() {
             self.process_block_batched(block, rows)
         } else {
             self.process_block_per_row(block, rows)
+        };
+        if let Err(e) = processed {
+            self.emits.clear();
+            return Err(e);
         }
+
+        Ok(self.take_output(rows))
+    }
+
+    /// Point `group_by_ids` at the columns of `registry`.
+    fn resolve_source(&mut self, registry: &Arc<ColumnRegistry>) {
+        if Arc::ptr_eq(&self.source_registry, registry) {
+            return;
+        }
+        self.group_by_ids = self
+            .def
+            .group_by
+            .iter()
+            .map(|col| registry.get_id(col))
+            .collect();
+        self.source_registry = registry.clone();
+    }
+
+    /// The emits of the block in input order, as rows.
+    fn take_output(&mut self, rows: &[Row]) -> Vec<Row> {
+        let mut emitted = self.emits.take();
+        if emitted.is_empty() {
+            return Vec::new();
+        }
+        // The batched path emits group by group. Stable: the emits of one
+        // row keep their order.
+        emitted.sort_by_key(|(source, _)| *source);
+
+        let columns = self.emits.columns().clone();
+        emitted
+            .into_iter()
+            .map(|(source, mut values)| {
+                let input = rows[source].values();
+                for (value, id) in values.iter_mut().zip(&self.group_by_ids) {
+                    if let (true, Some(id)) = (value.is_null(), id) {
+                        *value = input[*id as usize].clone();
+                    }
+                }
+                Row::from_values(columns.clone(), values)
+            })
+            .collect()
     }
 
     /// Fast per-row path: no grouping overhead, no row cloning.
-    fn process_block_per_row(&mut self, block: BlockNumber, rows: &[Row]) -> Result<Vec<RowMap>> {
-        let mut output_maps: Vec<RowMap> = Vec::new();
+    fn process_block_per_row(&mut self, block: BlockNumber, rows: &[Row]) -> Result<()> {
         let mut touched_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
 
-        let processed = self.process_rows(rows, &mut touched_keys, &mut output_maps);
+        let processed = self.process_rows(rows, &mut touched_keys);
 
         // Registered on failure too: the undo of the failed ingest then
         // restores the keys that the rows before the error changed.
@@ -263,13 +274,9 @@ impl ReducerEngine {
             return Err(e);
         }
 
-        // Save in-memory snapshot for each touched group key (one positional
-        // Vec<Value> per key per block — cheap vs a full HashMap clone).
+        // One snapshot of the state of each touched group per block.
         for group_key_bytes in touched_keys {
-            let snapshot = {
-                let state = self.state_cache.get(&group_key_bytes).unwrap();
-                state_to_values(state, &self.state_field_names)
-            };
+            let snapshot = self.state_cache[&group_key_bytes].clone();
             self.block_snapshots
                 .entry(group_key_bytes.clone())
                 .or_default()
@@ -277,18 +284,13 @@ impl ReducerEngine {
             block_keys.insert(group_key_bytes);
         }
 
-        Ok(output_maps)
+        Ok(())
     }
 
     /// The row loop of `process_block_per_row`. A key goes into
     /// `touched_keys` before its row can fail.
-    fn process_rows(
-        &mut self,
-        rows: &[Row],
-        touched_keys: &mut FxHashSet<Vec<u8>>,
-        output_maps: &mut Vec<RowMap>,
-    ) -> Result<()> {
-        for row in rows {
+    fn process_rows(&mut self, rows: &[Row], touched_keys: &mut FxHashSet<Vec<u8>>) -> Result<()> {
+        for (index, row) in rows.iter().enumerate() {
             let group_key_bytes = self.compute_group_key_bytes(row);
 
             // Hot path: borrowed lookup, no clone. Cold path: clone + insert.
@@ -300,38 +302,27 @@ impl ReducerEngine {
                     &self.def.name,
                     &group_key_bytes,
                     &self.default_state,
-                    &self.state_field_names,
                 )?;
                 self.state_cache
                     .entry(group_key_bytes.clone())
                     .or_insert(loaded)
             };
 
-            let emits = self.runtime.process(state, row);
+            self.emits.set_source(index);
+            let state = GroupState {
+                values: state,
+                fields: &self.state_fields,
+            };
+            let processed = self.runtime.process(state, row, &mut self.emits);
             touched_keys.insert(group_key_bytes);
-            let emits = emits?;
-
-            for mut emit_row in emits {
-                // Add group-by columns to the output row for downstream MVs.
-                // Check with a borrowed `&str` before the clone: the emit
-                // usually carries the column already, and `entry()` would
-                // allocate the key on every emit.
-                for col in &self.def.group_by {
-                    if !emit_row.contains_key(col.as_str()) {
-                        if let Some(v) = row.get(col.as_str()) {
-                            emit_row.insert(col.clone(), v.clone());
-                        }
-                    }
-                }
-                output_maps.push(emit_row);
-            }
+            processed?;
         }
         Ok(())
     }
 
     /// Batched path: groups rows by key, calls process_grouped() once.
     /// Avoids per-row FFI overhead for external reducers.
-    fn process_block_batched(&mut self, block: BlockNumber, rows: &[Row]) -> Result<Vec<RowMap>> {
+    fn process_block_batched(&mut self, block: BlockNumber, rows: &[Row]) -> Result<()> {
         // Phase 1: Group rows by key, load states
         let mut key_order: Vec<Vec<u8>> = Vec::new();
         let mut group_map: HashMap<Vec<u8>, (usize, Vec<usize>)> = HashMap::new();
@@ -348,7 +339,6 @@ impl ReducerEngine {
                     &self.def.name,
                     e.key(),
                     &self.default_state,
-                    &self.state_field_names,
                 )?;
                 e.insert(loaded);
             }
@@ -381,7 +371,7 @@ impl ReducerEngine {
         // Phase 2: Single batch call
         let processed = self
             .runtime
-            .process_grouped(&mut batches)
+            .process_grouped(&mut batches, &self.state_fields)
             .and_then(|()| self.check_emit_rows(&batches));
         if let Err(e) = processed {
             // The undo of the failed ingest restores these keys from the
@@ -390,43 +380,26 @@ impl ReducerEngine {
             return Err(e);
         }
 
-        // Phase 3: Collect results — restore states, save snapshots, enrich emits.
-        // Emit in original row order (not grouped order) so first()/last() MVs
-        // produce the same results as the per-row path.
-        let mut indexed_emits: Vec<(usize, RowMap)> = Vec::new();
+        // Phase 3: restore states, save snapshots, collect emits by input row.
         let block_keys = self.block_groups.entry(block).or_default();
-
         for (i, batch) in batches.into_iter().enumerate() {
             let key = &key_order[i];
             let (_, row_indices) = &group_map[key];
 
-            // Snapshot state (positional) before moving it into the cache.
-            let snapshot = state_to_values(&batch.state, &self.state_field_names);
             self.block_snapshots
                 .entry(key.clone())
                 .or_default()
-                .insert(block, snapshot);
+                .insert(block, batch.state.clone());
             self.state_cache.insert(key.clone(), batch.state);
             block_keys.insert(key.clone());
 
-            let first_row = &rows[row_indices[0]];
-            for (group_row, mut emit_row) in batch.emits {
-                for col in &self.def.group_by {
-                    if !emit_row.contains_key(col.as_str()) {
-                        if let Some(v) = first_row.get(col.as_str()) {
-                            emit_row.insert(col.clone(), v.clone());
-                        }
-                    }
-                }
-                indexed_emits.push((row_indices[group_row], emit_row));
+            for (group_row, emit) in batch.emits {
+                self.emits.set_source(row_indices[group_row]);
+                self.emits.push_named(emit);
             }
         }
 
-        // Stable: the emits of one row keep their order.
-        indexed_emits.sort_by_key(|(idx, _)| *idx);
-        let output_maps: Vec<RowMap> = indexed_emits.into_iter().map(|(_, row)| row).collect();
-
-        Ok(output_maps)
+        Ok(())
     }
 
     /// Err if an emit names a row that its group does not have.
@@ -441,40 +414,6 @@ impl ReducerEngine {
             }
         }
         Ok(())
-    }
-
-    /// Process a batch of RowMaps for a given block (normal ingestion path).
-    /// Converts each RowMap to Row inline using the stored source registry.
-    /// For chained reducers, builds the registry dynamically from input data.
-    pub fn process_block_maps(
-        &mut self,
-        block: BlockNumber,
-        rows: &[RowMap],
-    ) -> Result<Vec<RowMap>> {
-        if self.chained && !rows.is_empty() {
-            // Build registry from actual column names in this batch
-            let mut col_set = std::collections::HashSet::new();
-            for m in rows {
-                for k in m.keys() {
-                    col_set.insert(k.clone());
-                }
-            }
-            let columns: Vec<String> = col_set.into_iter().collect();
-            let registry = Arc::new(ColumnRegistry::new(columns));
-            // Re-compute group_by_ids against the actual columns
-            self.group_by_ids = self
-                .def
-                .group_by
-                .iter()
-                .map(|col| registry.get_id(col))
-                .collect();
-            self.source_registry = registry;
-        }
-        let typed_rows: Vec<Row> = rows
-            .iter()
-            .map(|m| Row::from_map(self.source_registry.clone(), m))
-            .collect();
-        self.process_block(block, &typed_rows)
     }
 
     /// Roll back all blocks after fork_point.
@@ -594,15 +533,15 @@ impl ReducerEngine {
         group_key_bytes: &[u8],
         block: BlockNumber,
         pending: &PendingWrites,
-    ) -> Result<State> {
+    ) -> Result<Vec<Value>> {
         if let Some(values) = self.find_snapshot_at_or_before(group_key_bytes, block) {
-            return Ok(values_to_state(values, &self.state_field_names));
+            return Ok(values.to_vec());
         }
 
         // `write_checkpoint` drops the snapshots it persists, so a checkpoint
         // that waits for an ack is the newest state of this group.
         if let Some(bytes) = pending.reducer_finalized(&self.def.name, group_key_bytes) {
-            return decode_state(bytes, &self.def.name, &self.state_field_names);
+            return decode_state(bytes, &self.def.name, self.default_state.len());
         }
 
         // Fall back to finalized state in storage
@@ -611,7 +550,6 @@ impl ReducerEngine {
             &self.def.name,
             group_key_bytes,
             &self.default_state,
-            &self.state_field_names,
         )
     }
 
@@ -661,63 +599,32 @@ impl ReducerEngine {
     }
 }
 
-fn compute_default_state(def: &ReducerDef) -> State {
-    let mut state = HashMap::new();
-    for field in &def.state {
-        let default_val = parse_default(&field.default, &field.column_type);
-        state.insert(field.name.clone(), default_val);
-    }
-    state
-}
-
 /// Load reducer state from storage, avoiding borrowing the entire ReducerEngine.
-/// Finalized state is persisted positionally (see `write_checkpoint`), so decode the
-/// `Vec<Value>` and rebuild the hot `HashMap` state by schema field order.
 fn load_state_from(
     storage: &dyn StorageBackend,
     reducer_name: &str,
     group_key_bytes: &[u8],
-    default_state: &State,
-    field_names: &[String],
-) -> Result<State> {
+    default_state: &[Value],
+) -> Result<Vec<Value>> {
     if let Some(bytes) = storage.get_reducer_finalized(reducer_name, group_key_bytes)? {
-        return decode_state(&bytes, reducer_name, field_names);
+        return decode_state(&bytes, reducer_name, default_state.len());
     }
-    Ok(default_state.clone())
+    Ok(default_state.to_vec())
 }
 
 /// Decode a finalized state that `write_checkpoint` encoded.
-fn decode_state(bytes: &[u8], reducer_name: &str, field_names: &[String]) -> Result<State> {
+fn decode_state(bytes: &[u8], reducer_name: &str, fields: usize) -> Result<Vec<Value>> {
     let unreadable =
         |reason: String| Error::Storage(format!("unreadable state of reducer '{reducer_name}': {reason}"));
 
     let values = storage::decode_values(bytes).map_err(|e| unreadable(e.to_string()))?;
-    if values.len() != field_names.len() {
+    if values.len() != fields {
         return Err(unreadable(format!(
-            "{} values for {} state fields",
-            values.len(),
-            field_names.len()
+            "{} values for {fields} state fields",
+            values.len()
         )));
     }
-    Ok(values_to_state(&values, field_names))
-}
-
-/// Convert the hot `HashMap` state into a positional `Vec<Value>` in schema
-/// field order. Avoids cloning string keys (the dominant snapshot cost).
-fn state_to_values(state: &State, field_names: &[String]) -> Vec<Value> {
-    field_names
-        .iter()
-        .map(|name| state.get(name).cloned().unwrap_or(Value::Null))
-        .collect()
-}
-
-/// Rebuild a `HashMap` state from positional values and schema field order.
-fn values_to_state(values: &[Value], field_names: &[String]) -> State {
-    field_names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.clone(), values.get(i).cloned().unwrap_or(Value::Null)))
-        .collect()
+    Ok(values)
 }
 
 fn parse_default(default_str: &str, column_type: &crate::types::ColumnType) -> Value {
@@ -748,6 +655,7 @@ mod tests {
     use crate::schema::ast::*;
     use crate::storage::memory::MemoryBackend;
     use crate::types::ColumnRegistry;
+    use crate::types::RowMap;
     use crate::types::ColumnType;
 
     fn pnl_reducer_def() -> ReducerDef {
@@ -1115,8 +1023,8 @@ mod tests {
 
             let mut emit = HashMap::new();
             if side == "buy" {
-                state.insert("quantity".into(), Value::Float64(qty + amount));
-                state.insert("cost_basis".into(), Value::Float64(cost + amount * price));
+                state.set("quantity", Value::Float64(qty + amount));
+                state.set("cost_basis", Value::Float64(cost + amount * price));
                 emit.insert("trade_pnl".into(), Value::Float64(0.0));
             } else {
                 let avg_cost = if qty > 0.0 { cost / qty } else { 0.0 };
@@ -1124,18 +1032,15 @@ mod tests {
                     "trade_pnl".into(),
                     Value::Float64(amount * (price - avg_cost)),
                 );
-                state.insert("quantity".into(), Value::Float64(qty - amount));
-                state.insert(
-                    "cost_basis".into(),
-                    Value::Float64(cost - amount * avg_cost),
-                );
+                state.set("quantity", Value::Float64(qty - amount));
+                state.set("cost_basis", Value::Float64(cost - amount * avg_cost));
             }
             let new_qty = state
                 .get("quantity")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
             emit.insert("position_size".into(), Value::Float64(new_qty));
-            vec![emit]
+            state.emit(emit)
         })
     }
 
@@ -1304,7 +1209,7 @@ mod tests {
 
         // Replace with FnReducer → no longer needs callback
         engine.set_runtime(Box::new(
-            crate::reducer_runtime::fn_reducer::FnReducerRuntime::new(|_state, _row| vec![]),
+            crate::reducer_runtime::fn_reducer::FnReducerRuntime::new(|_ctx, _row| {}),
         ));
         assert!(!engine.needs_host_callback());
         assert!(engine.is_external()); // def.body unchanged
@@ -1345,11 +1250,16 @@ mod tests {
         ReducerEngine::new(def, storage, &reg, &[])
     }
 
-    fn event(user: &str, amount: f64) -> RowMap {
-        HashMap::from([
+    fn event(user: &str, amount: f64) -> Row {
+        let registry = Arc::new(ColumnRegistry::new(vec![
+            "user".to_string(),
+            "amount".to_string(),
+        ]));
+        let map = HashMap::from([
             ("user".into(), Value::String(user.into())),
             ("amount".into(), Value::Float64(amount)),
-        ])
+        ]);
+        Row::from_owned_map(registry, map)
     }
 
     /// Batched path must preserve original input row order in emits.
@@ -1383,7 +1293,7 @@ mod tests {
         // Input: alice, bob, alice — interleaved
         let rows = vec![event("alice", 1.0), event("bob", 10.0), event("alice", 2.0)];
 
-        let output = engine.process_block_maps(1000, &rows).unwrap();
+        let output = engine.process_block(1000, &rows).unwrap();
 
         // The key assertion: output follows original input order (alice, bob, alice)
         // not grouped order (alice, alice, bob)
@@ -1412,10 +1322,48 @@ mod tests {
         });
 
         let rows = vec![event("alice", 0.0), event("bob", 1.0), event("alice", 2.0)];
-        let output = engine.process_block_maps(1000, &rows).unwrap();
+        let output = engine.process_block(1000, &rows).unwrap();
 
         let amounts: Vec<_> = output.iter().map(|r| r.get("amount").cloned().unwrap()).collect();
         assert_eq!(amounts, [Value::Float64(1.0), Value::Float64(2.0)]);
+    }
+
+    /// A host callback sees each STATE field, and sets only those: a field
+    /// that it leaves out is Null, one that STATE lacks is gone.
+    #[test]
+    fn batched_path_keeps_the_state_fields() {
+        use crate::reducer_runtime::external::install_test_context;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut engine = external_counter();
+        let seen: Rc<RefCell<Vec<RowMap>>> = Rc::default();
+        let seen_in_callback = seen.clone();
+        let _guard = install_test_context(move |groups| {
+            for group in groups.iter_mut() {
+                seen_in_callback.borrow_mut().push(group.state.clone());
+                group.state.clear();
+                group.state.insert("extra".into(), Value::UInt64(7));
+                if seen_in_callback.borrow().len() == 1 {
+                    group.state.insert("count".into(), Value::Float64(5.0));
+                }
+            }
+        });
+
+        for block in 1..=3 {
+            engine.process_block(block, &[event("alice", 1.0)]).unwrap();
+        }
+
+        let count = |state: &RowMap| (state.len(), state.get("count").cloned());
+        let seen: Vec<_> = seen.borrow().iter().map(count).collect();
+        assert_eq!(
+            seen,
+            [
+                (1, Some(Value::Float64(0.0))),
+                (1, Some(Value::Float64(5.0))),
+                (1, Some(Value::Null)),
+            ]
+        );
     }
 
     /// An emit that names a row its group lacks fails the block.
@@ -1429,6 +1377,6 @@ mod tests {
         });
 
         let rows = vec![event("alice", 1.0)];
-        assert!(engine.process_block_maps(1000, &rows).is_err());
+        assert!(engine.process_block(1000, &rows).is_err());
     }
 }

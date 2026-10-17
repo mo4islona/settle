@@ -97,12 +97,12 @@ fn balance_reducer() -> FnReducerRuntime {
         let delta = row.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let current = state.get("balance").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let next = current + delta;
-        state.insert("balance".into(), Value::Float64(next));
+        state.set("balance", Value::Float64(next));
 
         let mut emit = HashMap::new();
         emit.insert("from_addr".into(), Value::String(from.to_string()));
         emit.insert("balance".into(), Value::Float64(next));
-        vec![emit]
+        state.emit(emit)
     })
 }
 

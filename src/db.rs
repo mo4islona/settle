@@ -1460,3 +1460,7 @@ mod backfill_tests;
 #[cfg(all(test, feature = "rocksdb", feature = "lua"))]
 #[path = "db_rows_tests.rs"]
 mod rows_tests;
+
+#[cfg(test)]
+#[path = "db_reducer_output_tests.rs"]
+mod reducer_output_tests;

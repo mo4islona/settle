@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use crate::schema::ast::{AlwaysEmit, BinaryOp, Expr, ReducerBody, WhenBlock};
-use crate::types::{Row, RowMap, Value};
+use crate::types::{Row, Value};
 
-use super::ReducerRuntime;
+use super::{Emits, GroupState, ReducerRuntime, set_at};
 
 /// Event Rules runtime: evaluates WHEN/THEN blocks with first-match semantics.
 pub struct EventRulesRuntime {
@@ -29,25 +29,27 @@ impl EventRulesRuntime {
 impl ReducerRuntime for EventRulesRuntime {
     fn process(
         &self,
-        state: &mut HashMap<String, Value>,
+        mut state: GroupState<'_>,
         row: &Row,
-    ) -> crate::error::Result<Vec<RowMap>> {
-        let mut output = HashMap::new();
+        emits: &mut Emits,
+    ) -> crate::error::Result<()> {
+        let no_locals = HashMap::new();
+        let mut output = Vec::new();
         let mut matched = false;
 
         // First-match semantics: evaluate WHEN blocks in order
         for block in &self.when_blocks {
             let ctx = EvalContext {
-                state,
+                state: &state,
                 row,
-                locals: &HashMap::new(),
+                locals: &no_locals,
             };
             if eval_expr(&block.condition, &ctx).is_truthy() {
                 // Evaluate LET bindings
                 let mut locals = HashMap::new();
                 for (name, expr) in &block.lets {
                     let ctx = EvalContext {
-                        state,
+                        state: &state,
                         row,
                         locals: &locals,
                     };
@@ -55,26 +57,27 @@ impl ReducerRuntime for EventRulesRuntime {
                     locals.insert(name.clone(), val);
                 }
 
-                // Evaluate SET (state mutations)
+                // Evaluate SET (state mutations); the schema rejects a SET
+                // of a field that STATE does not declare.
                 for (field, expr) in &block.sets {
                     let ctx = EvalContext {
-                        state,
+                        state: &state,
                         row,
                         locals: &locals,
                     };
                     let val = eval_expr(expr, &ctx);
-                    state.insert(field.clone(), val);
+                    state.set(field, val);
                 }
 
                 // Evaluate EMIT
                 for (name, expr) in &block.emits {
                     let ctx = EvalContext {
-                        state,
+                        state: &state,
                         row,
                         locals: &locals,
                     };
                     let val = eval_expr(expr, &ctx);
-                    output.insert(name.clone(), val);
+                    set_at(&mut output, emits.column(name), val);
                 }
 
                 matched = true;
@@ -86,30 +89,29 @@ impl ReducerRuntime for EventRulesRuntime {
         if let Some(always) = &self.always_emit {
             for (name, expr) in &always.emits {
                 let ctx = EvalContext {
-                    state,
+                    state: &state,
                     row,
-                    locals: &HashMap::new(),
+                    locals: &no_locals,
                 };
                 let val = eval_expr(expr, &ctx);
-                output.insert(name.clone(), val);
+                set_at(&mut output, emits.column(name), val);
             }
         }
 
         if matched || self.always_emit.is_some() {
-            Ok(vec![output])
-        } else {
-            Ok(vec![])
+            emits.push(output);
         }
+        Ok(())
     }
 }
 
-struct EvalContext<'a> {
-    state: &'a HashMap<String, Value>,
+struct EvalContext<'a, 's> {
+    state: &'a GroupState<'s>,
     row: &'a Row,
     locals: &'a HashMap<String, Value>,
 }
 
-fn eval_expr(expr: &Expr, ctx: &EvalContext) -> Value {
+fn eval_expr(expr: &Expr, ctx: &EvalContext<'_, '_>) -> Value {
     match expr {
         Expr::Literal(s) => Value::String(s.clone()),
         Expr::Float(v) => Value::Float64(*v),
@@ -210,6 +212,28 @@ fn values_cmp(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reducer_runtime::run_by_name;
+    use crate::types::{ColumnRegistry, RowMap};
+
+    fn run(runtime: &EventRulesRuntime, state: &mut RowMap, row: &Row) -> Vec<RowMap> {
+        run_by_name(runtime, None, state, row).unwrap()
+    }
+
+    /// A context with `state` by name.
+    fn eval_in(expr: &Expr, state: &[(&str, Value)], row: &Row) -> Value {
+        let fields = ColumnRegistry::new(state.iter().map(|(n, _)| n.to_string()).collect());
+        let mut values: Vec<Value> = state.iter().map(|(_, v)| v.clone()).collect();
+        let state = GroupState {
+            values: &mut values,
+            fields: &fields,
+        };
+        let ctx = EvalContext {
+            state: &state,
+            row,
+            locals: &HashMap::new(),
+        };
+        eval_expr(expr, &ctx)
+    }
     use crate::schema::ast::{AlwaysEmit, BinaryOp as AstBinaryOp, Expr, ReducerBody, WhenBlock};
 
     fn pnl_reducer_body() -> ReducerBody {
@@ -356,12 +380,7 @@ mod tests {
 
         // Trade 1: BUY 10 ETH @ $2000
         let row1 = make_trade("buy", 10.0, 2000.0);
-        let out1 = runtime
-            .process(&mut state, &row1)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
+        let out1 = run(&runtime, &mut state, &row1).into_iter().next().unwrap();
         assert_eq!(state.get("quantity"), Some(&Value::Float64(10.0)));
         assert_eq!(state.get("cost_basis"), Some(&Value::Float64(20000.0)));
         assert_eq!(out1.get("trade_pnl"), Some(&Value::UInt64(0)));
@@ -370,12 +389,7 @@ mod tests {
 
         // Trade 2: BUY 5 ETH @ $2100
         let row2 = make_trade("buy", 5.0, 2100.0);
-        let out2 = runtime
-            .process(&mut state, &row2)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
+        let out2 = run(&runtime, &mut state, &row2).into_iter().next().unwrap();
         assert_eq!(state.get("quantity"), Some(&Value::Float64(15.0)));
         assert_eq!(state.get("cost_basis"), Some(&Value::Float64(30500.0)));
         assert_eq!(out2.get("trade_pnl"), Some(&Value::UInt64(0)));
@@ -385,12 +399,7 @@ mod tests {
 
         // Trade 3: SELL 8 ETH @ $2200
         let row3 = make_trade("sell", 8.0, 2200.0);
-        let out3 = runtime
-            .process(&mut state, &row3)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
+        let out3 = run(&runtime, &mut state, &row3).into_iter().next().unwrap();
 
         let trade_pnl = out3.get("trade_pnl").unwrap().as_f64().unwrap();
         // 8 * (2200 - 2033.33) = 1333.33
@@ -431,12 +440,7 @@ mod tests {
         let runtime = EventRulesRuntime::new(&body);
         let mut state = HashMap::new();
         let row = Row::from(HashMap::from([("x".to_string(), Value::Float64(1.0))]));
-        let out = runtime
-            .process(&mut state, &row)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
+        let out = run(&runtime, &mut state, &row).into_iter().next().unwrap();
         assert_eq!(out.get("matched"), Some(&Value::String("first".into())));
     }
 
@@ -458,7 +462,7 @@ mod tests {
         let runtime = EventRulesRuntime::new(&body);
         let mut state = HashMap::new();
         let row = Row::from(HashMap::from([("x".to_string(), Value::Float64(1.0))]));
-        assert!(runtime.process(&mut state, &row).unwrap().is_empty());
+        assert!(run(&runtime, &mut state, &row).is_empty());
     }
 
     #[test]
@@ -481,23 +485,13 @@ mod tests {
         let runtime = EventRulesRuntime::new(&body);
         let mut state = HashMap::new();
         let row = Row::from(HashMap::from([("x".to_string(), Value::Float64(1.0))]));
-        let out = runtime
-            .process(&mut state, &row)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
+        let out = run(&runtime, &mut state, &row).into_iter().next().unwrap();
         assert_eq!(out.get("always"), Some(&Value::UInt64(42)));
     }
 
     #[test]
     fn expression_evaluator_arithmetic() {
         let row = Row::from(HashMap::from([("a".to_string(), Value::Float64(10.0))]));
-        let ctx = EvalContext {
-            state: &HashMap::new(),
-            row: &row,
-            locals: &HashMap::new(),
-        };
 
         // a + 5
         let expr = Expr::BinaryOp {
@@ -505,7 +499,7 @@ mod tests {
             op: AstBinaryOp::Add,
             right: Box::new(Expr::Float(5.0)),
         };
-        assert_eq!(eval_expr(&expr, &ctx), Value::Float64(15.0));
+        assert_eq!(eval_in(&expr, &[], &row), Value::Float64(15.0));
 
         // a * 3
         let expr = Expr::BinaryOp {
@@ -513,33 +507,23 @@ mod tests {
             op: AstBinaryOp::Mul,
             right: Box::new(Expr::Float(3.0)),
         };
-        assert_eq!(eval_expr(&expr, &ctx), Value::Float64(30.0));
+        assert_eq!(eval_in(&expr, &[], &row), Value::Float64(30.0));
     }
 
     #[test]
     fn expression_evaluator_division_by_zero() {
         let row = Row::from(RowMap::new());
-        let ctx = EvalContext {
-            state: &HashMap::new(),
-            row: &row,
-            locals: &HashMap::new(),
-        };
         let expr = Expr::BinaryOp {
             left: Box::new(Expr::Float(10.0)),
             op: AstBinaryOp::Div,
             right: Box::new(Expr::Float(0.0)),
         };
-        assert_eq!(eval_expr(&expr, &ctx), Value::Float64(0.0));
+        assert_eq!(eval_in(&expr, &[], &row), Value::Float64(0.0));
     }
 
     #[test]
     fn expression_evaluator_if() {
         let row = Row::from(RowMap::new());
-        let ctx = EvalContext {
-            state: &HashMap::from([("qty".to_string(), Value::Float64(5.0))]),
-            row: &row,
-            locals: &HashMap::new(),
-        };
         let expr = Expr::If {
             condition: Box::new(Expr::BinaryOp {
                 left: Box::new(Expr::StateRef("qty".into())),
@@ -549,6 +533,10 @@ mod tests {
             then_expr: Box::new(Expr::Literal("positive".into())),
             else_expr: Box::new(Expr::Literal("zero_or_neg".into())),
         };
-        assert_eq!(eval_expr(&expr, &ctx), Value::String("positive".into()));
+        let state = [("qty", Value::Float64(5.0))];
+        assert_eq!(
+            eval_in(&expr, &state, &row),
+            Value::String("positive".into())
+        );
     }
 }

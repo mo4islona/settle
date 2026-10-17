@@ -13,7 +13,7 @@ pub type ColumnId = u16;
 
 /// Maps column names to integer indices and vice versa.
 /// Created once per table/pipeline stage; shared via Arc across all Rows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ColumnRegistry {
     names: Vec<String>,
     /// FxHash: the keys are schema names, and each input column looks one up.
@@ -44,6 +44,17 @@ impl ColumnRegistry {
 
     pub fn names(&self) -> &[String] {
         &self.names
+    }
+
+    /// The position of `name`, added at the end if the registry lacks it.
+    pub fn get_or_push(&mut self, name: &str) -> ColumnId {
+        if let Some(id) = self.get_id(name) {
+            return id;
+        }
+        let id = self.names.len() as ColumnId;
+        self.names.push(name.to_string());
+        self.indices.insert(name.to_string(), id);
+        id
     }
 }
 

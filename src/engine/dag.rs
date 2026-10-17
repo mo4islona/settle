@@ -107,37 +107,6 @@ impl ReplayCursor {
     }
 }
 
-/// The rows that a node passes downstream in one block.
-enum NodeRows {
-    /// A raw table's rows, in its column order.
-    Table(Vec<Row>),
-    /// A reducer's emits.
-    Emits(Vec<RowMap>),
-}
-
-impl NodeRows {
-    fn feed_reducer(&self, reducer: &mut ReducerEngine, block: BlockNumber) -> Result<Vec<RowMap>> {
-        match self {
-            NodeRows::Table(rows) => reducer.process_block(block, rows),
-            NodeRows::Emits(rows) => reducer.process_block_maps(block, rows),
-        }
-    }
-
-    fn apply_to(&self, mv: &mut MVEngine, block: BlockNumber) {
-        match self {
-            NodeRows::Table(rows) => mv.apply_rows(block, rows),
-            NodeRows::Emits(rows) => mv.apply_rows(block, rows),
-        }
-    }
-
-    fn replay_into(&self, mv: &mut MVEngine, block: BlockNumber) {
-        match self {
-            NodeRows::Table(rows) => mv.replay_block(block, rows),
-            NodeRows::Emits(rows) => mv.replay_block(block, rows),
-        }
-    }
-}
-
 /// An independent reducer→MV chain that can be processed in parallel.
 /// Engines are stored inline to avoid HashMap extraction/reinsertion per batch.
 struct PipelineBranch {
@@ -153,14 +122,14 @@ impl PipelineBranch {
     fn process_block(
         &mut self,
         block: BlockNumber,
-        output_rows: &HashMap<String, NodeRows>,
+        output_rows: &HashMap<String, Vec<Row>>,
         perf: bool,
     ) -> Result<Option<PerfNode>> {
         let timer = PerfTimer::start(perf);
         let mut mv_nodes = Vec::new();
 
         if let Some(rows) = output_rows.get(self.reducer.source()) {
-            let enriched = rows.feed_reducer(&mut self.reducer, block)?;
+            let enriched = self.reducer.process_block(block, rows)?;
             if !enriched.is_empty() {
                 for (mv_name, mv) in &mut self.mv_entries {
                     let mv_timer = PerfTimer::start(perf);
@@ -594,8 +563,8 @@ impl SettleEngine {
         perf_children.extend(raw_timer.stop(PerfNodeKind::RawTable, table, vec![]));
 
         // Output rows for downstream consumption (reducers + MVs)
-        let mut output_rows: HashMap<String, NodeRows> = HashMap::new();
-        output_rows.insert(table.to_string(), NodeRows::Table(rows));
+        let mut output_rows: HashMap<String, Vec<Row>> = HashMap::new();
+        output_rows.insert(table.to_string(), rows);
 
         // Check if parallel branch execution is possible:
         // - 2+ branches, all reducers source from raw tables (not from each other),
@@ -616,7 +585,7 @@ impl SettleEngine {
                     let mv_timer = PerfTimer::start(perf);
                     let mv = self.mvs.get_mut(mv_name).unwrap();
                     if let Some(source_rows) = output_rows.get(mv.source()) {
-                        source_rows.apply_to(mv, block);
+                        mv.apply_rows(block, source_rows);
                     }
                     perf_children.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
@@ -669,7 +638,7 @@ impl SettleEngine {
                             None => self.reducers.get_mut(name).unwrap(),
                         };
                         let enriched = match output_rows.get(reducer.source()) {
-                            Some(source_rows) => source_rows.feed_reducer(reducer, block)?,
+                            Some(source_rows) => reducer.process_block(block, source_rows)?,
                             None => Vec::new(),
                         };
                         if let Some(node) = timer.stop(PerfNodeKind::Reducer, name, vec![]) {
@@ -677,7 +646,7 @@ impl SettleEngine {
                             perf_children.push(node);
                         }
                         if !enriched.is_empty() {
-                            output_rows.insert(name.clone(), NodeRows::Emits(enriched));
+                            output_rows.insert(name.clone(), enriched);
                         }
                     }
                     PipelineNode::MV(name) => {
@@ -687,7 +656,7 @@ impl SettleEngine {
                             None => self.mvs.get_mut(name).unwrap(),
                         };
                         if let Some(source_rows) = output_rows.get(mv.source()) {
-                            source_rows.apply_to(mv, block);
+                            mv.apply_rows(block, source_rows);
                         }
                         let mv_source = mv.source();
                         // Nest under parent reducer if exists, otherwise add as sibling
@@ -871,8 +840,8 @@ impl SettleEngine {
         rows: Vec<Row>,
         only_nodes: Option<&HashSet<String>>,
     ) -> Result<()> {
-        let mut output_rows: HashMap<String, NodeRows> = HashMap::new();
-        output_rows.insert(table_name, NodeRows::Table(rows));
+        let mut output_rows: HashMap<String, Vec<Row>> = HashMap::new();
+        output_rows.insert(table_name, rows);
 
         for node in &self.pipeline {
             match node {
@@ -894,11 +863,11 @@ impl SettleEngine {
                         continue;
                     }
                     let enriched = match output_rows.get(reducer.source()) {
-                        Some(source_rows) => source_rows.feed_reducer(reducer, block)?,
+                        Some(source_rows) => reducer.process_block(block, source_rows)?,
                         None => Vec::new(),
                     };
                     if !enriched.is_empty() {
-                        output_rows.insert(name.clone(), NodeRows::Emits(enriched));
+                        output_rows.insert(name.clone(), enriched);
                     }
                 }
                 PipelineNode::MV(name) => {
@@ -911,7 +880,7 @@ impl SettleEngine {
                         None => self.mvs.get_mut(name).unwrap(),
                     };
                     if let Some(source_rows) = output_rows.get(mv.source()) {
-                        source_rows.replay_into(mv, block);
+                        mv.replay_block(block, source_rows);
                     }
                 }
             }

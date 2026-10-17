@@ -1773,6 +1773,20 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
             )));
         }
 
+        // The state of a group is a value per STATE field: a SET of another
+        // name would hold nowhere.
+        if let ReducerBody::EventRules { when_blocks, .. } = &reducer.body {
+            let sets = when_blocks.iter().flat_map(|block| &block.sets);
+            for (field, _) in sets {
+                if !reducer.state.iter().any(|f| f.name == *field) {
+                    return Err(Error::Schema(format!(
+                        "reducer '{}': SET state.{field} is not a STATE field",
+                        reducer.name
+                    )));
+                }
+            }
+        }
+
         // Validate GROUP BY columns against source table (only when source is a table;
         // for chained reducers, output columns are dynamic and validated at runtime)
         if source_is_table {
@@ -2195,6 +2209,31 @@ mod tests {
         "#;
         let err = parse_schema(sql).unwrap_err();
         assert!(err.to_string().contains("nonexistent_table"));
+    }
+
+    /// A group's state holds the STATE fields only: a SET of another name
+    /// would be lost at the next restore of the state.
+    #[test]
+    fn validation_rejects_set_of_an_undeclared_state_field() {
+        let sql = r#"
+            CREATE TABLE trades (block_number UInt64, user String, price Float64);
+
+            CREATE REDUCER r
+              SOURCE trades
+              GROUP BY user
+              STATE (qty Float64 DEFAULT 0)
+
+              WHEN row.price > 0 THEN
+                SET state.qty = state.qty + 1
+                SET state.total = state.qty
+                EMIT count = state.qty;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reducer 'r': SET state.total is not a STATE field"),
+            "{err}"
+        );
     }
 
     #[test]
