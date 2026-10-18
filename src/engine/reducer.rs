@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::error::{Error, Result};
 use crate::reducer_runtime::event_rules::EventRulesRuntime;
@@ -9,41 +9,35 @@ use crate::reducer_runtime::event_rules::EventRulesRuntime;
 use crate::reducer_runtime::lua::LuaRuntime;
 use crate::reducer_runtime::{Emits, GroupBatch, GroupState, GroupedRows, ReducerRuntime};
 use crate::schema::ast::{ReducerBody, ReducerDef};
-use crate::storage::{self, PendingWrites, StorageBackend, StorageWriteBatch};
-use crate::types::{BlockNumber, ColumnId, ColumnRegistry, GroupKey, Row, Value};
+use crate::storage::{self, StorageBackend, StorageWriteBatch};
+use crate::types::{BlockNumber, ColumnId, ColumnRegistry, Row, Value};
 
-/// Orchestrates a single reducer: state management, snapshots, rollback, and output.
+/// Orchestrates a single reducer: state management, rollback, and output.
 ///
 /// State is kept entirely in memory during normal processing. Storage is only
-/// used for persisting finalized state. Block-level snapshots are held in an
-/// in-memory `BTreeMap` so that rollback can restore to any unfinalized block
-/// without serialization overhead.
+/// used for persisting finalized state. Each group keeps its state from
+/// before each block that changed it and is not final yet, so that rollback
+/// can restore to any unfinalized block without serialization overhead.
 pub struct ReducerEngine {
     def: ReducerDef,
     runtime: Box<dyn ReducerRuntime>,
     storage: Arc<dyn StorageBackend>,
     /// The STATE fields in schema order: the layout of a group's state in
-    /// memory, in snapshots and in storage.
+    /// memory and in storage.
     state_fields: ColumnRegistry,
     /// Cached default state (computed once from def.state).
     default_state: Vec<Value>,
-    /// Current hot state per group key. Never evicted: a miss loads the
-    /// stored state, which lacks the checkpoints of unacked batches.
-    state_cache: FxHashMap<Vec<u8>, Vec<Value>>,
-    /// In-memory state snapshots: group_key -> (block -> state).
-    /// Holds unfinalized blocks for rollback, plus, for each key in
-    /// `pending_durable`, its newest finalized snapshot.
-    block_snapshots: FxHashMap<Vec<u8>, BTreeMap<BlockNumber, Vec<Value>>>,
-    /// Tracks which blocks have been processed and which group keys were touched.
-    /// BTreeMap for O(log N) range queries during rollback/finalize. FxHash on
-    /// the per-block key sets: keys are trusted internal `Vec<u8>` group keys
-    /// inserted once per touched group per block (hot path) — matches the
-    /// FxHash already used for `state_cache` / `block_snapshots`.
-    block_groups: BTreeMap<BlockNumber, FxHashSet<Vec<u8>>>,
-    /// Group keys finalized since the last checkpoint. Each keeps its newest
-    /// finalized snapshot, which `write_checkpoint` persists. Under backfill
-    /// deferral keys wait here for several finalizations.
-    pending_durable: FxHashSet<Vec<u8>>,
+    /// Every group since open or `reload`.
+    groups: Groups,
+    /// The groups that each block not final yet changed, by id. Each of them
+    /// holds an undo entry for the block.
+    block_groups: BTreeMap<BlockNumber, Vec<usize>>,
+    /// Groups finalized since the last checkpoint, which `write_checkpoint`
+    /// persists. Under backfill deferral they wait here for several
+    /// finalizations.
+    pending_durable: Vec<usize>,
+    /// The group key of the current row.
+    key: Vec<u8>,
     /// Positions of the group-by columns in `source_registry`.
     group_by_ids: Vec<Option<ColumnId>>,
     /// The registry of the source rows that `group_by_ids` refers to. The
@@ -58,6 +52,66 @@ pub struct ReducerEngine {
     /// rollback drops them. At most `MAX_EMIT_COLUMNS` entries: each one
     /// added a column.
     emit_growth: BTreeMap<BlockNumber, usize>,
+}
+
+/// One group of a reducer.
+struct Group {
+    /// The key of the group's finalized state in storage.
+    key: Box<[u8]>,
+    /// The current state, in the order of the STATE fields.
+    state: Vec<Value>,
+    /// The state before each block that changed it and is not final yet,
+    /// oldest first. A rollback restores the first one above its fork
+    /// point. The state as of finality is the first one above finality,
+    /// else `state`.
+    undo: VecDeque<(BlockNumber, Vec<Value>)>,
+    /// Whether `pending_durable` holds the group.
+    pending_durable: bool,
+}
+
+/// The groups of a reducer by id, their index in `all`. Never evicted: a
+/// group that is not here loads its stored state, which lacks the
+/// checkpoints of unacked batches.
+#[derive(Default)]
+struct Groups {
+    all: Vec<Group>,
+    ids: FxHashMap<Box<[u8]>, usize>,
+}
+
+impl Groups {
+    /// The id of the group `key`. On its first row, `load` gives its state.
+    fn id(&mut self, key: &[u8], load: impl FnOnce() -> Result<Vec<Value>>) -> Result<usize> {
+        if let Some(&id) = self.ids.get(key) {
+            return Ok(id);
+        }
+
+        let id = self.all.len();
+        self.all.push(Group {
+            key: key.into(),
+            state: load()?,
+            undo: VecDeque::new(),
+            pending_durable: false,
+        });
+        self.ids.insert(key.into(), id);
+        Ok(id)
+    }
+
+    /// The group `id`, about to change in `block`. Its first change in the
+    /// block keeps the state before it, and adds the group to `changed`.
+    fn change(&mut self, id: usize, block: BlockNumber, changed: &mut Vec<usize>) -> &mut Group {
+        let group = &mut self.all[id];
+        let first = group.undo.back().is_none_or(|(b, _)| *b != block);
+        if first {
+            group.undo.push_back((block, group.state.clone()));
+            changed.push(id);
+        }
+        group
+    }
+
+    fn clear(&mut self) {
+        self.all.clear();
+        self.ids.clear();
+    }
 }
 
 impl ReducerEngine {
@@ -118,10 +172,10 @@ impl ReducerEngine {
             storage,
             state_fields,
             default_state,
-            state_cache: FxHashMap::default(),
-            block_snapshots: FxHashMap::default(),
+            groups: Groups::default(),
             block_groups: BTreeMap::new(),
-            pending_durable: FxHashSet::default(),
+            pending_durable: Vec::new(),
+            key: Vec::new(),
             group_by_ids,
             source_registry: Arc::new(source_registry.clone()),
             emits,
@@ -199,9 +253,9 @@ impl ReducerEngine {
     /// Process a batch of rows for a given block.
     /// Returns enriched output rows (one per input row that produced emit output).
     ///
-    /// State is updated in memory only. A snapshot of each touched group key's
-    /// state is saved in `block_snapshots` at the end of the block — no storage
-    /// I/O or serialization happens here.
+    /// State is updated in memory only. Each group keeps its state from
+    /// before its first change in the block — no storage I/O or
+    /// serialization happens here, except a group's first read.
     ///
     /// Two code paths:
     /// - **Per-row** (default): iterates rows in order, calls `process()` per row.
@@ -271,64 +325,33 @@ impl ReducerEngine {
     }
 
     /// Fast per-row path: no grouping overhead, no row cloning.
+    ///
+    /// A group is in `block_groups` before its row can fail: the undo of the
+    /// failed ingest then restores the groups that the rows before the
+    /// error changed.
     fn process_block_per_row(&mut self, block: BlockNumber, rows: &[Row]) -> Result<()> {
-        let mut touched_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
+        let changed = self.block_groups.entry(block).or_default();
 
-        let processed = self.process_rows(rows, &mut touched_keys);
-
-        // Registered on failure too: the undo of the failed ingest then
-        // restores the keys that the rows before the error changed.
-        let block_keys = self.block_groups.entry(block).or_default();
-        if let Err(e) = processed {
-            block_keys.extend(touched_keys);
-            return Err(e);
-        }
-
-        // One snapshot of the state of each touched group per block.
-        for group_key_bytes in touched_keys {
-            let snapshot = self.state_cache[&group_key_bytes].clone();
-            self.block_snapshots
-                .entry(group_key_bytes.clone())
-                .or_default()
-                .insert(block, snapshot);
-            block_keys.insert(group_key_bytes);
-        }
-
-        Ok(())
-    }
-
-    /// The row loop of `process_block_per_row`. A key goes into
-    /// `touched_keys` before its row can fail.
-    fn process_rows(&mut self, rows: &[Row], touched_keys: &mut FxHashSet<Vec<u8>>) -> Result<()> {
         for (index, row) in rows.iter().enumerate() {
-            let group_key_bytes = self.compute_group_key_bytes(row);
-
-            // Hot path: borrowed lookup, no clone. Cold path: clone + insert.
-            let state = if let Some(s) = self.state_cache.get_mut(&group_key_bytes) {
-                s
-            } else {
-                let loaded = load_state_from(
+            write_group_key(&mut self.key, &self.group_by_ids, row);
+            let id = self.groups.id(&self.key, || {
+                load_state_from(
                     self.storage.as_ref(),
                     &self.def.name,
-                    &group_key_bytes,
+                    &self.key,
                     &self.default_state,
-                )?;
-                self.state_cache
-                    .entry(group_key_bytes.clone())
-                    .or_insert(loaded)
-            };
+                )
+            })?;
+            let group = self.groups.change(id, block, changed);
 
             self.emits.set_source(index);
             let state = GroupState {
-                values: state,
+                values: &mut group.state,
                 fields: &self.state_fields,
             };
-            let processed = self
-                .runtime
+            self.runtime
                 .process(state, row, &mut self.emits)
-                .and_then(|()| self.emits.check());
-            touched_keys.insert(group_key_bytes);
-            processed?;
+                .and_then(|()| self.emits.check())?;
         }
         Ok(())
     }
@@ -336,43 +359,39 @@ impl ReducerEngine {
     /// Batched path: groups rows by key, calls process_grouped() once.
     /// Avoids per-row FFI overhead for external reducers.
     fn process_block_batched(&mut self, block: BlockNumber, rows: &[Row]) -> Result<()> {
-        // The group of each row; the groups in order of their first row.
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+        // The group of each row as an index in `ids`; the groups in order of
+        // their first row. Each group loads before any state leaves
+        // `groups`: a failed load then loses none.
+        let mut ids: Vec<usize> = Vec::new();
         let mut sizes: Vec<usize> = Vec::new();
         let mut row_groups: Vec<usize> = Vec::with_capacity(rows.len());
-        let mut group_ids: FxHashMap<Vec<u8>, usize> = FxHashMap::default();
+        let mut slots: FxHashMap<usize, usize> = FxHashMap::default();
         for row in rows {
-            let key = self.compute_group_key_bytes(row);
-            let group = match group_ids.get(&key) {
-                Some(&group) => group,
-                None => {
-                    // Loaded before any state leaves the cache: a failed load
-                    // then loses none.
-                    if !self.state_cache.contains_key(&key) {
-                        let loaded = load_state_from(
-                            self.storage.as_ref(),
-                            &self.def.name,
-                            &key,
-                            &self.default_state,
-                        )?;
-                        self.state_cache.insert(key.clone(), loaded);
-                    }
-                    group_ids.insert(key.clone(), keys.len());
-                    keys.push(key);
-                    sizes.push(0);
-                    keys.len() - 1
-                }
-            };
-            sizes[group] += 1;
-            row_groups.push(group);
+            write_group_key(&mut self.key, &self.group_by_ids, row);
+            let id = self.groups.id(&self.key, || {
+                load_state_from(
+                    self.storage.as_ref(),
+                    &self.def.name,
+                    &self.key,
+                    &self.default_state,
+                )
+            })?;
+            let slot = *slots.entry(id).or_insert_with(|| {
+                ids.push(id);
+                sizes.push(0);
+                ids.len() - 1
+            });
+            sizes[slot] += 1;
+            row_groups.push(slot);
         }
 
-        let mut groups = Vec::with_capacity(keys.len());
+        let changed = self.block_groups.entry(block).or_default();
+        let mut groups = Vec::with_capacity(ids.len());
         let mut start = 0;
-        for (key, &size) in keys.iter().zip(&sizes) {
-            let state = self.state_cache.remove(key).expect("loaded above");
+        for (&id, &size) in ids.iter().zip(&sizes) {
+            let group = self.groups.change(id, block, changed);
             groups.push(GroupBatch {
-                state,
+                state: std::mem::take(&mut group.state),
                 rows: start..start + size,
             });
             start += size;
@@ -380,9 +399,9 @@ impl ReducerEngine {
 
         let mut next: Vec<usize> = groups.iter().map(|group| group.rows.start).collect();
         let mut order = vec![0; rows.len()];
-        for (index, &group) in row_groups.iter().enumerate() {
-            order[next[group]] = index;
-            next[group] += 1;
+        for (index, &slot) in row_groups.iter().enumerate() {
+            order[next[slot]] = index;
+            next[slot] += 1;
         }
 
         let mut grouped = GroupedRows {
@@ -393,37 +412,24 @@ impl ReducerEngine {
         let processed =
             self.runtime
                 .process_grouped(&mut grouped, &self.state_fields, &mut self.emits);
-        if let Err(e) = processed {
-            // The undo of the failed ingest restores these keys from the
-            // blocks before, also the states taken out of `state_cache`.
-            self.block_groups.entry(block).or_default().extend(keys);
-            return Err(e);
-        }
 
-        let block_keys = self.block_groups.entry(block).or_default();
-        for (key, group) in keys.into_iter().zip(grouped.groups) {
-            self.block_snapshots
-                .entry(key.clone())
-                .or_default()
-                .insert(block, group.state.clone());
-            self.state_cache.insert(key.clone(), group.state);
-            block_keys.insert(key);
+        // Also on failure, as on the per-row path: the undo of the failed
+        // ingest restores the states from before the block.
+        for (&id, group) in ids.iter().zip(grouped.groups) {
+            self.groups.all[id].state = group.state;
         }
-
-        // The keys are in `block_groups`: the undo of the failed ingest
-        // restores their states.
+        processed?;
         self.emits.check()
     }
 
-    /// Roll back all blocks after fork_point.
-    /// Restores state from in-memory block snapshots, else from the newest
-    /// finalized state in `pending` or storage.
+    /// Roll back all blocks after fork_point: each group they changed goes
+    /// back to its state before the first of them.
     /// Returns the number of groups affected.
-    pub fn rollback(&mut self, fork_point: BlockNumber, pending: &PendingWrites) -> Result<usize> {
+    pub fn rollback(&mut self, fork_point: BlockNumber) -> usize {
         // Guard: fork_point + 1 would overflow u64::MAX to 0, causing split_off(&0)
         // to remove the entire map. MAX is a valid no-op: nothing exists after it.
         if fork_point == BlockNumber::MAX {
-            return Ok(0);
+            return 0;
         }
 
         let grown = self.emit_growth.split_off(&(fork_point + 1));
@@ -431,50 +437,24 @@ impl ReducerEngine {
             self.emits.truncate_columns(width);
         }
 
-        // Use BTreeMap split_off for O(log N) range extraction
         let rolled_back = self.block_groups.split_off(&(fork_point + 1));
-
-        if rolled_back.is_empty() {
-            return Ok(0);
-        }
-
-        // Collect all affected group keys (consume by value to avoid cloning)
-        let mut affected_keys: FxHashSet<Vec<u8>> = FxHashSet::default();
-        for (_block, keys) in rolled_back {
-            for key in keys {
-                affected_keys.insert(key);
+        let mut affected = 0;
+        for id in rolled_back.into_values().flatten() {
+            let group = &mut self.groups.all[id];
+            let kept = group.undo.partition_point(|(block, _)| *block <= fork_point);
+            // Only the first block of the group restores: it drains the rest.
+            if let Some((_, state)) = group.undo.drain(kept..).next() {
+                group.state = state;
+                affected += 1;
             }
         }
-
-        // Restore state for each affected group key
-        for group_key_bytes in &affected_keys {
-            // Remove snapshots after fork_point from the in-memory map.
-            // split_off(fork_point+1) leaves entries <= fork_point in the original
-            // and returns entries > fork_point (which we discard).
-            if let Some(snapshots) = self.block_snapshots.get_mut(group_key_bytes) {
-                let _discarded = snapshots.split_off(&(fork_point + 1));
-            }
-
-            // Find the state at fork_point (or the most recent before it)
-            let state = self.find_state_at_or_before(group_key_bytes, fork_point, pending)?;
-            self.state_cache.insert(group_key_bytes.clone(), state);
-
-            // Clean up empty snapshot maps
-            if let Some(snapshots) = self.block_snapshots.get(group_key_bytes) {
-                if snapshots.is_empty() {
-                    self.block_snapshots.remove(group_key_bytes);
-                }
-            }
-        }
-
-        Ok(affected_keys.len())
+        affected
     }
 
     /// Drop all in-memory state: each group loads its stored state again on
     /// its next row.
     pub fn reload(&mut self) {
-        self.state_cache.clear();
-        self.block_snapshots.clear();
+        self.groups.clear();
         self.block_groups.clear();
         self.pending_durable.clear();
         self.emits.truncate_columns(self.def.group_by.len());
@@ -482,128 +462,58 @@ impl ReducerEngine {
     }
 
     /// Merge the blocks up to `block` into finalized state: they can no longer
-    /// roll back. Their groups wait in `pending_durable` for `write_checkpoint`,
-    /// which reads each group's newest snapshot at or before finality, so the
-    /// older snapshots go now.
+    /// roll back, so their undo entries go. Their groups wait in
+    /// `pending_durable` for `write_checkpoint`.
     pub fn advance_finality(&mut self, block: BlockNumber) {
         let remaining = self.block_groups.split_off(&(block + 1));
         let finalized = std::mem::replace(&mut self.block_groups, remaining);
 
-        for key in finalized.into_values().flatten() {
-            if let Some(snapshots) = self.block_snapshots.get_mut(&key) {
-                let newest = snapshots.range(..=block).next_back().map(|(b, _)| *b);
-                if let Some(newest) = newest {
-                    while let Some(entry) = snapshots.first_entry() {
-                        if *entry.key() >= newest {
-                            break;
-                        }
-                        entry.remove();
-                    }
-                }
+        for id in finalized.into_values().flatten() {
+            let group = &mut self.groups.all[id];
+            let final_entries = group.undo.partition_point(|(b, _)| *b <= block);
+            group.undo.drain(..final_entries);
+
+            if !group.pending_durable {
+                group.pending_durable = true;
+                self.pending_durable.push(id);
             }
-            self.pending_durable.insert(key);
         }
     }
 
     /// Write the state as of `finalized` of every group in `pending_durable`.
-    /// Storage then holds that state, so the snapshots up to `finalized` go.
     pub fn write_checkpoint(&mut self, finalized: BlockNumber, batch: &mut StorageWriteBatch) {
-        for key in std::mem::take(&mut self.pending_durable) {
-            let state_bytes = self
-                .find_snapshot_at_or_before(&key, finalized)
-                .map(storage::encode_values);
+        for id in self.pending_durable.drain(..) {
+            let group = &mut self.groups.all[id];
+            group.pending_durable = false;
 
-            if let Some(snapshots) = self.block_snapshots.get_mut(&key) {
-                // Not `split_off`: it allocates a new root even when no block is
-                // above `finalized`.
-                while let Some(entry) = snapshots.first_entry() {
-                    if *entry.key() > finalized {
-                        break;
-                    }
-                    entry.remove();
-                }
-                if snapshots.is_empty() {
-                    self.block_snapshots.remove(&key);
-                }
-            }
-
-            if let Some(state_bytes) = state_bytes {
-                batch.set_reducer_finalized(&self.def.name, key, state_bytes);
-            }
+            let above = group.undo.partition_point(|(b, _)| *b <= finalized);
+            let state = group.undo.get(above).map_or(&group.state, |(_, state)| state);
+            batch.set_reducer_finalized(&self.def.name, group.key.to_vec(), storage::encode_values(state));
         }
     }
+}
 
-    /// Find state at or before the given block from in-memory snapshots,
-    /// falling back to finalized state (pending, then stored) or defaults.
-    fn find_state_at_or_before(
-        &self,
-        group_key_bytes: &[u8],
-        block: BlockNumber,
-        pending: &PendingWrites,
-    ) -> Result<Vec<Value>> {
-        if let Some(values) = self.find_snapshot_at_or_before(group_key_bytes, block) {
-            return Ok(values.to_vec());
-        }
-
-        // `write_checkpoint` drops the snapshots it persists, so a checkpoint
-        // that waits for an ack is the newest state of this group.
-        if let Some(bytes) = pending.reducer_finalized(&self.def.name, group_key_bytes) {
-            return decode_state(bytes, &self.def.name, self.default_state.len());
-        }
-
-        // Fall back to finalized state in storage
-        load_state_from(
-            self.storage.as_ref(),
-            &self.def.name,
-            group_key_bytes,
-            &self.default_state,
-        )
+/// Write the group key of `row` into `key`: the raw bytes of a single
+/// String group-by column, else the encoded group-by values, Null for a
+/// column that the row lacks.
+fn write_group_key(key: &mut Vec<u8>, group_by_ids: &[Option<ColumnId>], row: &Row) {
+    key.clear();
+    if group_by_ids.is_empty() {
+        return;
     }
 
-    /// Look up the most recent in-memory snapshot at or before the given block.
-    /// Returns the positional state values (schema field order).
-    fn find_snapshot_at_or_before(
-        &self,
-        group_key_bytes: &[u8],
-        block: BlockNumber,
-    ) -> Option<&[Value]> {
-        self.block_snapshots
-            .get(group_key_bytes)
-            .and_then(|snapshots| {
-                snapshots
-                    .range(..=block)
-                    .next_back()
-                    .map(|(_, values)| values.as_slice())
-            })
+    let values = row.values();
+    if let [Some(id)] = group_by_ids
+        && let Value::String(s) = &values[*id as usize]
+    {
+        key.extend_from_slice(s.as_bytes());
+        return;
     }
 
-    fn compute_group_key_bytes(&self, row: &Row) -> Vec<u8> {
-        if self.group_by_ids.is_empty() {
-            return Vec::new();
-        }
-        let values = row.values();
-        // Fast path: single string group key — use raw bytes instead of MessagePack
-        if self.group_by_ids.len() == 1 {
-            if let Some(id) = self.group_by_ids[0] {
-                if let Value::String(s) = &values[id as usize] {
-                    return s.as_bytes().to_vec();
-                }
-            }
-        }
-        // General path: direct Vec indexing with pre-computed column IDs
-        let key: GroupKey = self
-            .group_by_ids
-            .iter()
-            .map(|id| {
-                id.map(|i| {
-                    let v = &values[i as usize];
-                    if v.is_null() { Value::Null } else { v.clone() }
-                })
-                .unwrap_or(Value::Null)
-            })
-            .collect();
-        storage::encode_group_key(&key)
-    }
+    let group_values = group_by_ids
+        .iter()
+        .map(|id| id.map_or(&Value::Null, |i| &values[i as usize]));
+    storage::write_group_key(key, group_values);
 }
 
 /// Load reducer state from storage, avoiding borrowing the entire ReducerEngine.
@@ -855,7 +765,7 @@ mod tests {
             .unwrap();
 
         // Rollback block 2
-        let affected = engine.rollback(1000, &PendingWrites::default()).unwrap();
+        let affected = engine.rollback(1000);
         assert_eq!(affected, 1);
 
         // Process block 2 again with different data
@@ -924,7 +834,7 @@ mod tests {
             .unwrap();
 
         // Rollback to 1001
-        engine.rollback(1001, &PendingWrites::default()).unwrap();
+        engine.rollback(1001);
 
         // After rollback: state should be at block 1001 (qty=15, cost=30500)
         let output = engine
@@ -935,10 +845,11 @@ mod tests {
         assert!((pnl - 1000.0).abs() < 0.01);
     }
 
-    /// Under deferral a finalize keeps only the newest finalized snapshot of
-    /// a group, and the next checkpoint persists that state.
+    /// Under deferral a finalize drops the undo entries up to finality, and
+    /// the next checkpoint persists the state as of finality, not the state
+    /// of a later block.
     #[test]
-    fn deferred_finalize_keeps_newest_finalized_snapshot() {
+    fn deferred_finalize_persists_the_state_as_of_finality() {
         let storage = Arc::new(MemoryBackend::new());
         let mut engine =
             ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]);
@@ -951,20 +862,20 @@ mod tests {
                 engine.advance_finality(block - 2);
             }
         }
-        let blocks: Vec<BlockNumber> = engine
-            .block_snapshots
-            .values()
-            .flat_map(|snapshots| snapshots.keys().copied())
-            .collect();
-        assert_eq!(blocks, vec![8, 9, 10]);
+        let blocks: Vec<BlockNumber> = engine.groups.all[0].undo.iter().map(|(b, _)| *b).collect();
+        assert_eq!(blocks, vec![9, 10]);
 
         let mut batch = StorageWriteBatch::new();
         engine.advance_finality(9);
         engine.write_checkpoint(9, &mut batch);
         storage.commit(&batch).unwrap();
 
+        let stored = storage.get_reducer_finalized("pnl_tracker", b"alice").unwrap().unwrap();
+        let stored = storage::decode_values(&stored).unwrap();
+        assert_eq!(stored, [Value::Float64(9.0), Value::Float64(900.0)]);
+
         // Block 10 rolls back onto the persisted state: 9 bought at 100.
-        engine.rollback(9, &PendingWrites::default()).unwrap();
+        engine.rollback(9);
         let output = engine
             .process_block(10, &[make_trade("alice", "sell", 9.0, 200.0)])
             .unwrap();
@@ -1150,7 +1061,7 @@ mod tests {
             .process_block(1001, &[make_trade("alice", "buy", 5.0, 2100.0)])
             .unwrap();
 
-        engine.rollback(1000, &PendingWrites::default()).unwrap();
+        engine.rollback(1000);
 
         let output = engine
             .process_block(1001, &[make_trade("alice", "sell", 3.0, 2200.0)])
