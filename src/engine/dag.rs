@@ -756,12 +756,11 @@ impl SettleEngine {
             .cloned()
             .collect();
 
-        let none_pending = PendingWrites::default();
         for name in upstream.iter().chain(&downstream) {
             if let Some(&i) = self.branch_index.get(name) {
-                self.branches[i].reducer.rollback(finalized, &none_pending)?;
+                self.branches[i].reducer.rollback(finalized);
             } else if let Some(reducer) = self.reducers.get_mut(name) {
-                reducer.rollback(finalized, &none_pending)?;
+                reducer.rollback(finalized);
             }
         }
         // The compensating records of these rollbacks go nowhere: the
@@ -1034,10 +1033,10 @@ impl SettleEngine {
                     if let Some(branch) =
                         self.branch_index.get(name).map(|&i| &mut self.branches[i])
                     {
-                        branch.reducer.rollback(fork_point, pending)?;
+                        branch.reducer.rollback(fork_point);
                     } else {
                         let reducer = self.reducers.get_mut(name).unwrap();
-                        reducer.rollback(fork_point, pending)?;
+                        reducer.rollback(fork_point);
                     }
                 }
                 PipelineNode::RawTable(name) => {

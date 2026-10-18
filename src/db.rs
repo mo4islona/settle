@@ -356,7 +356,7 @@ pub struct Settle {
     ack_warning_threshold: Duration,
     /// Set when a non-recoverable commit (heartbeat immediate-commit) fails.
     /// In that case the engine's in-memory state has already mutated past
-    /// disk (e.g. `advance_finality` pruned `block_snapshots`) and naively
+    /// disk (e.g. `advance_finality` dropped undo entries) and naively
     /// retrying would write a checkpoint from the pruned state, an *empty*
     /// batch, silently leaving CF_REDUCER_FIN stale. Also set when a rollback
     /// fails part way, or an ingest fails after its fork rollback: memory then
