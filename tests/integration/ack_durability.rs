@@ -934,8 +934,8 @@ fn register_reducer_callback_rejects_second_attach() {
         Box::new(FnReducerRuntime::new(|state, row| {
             let q = state.get("qty").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let a = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            state.insert("qty".into(), Value::Float64(q + a));
-            vec![HashMap::new()]
+            state.set("qty", Value::Float64(q + a));
+            state.emit(HashMap::new())
         })),
     )
     .expect("first attach should succeed");
@@ -944,7 +944,7 @@ fn register_reducer_callback_rejects_second_attach() {
     let err = db
         .register_reducer_callback(
             "pnl",
-            Box::new(FnReducerRuntime::new(|_state, _row| vec![HashMap::new()])),
+            Box::new(FnReducerRuntime::new(|ctx, _row| ctx.emit(HashMap::new()))),
         )
         .unwrap_err();
     match err {
@@ -961,7 +961,7 @@ fn register_reducer_callback_rejects_second_attach() {
     let err = db
         .register_reducer_callback(
             "no_such_reducer",
-            Box::new(FnReducerRuntime::new(|_state, _row| vec![HashMap::new()])),
+            Box::new(FnReducerRuntime::new(|ctx, _row| ctx.emit(HashMap::new()))),
         )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidOperation(msg) if msg.contains("unknown reducer")));
@@ -983,7 +983,7 @@ fn register_reducer_callback_rejects_lua_reducer() {
     let err = db
         .register_reducer_callback(
             "market_stats",
-            Box::new(FnReducerRuntime::new(|_state, _row| vec![HashMap::new()])),
+            Box::new(FnReducerRuntime::new(|ctx, _row| ctx.emit(HashMap::new()))),
         )
         .unwrap_err();
     match err {
