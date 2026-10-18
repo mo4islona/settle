@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use settle::types::{RowMap, Value};
-use testcontainers::{runners::AsyncRunner, ContainerAsync};
+use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres as PgImage;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, NoTls};
@@ -113,6 +113,16 @@ pub fn print_result_split(
     );
 }
 
+/// The Postgres image tag; `PG_TAG` overrides it. Without a tag the
+/// testcontainers module starts Postgres 11. Debian, not alpine: production
+/// Postgres runs on glibc, and the musl build runs `ON CONFLICT DO UPDATE`
+/// about 1.35x slower.
+const PG_TAG: &str = "18";
+
+fn pg_tag() -> String {
+    std::env::var("PG_TAG").unwrap_or_else(|_| PG_TAG.to_string())
+}
+
 /// Wraps a `testcontainers` Postgres instance and a `tokio` runtime so
 /// the sync `BenchBackend::ingest_batch` can drive async `tokio_postgres`.
 ///
@@ -149,7 +159,15 @@ impl PgRuntime {
             .build()?;
 
         let (container, client) = rt.block_on(async {
-            let container = PgImage::default().start().await?;
+            let container = PgImage::default()
+                .with_tag(pg_tag())
+                // The benches run a chain about 100x faster than real time. With
+                // the default 60 s nap, autovacuum does not run within a case, and
+                // a table that logs every write (Ponder's undo log) grows without
+                // a bound.
+                .with_cmd(["postgres", "-c", "autovacuum_naptime=1"])
+                .start()
+                .await?;
             let host = container.get_host().await?;
             let port = container.get_host_port_ipv4(5432).await?;
             let conn_str = format!(
@@ -272,9 +290,10 @@ enum BaselineMode {
 /// `PG_BASELINE=refresh` measures every case again, `PG_BASELINE=off` runs
 /// each case once and keeps nothing.
 ///
-/// The key is the bench's config and `version`, not its source: the two
-/// sides of an A/B can differ in their Settle code and still share one
-/// baseline. Bump `version` when the SQL or the workload of a case changes.
+/// The key is the bench's config, the Postgres image and `version`, not its
+/// source: the two sides of an A/B can differ in their Settle code and still
+/// share one baseline. Bump `version` when the SQL or the workload of a case
+/// changes.
 pub struct PgBaseline {
     path: PathBuf,
     mode: BaselineMode,
@@ -299,7 +318,7 @@ impl PgBaseline {
         let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join("pg_baseline")
             .join(format!("{bench}.json"));
-        let key = format!("v{version} {config}");
+        let key = format!("v{version} postgres:{} {config}", pg_tag());
 
         let stored = std::fs::read(&path)
             .ok()
