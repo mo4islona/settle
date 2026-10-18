@@ -132,6 +132,20 @@ function assignCode(obj: string, name: string, expr: string): string {
   return `${obj}[${JSON.stringify(name)}] = ${expr}`
 }
 
+/** `obj[name] = value` as an own field, also for `__proto__`. */
+function setOwn<T>(obj: Record<string, T>, name: string, value: T): void {
+  if (name === '__proto__') {
+    Object.defineProperty(obj, name, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    })
+  } else {
+    obj[name] = value
+  }
+}
+
 /** Distinct name lists are few (tables, views, reducers); the cap only bounds a misuse. */
 const MAX_COMPILED = 1024
 const compiled = new Map<string, unknown>()
@@ -535,7 +549,7 @@ export function readBatch(buffer: ArrayBuffer, joined: string, others: Others): 
       }
       records.push({ table: l.table, operation: OPERATIONS[flags & 3], key, values, prevValues })
     }
-    tables[name] = records
+    setOwn(tables, name, records)
   }
 
   const cursor = { slot, at }

@@ -268,6 +268,27 @@ describe('Binary bridge', () => {
     expect(batch.tables.docs[0].values).toEqual({ block_number: 1, meta: '{"x":1}', n: 42 })
   })
 
+  it('keeps a table named __proto__ as an own key of the batch', async () => {
+    const db = Settle.open({
+      schema: 'CREATE TABLE __proto__ (block_number UInt64, __proto__ String);',
+    })
+
+    const batch = await ingestAndAck(db, {
+      data: { ['__proto__']: [{ block_number: 1, ['__proto__']: 'x' }] },
+      ...at(1),
+    })
+
+    const tables = batch!.tables
+    expect(Object.getPrototypeOf(tables)).toBe(Object.prototype)
+    expect(Object.keys(tables)).toEqual(['__proto__'])
+    const [record] = Object.values(tables)[0]
+    expect(record.table).toBe('__proto__')
+    expect(Object.entries(record.values)).toEqual([
+      ['block_number', 1],
+      ['__proto__', 'x'],
+    ])
+  })
+
   it('rejects rows of a table that the schema lacks, unless there are none', async () => {
     const db = Settle.open({ schema: NOTES_SCHEMA })
     await expect(db.ingest({ data: { nope: [{ block_number: 1 }] }, ...at(1) })).rejects.toThrow(
