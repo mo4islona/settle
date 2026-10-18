@@ -606,6 +606,12 @@ pub trait StorageBackend: Send + Sync {
 
     fn set_reducer_finalized(&self, reducer: &str, group_key: &[u8], state: &[u8]) -> Result<()>;
 
+    /// Whether any group of `reducer` has a finalized state. A backend that
+    /// can stop at the first key overrides this default, which lists them all.
+    fn has_reducer_finalized(&self, reducer: &str) -> Result<bool> {
+        Ok(!self.list_reducer_group_keys(reducer)?.is_empty())
+    }
+
     fn delete_reducer_states_up_to(
         &self,
         reducer: &str,
@@ -714,6 +720,35 @@ mod tests {
     fn delete_raw_rows_in_rocksdb() {
         let dir = tempfile::tempdir().unwrap();
         check_delete_raw_rows(&rocks::RocksDbBackend::open(dir.path()).unwrap());
+    }
+
+    /// The probe sees only its own reducer, not the names next to it in key
+    /// order, and sees the empty key of a reducer without GROUP BY.
+    fn check_has_reducer_finalized(backend: &dyn StorageBackend) {
+        assert!(!backend.has_reducer_finalized("r").unwrap());
+
+        let mut neighbours = StorageWriteBatch::new();
+        neighbours.set_reducer_finalized("q", b"k".to_vec(), vec![1]);
+        neighbours.set_reducer_finalized("rr", b"k".to_vec(), vec![1]);
+        backend.commit(&neighbours).unwrap();
+        assert!(!backend.has_reducer_finalized("r").unwrap());
+
+        let mut own = StorageWriteBatch::new();
+        own.set_reducer_finalized("r", Vec::new(), vec![1]);
+        backend.commit(&own).unwrap();
+        assert!(backend.has_reducer_finalized("r").unwrap());
+    }
+
+    #[test]
+    fn has_reducer_finalized_in_memory() {
+        check_has_reducer_finalized(&memory::MemoryBackend::new());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn has_reducer_finalized_in_rocksdb() {
+        let dir = tempfile::tempdir().unwrap();
+        check_has_reducer_finalized(&rocks::RocksDbBackend::open(dir.path()).unwrap());
     }
 
     #[test]
