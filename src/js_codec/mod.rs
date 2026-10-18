@@ -66,6 +66,42 @@ pub fn bigint_to_value(negative: bool, words: &[u64]) -> Option<Value> {
     }
 }
 
+/// A JS number in JSON, as the msgpack input made it: a safe integer is an
+/// integer; NaN and ±Infinity are null.
+pub fn json_number(n: f64) -> serde_json::Value {
+    let safe = n.fract() == 0.0 && n.abs() <= MAX_SAFE_INTEGER as f64;
+    match (safe, n >= 0.0) {
+        (true, true) => serde_json::Value::from(n as u64),
+        (true, false) => serde_json::Value::from(n as i64),
+        (false, _) => serde_json::Number::from_f64(n).map_or(serde_json::Value::Null, Into::into),
+    }
+}
+
+/// A JSON number as JS gets it: an integer past 2^53 as a BigInt, as the
+/// msgpack output did.
+#[derive(Debug, PartialEq)]
+pub enum JsNumber {
+    Number(f64),
+    BigUint(u64),
+    BigInt(i64),
+}
+
+pub fn js_number(n: &serde_json::Number) -> JsNumber {
+    if let Some(u) = n.as_u64() {
+        return match u <= MAX_SAFE_INTEGER {
+            true => JsNumber::Number(u as f64),
+            false => JsNumber::BigUint(u),
+        };
+    }
+    if let Some(i) = n.as_i64() {
+        return match i.unsigned_abs() <= MAX_SAFE_INTEGER {
+            true => JsNumber::Number(i as f64),
+            false => JsNumber::BigInt(i),
+        };
+    }
+    JsNumber::Number(n.as_f64().unwrap_or(f64::NAN))
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);

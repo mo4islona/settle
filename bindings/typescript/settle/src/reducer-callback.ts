@@ -77,6 +77,7 @@ export function nativeBatchCallback<TState, TRow, TEmit>(
     for (let g = 0; g < groupCount; g++) {
       const rowCount = ints[sizesAt + g]
       const ctx = new Ctx(tags, nums, strings, o, g * stateCount)
+      out.ctx = ctx
       out.beginGroup()
       for (let r = 0; r < rowCount; r++) {
         out.row = r

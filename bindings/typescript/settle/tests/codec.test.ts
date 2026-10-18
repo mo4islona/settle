@@ -141,6 +141,81 @@ describe('Binary bridge', () => {
     expect(batch!.tables.blobs[0].key).toEqual({ block_number: 1, _row_index: 0 })
   })
 
+  it('keeps the numbers of a nested object on ingest as msgpack did', async () => {
+    const db = Settle.open({ schema: 'CREATE TABLE docs (block_number UInt64, meta String);' })
+    const meta = {
+      n: 1e20,
+      k: 5,
+      neg: -7,
+      f: 1.5,
+      b: 5n,
+      nan: Number.NaN,
+      u: undefined,
+      list: [1, 'x', null],
+      o: { z: true },
+    }
+    const batch = await ingestAndAck(db, { data: { docs: [{ block_number: 1, meta }] }, ...at(1) })
+
+    expect(batch!.tables.docs[0].values.meta).toBe(
+      '{"b":5,"f":1.5,"k":5,"list":[1,"x",null],"n":1e+20,"nan":null,"neg":-7,"o":{"z":true},"u":null}',
+    )
+  })
+
+  it('gives JSON integers back as numbers, and as BigInt only past 2^53', async () => {
+    const db = Settle.open({
+      schema: `
+        CREATE TABLE events (block_number UInt64, user String);
+        CREATE REDUCER tagged SOURCE events GROUP BY user STATE (meta JSON DEFAULT '{}') LANGUAGE EXTERNAL;
+        CREATE MATERIALIZED VIEW latest AS SELECT user, last(meta) AS meta FROM tagged GROUP BY user;
+      `,
+    })
+    const seen: unknown[] = []
+    db.registerReducerCallback<{ meta: any }>('tagged', (state) => {
+      seen.push(state.meta)
+      const meta = { n: 5_000_000_000, big: 2n ** 60n, f: 0.5, e: 1e20 }
+      state.update({ meta })
+      state.emit({ meta })
+    })
+
+    const first = await ingestAndAck(db, {
+      data: { events: [{ block_number: 1, user: 'a' }] },
+      ...at(1),
+    })
+    await ingestAndAck(db, { data: { events: [{ block_number: 2, user: 'a' }] }, ...at(2) })
+
+    const meta = first!.tables.latest[0].values.meta
+    expect(meta).toEqual({ n: 5_000_000_000, big: 2n ** 60n, f: 0.5, e: 1e20 })
+    expect(typeof meta.n).toBe('number')
+    expect(seen).toEqual([{}, { n: 5_000_000_000, big: 2n ** 60n, f: 0.5, e: 1e20 }])
+  })
+
+  it('keeps update and emit working when the reducer destructures them', async () => {
+    const db = Settle.open({
+      schema: `
+        CREATE TABLE notes (block_number UInt64, user String);
+        CREATE REDUCER counter SOURCE notes GROUP BY user STATE (n UInt64 DEFAULT 0) LANGUAGE EXTERNAL;
+        CREATE MATERIALIZED VIEW counts AS SELECT user, last(n) AS n FROM counter GROUP BY user;
+      `,
+    })
+    db.registerReducerCallback<{ n: number }>('counter', ({ n, update, emit }) => {
+      update({ n: n + 1 })
+      emit({ n: n + 1 })
+    })
+
+    const batch = await ingestAndAck(db, {
+      data: {
+        notes: [
+          { block_number: 1, user: 'a' },
+          { block_number: 1, user: 'a' },
+        ],
+      },
+      ...at(1),
+    })
+
+    expect(batch!.tables.counts[0].values.n).toBe(2)
+    expect('n' in globalThis).toBe(false)
+  })
+
   it('rejects rows of a table that the schema lacks, unless there are none', async () => {
     const db = Settle.open({ schema: NOTES_SCHEMA })
     await expect(db.ingest({ data: { nope: [{ block_number: 1 }] }, ...at(1) })).rejects.toThrow(

@@ -310,6 +310,8 @@ export type GroupResults = [Uint32Array, Uint8Array, Float64Array, string, strin
 export class GroupWriter extends Writer {
   /** The index in its group of the row that `reduce` runs on. */
   row = 0
+  /** The context of the current group: `update` and `emit` use no `this`, so that they work destructured. */
+  ctx: Record<string, unknown> | undefined = undefined
   changed = false
   next: unknown = undefined
   private groupAt = 0
@@ -427,14 +429,17 @@ export class ReducerLayout {
 /**
  * A class whose objects hold the state fields of a group, read from slots.
  * `update(next)` makes `next` the state that goes back to the engine and
- * shows its fields; `emit(row)` writes an emit of the current row.
+ * shows its fields on the context of the current group; `emit(row)` writes
+ * an emit of the current row.
  */
 function ctxClass(names: readonly string[], out: GroupWriter): CtxClass {
   const init = names.map((name, i) => assignCode('this', name, `value(t, n, s, o, b + ${i})`))
-  const update = names.map((name) => assignCode('this', name, readCode('next', name)))
+  const update = names.map((name) => assignCode('ctx', name, readCode('next', name)))
   const source = `
+    "use strict"
     function Ctx(t, n, s, o, b) { ${init.join('; ')} }
     Ctx.prototype.update = function update(next) {
+      const ctx = out.ctx
       out.changed = true
       out.next = next
       ${update.join('; ')}

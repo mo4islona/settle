@@ -557,3 +557,26 @@ fn ingest_rejects_a_row_count_without_rows() {
     let err = decode_tables(&out).unwrap_err();
     assert!(err.contains("the values end"), "{err}");
 }
+
+/// Numbers in JSON follow the msgpack paths: a safe integer is an integer
+/// in, a number out; past 2^53 an integer is a BigInt out.
+#[test]
+fn json_numbers_follow_msgpack() {
+    assert_eq!(json_number(5.0), serde_json::json!(5));
+    assert_eq!(json_number(-0.0), serde_json::json!(0));
+    assert_eq!(json_number(-7.0), serde_json::json!(-7));
+    assert_eq!(json_number(1.5), serde_json::json!(1.5));
+    assert_eq!(json_number(1e20), serde_json::json!(1e20));
+    assert_eq!(json_number(f64::NAN), serde_json::Value::Null);
+    assert_eq!(serde_json::json!({ "n": json_number(1e20) }).to_string(), r#"{"n":1e+20}"#);
+
+    let number = |json: serde_json::Value| match json {
+        serde_json::Value::Number(n) => js_number(&n),
+        other => panic!("{other}"),
+    };
+    assert_eq!(number(serde_json::json!(5_000_000_000u64)), JsNumber::Number(5e9));
+    assert_eq!(number(serde_json::json!(-3)), JsNumber::Number(-3.0));
+    assert_eq!(number(serde_json::json!(1u64 << 60)), JsNumber::BigUint(1 << 60));
+    assert_eq!(number(serde_json::json!(-(1i64 << 60))), JsNumber::BigInt(-(1 << 60)));
+    assert_eq!(number(serde_json::json!(0.5)), JsNumber::Number(0.5));
+}
