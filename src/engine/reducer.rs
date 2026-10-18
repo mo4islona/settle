@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::reducer_runtime::event_rules::EventRulesRuntime;
 #[cfg(feature = "lua")]
 use crate::reducer_runtime::lua::LuaRuntime;
-use crate::reducer_runtime::{Emits, GroupBatch, GroupState, ReducerRuntime};
+use crate::reducer_runtime::{Emits, GroupBatch, GroupState, GroupedRows, ReducerRuntime};
 use crate::schema::ast::{ReducerBody, ReducerDef};
 use crate::storage::{self, PendingWrites, StorageBackend, StorageWriteBatch};
 use crate::types::{BlockNumber, ColumnId, ColumnRegistry, GroupKey, Row, Value};
@@ -336,99 +336,83 @@ impl ReducerEngine {
     /// Batched path: groups rows by key, calls process_grouped() once.
     /// Avoids per-row FFI overhead for external reducers.
     fn process_block_batched(&mut self, block: BlockNumber, rows: &[Row]) -> Result<()> {
-        // Phase 1: Group rows by key, load states
-        let mut key_order: Vec<Vec<u8>> = Vec::new();
-        let mut group_map: HashMap<Vec<u8>, (usize, Vec<usize>)> = HashMap::new();
-
-        for (row_idx, row) in rows.iter().enumerate() {
+        // The group of each row; the groups in order of their first row.
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut sizes: Vec<usize> = Vec::new();
+        let mut row_groups: Vec<usize> = Vec::with_capacity(rows.len());
+        let mut group_ids: FxHashMap<Vec<u8>, usize> = FxHashMap::default();
+        for row in rows {
             let key = self.compute_group_key_bytes(row);
-
-            // Single lookup: entry API with load on miss
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                self.state_cache.entry(key.clone())
-            {
-                let loaded = load_state_from(
-                    self.storage.as_ref(),
-                    &self.def.name,
-                    e.key(),
-                    &self.default_state,
-                )?;
-                e.insert(loaded);
-            }
-
-            group_map
-                .entry(key.clone())
-                .or_insert_with(|| {
-                    let idx = key_order.len();
-                    key_order.push(key);
-                    (idx, Vec::new())
-                })
-                .1
-                .push(row_idx);
+            let group = match group_ids.get(&key) {
+                Some(&group) => group,
+                None => {
+                    // Loaded before any state leaves the cache: a failed load
+                    // then loses none.
+                    if !self.state_cache.contains_key(&key) {
+                        let loaded = load_state_from(
+                            self.storage.as_ref(),
+                            &self.def.name,
+                            &key,
+                            &self.default_state,
+                        )?;
+                        self.state_cache.insert(key.clone(), loaded);
+                    }
+                    group_ids.insert(key.clone(), keys.len());
+                    keys.push(key);
+                    sizes.push(0);
+                    keys.len() - 1
+                }
+            };
+            sizes[group] += 1;
+            row_groups.push(group);
         }
 
-        // Build GroupBatch array — take states out of cache for the batch call
-        let mut batches: Vec<GroupBatch> = key_order
-            .iter()
-            .map(|key| {
-                let (_, row_indices) = &group_map[key];
-                let state = self.state_cache.remove(key).unwrap();
-                GroupBatch {
-                    state,
-                    rows: row_indices.iter().map(|&i| rows[i].clone()).collect(),
-                    emits: Vec::new(),
-                }
-            })
-            .collect();
+        let mut groups = Vec::with_capacity(keys.len());
+        let mut start = 0;
+        for (key, &size) in keys.iter().zip(&sizes) {
+            let state = self.state_cache.remove(key).expect("loaded above");
+            groups.push(GroupBatch {
+                state,
+                rows: start..start + size,
+            });
+            start += size;
+        }
 
-        // Phase 2: Single batch call
-        let processed = self
-            .runtime
-            .process_grouped(&mut batches, &self.state_fields)
-            .and_then(|()| self.check_emit_rows(&batches));
+        let mut next: Vec<usize> = groups.iter().map(|group| group.rows.start).collect();
+        let mut order = vec![0; rows.len()];
+        for (index, &group) in row_groups.iter().enumerate() {
+            order[next[group]] = index;
+            next[group] += 1;
+        }
+
+        let mut grouped = GroupedRows {
+            rows,
+            order,
+            groups,
+        };
+        let processed =
+            self.runtime
+                .process_grouped(&mut grouped, &self.state_fields, &mut self.emits);
         if let Err(e) = processed {
             // The undo of the failed ingest restores these keys from the
             // blocks before, also the states taken out of `state_cache`.
-            self.block_groups.entry(block).or_default().extend(key_order);
+            self.block_groups.entry(block).or_default().extend(keys);
             return Err(e);
         }
 
-        // Phase 3: restore states, save snapshots, collect emits by input row.
         let block_keys = self.block_groups.entry(block).or_default();
-        for (i, batch) in batches.into_iter().enumerate() {
-            let key = &key_order[i];
-            let (_, row_indices) = &group_map[key];
-
+        for (key, group) in keys.into_iter().zip(grouped.groups) {
             self.block_snapshots
                 .entry(key.clone())
                 .or_default()
-                .insert(block, batch.state.clone());
-            self.state_cache.insert(key.clone(), batch.state);
-            block_keys.insert(key.clone());
-
-            for (group_row, emit) in batch.emits {
-                self.emits.set_source(row_indices[group_row]);
-                self.emits.push_named(emit);
-            }
+                .insert(block, group.state.clone());
+            self.state_cache.insert(key.clone(), group.state);
+            block_keys.insert(key);
         }
 
         // The keys are in `block_groups`: the undo of the failed ingest
         // restores their states.
         self.emits.check()
-    }
-
-    /// Err if an emit names a row that its group does not have.
-    fn check_emit_rows(&self, batches: &[GroupBatch]) -> Result<()> {
-        for batch in batches {
-            if let Some((row, _)) = batch.emits.iter().find(|(row, _)| *row >= batch.rows.len()) {
-                return Err(Error::InvalidOperation(format!(
-                    "reducer '{}': an emit names row {row} of a group with {} rows",
-                    self.def.name,
-                    batch.rows.len()
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// Roll back all blocks after fork_point.
@@ -674,6 +658,8 @@ fn parse_default(default_str: &str, column_type: &crate::types::ColumnType) -> V
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::schema::ast::*;
     use crate::storage::memory::MemoryBackend;

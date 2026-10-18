@@ -4,10 +4,13 @@ pub mod fn_reducer;
 #[cfg(feature = "lua")]
 pub mod lua;
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::types::{ColumnId, ColumnRegistry, Row, RowMap, Value};
+use crate::types::{ColumnId, ColumnRegistry, Row, Value};
+#[cfg(test)]
+use crate::types::RowMap;
 
 /// The most distinct column names that the emits of a reducer use. Each
 /// emitted row has a value for every one of them, so emit keys taken from
@@ -195,17 +198,28 @@ pub(crate) fn run_by_name(
     Ok(rows.collect())
 }
 
-/// A batch of rows for a single group key, used by `process_grouped`.
-///
-/// The runtime processes rows in order, updating state, and appending emits.
+/// The rows of one block by group key, the input of `process_grouped`.
+pub struct GroupedRows<'a> {
+    /// The rows of the block, in input order.
+    pub rows: &'a [Row],
+    /// Indices in `rows`, group by group; each group keeps input order.
+    pub order: Vec<usize>,
+    pub groups: Vec<GroupBatch>,
+}
+
+impl GroupedRows<'_> {
+    /// The indices in `rows` of the rows of `group`.
+    pub fn row_indices(&self, group: &GroupBatch) -> &[usize] {
+        &self.order[group.rows.clone()]
+    }
+}
+
+/// One group of a block, used by `process_grouped`.
 pub struct GroupBatch {
     /// The group's state, in the order of the reducer's STATE fields.
     pub state: Vec<Value>,
-    pub rows: Vec<Row>,
-    /// Output rows produced by the runtime, each with the index in `rows` of
-    /// the row that emitted it. Filled during `process_grouped`. By name: a
-    /// host builds them from its own objects.
-    pub emits: Vec<(usize, RowMap)>,
+    /// The group's range in `GroupedRows::order`.
+    pub rows: Range<usize>,
 }
 
 /// Trait for reducer process logic runtimes.
@@ -235,33 +249,33 @@ pub trait ReducerRuntime: Send {
         false
     }
 
-    /// Process a batch of groups. Each group has its state and ordered rows.
-    /// `fields` names the state values.
+    /// Process the groups of a block, each with its state and its rows in
+    /// order. `fields` names the state values. Each emit goes into `emits`
+    /// with the index in `block.rows` of the row that emitted it as its
+    /// source.
     ///
     /// Only called when `use_batched_processing()` returns true.
     /// External (host-language) reducers override this for batch callbacks.
-    fn process_grouped(&self, groups: &mut [GroupBatch], fields: &ColumnRegistry) -> Result<()> {
-        let mut emits = Emits::default();
+    fn process_grouped(
+        &self,
+        block: &mut GroupedRows<'_>,
+        fields: &ColumnRegistry,
+        emits: &mut Emits,
+    ) -> Result<()> {
+        let GroupedRows {
+            rows,
+            order,
+            groups,
+        } = block;
         for group in groups.iter_mut() {
-            for (index, row) in group.rows.iter().enumerate() {
+            for &index in &order[group.rows.clone()] {
+                emits.set_source(index);
                 let state = GroupState {
                     values: &mut group.state,
                     fields,
                 };
-                self.process(state, row, &mut emits)?;
+                self.process(state, &rows[index], emits)?;
                 emits.check()?;
-
-                let columns = emits.columns().clone();
-                for (_, values) in emits.take() {
-                    let emit = columns
-                        .names()
-                        .iter()
-                        .cloned()
-                        .zip(values)
-                        .filter(|(_, v)| !v.is_null())
-                        .collect();
-                    group.emits.push((index, emit));
-                }
             }
         }
         Ok(())
