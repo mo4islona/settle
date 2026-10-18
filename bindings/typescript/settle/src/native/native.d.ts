@@ -48,13 +48,14 @@ export interface SettleCursor {
 export interface ForkResultJs {
   /** The block to resume ingestion from (highest common ancestor). */
   cursor: SettleCursor
-  /** Compensating change batch (msgpack-encoded), or null if nothing was rolled back. */
-  batch?: Buffer
+  /**
+   * Compensating change batch (`[buffer, strings, others]`, read by
+   * `readBatch` in `codec.ts`), or null if nothing was rolled back.
+   */
+  batch?: object
 }
-/** Input for the atomic `ingest()` method. */
+/** Input for the atomic `ingest()` method, besides the rows. */
 export interface IngestInput {
-  /** Table name → rows, msgpack-encoded as `{tableName: [{col: val}, ...], ...}`. */
-  data: Buffer
   /** Unfinalized blocks with hashes for fork resolution. */
   rollbackChain?: Array<SettleCursor>
   /** Finalized head cursor — both number and hash stored. */
@@ -104,11 +105,18 @@ export declare class Settle {
    */
   registerReducerCallback(name: string, callback: (...args: any[]) => any): void
   /**
+   * The columns of table `name` in the order that `ingest` takes their
+   * values, or null if the schema has no such table.
+   */
+  tableColumns(name: string): Array<string> | null
+  /**
    * Process a batch of rows for a raw table.
    * Atomic ingest: process all tables, store rollback chain, finalize, flush.
-   * Returns a msgpack-encoded ChangeBatch buffer, or null if no records produced.
+   * `rows` is `[ints, tags, nums, strings, others]` from `encodeTables` in
+   * `codec.ts`. Returns the ChangeBatch as `[buffer, strings, others]`
+   * (`readBatch` in `codec.ts`), or null if no records produced.
    */
-  ingest(input: IngestInput): Buffer | null
+  ingest(rows: object, input: IngestInput): object | null
   /**
    * Find the common ancestor between our state and the Portal's chain.
    * Returns the matching block cursor, or null if no common ancestor found.

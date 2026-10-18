@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 
-use napi::NapiRaw;
+use napi::{JsObject, JsUnknown, NapiRaw, NapiValue};
 use napi::bindgen_prelude::*;
 use napi::sys;
 use napi_derive::napi;
 
-use crate::db::{Config, IngestRows, Settle as Inner};
+use crate::db::{BlockRows, Config, IngestRows, Settle as Inner};
 use crate::error::Error as SettleError;
-use crate::msgpack_conv::{decode_table_rows_from_msgpack, encode_batch_to_msgpack};
+use crate::js_codec::napi::{element, other_value, read_strings, to_js, typed_array};
+use crate::js_codec::{self, Decoder};
 use crate::reducer_runtime::external::install_context;
 use crate::schema::ast::{ReducerBody, ReducerDef, StateField};
-use crate::types::{BlockCursor, ColumnType};
+use crate::types::{BlockCursor, ChangeBatch, ColumnRegistry, ColumnType};
 
 /// Convert a `SettleError` to a NAPI error. Typed variants (`PendingAck`,
 /// `WrongAckSequence`) are surfaced with a structured prefix that the TS
@@ -80,15 +81,14 @@ impl From<BlockCursor> for SettleCursor {
 pub struct ForkResultJs {
     /// The block to resume ingestion from (highest common ancestor).
     pub cursor: SettleCursor,
-    /// Compensating change batch (msgpack-encoded), or null if nothing was rolled back.
-    pub batch: Option<Buffer>,
+    /// Compensating change batch (`[buffer, strings, others]`, read by
+    /// `readBatch` in `codec.ts`), or null if nothing was rolled back.
+    pub batch: Option<JsObject>,
 }
 
-/// Input for the atomic `ingest()` method.
+/// Input for the atomic `ingest()` method, besides the rows.
 #[napi(object)]
 pub struct IngestInput {
-    /// Table name → rows, msgpack-encoded as `{tableName: [{col: val}, ...], ...}`.
-    pub data: Buffer,
     /// Unfinalized blocks with hashes for fork resolution.
     pub rollback_chain: Option<Vec<SettleCursor>>,
     /// Finalized head cursor — both number and hash stored.
@@ -351,17 +351,32 @@ impl Settle {
         Ok(())
     }
 
+    /// The columns of table `name` in the order that `ingest` takes their
+    /// values, or null if the schema has no such table.
+    #[napi]
+    pub fn table_columns(&self, name: String) -> Option<Vec<String>> {
+        self.inner
+            .table_registry(&name)
+            .map(|registry| registry.names().to_vec())
+    }
+
     /// Process a batch of rows for a raw table.
     // process_batch, rollback, finalize removed from public API:
     // not crash-safe individually. Use ingest() which handles all three atomically.
 
     /// Atomic ingest: process all tables, store rollback chain, finalize, flush.
-    /// Returns a msgpack-encoded ChangeBatch buffer, or null if no records produced.
+    /// `rows` is `[ints, tags, nums, strings, others]` from `TableWriter` in
+    /// `codec.ts`. Returns the ChangeBatch as `[buffer, strings, others]`
+    /// (`readBatch` in `codec.ts`), or null if no records produced.
     #[napi]
-    pub fn ingest(&mut self, env: Env, input: IngestInput) -> Result<Option<Buffer>> {
-        let data =
-            decode_table_rows_from_msgpack(&input.data, |table| self.inner.table_registry(table))
-                .map_err(|e| Error::new(Status::InvalidArg, e))?;
+    pub fn ingest(
+        &mut self,
+        env: Env,
+        rows: JsObject,
+        input: IngestInput,
+    ) -> Result<Option<JsObject>> {
+        let data = decode_rows(&env, &rows, |table| self.inner.table_registry(table))
+            .map_err(|e| Error::new(Status::InvalidArg, e))?;
 
         let rollback_chain = input
             .rollback_chain
@@ -394,7 +409,7 @@ impl Settle {
             .ingest_rows(ingest_input)
             .map_err(settle_err_to_napi)?;
 
-        Ok(batch.map(|b| Buffer::from(encode_batch_to_msgpack(&b))))
+        batch.map(|b| batch_to_js(&env, &b)).transpose()
     }
 
     /// Find the common ancestor between our state and the Portal's chain.
@@ -426,7 +441,7 @@ impl Settle {
     #[napi]
     pub fn handle_fork(
         &mut self,
-        _env: Env,
+        env: Env,
         previous_blocks: Vec<SettleCursor>,
     ) -> napi::Result<ForkResultJs> {
         let chain: Vec<crate::types::BlockCursor> = previous_blocks
@@ -439,9 +454,7 @@ impl Settle {
 
         let result = self.inner.handle_fork(chain).map_err(settle_err_to_napi)?;
 
-        let batch = result
-            .batch
-            .map(|b| Buffer::from(encode_batch_to_msgpack(&b)));
+        let batch = result.batch.map(|b| batch_to_js(&env, &b)).transpose()?;
 
         Ok(ForkResultJs {
             cursor: result.cursor.into(),
@@ -513,6 +526,55 @@ impl Settle {
     pub fn cursor(&self) -> Option<SettleCursor> {
         self.inner.latest_cursor().map(|c| c.into())
     }
+}
+
+/// The rows of `ingest`, `[ints, tags, nums, strings, others]`: ints
+/// start with their count and the slot count, then
+/// `js_codec::decode_ingest` reads them.
+fn decode_rows<'r>(
+    env: &Env,
+    rows: &JsObject,
+    registry: impl Fn(&str) -> Option<&'r std::sync::Arc<ColumnRegistry>>,
+) -> std::result::Result<HashMap<String, BlockRows>, String> {
+    let raw = unsafe { rows.raw() };
+    let part = |i| element(env, raw, i);
+    // SAFETY: `rows` holds the arrays for the whole call, and no JS runs
+    // while they are read.
+    let ints: &[u32] = unsafe { typed_array(env, part(0)?, sys::TypedarrayType::uint32_array)? };
+    let tags: &[u8] = unsafe { typed_array(env, part(1)?, sys::TypedarrayType::uint8_array)? };
+    let nums: &[f64] = unsafe { typed_array(env, part(2)?, sys::TypedarrayType::float64_array)? };
+    let strings = read_strings(env, part(3)?)?;
+    let others_array = part(4)?;
+
+    let [int_count, slot_count] = match ints {
+        [a, b, ..] => [*a as usize, *b as usize],
+        _ => return Err("the ints have no header".to_string()),
+    };
+    if int_count < 2 || int_count > ints.len() || slot_count > tags.len().min(nums.len()) {
+        return Err("the row header is out of range".to_string());
+    }
+
+    let mut dec = Decoder::new(
+        &ints[2..int_count],
+        &tags[..slot_count],
+        &nums[..slot_count],
+        strings.as_strings(),
+        true,
+    )?;
+    let mut others = |i| other_value(env, others_array, i, true);
+    js_codec::decode_ingest(&mut dec, registry, &mut others)
+}
+
+/// A change batch as `[buffer, strings, others]` (`readBatch` in `codec.ts`).
+fn batch_to_js(env: &Env, batch: &ChangeBatch) -> Result<JsObject> {
+    let parts = to_js(env, &js_codec::encode_batch(batch))
+        .map_err(|e| Error::new(Status::GenericFailure, e))?;
+    let mut array = env.create_array_with_length(parts.len())?;
+    for (i, part) in parts.into_iter().enumerate() {
+        let part = unsafe { JsUnknown::from_raw_unchecked(env.raw(), part) };
+        array.set_element(i as u32, part)?;
+    }
+    Ok(array)
 }
 
 fn parse_column_type(s: &str) -> ColumnType {

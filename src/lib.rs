@@ -12,6 +12,9 @@ mod change;
 pub mod db;
 pub mod engine;
 pub mod error;
+/// Public for `benches/instructions.rs`, which counts the napi boundary.
+#[doc(hidden)]
+pub mod js_codec;
 pub mod json_conv;
 pub mod msgpack_conv;
 #[cfg(feature = "napi")]

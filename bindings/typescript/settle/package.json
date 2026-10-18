@@ -33,9 +33,6 @@
     "lint": "biome check",
     "lint:fix": "biome check --fix"
   },
-  "dependencies": {
-    "@msgpack/msgpack": "^3.0.0"
-  },
   "optionalDependencies": {
     "@settle/stream-darwin-arm64": "0.0.1-alpha.20",
     "@settle/stream-darwin-x64": "0.0.1-alpha.20",

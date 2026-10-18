@@ -8,42 +8,32 @@
 //! The batched path sends all groups for a block in a single JS call,
 //! avoiding per-row FFI overhead.
 
-use crate::types::{ColumnRegistry, Row, Value};
+use crate::types::{ColumnRegistry, Row};
 
-use super::{Emits, GroupBatch, GroupState, ReducerRuntime};
-
-/// The largest integer that a JS number holds exactly: 2^53 - 1. Larger
-/// integers cross to JS as BigInt.
-#[cfg_attr(not(any(feature = "napi", feature = "wasm")), allow(dead_code))]
-const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
-
-/// The value of a JS BigInt from its sign and its 64-bit words, least
-/// significant first: UInt64, Int64 or Uint256. None if none of them holds it.
-#[cfg_attr(not(any(feature = "napi", feature = "wasm")), allow(dead_code))]
-fn bigint_to_value(negative: bool, words: &[u64]) -> Option<Value> {
-    let len = words.iter().rposition(|&w| w != 0).map_or(0, |i| i + 1);
-    let words = &words[..len];
-
-    match (negative, words) {
-        (_, []) => Some(Value::UInt64(0)),
-        (false, &[w]) => Some(Value::UInt64(w)),
-        (true, &[w]) if w <= 1 << 63 => Some(Value::Int64((w as i64).wrapping_neg())),
-        (false, _) if words.len() <= 4 => {
-            let mut be = [0u8; 32];
-            for (i, w) in words.iter().enumerate() {
-                be[32 - 8 * (i + 1)..32 - 8 * i].copy_from_slice(&w.to_be_bytes());
-            }
-            Some(Value::Uint256(be))
-        }
-        _ => None,
-    }
-}
+use super::{Emits, GroupState, GroupedRows, ReducerRuntime};
 
 /// The row of emit `index` from a callback that names no rows: emit n
 /// belongs to row n, and each emit past the rows to the last row.
-#[cfg_attr(not(any(feature = "napi", feature = "wasm")), allow(dead_code))]
+#[cfg(any(feature = "wasm", test))]
 fn legacy_emit_row(index: usize, rows: usize) -> usize {
     index.min(rows.saturating_sub(1))
+}
+
+/// The emit of host callback row `row` of a group whose rows are `rows`
+/// (indices in the block), by name.
+#[cfg(any(feature = "wasm", test))]
+fn push_host_emit(
+    emits: &mut Emits,
+    rows: &[usize],
+    row: usize,
+    emit: crate::types::RowMap,
+) -> Result<(), String> {
+    let &source = rows
+        .get(row)
+        .ok_or_else(|| format!("an emit names row {row} of a group with {} rows", rows.len()))?;
+    emits.set_source(source);
+    emits.push_named(emit);
+    Ok(())
 }
 
 // ─── Thread-local callback context (napi only) ────────────────────
@@ -52,14 +42,16 @@ fn legacy_emit_row(index: usize, rows: usize) -> usize {
 mod napi_bridge {
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::ptr;
 
-    use napi::NapiValue;
     use napi::sys;
 
-    use crate::json_conv::value_to_json;
-    use crate::types::{ColumnRegistry, Row, Value};
-
-    use super::{GroupBatch, MAX_SAFE_INTEGER, bigint_to_value, legacy_emit_row};
+    use crate::js_codec::napi::{
+        HandleScope, element, other_value, read_strings, to_js, typed_array,
+    };
+    use crate::js_codec::{self, Decoder};
+    use crate::reducer_runtime::{Emits, GroupedRows};
+    use crate::types::ColumnRegistry;
 
     /// Raw napi env + callback pointers. Stored in thread-local.
     /// We store raw pointers because napi::Ref<()> is not Clone.
@@ -105,234 +97,92 @@ mod napi_bridge {
         }
     }
 
-    /// Called by ExternalRuntime::process_grouped to invoke the JS callback.
-    pub fn call_js_batch(reducer_id: &str, groups: &mut [GroupBatch], fields: &ColumnRegistry) {
+    /// Run the JS callback of `reducer_id` on the groups of a block, in one
+    /// call each way (`nativeBatchCallback` in `reducer-callback.ts`).
+    ///
+    /// The callback gets `(buffer, strings, others)` from
+    /// `js_codec::encode_groups` and returns `[ints, tags, nums, strings,
+    /// columns, others]`: ints `[int count, slot count, column count, ...
+    /// js_codec::decode_group_results ..., the UTF-16 length of each
+    /// column name]`; `columns` is the emit column names, joined.
+    ///
+    /// If the callback throws, the JS exception stays pending: the ingest
+    /// that fails with this error rethrows it.
+    pub fn call_js_batch(
+        reducer_id: &str,
+        block: &mut GroupedRows<'_>,
+        fields: &ColumnRegistry,
+        emits: &mut Emits,
+    ) -> Result<(), String> {
         EXTERNAL_CTX.with(|cell| {
             let ctx = cell.borrow();
             let ctx = ctx
                 .as_ref()
-                .expect("ExternalRuntime called outside napi context");
-
+                .ok_or("external reducer called outside a napi call")?;
             let raw_ref = ctx
                 .callbacks
                 .get(reducer_id)
-                .unwrap_or_else(|| panic!("no callback for reducer '{}'", reducer_id));
+                .ok_or_else(|| format!("no callback for reducer '{reducer_id}'"))?;
+            let env = &ctx.env;
+            let raw = env.raw();
+            let _scope = HandleScope::open(env)?;
 
-            let env = ctx.env;
-
-            // Get JsFunction from raw ref
-            let mut raw_value: sys::napi_value = std::ptr::null_mut();
-            unsafe {
-                let status = sys::napi_get_reference_value(env.raw(), *raw_ref, &mut raw_value);
-                assert_eq!(status, sys::Status::napi_ok, "failed to get callback ref");
-            }
-            let js_fn = unsafe { napi::JsFunction::from_raw_unchecked(env.raw(), raw_value) };
-
-            // Marshal groups → JS
-            let js_input = groups_to_js(&env, groups, fields);
-
-            // Single JS call
-            let js_result = js_fn
-                .call(None, &[js_input])
-                .expect("external reducer callback threw an exception");
-
-            // Unmarshal result
-            js_result_to_groups(&env, js_result, groups, fields);
-        });
-    }
-
-    // ── Marshalling: Rust → JS ─────────────────────────────────────
-
-    fn groups_to_js(
-        env: &napi::Env,
-        groups: &[GroupBatch],
-        fields: &ColumnRegistry,
-    ) -> napi::JsObject {
-        let mut js_array = env.create_array_with_length(groups.len()).unwrap();
-        for (i, group) in groups.iter().enumerate() {
-            let mut group_obj = env.create_object().unwrap();
-
-            let state_obj = state_to_js(env, fields, &group.state);
-            group_obj.set_named_property("state", state_obj).unwrap();
-
-            let mut rows_array = env.create_array_with_length(group.rows.len()).unwrap();
-            for (j, row) in group.rows.iter().enumerate() {
-                let row_obj = row_to_js(env, row);
-                rows_array.set_element(j as u32, row_obj).unwrap();
-            }
-            group_obj.set_named_property("rows", rows_array).unwrap();
-
-            js_array.set_element(i as u32, group_obj).unwrap();
-        }
-        js_array
-    }
-
-    fn state_to_js(env: &napi::Env, fields: &ColumnRegistry, state: &[Value]) -> napi::JsObject {
-        let mut obj = env.create_object().unwrap();
-        for (name, val) in fields.names().iter().zip(state) {
-            let js_val = value_to_napi(env, val);
-            obj.set_named_property(name, js_val).unwrap();
-        }
-        obj
-    }
-
-    fn row_to_js(env: &napi::Env, row: &Row) -> napi::JsObject {
-        let mut obj = env.create_object().unwrap();
-        let registry = row.registry();
-        for name in registry.names() {
-            if let Some(val) = row.get(name) {
-                let js_val = value_to_napi(env, val);
-                obj.set_named_property(name, js_val).unwrap();
-            }
-        }
-        obj
-    }
-
-    fn value_to_napi(env: &napi::Env, val: &Value) -> napi::JsUnknown {
-        match val {
-            Value::Float64(f) => env.create_double(*f).unwrap().into_unknown(),
-            Value::UInt64(n) if *n <= MAX_SAFE_INTEGER => {
-                env.create_double(*n as f64).unwrap().into_unknown()
-            }
-            Value::UInt64(n) => env.create_bigint_from_u64(*n).unwrap().into_unknown().unwrap(),
-            Value::Int64(n) if n.unsigned_abs() <= MAX_SAFE_INTEGER => {
-                env.create_double(*n as f64).unwrap().into_unknown()
-            }
-            Value::Int64(n) => env.create_bigint_from_i64(*n).unwrap().into_unknown().unwrap(),
-            Value::String(s) => env.create_string(s).unwrap().into_unknown(),
-            Value::Boolean(b) => env.get_boolean(*b).unwrap().into_unknown(),
-            Value::Null => env.get_null().unwrap().into_unknown(),
-            Value::JSON(v) => env.to_js_value(v).unwrap(),
-            _ => {
-                let json = value_to_json(val);
-                env.to_js_value(&json).unwrap()
-            }
-        }
-    }
-
-    // ── Marshalling: JS → Rust ─────────────────────────────────────
-
-    fn js_result_to_groups(
-        env: &napi::Env,
-        result: napi::JsUnknown,
-        groups: &mut [GroupBatch],
-        fields: &ColumnRegistry,
-    ) {
-        let result_obj: napi::JsObject = result
-            .coerce_to_object()
-            .expect("external reducer must return an array");
-
-        for (i, group) in groups.iter_mut().enumerate() {
-            let group_result: napi::JsObject = result_obj
-                .get_element::<napi::JsObject>(i as u32)
-                .expect("result array too short");
-
-            // Parse state
-            let js_state: napi::JsObject = group_result
-                .get_named_property("state")
-                .expect("result group missing 'state'");
-            for (value, name) in group.state.iter_mut().zip(fields.names()) {
-                let js_value: napi::JsUnknown = js_state
-                    .get_named_property(name)
-                    .expect("failed to read a state field");
-                *value = napi_to_value(env, js_value);
+            let mut callback = ptr::null_mut();
+            let status = unsafe { sys::napi_get_reference_value(raw, *raw_ref, &mut callback) };
+            if status != sys::Status::napi_ok || callback.is_null() {
+                return Err("the callback is gone".to_string());
             }
 
-            let js_emits: napi::JsObject = group_result
-                .get_named_property("emits")
-                .expect("result group missing 'emits'");
-            let emits_len = js_emits.get_array_length().expect("emits must be an array");
-            let js_emit_rows: napi::JsUnknown = group_result
-                .get_named_property("emitRows")
-                .expect("failed to read 'emitRows'");
-            let emit_rows = match js_emit_rows.get_type().unwrap() {
-                napi::ValueType::Object => Some(js_emit_rows.coerce_to_object().unwrap()),
-                _ => None,
+            let args = to_js(env, &js_codec::encode_groups(block, fields))?;
+            let mut this = ptr::null_mut();
+            unsafe { sys::napi_get_undefined(raw, &mut this) };
+            let mut result = ptr::null_mut();
+            let status = unsafe {
+                sys::napi_call_function(raw, this, callback, args.len(), args.as_ptr(), &mut result)
             };
-
-            for j in 0..emits_len {
-                let js_emit: napi::JsObject =
-                    js_emits.get_element(j).expect("emit element missing");
-                let emit_map = js_object_to_value_map(env, &js_emit);
-                let row = match &emit_rows {
-                    Some(rows) => rows
-                        .get_element::<napi::JsNumber>(j)
-                        .and_then(|n| n.get_uint32())
-                        .expect("'emitRows' must hold a row index per emit")
-                        as usize,
-                    None => legacy_emit_row(j as usize, group.rows.len()),
-                };
-                group.emits.push((row, emit_map));
+            if status != sys::Status::napi_ok {
+                return Err("the callback threw".to_string());
             }
-        }
-    }
 
-    fn js_object_to_value_map(env: &napi::Env, obj: &napi::JsObject) -> crate::types::RowMap {
-        let mut map = crate::types::RowMap::new();
+            let part = |i| element(env, result, i);
+            // SAFETY: `result` holds the arrays until the scope closes, and
+            // no JS runs while they are read.
+            let ints: &[u32] =
+                unsafe { typed_array(env, part(0)?, sys::TypedarrayType::uint32_array)? };
+            let tags: &[u8] =
+                unsafe { typed_array(env, part(1)?, sys::TypedarrayType::uint8_array)? };
+            let nums: &[f64] =
+                unsafe { typed_array(env, part(2)?, sys::TypedarrayType::float64_array)? };
+            let strings = read_strings(env, part(3)?)?;
+            let column_names = read_strings(env, part(4)?)?;
+            let others_array = part(5)?;
 
-        let keys = obj.get_property_names().expect("failed to get object keys");
-        let len = keys.get_array_length().expect("keys not an array");
-
-        for i in 0..len {
-            let key: napi::JsString = keys.get_element(i).expect("key not a string");
-            let key_str = key
-                .into_utf8()
-                .expect("key not valid utf8")
-                .as_str()
-                .expect("key str failed")
-                .to_string();
-
-            let val: napi::JsUnknown = obj
-                .get_named_property(&key_str)
-                .expect("failed to get property");
-
-            let value = napi_to_value(env, val);
-            map.insert(key_str, value);
-        }
-
-        map
-    }
-
-    fn napi_to_value(env: &napi::Env, val: napi::JsUnknown) -> Value {
-        use napi::ValueType;
-
-        match val.get_type().unwrap() {
-            ValueType::Number => {
-                let n = val.coerce_to_number().unwrap().get_double().unwrap();
-                Value::Float64(n)
+            let [int_count, slot_count, column_count] = match ints {
+                [a, b, c, ..] => [*a as usize, *b as usize, *c as usize],
+                _ => return Err("the ints have no header".to_string()),
+            };
+            let valid = int_count <= ints.len()
+                && 3 + column_count <= int_count
+                && slot_count <= tags.len()
+                && slot_count <= nums.len();
+            if !valid {
+                return Err("the output header is out of range".to_string());
             }
-            ValueType::String => {
-                let s = val
-                    .coerce_to_string()
-                    .unwrap()
-                    .into_utf8()
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-                    .to_string();
-                Value::String(s)
-            }
-            ValueType::Boolean => {
-                let b = val.coerce_to_bool().unwrap().get_value().unwrap();
-                Value::Boolean(b)
-            }
-            ValueType::Null | ValueType::Undefined => Value::Null,
-            ValueType::Object => {
-                // Preserve nested objects/arrays as Value::JSON (not Value::String)
-                let json: serde_json::Value =
-                    env.from_js_value(val).unwrap_or(serde_json::Value::Null);
-                Value::JSON(json)
-            }
-            ValueType::BigInt => {
-                let mut big: napi::JsBigInt = unsafe { val.cast() };
-                let (negative, words) = big.get_words().unwrap();
-                bigint_to_value(negative, &words).unwrap_or_else(|| {
-                    let text = val.coerce_to_string().unwrap().into_utf8().unwrap();
-                    Value::String(text.as_str().unwrap().to_string())
-                })
-            }
-            _ => Value::Null,
-        }
+
+            let columns = js_codec::split_names(
+                column_names.as_strings(),
+                &ints[int_count - column_count..int_count],
+            )?;
+            let mut dec = Decoder::new(
+                &ints[3..int_count - column_count],
+                &tags[..slot_count],
+                &nums[..slot_count],
+                strings.as_strings(),
+                false,
+            )?;
+            let mut others = |i| other_value(env, others_array, i, false);
+            js_codec::decode_group_results(&mut dec, &columns, block, emits, &mut others)
+        })
     }
 }
 
@@ -349,10 +199,12 @@ mod wasm_bridge {
     use js_sys::Function;
     use wasm_bindgen::prelude::*;
 
+    use crate::js_codec::{MAX_SAFE_INTEGER, bigint_to_value};
     use crate::json_conv::value_to_json;
+    use crate::reducer_runtime::{Emits, GroupedRows};
     use crate::types::{ColumnRegistry, Row, RowMap, Value};
 
-    use super::{GroupBatch, MAX_SAFE_INTEGER, bigint_to_value, legacy_emit_row};
+    use super::{legacy_emit_row, push_host_emit};
 
     thread_local! {
         pub(super) static WASM_CTX: RefCell<Option<HashMap<String, Function>>> = RefCell::new(None);
@@ -375,30 +227,35 @@ mod wasm_bridge {
         }
     }
 
-    pub fn call_js_batch(reducer_id: &str, groups: &mut [GroupBatch], fields: &ColumnRegistry) {
+    pub fn call_js_batch(
+        reducer_id: &str,
+        block: &mut GroupedRows<'_>,
+        fields: &ColumnRegistry,
+        emits: &mut Emits,
+    ) -> Result<(), String> {
         WASM_CTX.with(|cell| {
             let ctx = cell.borrow();
             let ctx = ctx
                 .as_ref()
-                .expect("ExternalRuntime called outside wasm context");
+                .ok_or("external reducer called outside a wasm call")?;
 
             let func = ctx
                 .get(reducer_id)
-                .unwrap_or_else(|| panic!("no callback for reducer '{reducer_id}'"));
+                .ok_or_else(|| format!("no callback for reducer '{reducer_id}'"))?;
 
-            let js_input = groups_to_js(groups, fields);
+            let js_input = groups_to_js(block, fields);
 
             let result = func
                 .call1(&JsValue::NULL, &js_input)
-                .expect("external reducer callback threw an exception");
+                .map_err(|e| format!("the callback threw: {e:?}"))?;
 
-            js_result_to_groups(result, groups, fields);
-        });
+            js_result_to_groups(result, block, fields, emits)
+        })
     }
 
-    fn groups_to_js(groups: &[GroupBatch], fields: &ColumnRegistry) -> JsValue {
+    fn groups_to_js(block: &GroupedRows<'_>, fields: &ColumnRegistry) -> JsValue {
         let arr = js_sys::Array::new();
-        for group in groups {
+        for group in &block.groups {
             let obj = js_sys::Object::new();
 
             js_sys::Reflect::set(
@@ -409,8 +266,8 @@ mod wasm_bridge {
             .unwrap();
 
             let rows_arr = js_sys::Array::new();
-            for row in &group.rows {
-                rows_arr.push(&row_to_js(row));
+            for &index in block.row_indices(group) {
+                rows_arr.push(&row_to_js(&block.rows[index]));
             }
             js_sys::Reflect::set(&obj, &JsValue::from_str("rows"), &rows_arr).unwrap();
 
@@ -455,13 +312,21 @@ mod wasm_bridge {
         }
     }
 
-    fn js_result_to_groups(result: JsValue, groups: &mut [GroupBatch], fields: &ColumnRegistry) {
+    fn js_result_to_groups(
+        result: JsValue,
+        block: &mut GroupedRows<'_>,
+        fields: &ColumnRegistry,
+        emits: &mut Emits,
+    ) -> Result<(), String> {
         let arr: js_sys::Array = result
             .dyn_into()
-            .expect("external reducer result must be an array");
+            .map_err(|_| "external reducer result must be an array")?;
+        let GroupedRows { order, groups, .. } = block;
         for (i, group) in groups.iter_mut().enumerate() {
             let item = arr.get(i as u32);
-            let item_obj: js_sys::Object = item.dyn_into().expect("result item must be an object");
+            let item_obj: js_sys::Object = item
+                .dyn_into()
+                .map_err(|_| "result item must be an object")?;
 
             let js_state = js_sys::Reflect::get(&item_obj, &JsValue::from_str("state")).unwrap();
             for (value, name) in group.state.iter_mut().zip(fields.names()) {
@@ -470,23 +335,27 @@ mod wasm_bridge {
                 *value = js_to_value(js_value);
             }
 
+            let rows = &order[group.rows.clone()];
             let js_emits = js_sys::Reflect::get(&item_obj, &JsValue::from_str("emits")).unwrap();
-            let emits_arr: js_sys::Array = js_emits.dyn_into().expect("emits must be an array");
+            let emits_arr: js_sys::Array = js_emits
+                .dyn_into()
+                .map_err(|_| "emits must be an array")?;
             let js_emit_rows =
                 js_sys::Reflect::get(&item_obj, &JsValue::from_str("emitRows")).unwrap();
             let emit_rows: Option<js_sys::Array> = js_emit_rows.dyn_into().ok();
             for j in 0..emits_arr.length() {
                 let row = match &emit_rows {
-                    Some(rows) => rows
+                    Some(emit_rows) => emit_rows
                         .get(j)
                         .as_f64()
-                        .expect("'emitRows' must hold a row index per emit")
+                        .ok_or("'emitRows' must hold a row index per emit")?
                         as usize,
-                    None => legacy_emit_row(j as usize, group.rows.len()),
+                    None => legacy_emit_row(j as usize, rows.len()),
                 };
-                group.emits.push((row, js_to_value_map(emits_arr.get(j))));
+                push_host_emit(emits, rows, row, js_to_value_map(emits_arr.get(j)))?;
             }
         }
+        Ok(())
     }
 
     /// A BigInt as UInt64, Int64 or Uint256, else as its decimal text.
@@ -568,7 +437,8 @@ pub use wasm_bridge::{ContextGuard as WasmContextGuard, install_context as insta
 pub mod test_bridge {
     use std::cell::RefCell;
 
-    use super::GroupBatch;
+    use super::push_host_emit;
+    use crate::reducer_runtime::{Emits, GroupedRows};
     use crate::types::{ColumnRegistry, Row, RowMap, Value};
 
     /// A group as a host callback sees it: the state by field name, as JS
@@ -604,18 +474,28 @@ pub mod test_bridge {
         TestContextGuard
     }
 
-    /// Run the test callback on `groups`, with each state by name.
-    pub(super) fn call(groups: &mut [GroupBatch], fields: &ColumnRegistry) {
+    /// Run the test callback on the groups of `block`, with each state by
+    /// name.
+    pub(super) fn call(
+        block: &mut GroupedRows<'_>,
+        fields: &ColumnRegistry,
+        emits: &mut Emits,
+    ) -> Result<(), String> {
         let names = fields.names();
-        let mut host: Vec<HostGroup> = groups
-            .iter_mut()
+        let mut host: Vec<HostGroup> = block
+            .groups
+            .iter()
             .map(|group| HostGroup {
                 state: names
                     .iter()
                     .cloned()
                     .zip(group.state.iter().cloned())
                     .collect(),
-                rows: std::mem::take(&mut group.rows),
+                rows: block
+                    .row_indices(group)
+                    .iter()
+                    .map(|&i| block.rows[i].clone())
+                    .collect(),
                 emits: Vec::new(),
             })
             .collect();
@@ -628,13 +508,17 @@ pub mod test_bridge {
             cb(&mut host);
         });
 
+        let GroupedRows { order, groups, .. } = block;
         for (group, mut host) in groups.iter_mut().zip(host) {
             for (value, name) in group.state.iter_mut().zip(names) {
                 *value = host.state.remove(name).unwrap_or(Value::Null);
             }
-            group.rows = host.rows;
-            group.emits = host.emits;
+            let rows = &order[group.rows.clone()];
+            for (row, emit) in host.emits {
+                push_host_emit(emits, rows, row, emit)?;
+            }
         }
+        Ok(())
     }
 }
 
@@ -715,8 +599,9 @@ impl ReducerRuntime for ExternalRuntime {
 
     fn process_grouped(
         &self,
-        groups: &mut [GroupBatch],
+        block: &mut GroupedRows<'_>,
         fields: &ColumnRegistry,
+        emits: &mut Emits,
     ) -> crate::error::Result<()> {
         if self.missing_host_callback() {
             return Err(crate::error::Error::InvalidOperation(format!(
@@ -724,54 +609,28 @@ impl ReducerRuntime for ExternalRuntime {
                 self.reducer_id
             )));
         }
+
         #[cfg(feature = "napi")]
-        {
-            napi_bridge::call_js_batch(&self.reducer_id, groups, fields);
-            return Ok(());
-        }
+        let called = napi_bridge::call_js_batch(&self.reducer_id, block, fields, emits);
         #[cfg(all(feature = "wasm", not(feature = "napi")))]
-        {
-            wasm_bridge::call_js_batch(&self.reducer_id, groups, fields);
-            return Ok(());
-        }
-        #[cfg(test)]
-        {
-            test_bridge::call(groups, fields);
-            return Ok(());
-        }
-        #[cfg(not(any(feature = "napi", feature = "wasm")))]
-        {
-            let _ = (groups, fields);
-            panic!("ExternalRuntime requires the 'napi' or 'wasm' feature");
-        }
-        #[allow(unreachable_code)]
-        Ok(())
+        let called = wasm_bridge::call_js_batch(&self.reducer_id, block, fields, emits);
+        #[cfg(all(test, not(any(feature = "napi", feature = "wasm"))))]
+        let called = test_bridge::call(block, fields, emits);
+        #[cfg(not(any(test, feature = "napi", feature = "wasm")))]
+        let called: Result<(), String> = {
+            let _ = (block, fields, emits);
+            Err("ExternalRuntime requires the 'napi' or 'wasm' feature".to_string())
+        };
+
+        called.map_err(|e| {
+            crate::error::Error::Reducer(format!("external reducer '{}': {e}", self.reducer_id))
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bigint_to_value_keeps_every_digit() {
-        assert_eq!(bigint_to_value(false, &[]), Some(Value::UInt64(0)));
-        assert_eq!(bigint_to_value(true, &[0, 0]), Some(Value::UInt64(0)));
-        assert_eq!(bigint_to_value(false, &[u64::MAX, 0]), Some(Value::UInt64(u64::MAX)));
-        assert_eq!(bigint_to_value(true, &[5]), Some(Value::Int64(-5)));
-        assert_eq!(bigint_to_value(true, &[1 << 63]), Some(Value::Int64(i64::MIN)));
-        assert_eq!(bigint_to_value(true, &[(1 << 63) + 1]), None);
-        assert_eq!(bigint_to_value(true, &[0, 1]), None);
-
-        let mut two_pow_64 = [0u8; 32];
-        two_pow_64[23] = 1;
-        assert_eq!(bigint_to_value(false, &[0, 1]), Some(Value::Uint256(two_pow_64)));
-        assert_eq!(
-            bigint_to_value(false, &[u64::MAX; 4]),
-            Some(Value::Uint256([0xff; 32]))
-        );
-        assert_eq!(bigint_to_value(false, &[0, 0, 0, 0, 1]), None);
-    }
 
     #[test]
     fn legacy_emit_rows_follow_the_rows() {

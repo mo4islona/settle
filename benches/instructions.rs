@@ -27,7 +27,7 @@ use std::sync::Arc;
 use gungraun::prelude::*;
 use gungraun::{Callgrind, Dhat, DhatMetric, EventKind};
 use settle::db::{Config, IngestInput, IngestRows, Settle};
-use settle::msgpack_conv::decode_table_rows_from_msgpack;
+use settle::js_codec::{self, Decoder, Strings};
 use settle::storage::memory::MemoryBackend;
 use settle::test_helpers::cursor;
 use settle::types::{BlockCursor, ChangeBatch, RowMap, Value};
@@ -510,77 +510,116 @@ fn reopen(config: Config) {
     std::mem::forget(black_box(Settle::open(config).unwrap()));
 }
 
-/// An ingest as the napi binding receives it.
-struct MsgpackInput {
-    data: Vec<u8>,
+/// An ingest as the napi binding receives it: the arrays that `TableWriter`
+/// in `codec.ts` fills.
+struct EncodedInput {
+    ints: Vec<u32>,
+    tags: Vec<u8>,
+    nums: Vec<f64>,
+    strings: String,
     rollback_chain: Vec<BlockCursor>,
     finalized_head: BlockCursor,
 }
 
-impl From<IngestInput> for MsgpackInput {
-    fn from(input: IngestInput) -> Self {
-        let plain = |value: &Value| match value {
-            Value::String(s) => serde_json::json!(s),
-            Value::Float64(f) => serde_json::json!(f),
-            Value::UInt64(n) => serde_json::json!(n),
-            other => panic!("no plain msgpack for {other:?}"),
-        };
-        let tables: HashMap<&String, Vec<HashMap<&String, serde_json::Value>>> = input
-            .data
-            .iter()
-            .map(|(table, rows)| {
-                let rows = rows
-                    .iter()
-                    .map(|row| row.iter().map(|(k, v)| (k, plain(v))).collect())
-                    .collect();
-                (table, rows)
-            })
-            .collect();
-
-        Self {
-            data: rmp_serde::to_vec(&tables).unwrap(),
+impl EncodedInput {
+    fn new(db: &Settle, input: IngestInput) -> Self {
+        let mut encoded = Self {
+            ints: vec![0, 0],
+            tags: Vec::new(),
+            nums: Vec::new(),
+            strings: String::new(),
             rollback_chain: input.rollback_chain,
             finalized_head: input.finalized_head,
+        };
+
+        let tables: Vec<_> = input.data.iter().collect();
+        encoded.ints.push(tables.len() as u32);
+        for (table, rows) in &tables {
+            let width = db.table_registry(table).unwrap().len() + 1;
+            encoded.ints.extend([table.len() as u32, rows.len() as u32, width as u32]);
+            encoded.strings.push_str(table);
         }
+        for (table, rows) in &tables {
+            let columns = db.table_registry(table).unwrap().names().to_vec();
+            for row in rows.iter() {
+                encoded.put(row.get("block_number"));
+                for column in &columns {
+                    encoded.put(row.get(column));
+                }
+            }
+        }
+
+        encoded.ints[0] = encoded.ints.len() as u32;
+        encoded.ints[1] = encoded.tags.len() as u32;
+        assert!(encoded.strings.is_ascii());
+        encoded
+    }
+
+    fn put(&mut self, value: Option<&Value>) {
+        let (tag, num) = match value {
+            None | Some(Value::Null) => (js_codec::NULL, 0.0),
+            Some(Value::Float64(f)) => (js_codec::NUMBER, *f),
+            Some(Value::UInt64(n)) => (js_codec::NUMBER, *n as f64),
+            Some(Value::String(s)) => {
+                self.strings.push_str(s);
+                (js_codec::STRING, s.len() as f64)
+            }
+            Some(other) => panic!("no JS value for {other:?}"),
+        };
+        self.tags.push(tag);
+        self.nums.push(num);
     }
 }
 
-/// What the napi binding does with an ingest.
-fn ingest_msgpack(db: &mut Settle, input: MsgpackInput) -> Option<ChangeBatch> {
-    let data = decode_table_rows_from_msgpack(&input.data, |t| db.table_registry(t)).unwrap();
-    db.ingest_rows(IngestRows {
-        data,
-        rollback_chain: input.rollback_chain,
-        finalized_head: input.finalized_head,
-    })
-    .unwrap()
+/// What the napi binding does with an ingest in Rust: decode the rows,
+/// ingest them, encode the batch.
+fn ingest_napi(db: &mut Settle, input: EncodedInput) -> Option<ChangeBatch> {
+    let strings = Strings::Ascii(&input.strings);
+    let mut dec = Decoder::new(&input.ints[2..], &input.tags, &input.nums, strings, true).unwrap();
+    let mut no_others = |i: usize| -> Result<Value, String> { panic!("host value {i}") };
+    let data = js_codec::decode_ingest(&mut dec, |t| db.table_registry(t), &mut no_others).unwrap();
+
+    let batch = db
+        .ingest_rows(IngestRows {
+            data,
+            rollback_chain: input.rollback_chain,
+            finalized_head: input.finalized_head,
+        })
+        .unwrap();
+    if let Some(batch) = &batch {
+        let enc = js_codec::encode_batch(batch);
+        let mut buffer = vec![0u8; enc.byte_len()];
+        enc.write(&mut buffer);
+        black_box((buffer, enc.strings()));
+    }
+    batch
 }
 
-struct PreparedMsgpack {
+struct PreparedNapi {
     db: Settle,
-    inputs: Vec<MsgpackInput>,
+    inputs: Vec<EncodedInput>,
 }
 
 /// Leaked, so that dropping the engine is not counted.
-fn prepare_msgpack(workload: Workload, mode: Mode) -> &'static mut PreparedMsgpack {
+fn prepare_napi(workload: Workload, mode: Mode) -> &'static mut PreparedNapi {
     let (db, inputs) = warm_up(workload, mode);
-    let inputs = inputs.into_iter().map(MsgpackInput::from).collect();
-    Box::leak(Box::new(PreparedMsgpack { db, inputs }))
+    let inputs = inputs.into_iter().map(|input| EncodedInput::new(&db, input)).collect();
+    Box::leak(Box::new(PreparedNapi { db, inputs }))
 }
 
-fn prepare_msgpack_backfill(workload: Workload) -> &'static mut PreparedMsgpack {
-    prepare_msgpack(workload, Mode::Backfill)
+fn prepare_napi_backfill(workload: Workload) -> &'static mut PreparedNapi {
+    prepare_napi(workload, Mode::Backfill)
 }
 
-fn prepare_msgpack_tip(workload: Workload) -> &'static mut PreparedMsgpack {
-    prepare_msgpack(workload, Mode::Tip)
+fn prepare_napi_tip(workload: Workload) -> &'static mut PreparedNapi {
+    prepare_napi(workload, Mode::Tip)
 }
 
-fn ingest_all_msgpack(case: &'static mut PreparedMsgpack) -> usize {
+fn ingest_all_napi(case: &'static mut PreparedNapi) -> usize {
     let inputs = std::mem::take(&mut case.inputs);
     let mut records = 0;
     for input in inputs {
-        if let Some(batch) = ingest_msgpack(&mut case.db, input) {
+        if let Some(batch) = ingest_napi(&mut case.db, input) {
             case.db.ack(batch.sequence).unwrap();
             records += batch.record_count();
         }
@@ -589,22 +628,22 @@ fn ingest_all_msgpack(case: &'static mut PreparedMsgpack) -> usize {
 }
 
 #[library_benchmark]
-#[bench::mv_sum(args = (Workload::MvSum), setup = prepare_msgpack_backfill)]
-#[bench::event_rules(args = (Workload::EventRules), setup = prepare_msgpack_backfill)]
-#[bench::polymarket(args = (Workload::Polymarket), setup = prepare_msgpack_backfill)]
-fn msgpack_backfill(case: &'static mut PreparedMsgpack) -> usize {
-    ingest_all_msgpack(case)
+#[bench::mv_sum(args = (Workload::MvSum), setup = prepare_napi_backfill)]
+#[bench::event_rules(args = (Workload::EventRules), setup = prepare_napi_backfill)]
+#[bench::polymarket(args = (Workload::Polymarket), setup = prepare_napi_backfill)]
+fn napi_backfill(case: &'static mut PreparedNapi) -> usize {
+    ingest_all_napi(case)
 }
 
 #[library_benchmark]
-#[bench::mv_sum(args = (Workload::MvSum), setup = prepare_msgpack_tip)]
-#[bench::polymarket(args = (Workload::Polymarket), setup = prepare_msgpack_tip)]
-fn msgpack_tip(case: &'static mut PreparedMsgpack) -> usize {
-    ingest_all_msgpack(case)
+#[bench::mv_sum(args = (Workload::MvSum), setup = prepare_napi_tip)]
+#[bench::polymarket(args = (Workload::Polymarket), setup = prepare_napi_tip)]
+fn napi_tip(case: &'static mut PreparedNapi) -> usize {
+    ingest_all_napi(case)
 }
 
 library_benchmark_group!(name = ingest, benchmarks = [backfill, tip]);
-library_benchmark_group!(name = msgpack, benchmarks = [msgpack_backfill, msgpack_tip]);
+library_benchmark_group!(name = napi, benchmarks = [napi_backfill, napi_tip]);
 library_benchmark_group!(name = scaling, benchmarks = [scale, checkpoint]);
 library_benchmark_group!(name = recovery, benchmarks = [reopen]);
 
@@ -626,5 +665,5 @@ main!(
                     (DhatMetric::TotalBlocks, 1.0),
                 ])
         ),
-    library_benchmark_groups = [ingest, msgpack, scaling, recovery]
+    library_benchmark_groups = [ingest, napi, scaling, recovery]
 );
