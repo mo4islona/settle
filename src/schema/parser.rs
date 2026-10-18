@@ -1839,6 +1839,24 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
             )));
         }
 
+        // A view reads its source rows by position, so a raw table must
+        // have each column that it reads.
+        if source_is_table {
+            let source_table = schema.tables.iter().find(|t| t.name == mv.source).unwrap();
+            let read = mv.select.iter().filter_map(|item| match &item.expr {
+                SelectExpr::Column(col) | SelectExpr::WindowFunc { column: col, .. } => Some(col),
+                SelectExpr::Agg(_, col) => col.as_ref(),
+            });
+            for col in read {
+                if !source_table.columns.iter().any(|c| c.name == *col) {
+                    return Err(Error::Schema(format!(
+                        "MV '{}': column '{}' not found in source table '{}'",
+                        mv.name, col, mv.source
+                    )));
+                }
+            }
+        }
+
         // Validate sliding window time_column exists in source table with a numeric type
         if let Some(ref sw) = mv.sliding_window {
             if source_is_table {
@@ -2102,6 +2120,40 @@ mod tests {
         "#;
         let err = parse_schema(sql).unwrap_err();
         assert!(err.to_string().contains("nonexistent_table"));
+    }
+
+    /// A view reads the rows of a raw table by position: a column that the
+    /// table lacks would read as Null.
+    #[test]
+    fn validation_rejects_mv_column_missing_from_source_table() {
+        let mv_sql = |select: &str| {
+            format!(
+                "CREATE TABLE trades (pair String, ts DateTime, price Float64);
+                 CREATE MATERIALIZED VIEW v AS SELECT {select} FROM trades GROUP BY pair;"
+            )
+        };
+
+        parse_schema(&mv_sql(
+            "pair, toStartOfInterval(ts, INTERVAL 1 HOUR) AS hour, sum(price) AS s, count() AS n",
+        ))
+        .expect("every column is in the table");
+
+        for (select, missing) in [
+            ("block_number, sum(price) AS s", "block_number"),
+            ("pair, sum(amount) AS s", "amount"),
+            (
+                "pair, toStartOfInterval(time, INTERVAL 1 HOUR) AS hour",
+                "time",
+            ),
+        ] {
+            let err = parse_schema(&mv_sql(select)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "column '{missing}' not found in source table 'trades'"
+                )),
+                "{select}: {err}"
+            );
+        }
     }
 
     #[test]

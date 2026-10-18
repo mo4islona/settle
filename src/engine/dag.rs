@@ -9,8 +9,8 @@ use crate::schema::ast::Schema;
 use crate::storage::StorageBackend;
 use crate::storage::{PendingWrites, StorageWriteBatch};
 use crate::types::{
-    BlockCursor, BlockNumber, ColumnType, ChangeBatch, ChangeRecord, PerfNode, PerfNodeKind, Row,
-    RowMap,
+    BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, ColumnRegistry, ColumnType, PerfNode,
+    PerfNodeKind, Row, RowMap,
 };
 
 use super::mv::MVEngine;
@@ -107,6 +107,37 @@ impl ReplayCursor {
     }
 }
 
+/// The rows that a node passes downstream in one block.
+enum NodeRows {
+    /// A raw table's rows, in its column order.
+    Table(Vec<Row>),
+    /// A reducer's emits.
+    Emits(Vec<RowMap>),
+}
+
+impl NodeRows {
+    fn feed_reducer(&self, reducer: &mut ReducerEngine, block: BlockNumber) -> Result<Vec<RowMap>> {
+        match self {
+            NodeRows::Table(rows) => reducer.process_block(block, rows),
+            NodeRows::Emits(rows) => reducer.process_block_maps(block, rows),
+        }
+    }
+
+    fn apply_to(&self, mv: &mut MVEngine, block: BlockNumber) {
+        match self {
+            NodeRows::Table(rows) => mv.apply_rows(block, rows),
+            NodeRows::Emits(rows) => mv.apply_rows(block, rows),
+        }
+    }
+
+    fn replay_into(&self, mv: &mut MVEngine, block: BlockNumber) {
+        match self {
+            NodeRows::Table(rows) => mv.replay_block(block, rows),
+            NodeRows::Emits(rows) => mv.replay_block(block, rows),
+        }
+    }
+}
+
 /// An independent reducer→MV chain that can be processed in parallel.
 /// Engines are stored inline to avoid HashMap extraction/reinsertion per batch.
 struct PipelineBranch {
@@ -122,14 +153,14 @@ impl PipelineBranch {
     fn process_block(
         &mut self,
         block: BlockNumber,
-        output_rows: &HashMap<String, Vec<RowMap>>,
+        output_rows: &HashMap<String, NodeRows>,
         perf: bool,
     ) -> Result<Option<PerfNode>> {
         let timer = PerfTimer::start(perf);
         let mut mv_nodes = Vec::new();
 
         if let Some(rows) = output_rows.get(self.reducer.source()) {
-            let enriched = self.reducer.process_block_maps(block, rows)?;
+            let enriched = rows.feed_reducer(&mut self.reducer, block)?;
             if !enriched.is_empty() {
                 for (mv_name, mv) in &mut self.mv_entries {
                     let mv_timer = PerfTimer::start(perf);
@@ -424,6 +455,11 @@ impl SettleEngine {
         self.raw_tables.contains_key(name)
     }
 
+    /// The columns of a raw table, in the order of its positional rows.
+    pub fn table_registry(&self, name: &str) -> Option<&Arc<ColumnRegistry>> {
+        self.raw_tables.get(name).map(|t| t.registry())
+    }
+
     /// Check if a reducer with the given name exists in the engine.
     pub fn has_reducer(&self, name: &str) -> bool {
         self.reducers.contains_key(name) || self.branch_index.contains_key(name)
@@ -473,22 +509,30 @@ impl SettleEngine {
         block: BlockNumber,
         row_maps: Vec<RowMap>,
     ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
-        let (mut changes, perf_node) = self.process_batch_inner(table, block, row_maps, None)?;
+        let Some(registry) = self.table_registry(table) else {
+            return Err(Error::InvalidOperation(format!("unknown table: {table}")));
+        };
+        let rows = row_maps
+            .into_iter()
+            .map(|m| Row::from_owned_map(registry.clone(), m))
+            .collect();
+        let (mut changes, perf_node) = self.process_batch_inner(table, block, rows, None)?;
         changes.extend(self.take_changes());
         Ok((changes, perf_node))
     }
 
     /// Process a batch, deferring raw row storage writes to the given WriteBatch.
+    /// `rows` are in the column order of the table (`table_registry`).
     /// Returns the raw-table changes only: the MV changes of all the blocks of
     /// an ingest wait for `take_changes`.
     pub fn process_batch_deferred(
         &mut self,
         table: &str,
         block: BlockNumber,
-        row_maps: Vec<RowMap>,
+        rows: Vec<Row>,
         write_batch: &mut StorageWriteBatch,
     ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
-        self.process_batch_inner(table, block, row_maps, Some(write_batch))
+        self.process_batch_inner(table, block, rows, Some(write_batch))
     }
 
     /// The MV changes of the blocks processed since the last call, one per
@@ -521,7 +565,7 @@ impl SettleEngine {
         &mut self,
         table: &str,
         block: BlockNumber,
-        row_maps: Vec<RowMap>,
+        rows: Vec<Row>,
         write_batch: Option<&mut StorageWriteBatch>,
     ) -> Result<(Vec<ChangeRecord>, Option<PerfNode>)> {
         let perf = self.collect_perf;
@@ -539,19 +583,19 @@ impl SettleEngine {
         let raw_eng = self.raw_tables.get(table).unwrap();
         let is_virtual = self.virtual_tables.contains(table);
         if let Some(batch) = write_batch {
-            let changes = raw_eng.ingest_to_batch(block, &row_maps, batch, is_virtual)?;
+            let changes = raw_eng.ingest_to_batch(block, &rows, batch, is_virtual)?;
             all_changes.extend(changes);
         } else if is_virtual {
-            raw_eng.ingest_no_changes(block, &row_maps)?;
+            raw_eng.ingest_no_changes(block, &rows)?;
         } else {
-            let changes = raw_eng.ingest(block, &row_maps)?;
+            let changes = raw_eng.ingest(block, &rows)?;
             all_changes.extend(changes);
         }
         perf_children.extend(raw_timer.stop(PerfNodeKind::RawTable, table, vec![]));
 
         // Output rows for downstream consumption (reducers + MVs)
-        let mut output_rows: HashMap<String, Vec<RowMap>> = HashMap::new();
-        output_rows.insert(table.to_string(), row_maps);
+        let mut output_rows: HashMap<String, NodeRows> = HashMap::new();
+        output_rows.insert(table.to_string(), NodeRows::Table(rows));
 
         // Check if parallel branch execution is possible:
         // - 2+ branches, all reducers source from raw tables (not from each other),
@@ -571,9 +615,8 @@ impl SettleEngine {
                 for mv_name in &self.direct_mvs {
                     let mv_timer = PerfTimer::start(perf);
                     let mv = self.mvs.get_mut(mv_name).unwrap();
-                    let source = mv.source().to_string();
-                    if let Some(source_rows) = output_rows.get(&source) {
-                        mv.apply_rows(block, source_rows);
+                    if let Some(source_rows) = output_rows.get(mv.source()) {
+                        source_rows.apply_to(mv, block);
                     }
                     perf_children.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
@@ -621,51 +664,35 @@ impl SettleEngine {
                     PipelineNode::RawTable(_) => {} // Already processed in Phase 1
                     PipelineNode::Reducer(name) => {
                         let timer = PerfTimer::start(perf);
-                        let enriched = if let Some(branch) =
-                            self.branch_index.get(name).map(|&i| &mut self.branches[i])
-                        {
-                            let source = branch.reducer.source().to_string();
-                            if let Some(source_rows) = output_rows.get(&source) {
-                                branch.reducer.process_block_maps(block, source_rows)?
-                            } else {
-                                Vec::new()
-                            }
-                        } else {
-                            let reducer = self.reducers.get_mut(name).unwrap();
-                            let source = reducer.source().to_string();
-                            if let Some(source_rows) = output_rows.get(&source) {
-                                reducer.process_block_maps(block, source_rows)?
-                            } else {
-                                Vec::new()
-                            }
+                        let reducer = match self.branch_index.get(name) {
+                            Some(&i) => &mut self.branches[i].reducer,
+                            None => self.reducers.get_mut(name).unwrap(),
+                        };
+                        let enriched = match output_rows.get(reducer.source()) {
+                            Some(source_rows) => source_rows.feed_reducer(reducer, block)?,
+                            None => Vec::new(),
                         };
                         if let Some(node) = timer.stop(PerfNodeKind::Reducer, name, vec![]) {
                             reducer_perf_idx.insert(name.clone(), perf_children.len());
                             perf_children.push(node);
                         }
                         if !enriched.is_empty() {
-                            output_rows.insert(name.clone(), enriched);
+                            output_rows.insert(name.clone(), NodeRows::Emits(enriched));
                         }
                     }
                     PipelineNode::MV(name) => {
                         let timer = PerfTimer::start(perf);
-                        let mv_source;
-                        if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
-                            let mv = &mut self.branches[bi].mv_entries[mi].1;
-                            mv_source = mv.source().to_string();
-                            if let Some(source_rows) = output_rows.get(&mv_source) {
-                                mv.apply_rows(block, source_rows);
-                            }
-                        } else {
-                            let mv = self.mvs.get_mut(name).unwrap();
-                            mv_source = mv.source().to_string();
-                            if let Some(source_rows) = output_rows.get(&mv_source) {
-                                mv.apply_rows(block, source_rows);
-                            }
+                        let mv = match self.mv_branch_index.get(name) {
+                            Some(&(bi, mi)) => &mut self.branches[bi].mv_entries[mi].1,
+                            None => self.mvs.get_mut(name).unwrap(),
+                        };
+                        if let Some(source_rows) = output_rows.get(mv.source()) {
+                            source_rows.apply_to(mv, block);
                         }
+                        let mv_source = mv.source();
                         // Nest under parent reducer if exists, otherwise add as sibling
                         if let Some(node) = timer.stop(PerfNodeKind::MV, name, vec![]) {
-                            match reducer_perf_idx.get(&mv_source) {
+                            match reducer_perf_idx.get(mv_source) {
                                 Some(&idx) => perf_children[idx].children.push(node),
                                 None => perf_children.push(node),
                             }
@@ -844,12 +871,8 @@ impl SettleEngine {
         rows: Vec<Row>,
         only_nodes: Option<&HashSet<String>>,
     ) -> Result<()> {
-        // Row cache for reducer input (indexed access)
-        let mut row_cache: HashMap<String, Vec<Row>> = HashMap::new();
-        row_cache.insert(table_name, rows);
-
-        // Output from reducers (RowMaps for MV consumption)
-        let mut output_rows: HashMap<String, Vec<RowMap>> = HashMap::new();
+        let mut output_rows: HashMap<String, NodeRows> = HashMap::new();
+        output_rows.insert(table_name, NodeRows::Table(rows));
 
         for node in &self.pipeline {
             match node {
@@ -857,79 +880,38 @@ impl SettleEngine {
                     // Skip — rows already in storage
                 }
                 PipelineNode::Reducer(name) => {
-                    // Skip if filtered out
-                    if let Some(filter) = &only_nodes {
-                        if !filter.contains(name.as_str()) {
-                            continue;
-                        }
+                    if only_nodes.is_some_and(|filter| !filter.contains(name.as_str())) {
+                        continue;
                     }
 
-                    // Skip external reducers when no JS context is installed
-                    let is_ext = self
-                        .branch_index
-                        .get(name)
-                        .map(|&i| self.branches[i].reducer.needs_host_callback())
-                        .unwrap_or_else(|| {
-                            self.reducers
-                                .get(name)
-                                .map(|r| r.needs_host_callback())
-                                .unwrap_or(false)
-                        });
-
-                    let enriched = if is_ext {
-                        Vec::new()
-                    } else if let Some(branch) =
-                        self.branch_index.get(name).map(|&i| &mut self.branches[i])
-                    {
-                        let source = branch.reducer.source().to_string();
-                        if let Some(source_rows) = row_cache.get(&source) {
-                            branch.reducer.process_block(block, source_rows)?
-                        } else if let Some(source_maps) = output_rows.get(&source) {
-                            branch.reducer.process_block_maps(block, source_maps)?
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        let reducer = self.reducers.get_mut(name).unwrap();
-                        let source = reducer.source().to_string();
-                        if let Some(source_rows) = row_cache.get(&source) {
-                            reducer.process_block(block, source_rows)?
-                        } else if let Some(source_maps) = output_rows.get(&source) {
-                            reducer.process_block_maps(block, source_maps)?
-                        } else {
-                            Vec::new()
-                        }
+                    let reducer = match self.branch_index.get(name) {
+                        Some(&i) => &mut self.branches[i].reducer,
+                        None => self.reducers.get_mut(name).unwrap(),
+                    };
+                    // An external reducer with no JS context produces nothing:
+                    // the replay that its callback starts rebuilds it.
+                    if reducer.needs_host_callback() {
+                        continue;
+                    }
+                    let enriched = match output_rows.get(reducer.source()) {
+                        Some(source_rows) => source_rows.feed_reducer(reducer, block)?,
+                        None => Vec::new(),
                     };
                     if !enriched.is_empty() {
-                        output_rows.insert(name.clone(), enriched);
+                        output_rows.insert(name.clone(), NodeRows::Emits(enriched));
                     }
                 }
                 PipelineNode::MV(name) => {
-                    // Skip if filtered out
-                    if let Some(filter) = &only_nodes {
-                        if !filter.contains(name.as_str()) {
-                            continue;
-                        }
+                    if only_nodes.is_some_and(|filter| !filter.contains(name.as_str())) {
+                        continue;
                     }
 
-                    if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
-                        let mv = &mut self.branches[bi].mv_entries[mi].1;
-                        let source = mv.source().to_string();
-                        if let Some(source_rows) = output_rows.get(&source) {
-                            mv.replay_block(block, source_rows);
-                        } else if let Some(raw_rows) = row_cache.get(&source) {
-                            let maps: Vec<RowMap> = raw_rows.iter().map(|r| r.to_map()).collect();
-                            mv.replay_block(block, &maps);
-                        }
-                    } else {
-                        let mv = self.mvs.get_mut(name).unwrap();
-                        let source = mv.source().to_string();
-                        if let Some(source_rows) = output_rows.get(&source) {
-                            mv.replay_block(block, source_rows);
-                        } else if let Some(raw_rows) = row_cache.get(&source) {
-                            let maps: Vec<RowMap> = raw_rows.iter().map(|r| r.to_map()).collect();
-                            mv.replay_block(block, &maps);
-                        }
+                    let mv = match self.mv_branch_index.get(name) {
+                        Some(&(bi, mi)) => &mut self.branches[bi].mv_entries[mi].1,
+                        None => self.mvs.get_mut(name).unwrap(),
+                    };
+                    if let Some(source_rows) = output_rows.get(mv.source()) {
+                        source_rows.replay_into(mv, block);
                     }
                 }
             }
@@ -1984,11 +1966,13 @@ mod tests {
         // below finality, and the finalized head hash survives the undo.
         let storage = Arc::new(MemoryBackend::new());
         let mut engine = SettleEngine::new(&simple_mv_only_schema(), storage.clone()).unwrap();
+        let registry = engine.table_registry("swaps").unwrap().clone();
         let swap = |amount: f64| {
-            vec![HashMap::from([
+            let map = HashMap::from([
                 ("pool".to_string(), Value::String("ETH/USDC".into())),
                 ("amount".to_string(), Value::Float64(amount)),
-            ])]
+            ]);
+            vec![Row::from_owned_map(registry.clone(), map)]
         };
 
         let mut batch = StorageWriteBatch::new();

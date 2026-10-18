@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::Deserialize;
-use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
-use crate::types::{ChangeBatch, ChangeOp, ChangeRecord, RowMap, Value};
+use crate::db::BlockRows;
+use crate::types::{
+    ChangeBatch, ChangeOp, ChangeRecord, ColumnId, ColumnRegistry, Row, RowMap, Value,
+};
 
 /// Wrapper for Value that deserializes from plain (untagged) msgpack values.
 ///
@@ -128,6 +132,214 @@ pub fn decode_data_from_msgpack(buf: &[u8]) -> Result<HashMap<String, Vec<RowMap
         .collect();
 
     Ok(data)
+}
+
+/// Decode a msgpack buffer `{tableName: [{col: val, ...}, ...], ...}` into
+/// rows by block in the column order of each table, the input of
+/// [`Settle::ingest_rows`](crate::db::Settle::ingest_rows). `registry` gives
+/// the columns of a table; a row column that its table lacks is skipped.
+pub fn decode_table_rows_from_msgpack<'r>(
+    buf: &[u8],
+    registry: impl Fn(&str) -> Option<&'r Arc<ColumnRegistry>>,
+) -> Result<HashMap<String, BlockRows>, String> {
+    let mut de = rmp_serde::Deserializer::from_read_ref(buf);
+    let tables = TablesSeed {
+        registry: &registry,
+    }
+    .deserialize(&mut de)
+    .map_err(|e| format!("invalid msgpack: {e}"))?;
+
+    let mut data = HashMap::with_capacity(tables.len());
+    for (table, decoded) in tables {
+        let rows = match decoded {
+            DecodedTable::Unknown { rows: 0 } => continue,
+            DecodedTable::Unknown { .. } => return Err(format!("unknown table: {table}")),
+            DecodedTable::Rows(rows) => rows,
+        };
+
+        let mut by_block = BlockRows::new();
+        for (block, row) in rows {
+            let block = match block {
+                Some(Value::UInt64(n)) => n,
+                Some(other) => {
+                    return Err(format!(
+                        "row in table '{table}' has invalid block_number type: expected UInt64, got {}",
+                        other.type_name()
+                    ));
+                }
+                None => return Err(format!("row in table '{table}' missing block_number")),
+            };
+            by_block.entry(block).or_default().push(row);
+        }
+        data.insert(table, by_block);
+    }
+    Ok(data)
+}
+
+/// The most rows that a table reserves before it decodes them: 1 MiB.
+const MAX_PREALLOC_ROWS: usize = (1 << 20) / std::mem::size_of::<(Option<Value>, Row)>();
+
+/// The rows to reserve for a table whose array header claims `hint`: the
+/// header is input, not rows that exist.
+fn prealloc_rows(hint: Option<usize>) -> usize {
+    hint.unwrap_or(0).min(MAX_PREALLOC_ROWS)
+}
+
+enum DecodedTable {
+    /// A table that `registry` does not know, with its row count.
+    Unknown { rows: usize },
+    /// Each row with its `block_number` field, if it has one.
+    Rows(Vec<(Option<Value>, Row)>),
+}
+
+struct TablesSeed<'a, F> {
+    registry: &'a F,
+}
+
+impl<'de, 'r, F> DeserializeSeed<'de> for TablesSeed<'_, F>
+where
+    F: Fn(&str) -> Option<&'r Arc<ColumnRegistry>>,
+{
+    type Value = HashMap<String, DecodedTable>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de, 'r, F> Visitor<'de> for TablesSeed<'_, F>
+where
+    F: Fn(&str) -> Option<&'r Arc<ColumnRegistry>>,
+{
+    type Value = HashMap<String, DecodedTable>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a map of table names to rows")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut tables = HashMap::new();
+        while let Some(table) = map.next_key::<String>()? {
+            let decoded = map.next_value_seed(TableSeed {
+                registry: (self.registry)(&table),
+            })?;
+            tables.insert(table, decoded);
+        }
+        Ok(tables)
+    }
+}
+
+struct TableSeed<'r> {
+    registry: Option<&'r Arc<ColumnRegistry>>,
+}
+
+impl<'de> DeserializeSeed<'de> for TableSeed<'_> {
+    type Value = DecodedTable;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for TableSeed<'_> {
+    type Value = DecodedTable;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("an array of rows")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let Some(registry) = self.registry else {
+            let mut rows = 0;
+            while seq.next_element::<IgnoredAny>()?.is_some() {
+                rows += 1;
+            }
+            return Ok(DecodedTable::Unknown { rows });
+        };
+
+        let mut rows = Vec::with_capacity(prealloc_rows(seq.size_hint()));
+        while let Some(row) = seq.next_element_seed(RowSeed { registry })? {
+            rows.push(row);
+        }
+        Ok(DecodedTable::Rows(rows))
+    }
+}
+
+struct RowSeed<'r> {
+    registry: &'r Arc<ColumnRegistry>,
+}
+
+impl<'de> DeserializeSeed<'de> for RowSeed<'_> {
+    type Value = (Option<Value>, Row);
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for RowSeed<'_> {
+    type Value = (Option<Value>, Row);
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a row object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut values = vec![Value::Null; self.registry.len()];
+        let mut block = None;
+
+        while let Some(key) = map.next_key_seed(KeySeed(self.registry))? {
+            match key {
+                RowKey::Column(id) => values[id as usize] = map.next_value::<PlainValue>()?.0,
+                RowKey::Block(id) => {
+                    let PlainValue(value) = map.next_value()?;
+                    if let Some(id) = id {
+                        values[id as usize] = value.clone();
+                    }
+                    block = Some(value);
+                }
+                RowKey::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok((block, Row::from_values(self.registry.clone(), values)))
+    }
+}
+
+enum RowKey {
+    Column(ColumnId),
+    /// `block_number`, with its position if the table has it.
+    Block(Option<ColumnId>),
+    Other,
+}
+
+struct KeySeed<'r>(&'r ColumnRegistry);
+
+impl<'de> DeserializeSeed<'de> for KeySeed<'_> {
+    type Value = RowKey;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for KeySeed<'_> {
+    type Value = RowKey;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a column name")
+    }
+
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<RowKey, E> {
+        let id = self.0.get_id(name);
+        Ok(match id {
+            _ if name == "block_number" => RowKey::Block(id),
+            Some(id) => RowKey::Column(id),
+            None => RowKey::Other,
+        })
+    }
 }
 
 /// Decode a msgpack buffer into a Vec of rows.
@@ -523,5 +735,95 @@ mod tests {
         let buf = encode_batch_to_msgpack(&batch);
         let decoded: serde_json::Value = rmp_serde::from_slice(&buf).unwrap();
         assert_eq!(decoded["tables"].as_object().unwrap().len(), 0);
+    }
+
+    fn decode_positional(json: serde_json::Value) -> Result<HashMap<String, BlockRows>, String> {
+        let swaps = Arc::new(ColumnRegistry::new(vec!["pool".into(), "amount".into()]));
+        let trades = Arc::new(ColumnRegistry::new(vec![
+            "block_number".into(),
+            "user".into(),
+        ]));
+        decode_table_rows_from_msgpack(&encode_json_as_msgpack(&json), |table| match table {
+            "swaps" => Some(&swaps),
+            "trades" => Some(&trades),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn decode_table_rows_by_position() {
+        let data = decode_positional(serde_json::json!({
+            "swaps": [
+                {"amount": 7, "block_number": 11, "extra": [1, 2], "pool": "ETH"},
+                {"pool": "BTC", "block_number": 10},
+                {"block_number": 11, "pool": "SOL", "amount": -3},
+            ],
+            "trades": [{"user": "alice", "block_number": 10}],
+            "orders": [],
+        }))
+        .unwrap();
+
+        assert_eq!(data.len(), 2);
+        let values = |table: &str, block| -> Vec<Vec<Value>> {
+            data[table][&block]
+                .iter()
+                .map(|r| r.values().to_vec())
+                .collect()
+        };
+        assert_eq!(
+            values("swaps", 10),
+            vec![vec![Value::String("BTC".into()), Value::Null]]
+        );
+        assert_eq!(
+            values("swaps", 11),
+            vec![
+                vec![Value::String("ETH".into()), Value::UInt64(7)],
+                vec![Value::String("SOL".into()), Value::Int64(-3)],
+            ]
+        );
+        assert_eq!(
+            values("trades", 10),
+            vec![vec![Value::UInt64(10), Value::String("alice".into())]]
+        );
+    }
+
+    #[test]
+    fn decode_table_rows_errors() {
+        let err = |json| decode_positional(json).unwrap_err();
+
+        assert_eq!(
+            err(serde_json::json!({"orders": [{"block_number": 1}]})),
+            "unknown table: orders"
+        );
+        assert_eq!(
+            err(serde_json::json!({"swaps": [{"pool": "ETH"}]})),
+            "row in table 'swaps' missing block_number"
+        );
+        assert_eq!(
+            err(serde_json::json!({"swaps": [{"block_number": 1.5}]})),
+            "row in table 'swaps' has invalid block_number type: expected UInt64, got Float64"
+        );
+        assert!(err(serde_json::json!({"swaps": [1]})).starts_with("invalid msgpack"));
+        assert!(err(serde_json::json!([])).starts_with("invalid msgpack"));
+    }
+
+    #[test]
+    fn row_reservation_is_capped() {
+        assert_eq!(prealloc_rows(None), 0);
+        assert_eq!(prealloc_rows(Some(10)), 10);
+        assert_eq!(prealloc_rows(Some(u32::MAX as usize)), MAX_PREALLOC_ROWS);
+    }
+
+    /// An array header that claims more rows than the buffer holds is a
+    /// decode error, not a reservation of that many rows.
+    #[test]
+    fn decode_table_rows_with_a_false_row_count() {
+        let mut buf = vec![0x81, 0xa5];
+        buf.extend_from_slice(b"swaps");
+        buf.extend_from_slice(&[0xdd, 0xff, 0xff, 0xff, 0xff]);
+
+        let registry = Arc::new(ColumnRegistry::new(vec!["pool".into()]));
+        let err = decode_table_rows_from_msgpack(&buf, |_| Some(&registry)).unwrap_err();
+        assert!(err.starts_with("invalid msgpack"), "{err}");
     }
 }
