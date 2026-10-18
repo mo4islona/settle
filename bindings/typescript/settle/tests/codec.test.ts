@@ -4,7 +4,9 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { NUMBER, OTHER, readBatch } from '../src/codec'
 import { Settle } from '../src/index'
+import { Settle as NativeSettle } from '../src/native/native.js'
 import { ingestAndAck } from './util'
 
 const NOTES_SCHEMA = `
@@ -214,6 +216,56 @@ describe('Binary bridge', () => {
 
     expect(batch!.tables.counts[0].values.n).toBe(2)
     expect('n' in globalThis).toBe(false)
+  })
+
+  it('takes every typed array and DataView on ingest as bytes, as msgpack did', async () => {
+    const db = Settle.open({ schema: 'CREATE TABLE blobs (block_number UInt64, data BYTEA);' })
+    const raw = new Uint8Array([9, 8, 7, 6, 5, 4])
+    const views = [
+      new Int8Array([1, 2, -1]),
+      new Uint16Array([1, 258]),
+      new Float32Array([1]),
+      new Uint16Array(raw.buffer, 2, 2),
+      new DataView(raw.buffer, 1, 2),
+    ]
+    const batch = await ingestAndAck(db, {
+      data: { blobs: views.map((data) => ({ block_number: 1, data })) },
+      ...at(1),
+    })
+
+    const bytes = batch!.tables.blobs.map((r) => [...r.values.data])
+    expect(bytes).toEqual([
+      [1, 2, 255],
+      [1, 0, 2, 1],
+      [0, 0, 128, 63],
+      [7, 6, 5, 4],
+      [8, 7],
+    ])
+  })
+
+  it('reads the rows of an ingest from a copy, not from arrays that a getter can detach', () => {
+    const db = NativeSettle.open({
+      schema: 'CREATE TABLE docs (block_number UInt64, meta String, n UInt64);',
+    })
+    // `TableWriter` layout: [int count, slot count, tables, name length, rows, width].
+    const ints = new Uint32Array([6, 4, 1, 4, 1, 4])
+    const tags = new Uint8Array([NUMBER, NUMBER, OTHER, NUMBER])
+    const nums = new Float64Array([1, 1, 0, 42])
+    const meta = {
+      get x() {
+        const moved = structuredClone(nums.buffer, { transfer: [nums.buffer] })
+        new Float64Array(moved)[3] = 999
+        return 1
+      },
+    }
+
+    const out = db.ingest([ints, tags, nums, 'docs', [meta]], at(1)) as [
+      ArrayBuffer,
+      string,
+      unknown[] | null,
+    ]
+    const batch = readBatch(...out)
+    expect(batch.tables.docs[0].values).toEqual({ block_number: 1, meta: '{"x":1}', n: 42 })
   })
 
   it('rejects rows of a table that the schema lacks, unless there are none', async () => {

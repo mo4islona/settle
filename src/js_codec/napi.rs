@@ -237,7 +237,7 @@ fn object_to_json(
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(serde_json::Value::Array(items));
     }
-    if let Some(bytes) = uint8_array(env, value)? {
+    if let Some(bytes) = view_bytes(env, value)? {
         return Ok(serde_json::Value::Array(bytes.into_iter().map(Into::into).collect()));
     }
 
@@ -320,17 +320,9 @@ pub fn element(env: &Env, array: sys::napi_value, index: u32) -> Result<sys::nap
     Ok(out)
 }
 
-/// The elements of a JS typed array.
-///
-/// # Safety
-///
-/// `value` must stay alive, and its buffer must not be detached or resized,
-/// while the slice is in use.
-pub unsafe fn typed_array<'a, T>(
-    env: &Env,
-    value: sys::napi_value,
-    expected: sys::napi_typedarray_type,
-) -> Result<&'a [T], String> {
+/// The address, element count and kind of a JS typed array. The address is
+/// valid only until JS runs: JS can detach the buffer.
+fn typed_array_raw(env: &Env, value: sys::napi_value) -> Result<(*const c_void, usize, i32), String> {
     let mut kind = 0;
     let mut len = 0;
     let mut data: *mut c_void = ptr::null_mut();
@@ -350,15 +342,67 @@ pub unsafe fn typed_array<'a, T>(
         },
         "read typed array",
     )?;
-    if kind != expected {
-        return Err(format!("expected typed array kind {expected}, got {kind}"));
-    }
+    Ok((data, len, kind))
+}
+
+/// The first `len` elements at `data`, copied.
+///
+/// # Safety
+///
+/// `data` must point at `len` or more elements of `T`, and no JS may run
+/// during the call.
+unsafe fn copy_out<T: Copy>(data: *const c_void, len: usize) -> Vec<T> {
     if len == 0 {
-        return Ok(&[]);
+        return Vec::new();
     }
-    // SAFETY: napi points `data` at `len` elements of the array's kind,
-    // which the check above matched to `T`.
-    Ok(unsafe { std::slice::from_raw_parts(data as *const T, len) })
+    unsafe { std::slice::from_raw_parts(data as *const T, len) }.to_vec()
+}
+
+/// The used part of the arrays that JS filled for one call, copied out: JS
+/// that runs later (a getter of a host value) can detach or change them.
+pub struct Arrays {
+    /// Starts with the used int count and the used slot count.
+    pub ints: Vec<u32>,
+    pub tags: Vec<u8>,
+    pub nums: Vec<f64>,
+}
+
+impl Arrays {
+    pub fn read(
+        env: &Env,
+        ints: sys::napi_value,
+        tags: sys::napi_value,
+        nums: sys::napi_value,
+    ) -> Result<Self, String> {
+        let (int_data, int_len, int_kind) = typed_array_raw(env, ints)?;
+        let (tag_data, tag_len, tag_kind) = typed_array_raw(env, tags)?;
+        let (num_data, num_len, num_kind) = typed_array_raw(env, nums)?;
+        let kinds = [int_kind, tag_kind, num_kind];
+        let expected = [
+            sys::TypedarrayType::uint32_array,
+            sys::TypedarrayType::uint8_array,
+            sys::TypedarrayType::float64_array,
+        ];
+        if kinds != expected {
+            return Err(format!("expected typed array kinds {expected:?}, got {kinds:?}"));
+        }
+        if int_len < 2 {
+            return Err("the ints have no header".to_string());
+        }
+
+        // SAFETY: napi points each address at its count of elements of the
+        // kind checked above, and no JS runs until the copies end.
+        let header: Vec<u32> = unsafe { copy_out(int_data, 2) };
+        let (int_count, slot_count) = (header[0] as usize, header[1] as usize);
+        if int_count < 2 || int_count > int_len || slot_count > tag_len.min(num_len) {
+            return Err("the header is out of range".to_string());
+        }
+        Ok(Self {
+            ints: unsafe { copy_out(int_data, int_count) },
+            tags: unsafe { copy_out(tag_data, slot_count) },
+            nums: unsafe { copy_out(num_data, slot_count) },
+        })
+    }
 }
 
 /// A JS string, copied out: as bytes if it is all ASCII, else as UTF-16.
@@ -417,7 +461,7 @@ pub fn read_strings(env: &Env, value: sys::napi_value) -> Result<OwnedStrings, S
 /// The value of element `index` of the host value array `others`. A BigInt
 /// becomes UInt64, Int64 or Uint256, else its decimal text. An object
 /// becomes JSON (`js_to_json`); on ingest, as the msgpack input did, its
-/// JSON text, and a `Uint8Array` its bytes.
+/// JSON text, and a typed array or a DataView its bytes.
 pub fn other_value(
     env: &Env,
     others: sys::napi_value,
@@ -431,7 +475,7 @@ pub fn other_value(
     match value.get_type().map_err(|e| e.to_string())? {
         napi::ValueType::BigInt => bigint(env, raw_value),
         napi::ValueType::Object if ingest => {
-            if let Some(bytes) = uint8_array(env, raw_value)? {
+            if let Some(bytes) = view_bytes(env, raw_value)? {
                 return Ok(Value::Bytes(bytes));
             }
             Ok(Value::String(js_to_json(env, raw_value, 0)?.to_string()))
@@ -441,21 +485,48 @@ pub fn other_value(
     }
 }
 
-/// The bytes of `value` if it is a `Uint8Array` (a `Buffer` is one).
-fn uint8_array(env: &Env, value: sys::napi_value) -> Result<Option<Vec<u8>>, String> {
+/// The bytes of `value` if it is a typed array of any kind or a DataView,
+/// as msgpack sent each `ArrayBuffer.isView` value.
+fn view_bytes(env: &Env, value: sys::napi_value) -> Result<Option<Vec<u8>>, String> {
+    let raw = env.raw();
     let mut is_typed = false;
-    check(
-        unsafe { sys::napi_is_typedarray(env.raw(), value, &mut is_typed) },
-        "check typed array",
-    )?;
-    if !is_typed {
+    check(unsafe { sys::napi_is_typedarray(raw, value, &mut is_typed) }, "check typed array")?;
+    if is_typed {
+        let (data, len, kind) = typed_array_raw(env, value)?;
+        let width = match kind {
+            sys::TypedarrayType::int8_array
+            | sys::TypedarrayType::uint8_array
+            | sys::TypedarrayType::uint8_clamped_array => 1,
+            sys::TypedarrayType::int16_array | sys::TypedarrayType::uint16_array => 2,
+            sys::TypedarrayType::int32_array
+            | sys::TypedarrayType::uint32_array
+            | sys::TypedarrayType::float32_array => 4,
+            sys::TypedarrayType::float64_array
+            | sys::TypedarrayType::bigint64_array
+            | sys::TypedarrayType::biguint64_array => 8,
+            other => return Err(format!("unknown typed array kind {other}")),
+        };
+        // SAFETY: napi points `data` at `len` elements of `width` bytes, and
+        // no JS runs during the copy.
+        return Ok(Some(unsafe { copy_out(data, len * width) }));
+    }
+
+    let mut is_view = false;
+    check(unsafe { sys::napi_is_dataview(raw, value, &mut is_view) }, "check DataView")?;
+    if !is_view {
         return Ok(None);
     }
-    // SAFETY: the bytes are copied out before any JS runs.
-    match unsafe { typed_array::<u8>(env, value, sys::TypedarrayType::uint8_array) } {
-        Ok(bytes) => Ok(Some(bytes.to_vec())),
-        Err(_) => Ok(None),
-    }
+    let mut len = 0;
+    let mut data: *mut c_void = ptr::null_mut();
+    let mut buffer = ptr::null_mut();
+    let mut offset = 0;
+    check(
+        unsafe { sys::napi_get_dataview_info(raw, value, &mut len, &mut data, &mut buffer, &mut offset) },
+        "read DataView",
+    )?;
+    // SAFETY: napi points `data` at the `len` bytes of the view, and no JS
+    // runs during the copy.
+    Ok(Some(unsafe { copy_out(data, len) }))
 }
 
 /// A handle scope for the napi values of one callback: without it, they

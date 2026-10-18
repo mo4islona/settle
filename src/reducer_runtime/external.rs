@@ -47,7 +47,7 @@ mod napi_bridge {
     use napi::sys;
 
     use crate::js_codec::napi::{
-        HandleScope, element, other_value, read_strings, to_js, typed_array,
+        Arrays, HandleScope, element, other_value, read_strings, to_js,
     };
     use crate::js_codec::{self, Decoder};
     use crate::reducer_runtime::{Emits, GroupedRows};
@@ -145,38 +145,23 @@ mod napi_bridge {
             }
 
             let part = |i| element(env, result, i);
-            // SAFETY: `result` holds the arrays until the scope closes, and
-            // no JS runs while they are read.
-            let ints: &[u32] =
-                unsafe { typed_array(env, part(0)?, sys::TypedarrayType::uint32_array)? };
-            let tags: &[u8] =
-                unsafe { typed_array(env, part(1)?, sys::TypedarrayType::uint8_array)? };
-            let nums: &[f64] =
-                unsafe { typed_array(env, part(2)?, sys::TypedarrayType::float64_array)? };
+            let arrays = Arrays::read(env, part(0)?, part(1)?, part(2)?)?;
             let strings = read_strings(env, part(3)?)?;
             let column_names = read_strings(env, part(4)?)?;
             let others_array = part(5)?;
 
-            let [int_count, slot_count, column_count] = match ints {
-                [a, b, c, ..] => [*a as usize, *b as usize, *c as usize],
-                _ => return Err("the ints have no header".to_string()),
-            };
-            let valid = int_count <= ints.len()
-                && 3 + column_count <= int_count
-                && slot_count <= tags.len()
-                && slot_count <= nums.len();
-            if !valid {
+            let ints = &arrays.ints;
+            let column_count = *ints.get(2).ok_or("the ints have no column count")? as usize;
+            if 3 + column_count > ints.len() {
                 return Err("the output header is out of range".to_string());
             }
 
-            let columns = js_codec::split_names(
-                column_names.as_strings(),
-                &ints[int_count - column_count..int_count],
-            )?;
+            let columns_at = ints.len() - column_count;
+            let columns = js_codec::split_names(column_names.as_strings(), &ints[columns_at..])?;
             let mut dec = Decoder::new(
-                &ints[3..int_count - column_count],
-                &tags[..slot_count],
-                &nums[..slot_count],
+                &ints[3..columns_at],
+                &arrays.tags,
+                &arrays.nums,
                 strings.as_strings(),
                 false,
             )?;

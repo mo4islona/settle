@@ -7,7 +7,7 @@ use napi_derive::napi;
 
 use crate::db::{BlockRows, Config, IngestRows, Settle as Inner};
 use crate::error::Error as SettleError;
-use crate::js_codec::napi::{element, other_value, read_strings, to_js, typed_array};
+use crate::js_codec::napi::{Arrays, element, other_value, read_strings, to_js};
 use crate::js_codec::{self, Decoder};
 use crate::reducer_runtime::external::install_context;
 use crate::schema::ast::{ReducerBody, ReducerDef, StateField};
@@ -538,26 +538,14 @@ fn decode_rows<'r>(
 ) -> std::result::Result<HashMap<String, BlockRows>, String> {
     let raw = unsafe { rows.raw() };
     let part = |i| element(env, raw, i);
-    // SAFETY: `rows` holds the arrays for the whole call, and no JS runs
-    // while they are read.
-    let ints: &[u32] = unsafe { typed_array(env, part(0)?, sys::TypedarrayType::uint32_array)? };
-    let tags: &[u8] = unsafe { typed_array(env, part(1)?, sys::TypedarrayType::uint8_array)? };
-    let nums: &[f64] = unsafe { typed_array(env, part(2)?, sys::TypedarrayType::float64_array)? };
+    let arrays = Arrays::read(env, part(0)?, part(1)?, part(2)?)?;
     let strings = read_strings(env, part(3)?)?;
     let others_array = part(4)?;
 
-    let [int_count, slot_count] = match ints {
-        [a, b, ..] => [*a as usize, *b as usize],
-        _ => return Err("the ints have no header".to_string()),
-    };
-    if int_count < 2 || int_count > ints.len() || slot_count > tags.len().min(nums.len()) {
-        return Err("the row header is out of range".to_string());
-    }
-
     let mut dec = Decoder::new(
-        &ints[2..int_count],
-        &tags[..slot_count],
-        &nums[..slot_count],
+        &arrays.ints[2..],
+        &arrays.tags,
+        &arrays.nums,
         strings.as_strings(),
         true,
     )?;
