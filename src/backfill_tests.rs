@@ -220,8 +220,11 @@ fn ext_runtime() -> FnReducerRuntime {
         let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let total = state.get("total").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let new_total = total + amount;
-        state.insert("total".to_string(), Value::Float64(new_total));
-        vec![HashMap::from([("total".to_string(), Value::Float64(new_total))])]
+        state.set("total", Value::Float64(new_total));
+        state.emit(HashMap::from([(
+            "total".to_string(),
+            Value::Float64(new_total),
+        )]))
     })
 }
 

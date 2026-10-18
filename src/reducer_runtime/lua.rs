@@ -1,12 +1,12 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use mlua::{Lua, MultiValue, RegistryKey, Result as LuaResult, Value as LuaValue};
 
-use crate::types::{ColumnType, Row, RowMap, Value};
+use crate::types::{ColumnType, Row, Value};
 
-use super::ReducerRuntime;
+use super::{Emits, GroupState, ReducerRuntime, set_at};
 
 /// Lua runtime for reducer process functions.
 ///
@@ -29,15 +29,16 @@ pub struct LuaRuntime {
     row_key: RegistryKey,
     /// Ordered state field names for positional arg passing (empty = use generic path)
     state_fields: Vec<String>,
-    /// State field types — used to know which fields should be read back as JSON
-    state_types: HashMap<String, ColumnType>,
+    /// The type of each state field, by position — JSON fields are read back
+    /// as JSON
+    state_types: Vec<Option<ColumnType>>,
     /// Row field names actually referenced by the Lua script.
     /// Used to filter row.iter() — only matching fields are marshalled to Lua.
     /// Empty = no filtering (all non-null fields are set).
     accessed_fields: HashSet<String>,
-    /// Rust-side emit buffer. Each `emit({...})` call from Lua is serialized
-    /// immediately into this Vec, avoiding any Lua-side table accumulation.
-    emits: Rc<RefCell<Vec<RowMap>>>,
+    /// The engine's emit buffer during a call. Each `emit({...})` call from
+    /// Lua goes into it at once, with no Lua-side table accumulation.
+    emits: Rc<RefCell<Emits>>,
 }
 
 // Safety: Each LuaRuntime is owned by exactly one ReducerEngine.
@@ -103,15 +104,16 @@ impl LuaRuntime {
             .create_registry_value(row_table)
             .expect("failed to store row in registry");
 
-        // Register `emit` as a Rust callback. Each emit({...}) call is serialized
-        // immediately into the Rust-side buffer — no Lua table accumulation.
-        let emits: Rc<RefCell<Vec<RowMap>>> = Rc::new(RefCell::new(Vec::new()));
+        // Register `emit` as a Rust callback. Each emit({...}) call goes into
+        // the emit buffer at once — no Lua table accumulation.
+        let emits: Rc<RefCell<Emits>> = Rc::new(RefCell::new(Emits::default()));
         let emits_for_lua = emits.clone();
         let emit_fn = lua
             .create_function(move |_lua, tbl: mlua::Table| {
-                let map = lua_table_to_value_map(&tbl)?;
-                if !map.is_empty() {
-                    emits_for_lua.borrow_mut().push(map);
+                let mut emits = emits_for_lua.borrow_mut();
+                let values = lua_table_to_values(&tbl, &mut emits)?;
+                if !values.is_empty() {
+                    emits.push(values);
                 }
                 Ok(())
             })
@@ -180,7 +182,15 @@ impl LuaRuntime {
             state_key,
             row_key,
             state_fields: state_fields.to_vec(),
-            state_types: state_types.iter().cloned().collect(),
+            state_types: state_fields
+                .iter()
+                .map(|f| {
+                    state_types
+                        .iter()
+                        .find(|(name, _)| name == f)
+                        .map(|(_, t)| t.clone())
+                })
+                .collect(),
             accessed_fields,
             emits,
         }
@@ -190,40 +200,36 @@ impl LuaRuntime {
 impl ReducerRuntime for LuaRuntime {
     fn process(
         &self,
-        state: &mut HashMap<String, Value>,
+        state: GroupState<'_>,
         row: &Row,
-    ) -> crate::error::Result<Vec<RowMap>> {
-        let lua_err = |e: mlua::Error| crate::error::Error::Reducer(e.to_string());
+        emits: &mut Emits,
+    ) -> crate::error::Result<()> {
+        std::mem::swap(&mut *self.emits.borrow_mut(), emits);
+        let processed = self.call(state, row);
+        std::mem::swap(&mut *self.emits.borrow_mut(), emits);
+        processed.map_err(|e| crate::error::Error::Reducer(e.to_string()))
+    }
+}
 
-        let row_table: mlua::Table = self.lua.registry_value(&self.row_key).map_err(lua_err)?;
-        marshal_row_to_lua(&self.lua, &row_table, row, &self.accessed_fields)
-            .map_err(lua_err)?;
+impl LuaRuntime {
+    /// Run the script on `row`, with the engine's emit buffer in `self.emits`.
+    fn call(&self, state: GroupState<'_>, row: &Row) -> LuaResult<()> {
+        let row_table: mlua::Table = self.lua.registry_value(&self.row_key)?;
+        marshal_row_to_lua(&self.lua, &row_table, row, &self.accessed_fields)?;
 
-        let call: mlua::Function = self.lua.registry_value(&self.call_key).map_err(lua_err)?;
-
-        // Clear the emit buffer before calling user script
-        self.emits.borrow_mut().clear();
+        let call: mlua::Function = self.lua.registry_value(&self.call_key)?;
 
         if self.state_fields.is_empty() {
-            let state_table: mlua::Table =
-                self.lua.registry_value(&self.state_key).map_err(lua_err)?;
-            serialize_state_generic(&self.lua, &state_table, state).map_err(lua_err)?;
-
-            lua_call_generic(&call).map_err(lua_err)?;
-
-            deserialize_state_generic(&state_table, state, &self.state_types)
-                .map_err(lua_err)?;
-        } else {
-            let args =
-                serialize_state_hoisted(&self.lua, &self.state_fields, state).map_err(lua_err)?;
-
-            let result =
-                lua_call_hoisted(&call, args).map_err(lua_err)?;
-
-            deserialize_state_hoisted(result, &self.state_fields, state, &self.state_types);
+            let state_table: mlua::Table = self.lua.registry_value(&self.state_key)?;
+            serialize_state_generic(&self.lua, &state_table, &state)?;
+            lua_call_generic(&call)?;
+            return deserialize_state_generic(&state_table, state);
         }
 
-        Ok(std::mem::take(&mut *self.emits.borrow_mut()))
+        let args = serialize_state_hoisted(&self.lua, state.values)?;
+        let result = lua_call_hoisted(&call, args)?;
+        deserialize_state_hoisted(result, state.values, &self.state_types);
+        Ok(())
     }
 }
 
@@ -252,29 +258,25 @@ fn marshal_row_to_lua(
     Ok(())
 }
 
-/// Phase 2a: Serialize state → Lua table (generic path)
+/// Phase 2a: Serialize state → Lua table (generic path, a runtime built
+/// without its state fields)
 #[inline(never)]
 fn serialize_state_generic(
     lua: &Lua,
     state_table: &mlua::Table,
-    state: &HashMap<String, Value>,
+    state: &GroupState<'_>,
 ) -> LuaResult<()> {
-    for (k, v) in state.iter() {
-        state_table.raw_set(k.as_str(), value_to_lua(lua, v)?)?;
+    for (name, v) in state.fields.names().iter().zip(state.values.iter()) {
+        state_table.raw_set(name.as_str(), value_to_lua(lua, v)?)?;
     }
     Ok(())
 }
 
 /// Phase 2b: Serialize state → MultiValue args (hoisted path)
 #[inline(never)]
-fn serialize_state_hoisted(
-    lua: &Lua,
-    state_fields: &[String],
-    state: &HashMap<String, Value>,
-) -> LuaResult<MultiValue> {
+fn serialize_state_hoisted(lua: &Lua, state: &[Value]) -> LuaResult<MultiValue> {
     let mut args = MultiValue::new();
-    for field in state_fields {
-        let v = state.get(field).unwrap_or(&Value::Null);
+    for v in state {
         args.push_back(value_to_lua(lua, v)?);
     }
     Ok(args)
@@ -294,14 +296,10 @@ fn lua_call_hoisted(call: &mlua::Function, args: MultiValue) -> LuaResult<MultiV
 
 /// Phase 4a: Deserialize state ← Lua table (generic path)
 #[inline(never)]
-fn deserialize_state_generic(
-    state_table: &mlua::Table,
-    state: &mut HashMap<String, Value>,
-    state_types: &HashMap<String, ColumnType>,
-) -> LuaResult<()> {
-    for (k, v) in state.iter_mut() {
-        let lua_val: LuaValue = state_table.raw_get(k.as_str())?;
-        *v = lua_to_value_typed(&lua_val, state_types.get(k));
+fn deserialize_state_generic(state_table: &mlua::Table, state: GroupState<'_>) -> LuaResult<()> {
+    for (name, v) in state.fields.names().iter().zip(state.values.iter_mut()) {
+        let lua_val: LuaValue = state_table.raw_get(name.as_str())?;
+        *v = lua_to_value(&lua_val);
     }
     Ok(())
 }
@@ -310,17 +308,12 @@ fn deserialize_state_generic(
 #[inline(never)]
 fn deserialize_state_hoisted(
     result: MultiValue,
-    state_fields: &[String],
-    state: &mut HashMap<String, Value>,
-    state_types: &HashMap<String, ColumnType>,
+    state: &mut [Value],
+    state_types: &[Option<ColumnType>],
 ) {
-    let mut iter = result.into_vec().into_iter();
-    for field in state_fields {
-        if let Some(lua_val) = iter.next() {
-            if let Some(v) = state.get_mut(field) {
-                *v = lua_to_value_typed(&lua_val, state_types.get(field));
-            }
-        }
+    let returned = result.into_vec().into_iter();
+    for ((value, lua_val), col_type) in state.iter_mut().zip(returned).zip(state_types) {
+        *value = lua_to_value_typed(&lua_val, col_type.as_ref());
     }
 }
 
@@ -417,13 +410,16 @@ fn register_json_module(lua: &Lua) -> LuaResult<()> {
     Ok(())
 }
 
-fn lua_table_to_value_map(table: &mlua::Table) -> LuaResult<HashMap<String, Value>> {
-    let mut map = HashMap::new();
-    table.for_each(|k: String, v: LuaValue| {
-        map.insert(k, lua_to_value(&v));
+/// An emitted Lua table as values by the columns of `emits`.
+fn lua_table_to_values(table: &mlua::Table, emits: &mut Emits) -> LuaResult<Vec<Value>> {
+    let mut values = Vec::new();
+    table.for_each(|k: mlua::String, v: LuaValue| {
+        if let Some(id) = emits.column(&k.to_str()?) {
+            set_at(&mut values, id, lua_to_value(&v));
+        }
         Ok(())
     })?;
-    Ok(map)
+    Ok(values)
 }
 
 fn value_to_lua(lua: &Lua, val: &Value) -> LuaResult<LuaValue> {
@@ -593,7 +589,19 @@ fn is_lua_array(table: &mlua::Table) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::types::RowMap;
+
+    impl LuaRuntime {
+        /// `process` with the state and emits by name. A runtime built
+        /// with state fields takes them in its order.
+        fn run(&self, state: &mut RowMap, row: &Row) -> crate::error::Result<Vec<RowMap>> {
+            let fields = (!self.state_fields.is_empty()).then_some(self.state_fields.as_slice());
+            crate::reducer_runtime::run_by_name(self, fields, state, row)
+        }
+    }
 
     fn make_trade(side: &str, amount: f64, price: f64) -> Row {
         Row::from(HashMap::from([
@@ -616,7 +624,7 @@ mod tests {
         let row = Row::from(RowMap::new());
 
         let out1 = runtime
-            .process(&mut state, &row)
+            .run(&mut state, &row)
             .unwrap()
             .into_iter()
             .next()
@@ -624,7 +632,7 @@ mod tests {
         assert_eq!(out1.get("total"), Some(&Value::Float64(1.0)));
 
         let out2 = runtime
-            .process(&mut state, &row)
+            .run(&mut state, &row)
             .unwrap()
             .into_iter()
             .next()
@@ -644,7 +652,7 @@ mod tests {
         let row = Row::from(HashMap::from([("amount".to_string(), Value::Float64(5.0))]));
 
         let out = runtime
-            .process(&mut state, &row)
+            .run(&mut state, &row)
             .unwrap()
             .into_iter()
             .next()
@@ -678,7 +686,7 @@ mod tests {
 
         // BUY 10 @ 2000
         let out1 = runtime
-            .process(&mut state, &make_trade("buy", 10.0, 2000.0))
+            .run(&mut state, &make_trade("buy", 10.0, 2000.0))
             .unwrap()
             .into_iter()
             .next()
@@ -688,7 +696,7 @@ mod tests {
 
         // BUY 5 @ 2100
         let out2 = runtime
-            .process(&mut state, &make_trade("buy", 5.0, 2100.0))
+            .run(&mut state, &make_trade("buy", 5.0, 2100.0))
             .unwrap()
             .into_iter()
             .next()
@@ -697,7 +705,7 @@ mod tests {
 
         // SELL 8 @ 2200
         let out3 = runtime
-            .process(&mut state, &make_trade("sell", 8.0, 2200.0))
+            .run(&mut state, &make_trade("sell", 8.0, 2200.0))
             .unwrap()
             .into_iter()
             .next()
@@ -742,7 +750,7 @@ mod tests {
 
         // BUY 10 @ 100
         let out1 = runtime
-            .process(&mut state, &make_trade("buy", 10.0, 100.0))
+            .run(&mut state, &make_trade("buy", 10.0, 100.0))
             .unwrap()
             .into_iter()
             .next()
@@ -752,7 +760,7 @@ mod tests {
 
         // BUY 5 @ 200
         let out2 = runtime
-            .process(&mut state, &make_trade("buy", 5.0, 200.0))
+            .run(&mut state, &make_trade("buy", 5.0, 200.0))
             .unwrap()
             .into_iter()
             .next()
@@ -761,7 +769,7 @@ mod tests {
 
         // SELL 12 @ 150 (FIFO: 10 @ cost=100, 2 @ cost=200)
         let out3 = runtime
-            .process(&mut state, &make_trade("sell", 12.0, 150.0))
+            .run(&mut state, &make_trade("sell", 12.0, 150.0))
             .unwrap()
             .into_iter()
             .next()
@@ -778,7 +786,7 @@ mod tests {
         let runtime = LuaRuntime::new("-- do nothing");
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
-        assert!(runtime.process(&mut state, &row).unwrap().is_empty());
+        assert!(runtime.run(&mut state, &row).unwrap().is_empty());
     }
 
     #[test]
@@ -793,7 +801,7 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
         let out = runtime
-            .process(&mut state, &row)
+            .run(&mut state, &row)
             .unwrap()
             .into_iter()
             .next()
@@ -814,7 +822,7 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
         let out = runtime
-            .process(&mut state, &row)
+            .run(&mut state, &row)
             .unwrap()
             .into_iter()
             .next()
@@ -839,7 +847,7 @@ mod tests {
             Value::String("buy".to_string()),
         )]));
         let out = runtime
-            .process(&mut state, &row)
+            .run(&mut state, &row)
             .unwrap()
             .into_iter()
             .next()
@@ -867,7 +875,7 @@ mod tests {
             ),
         )]));
 
-        let results = runtime.process(&mut state, &row).unwrap();
+        let results = runtime.run(&mut state, &row).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].get("name"), Some(&Value::String("a".into())));
         assert_eq!(results[0].get("value"), Some(&Value::Int64(1)));
@@ -890,7 +898,7 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
 
-        let results = runtime.process(&mut state, &row).unwrap();
+        let results = runtime.run(&mut state, &row).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].get("x"), Some(&Value::Int64(1)));
         assert_eq!(results[1].get("x"), Some(&Value::Int64(2)));
@@ -904,7 +912,7 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
 
-        let results = runtime.process(&mut state, &row).unwrap();
+        let results = runtime.run(&mut state, &row).unwrap();
         assert!(results.is_empty());
     }
 
@@ -950,7 +958,7 @@ mod tests {
             ("token".to_string(), Value::String("A".into())),
             ("volume".to_string(), Value::Float64(100.0)),
         ]));
-        let out1 = runtime.process(&mut state, &row1).unwrap();
+        let out1 = runtime.run(&mut state, &row1).unwrap();
         assert_eq!(out1.len(), 1);
         assert_eq!(out1[0].get("token"), Some(&Value::String("A".into())));
         assert_eq!(out1[0].get("total_volume"), Some(&Value::Float64(100.0)));
@@ -970,7 +978,7 @@ mod tests {
             ("token".to_string(), Value::String("A".into())),
             ("volume".to_string(), Value::Float64(50.0)),
         ]));
-        let out2 = runtime.process(&mut state, &row2).unwrap();
+        let out2 = runtime.run(&mut state, &row2).unwrap();
         assert_eq!(out2[0].get("total_volume"), Some(&Value::Float64(150.0)));
         assert_eq!(out2[0].get("total_trades").unwrap().as_f64(), Some(2.0));
 
@@ -979,7 +987,7 @@ mod tests {
             ("token".to_string(), Value::String("B".into())),
             ("volume".to_string(), Value::Float64(200.0)),
         ]));
-        let out3 = runtime.process(&mut state, &row3).unwrap();
+        let out3 = runtime.run(&mut state, &row3).unwrap();
         assert_eq!(out3[0].get("total_volume"), Some(&Value::Float64(200.0)));
 
         // State should have both tokens
@@ -1033,18 +1041,18 @@ mod tests {
 
         // BUY 10 @ 100
         let out1 = runtime
-            .process(&mut state, &make_trade("buy", 10.0, 100.0))
+            .run(&mut state, &make_trade("buy", 10.0, 100.0))
             .unwrap();
         assert_eq!(out1[0].get("pnl"), Some(&Value::Int64(0)));
 
         // BUY 5 @ 200
         runtime
-            .process(&mut state, &make_trade("buy", 5.0, 200.0))
+            .run(&mut state, &make_trade("buy", 5.0, 200.0))
             .unwrap();
 
         // SELL 12 @ 150 (FIFO: 10@100, 2@200)
         let out3 = runtime
-            .process(&mut state, &make_trade("sell", 12.0, 150.0))
+            .run(&mut state, &make_trade("sell", 12.0, 150.0))
             .unwrap();
         let pnl = out3[0].get("pnl").unwrap().as_f64().unwrap();
         // 10*(150-100) + 2*(150-200) = 500 + (-100) = 400
@@ -1131,12 +1139,12 @@ mod tests {
         let mut state = HashMap::from([("total".to_string(), Value::Float64(0.0))]);
         let row = Row::from(HashMap::from([("value".to_string(), Value::Float64(5.0))]));
 
-        let out = runtime.process(&mut state, &row).unwrap();
+        let out = runtime.run(&mut state, &row).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].get("result"), Some(&Value::Float64(10.0)));
 
         let row2 = Row::from(HashMap::from([("value".to_string(), Value::Float64(3.0))]));
-        let out2 = runtime.process(&mut state, &row2).unwrap();
+        let out2 = runtime.run(&mut state, &row2).unwrap();
         assert_eq!(out2[0].get("result"), Some(&Value::Float64(16.0)));
     }
 
@@ -1153,7 +1161,7 @@ mod tests {
         let big: i64 = (1i64 << 53) + 1;
         let row = Row::from(HashMap::from([("big".to_string(), Value::Int64(big))]));
         let out = runtime
-            .process(&mut state, &row)
+            .run(&mut state, &row)
             .unwrap()
             .into_iter()
             .next()
@@ -1186,7 +1194,7 @@ mod tests {
             Value::String("present".into()),
         )]));
         let out1 = runtime
-            .process(&mut state, &row1)
+            .run(&mut state, &row1)
             .unwrap()
             .into_iter()
             .next()
@@ -1196,7 +1204,7 @@ mod tests {
         // Row 2: does NOT have "optional" field — it must be nil, not "present"
         let row2 = Row::from(HashMap::new());
         let out2 = runtime
-            .process(&mut state, &row2)
+            .run(&mut state, &row2)
             .unwrap()
             .into_iter()
             .next()
@@ -1230,12 +1238,12 @@ mod tests {
             "do_set".to_string(),
             Value::Boolean(true),
         )]));
-        let out1 = runtime.process(&mut state, &row1).unwrap();
+        let out1 = runtime.run(&mut state, &row1).unwrap();
         assert_eq!(out1[0].get("saw"), Some(&Value::String("injected".into())));
 
         // Row 2: no do_set flag — row[1] must be cleared from previous call
         let row2 = Row::from(RowMap::new());
-        let out2 = runtime.process(&mut state, &row2).unwrap();
+        let out2 = runtime.run(&mut state, &row2).unwrap();
         assert_eq!(
             out2[0].get("saw"),
             Some(&Value::String("nil".into())),
@@ -1310,7 +1318,7 @@ mod tests {
                 ("trader".to_string(), Value::String("trader1".into())),
                 ("asset_id".to_string(), Value::String(asset)),
             ]));
-            runtime.process(&mut state, &row).unwrap();
+            runtime.run(&mut state, &row).unwrap();
         }
         assert_eq!(
             state.get("status"),
@@ -1333,18 +1341,18 @@ mod tests {
 
         // Row 1 emits 5
         let row1 = Row::from(HashMap::from([("n".to_string(), Value::Int64(5))]));
-        let out1 = runtime.process(&mut state, &row1).unwrap();
+        let out1 = runtime.run(&mut state, &row1).unwrap();
         assert_eq!(out1.len(), 5);
 
         // Row 2 emits 1 — must NOT include the 5 from row 1
         let row2 = Row::from(HashMap::from([("n".to_string(), Value::Int64(1))]));
-        let out2 = runtime.process(&mut state, &row2).unwrap();
+        let out2 = runtime.run(&mut state, &row2).unwrap();
         assert_eq!(out2.len(), 1, "emit buffer must be cleared between rows");
         assert_eq!(out2[0].get("i"), Some(&Value::Int64(1)));
 
         // Row 3 emits 0
         let row3 = Row::from(HashMap::from([("n".to_string(), Value::Int64(0))]));
-        let out3 = runtime.process(&mut state, &row3).unwrap();
+        let out3 = runtime.run(&mut state, &row3).unwrap();
         assert!(out3.is_empty(), "emit buffer must be empty when no emit is called");
     }
 
@@ -1363,7 +1371,7 @@ mod tests {
         let n = 1000i64;
         let row = Row::from(HashMap::from([("n".to_string(), Value::Int64(n))]));
 
-        let results = runtime.process(&mut state, &row).unwrap();
+        let results = runtime.run(&mut state, &row).unwrap();
         assert_eq!(results.len(), n as usize);
         for (i, r) in results.iter().enumerate() {
             let expected_idx = (i + 1) as i64;
@@ -1394,18 +1402,18 @@ mod tests {
 
         // Large flush
         let row_many = Row::from(HashMap::from([("n".to_string(), Value::Int64(500))]));
-        let out_many = runtime.process(&mut state, &row_many).unwrap();
+        let out_many = runtime.run(&mut state, &row_many).unwrap();
         assert_eq!(out_many.len(), 500);
 
         // Single emit after flush
         let row_one = Row::from(HashMap::from([("n".to_string(), Value::Int64(1))]));
-        let out_one = runtime.process(&mut state, &row_one).unwrap();
+        let out_one = runtime.run(&mut state, &row_one).unwrap();
         assert_eq!(out_one.len(), 1);
         assert_eq!(out_one[0].get("val"), Some(&Value::Int64(1)));
 
         // Zero emits after flush
         let row_zero = Row::from(HashMap::from([("n".to_string(), Value::Int64(0))]));
-        let out_zero = runtime.process(&mut state, &row_zero).unwrap();
+        let out_zero = runtime.run(&mut state, &row_zero).unwrap();
         assert!(out_zero.is_empty());
     }
 
@@ -1441,7 +1449,7 @@ mod tests {
 
         // Single row triggers 500 emits inside pairs()
         let row = Row::from(HashMap::from([("x".to_string(), Value::UInt64(1))]));
-        let out = runtime.process(&mut state, &row).unwrap();
+        let out = runtime.run(&mut state, &row).unwrap();
         assert_eq!(out.len(), 500);
     }
 
@@ -1488,11 +1496,11 @@ mod tests {
         };
 
         // Rows 1 & 2: no flush yet
-        assert!(runtime.process(&mut state, &make_row("A", 10.0)).unwrap().is_empty());
-        assert!(runtime.process(&mut state, &make_row("B", 20.0)).unwrap().is_empty());
+        assert!(runtime.run(&mut state, &make_row("A", 10.0)).unwrap().is_empty());
+        assert!(runtime.run(&mut state, &make_row("B", 20.0)).unwrap().is_empty());
 
         // Row 3: count == 3, triggers flush (2 tokens: A and B)
-        let out3 = runtime.process(&mut state, &make_row("A", 5.0)).unwrap();
+        let out3 = runtime.run(&mut state, &make_row("A", 5.0)).unwrap();
         assert_eq!(out3.len(), 2, "flush should emit one row per tracked token");
         let mut totals: HashMap<String, f64> = HashMap::new();
         for r in &out3 {
@@ -1507,11 +1515,11 @@ mod tests {
         assert_eq!(state.get("count"), Some(&Value::Float64(3.0)));
 
         // Rows 4 & 5: no flush
-        assert!(runtime.process(&mut state, &make_row("C", 30.0)).unwrap().is_empty());
-        assert!(runtime.process(&mut state, &make_row("C", 10.0)).unwrap().is_empty());
+        assert!(runtime.run(&mut state, &make_row("C", 30.0)).unwrap().is_empty());
+        assert!(runtime.run(&mut state, &make_row("C", 10.0)).unwrap().is_empty());
 
         // Row 6: flush again (3 tokens: A, B, C)
-        let out6 = runtime.process(&mut state, &make_row("B", 5.0)).unwrap();
+        let out6 = runtime.run(&mut state, &make_row("B", 5.0)).unwrap();
         assert_eq!(out6.len(), 3, "second flush should emit 3 tokens");
     }
 
@@ -1527,7 +1535,7 @@ mod tests {
         );
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
-        let results = runtime.process(&mut state, &row).unwrap();
+        let results = runtime.run(&mut state, &row).unwrap();
         assert_eq!(results.len(), 1, "empty table emits must be skipped");
         assert_eq!(results[0].get("x"), Some(&Value::Int64(1)));
     }
@@ -1542,7 +1550,7 @@ mod tests {
         );
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
-        let result = runtime.process(&mut state, &row);
+        let result = runtime.run(&mut state, &row);
         assert!(result.is_err(), "Lua error() should return Err, not panic");
         let msg = result.unwrap_err().to_string();
         assert!(

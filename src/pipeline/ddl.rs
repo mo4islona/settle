@@ -1,9 +1,8 @@
 //! Builder option types + helpers — Rust mirror of `@settle/stream`'s `ddl.ts`.
 
-use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::types::{Row, RowMap, Value};
+use crate::types::{Row, RowMap};
 
 // ─── Duration parsing ───────────────────────────────────────────
 
@@ -215,66 +214,4 @@ pub struct ViewOptions {
 
 // ─── State context (passed to reduce closures) ──────────────────
 
-/// Mutable context handed to `reduce(state, row)` closures.
-///
-/// Wraps the reducer's running state and accumulates emitted rows for the
-/// current input row. Mirrors TS `ReducerCtx<TState, TEmit>` (`state.update()`,
-/// `state.emit()`, plus typed read accessors).
-pub struct StateCtx<'a> {
-    state: &'a mut HashMap<String, Value>,
-    emits: Vec<RowMap>,
-}
-
-impl<'a> StateCtx<'a> {
-    pub(crate) fn new(state: &'a mut HashMap<String, Value>) -> Self {
-        Self {
-            state,
-            emits: Vec::new(),
-        }
-    }
-
-    pub(crate) fn into_emits(self) -> Vec<RowMap> {
-        self.emits
-    }
-
-    /// Replace the entire state with the given map.
-    pub fn update(&mut self, new_state: RowMap) {
-        *self.state = new_state;
-    }
-
-    /// Set a single state field without touching the others.
-    pub fn set(&mut self, name: impl Into<String>, value: Value) {
-        self.state.insert(name.into(), value);
-    }
-
-    /// Emit a row into the reducer's output stream.
-    pub fn emit(&mut self, row: RowMap) {
-        self.emits.push(row);
-    }
-
-    /// Read a state field by name.
-    pub fn get(&self, name: &str) -> Option<&Value> {
-        self.state.get(name)
-    }
-
-    pub fn get_f64(&self, name: &str) -> f64 {
-        self.state.get(name).and_then(Value::as_f64).unwrap_or(0.0)
-    }
-    pub fn get_i64(&self, name: &str) -> i64 {
-        self.state.get(name).and_then(Value::as_i64).unwrap_or(0)
-    }
-    pub fn get_u64(&self, name: &str) -> u64 {
-        self.state.get(name).and_then(Value::as_u64).unwrap_or(0)
-    }
-    pub fn get_bool(&self, name: &str) -> bool {
-        self.state.get(name).and_then(Value::as_bool).unwrap_or(false)
-    }
-    pub fn get_str(&self, name: &str) -> &str {
-        self.state.get(name).and_then(Value::as_str).unwrap_or("")
-    }
-
-    /// Borrow the underlying state map.
-    pub fn state(&self) -> &HashMap<String, Value> {
-        self.state
-    }
-}
+pub use crate::reducer_runtime::fn_reducer::StateCtx;
