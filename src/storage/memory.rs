@@ -215,6 +215,15 @@ impl StorageBackend for MemoryBackend {
         Ok(())
     }
 
+    fn has_reducer_finalized(&self, reducer: &str) -> Result<bool> {
+        let inner = self.inner.lock().unwrap();
+        let first = inner
+            .reducer_finalized
+            .range((reducer.to_string(), Vec::new())..)
+            .next();
+        Ok(first.is_some_and(|((r, _), _)| r == reducer))
+    }
+
     fn delete_reducer_states_up_to(
         &self,
         reducer: &str,

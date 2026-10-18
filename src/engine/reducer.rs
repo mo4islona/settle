@@ -29,6 +29,11 @@ pub struct ReducerEngine {
     default_state: Vec<Value>,
     /// Every group since open or `reload`.
     groups: Groups,
+    /// Whether a new group reads its state from storage. False when storage
+    /// held no state of the reducer at open or `reload`, as on a fresh
+    /// database: groups are never evicted, so storage then holds no group
+    /// that `groups` lacks.
+    reads_storage: bool,
     /// The groups that each block not final yet changed, by id. Each of them
     /// holds an undo entry for the block.
     block_groups: BTreeMap<BlockNumber, Vec<usize>>,
@@ -165,6 +170,7 @@ impl ReducerEngine {
             .map(|col| source_registry.get_id(col))
             .collect();
         let emits = Emits::with_columns(&def.group_by);
+        let reads_storage = stores_state(storage.as_ref(), &def.name);
 
         Self {
             def,
@@ -173,6 +179,7 @@ impl ReducerEngine {
             state_fields,
             default_state,
             groups: Groups::default(),
+            reads_storage,
             block_groups: BTreeMap::new(),
             pending_durable: Vec::new(),
             key: Vec::new(),
@@ -331,16 +338,12 @@ impl ReducerEngine {
     /// error changed.
     fn process_block_per_row(&mut self, block: BlockNumber, rows: &[Row]) -> Result<()> {
         let changed = self.block_groups.entry(block).or_default();
+        let storage = self.reads_storage.then_some(self.storage.as_ref());
 
         for (index, row) in rows.iter().enumerate() {
             write_group_key(&mut self.key, &self.group_by_ids, row);
             let id = self.groups.id(&self.key, || {
-                load_state_from(
-                    self.storage.as_ref(),
-                    &self.def.name,
-                    &self.key,
-                    &self.default_state,
-                )
+                load_state_from(storage, &self.def.name, &self.key, &self.default_state)
             })?;
             let group = self.groups.change(id, block, changed);
 
@@ -366,15 +369,11 @@ impl ReducerEngine {
         let mut sizes: Vec<usize> = Vec::new();
         let mut row_groups: Vec<usize> = Vec::with_capacity(rows.len());
         let mut slots: FxHashMap<usize, usize> = FxHashMap::default();
+        let storage = self.reads_storage.then_some(self.storage.as_ref());
         for row in rows {
             write_group_key(&mut self.key, &self.group_by_ids, row);
             let id = self.groups.id(&self.key, || {
-                load_state_from(
-                    self.storage.as_ref(),
-                    &self.def.name,
-                    &self.key,
-                    &self.default_state,
-                )
+                load_state_from(storage, &self.def.name, &self.key, &self.default_state)
             })?;
             let slot = *slots.entry(id).or_insert_with(|| {
                 ids.push(id);
@@ -455,6 +454,7 @@ impl ReducerEngine {
     /// its next row.
     pub fn reload(&mut self) {
         self.groups.clear();
+        self.reads_storage = stores_state(self.storage.as_ref(), &self.def.name);
         self.block_groups.clear();
         self.pending_durable.clear();
         self.emits.truncate_columns(self.def.group_by.len());
@@ -516,14 +516,23 @@ fn write_group_key(key: &mut Vec<u8>, group_by_ids: &[Option<ColumnId>], row: &R
     storage::write_group_key(key, group_values);
 }
 
-/// Load reducer state from storage, avoiding borrowing the entire ReducerEngine.
+/// Whether storage may hold a finalized state of `reducer`. A failed probe
+/// counts as yes: the reads of the groups then report the error.
+fn stores_state(storage: &dyn StorageBackend, reducer: &str) -> bool {
+    storage.has_reducer_finalized(reducer).unwrap_or(true)
+}
+
+/// The state of a new group: its finalized state in `storage`, else the
+/// default. No `storage` when it holds no state of the reducer.
 fn load_state_from(
-    storage: &dyn StorageBackend,
+    storage: Option<&dyn StorageBackend>,
     reducer_name: &str,
     group_key_bytes: &[u8],
     default_state: &[Value],
 ) -> Result<Vec<Value>> {
-    if let Some(bytes) = storage.get_reducer_finalized(reducer_name, group_key_bytes)? {
+    if let Some(storage) = storage
+        && let Some(bytes) = storage.get_reducer_finalized(reducer_name, group_key_bytes)?
+    {
         return decode_state(&bytes, reducer_name, default_state.len());
     }
     Ok(default_state.to_vec())
@@ -881,6 +890,40 @@ mod tests {
             .unwrap();
         let pnl = output[0].get("trade_pnl").unwrap().as_f64().unwrap();
         assert!((pnl - 900.0).abs() < 0.01);
+    }
+
+    /// A new group reads storage only when storage holds a state of the
+    /// reducer: not on a fresh database, but after a reopen or a `reload`
+    /// once a checkpoint is stored.
+    #[test]
+    fn new_groups_read_storage_once_it_holds_state() {
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine =
+            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]);
+        assert!(!engine.reads_storage);
+
+        engine
+            .process_block(1, &[make_trade("alice", "buy", 10.0, 100.0)])
+            .unwrap();
+        let mut batch = StorageWriteBatch::new();
+        engine.advance_finality(1);
+        engine.write_checkpoint(1, &mut batch);
+        storage.commit(&batch).unwrap();
+        assert!(!engine.reads_storage);
+
+        engine.reload();
+        let mut reopened =
+            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]);
+
+        // Both continue from the stored 10 bought at 100.
+        for engine in [&mut engine, &mut reopened] {
+            assert!(engine.reads_storage);
+            let output = engine
+                .process_block(2, &[make_trade("alice", "sell", 10.0, 200.0)])
+                .unwrap();
+            let pnl = output[0].get("trade_pnl").unwrap().as_f64().unwrap();
+            assert!((pnl - 1000.0).abs() < 0.01);
+        }
     }
 
     #[test]

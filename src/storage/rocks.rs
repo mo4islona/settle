@@ -448,6 +448,21 @@ impl StorageBackend for RocksDbBackend {
             .map_err(to_err)
     }
 
+    fn has_reducer_finalized(&self, reducer: &str) -> Result<bool> {
+        let cf = self.db.cf_handle(CF_REDUCER_FIN).expect("reducer_fin CF");
+        let prefix = name_prefix(reducer);
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_upper_bound(upper_bound(&prefix));
+
+        let mut iter =
+            self.db
+                .iterator_cf_opt(cf, opts, IteratorMode::From(&prefix, Direction::Forward));
+        match iter.next() {
+            Some(item) => item.map(|_| true).map_err(to_err),
+            None => Ok(false),
+        }
+    }
+
     fn delete_reducer_states_up_to(
         &self,
         reducer: &str,
