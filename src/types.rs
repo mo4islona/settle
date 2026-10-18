@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -15,7 +16,8 @@ pub type ColumnId = u16;
 #[derive(Debug, Clone)]
 pub struct ColumnRegistry {
     names: Vec<String>,
-    indices: HashMap<String, ColumnId>,
+    /// FxHash: the keys are schema names, and each input column looks one up.
+    indices: FxHashMap<String, ColumnId>,
 }
 
 impl ColumnRegistry {
@@ -80,6 +82,17 @@ impl Row {
         let mut row = Self::new(registry);
         for (k, v) in map {
             row.set(k, v.clone());
+        }
+        row
+    }
+
+    /// `from_map` that moves the values out of the map.
+    pub fn from_owned_map(registry: Arc<ColumnRegistry>, map: HashMap<String, Value>) -> Self {
+        let mut row = Self::new(registry);
+        for (k, v) in map {
+            if let Some(id) = row.registry.get_id(&k) {
+                row.values[id as usize] = v;
+            }
         }
         row
     }

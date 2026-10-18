@@ -8,7 +8,8 @@ use crate::error::{Error, Result};
 use crate::schema::ast::{AggFunc, MVDef, SelectExpr, SelectItem, SlidingWindowDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
 use crate::types::{
-    BlockNumber, ChangeOp, ChangeRecord, ChangeSchema, ColumnType, GroupKey, RowMap, Value,
+    BlockNumber, ChangeOp, ChangeRecord, ChangeSchema, ColumnId, ColumnRegistry, ColumnType,
+    GroupKey, Row, RowMap, Value,
 };
 
 use super::aggregation::{AggregationFunc, create_agg, restore_agg, to_start_of_interval};
@@ -37,15 +38,60 @@ enum OutputColumn {
 
 /// Pre-computed info for feeding a single aggregation from a source row.
 struct AggFeedInfo {
-    source_col: Option<String>,
+    source_col: Option<SourceColumn>,
     agg_index: usize,
     column_type: ColumnType,
 }
 
 /// Pre-computed group key extraction — avoids per-row pattern matching on OutputColumn.
 enum GroupKeyExtractor {
-    Column(String),
-    Window(String, u64),
+    Column(SourceColumn),
+    Window(SourceColumn, u64),
+}
+
+/// A column that the view reads from its source rows.
+pub struct SourceColumn {
+    name: String,
+    /// Its position in the registry of the last positional rows applied.
+    id: Option<ColumnId>,
+}
+
+impl SourceColumn {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            id: None,
+        }
+    }
+}
+
+static NULL: Value = Value::Null;
+
+/// A source row of a view: the positional rows of a raw table, or the
+/// emits of a reducer. A column that the row lacks reads as Null.
+pub trait SourceRow {
+    fn column<'a>(&'a self, column: &SourceColumn) -> &'a Value;
+
+    /// The registry of positional rows, which `SourceColumn::id` refers to.
+    fn registry(&self) -> Option<&Arc<ColumnRegistry>> {
+        None
+    }
+}
+
+impl SourceRow for Row {
+    fn column<'a>(&'a self, column: &SourceColumn) -> &'a Value {
+        column.id.map_or(&NULL, |id| &self.values()[id as usize])
+    }
+
+    fn registry(&self) -> Option<&Arc<ColumnRegistry>> {
+        Some(Row::registry(self))
+    }
+}
+
+impl SourceRow for RowMap {
+    fn column<'a>(&'a self, column: &SourceColumn) -> &'a Value {
+        self.get(&column.name).unwrap_or(&NULL)
+    }
 }
 
 const EMIT_ORDER_KEEP: usize = 8192;
@@ -141,6 +187,10 @@ pub struct MVEngine {
     agg_feeds: Vec<AggFeedInfo>,
     /// Pre-computed group key extractors (avoids per-row pattern matching on OutputColumn).
     group_key_extractors: Vec<GroupKeyExtractor>,
+    /// Sliding windows only: the time column.
+    time_column: Option<SourceColumn>,
+    /// The registry that the `SourceColumn` ids refer to.
+    resolved_for: Option<Arc<ColumnRegistry>>,
     /// group_key -> aggregation state (one AggregationFunc per agg column).
     groups: FxHashMap<GroupKey, Vec<Box<dyn AggregationFunc>>>,
     /// Tracks which blocks have been ingested (for rollback).
@@ -242,7 +292,7 @@ impl MVEngine {
                         .cloned()
                         .unwrap_or(ColumnType::Float64);
                     Some(AggFeedInfo {
-                        source_col: source_col.clone(),
+                        source_col: source_col.as_deref().map(SourceColumn::new),
                         agg_index: *agg_index,
                         column_type: ct,
                     })
@@ -257,14 +307,14 @@ impl MVEngine {
             .iter()
             .filter_map(|col| match col {
                 OutputColumn::GroupBy { source_col, .. } => {
-                    Some(GroupKeyExtractor::Column(source_col.clone()))
+                    Some(GroupKeyExtractor::Column(SourceColumn::new(source_col)))
                 }
                 OutputColumn::Window {
                     source_col,
                     interval_seconds,
                     ..
                 } => Some(GroupKeyExtractor::Window(
-                    source_col.clone(),
+                    SourceColumn::new(source_col),
                     *interval_seconds,
                 )),
                 OutputColumn::Agg { .. } => None,
@@ -280,6 +330,11 @@ impl MVEngine {
             }),
         ));
 
+        let time_column = def
+            .sliding_window
+            .as_ref()
+            .map(|sw| SourceColumn::new(&sw.time_column));
+
         let mut mv = MVEngine {
             sliding_window: def.sliding_window.clone(),
             def,
@@ -288,6 +343,8 @@ impl MVEngine {
             agg_count,
             agg_feeds,
             group_key_extractors,
+            time_column,
+            resolved_for: None,
             groups: FxHashMap::default(),
             block_groups: BTreeMap::new(),
             storage,
@@ -406,14 +463,18 @@ impl MVEngine {
 
     /// Process a batch of rows from a single block.
     /// Returns change records for new/updated groups.
-    pub fn process_block(&mut self, block: BlockNumber, rows: &[RowMap]) -> Vec<ChangeRecord> {
+    pub fn process_block<R: SourceRow>(
+        &mut self,
+        block: BlockNumber,
+        rows: &[R],
+    ) -> Vec<ChangeRecord> {
         self.apply_rows(block, rows);
         self.take_changes()
     }
 
     /// Apply the rows of one block of the current ingest; `take_changes`
     /// emits their changes.
-    pub fn apply_rows(&mut self, block: BlockNumber, rows: &[RowMap]) {
+    pub fn apply_rows<R: SourceRow>(&mut self, block: BlockNumber, rows: &[R]) {
         let mut touched = std::mem::take(&mut self.ingest_touched);
         self.apply_block(block, rows, &mut touched);
         self.ingest_touched = touched;
@@ -437,7 +498,7 @@ impl MVEngine {
     /// them. Replay after a deferred tail leaves every replayed block
     /// unfinalized, so reading the values of a group touched in each block
     /// would cost quadratic time in the tail length.
-    pub fn replay_block(&mut self, block: BlockNumber, rows: &[RowMap]) {
+    pub fn replay_block<R: SourceRow>(&mut self, block: BlockNumber, rows: &[R]) {
         let mut touched = Touched {
             existence_only: true,
             ..Touched::default()
@@ -447,17 +508,26 @@ impl MVEngine {
     }
 
     #[inline]
-    fn apply_block(&mut self, block: BlockNumber, rows: &[RowMap], touched: &mut Touched) {
+    fn apply_block<R: SourceRow>(&mut self, block: BlockNumber, rows: &[R], touched: &mut Touched) {
         // Sliding window replay protection: skip blocks already in restored state
         if self.sliding_window.is_some() && self.block_times.contains_key(&block) {
             return;
         }
 
+        if let Some(registry) = rows.first().and_then(R::registry) {
+            self.resolve_columns(registry);
+        }
+        debug_assert!(rows.iter().all(|r| {
+            let resolved = self.resolved_for.as_ref();
+            r.registry()
+                .is_none_or(|reg| resolved.is_some_and(|res| reg.names() == res.names()))
+        }));
+
         // Track block timestamp for sliding windows
-        if let Some(ref sw) = self.sliding_window {
+        if let Some(time_column) = &self.time_column {
             let block_max_ts = rows
                 .iter()
-                .filter_map(|r| r.get(&sw.time_column).and_then(|v| v.as_i64()))
+                .filter_map(|r| r.column(time_column).as_i64())
                 .max()
                 // Fallback: if no rows have a valid timestamp, use current watermark
                 // so the block still participates in expiry rather than leaking.
@@ -483,8 +553,8 @@ impl MVEngine {
 
             // Feed values to each aggregation using pre-computed agg info
             for feed in &self.agg_feeds {
-                let value = match feed.source_col.as_deref() {
-                    Some(col) => row.get(col).unwrap_or(&Value::Null),
+                let value = match &feed.source_col {
+                    Some(col) => row.column(col),
                     None => &Value::UInt64(1),
                 };
                 aggs[feed.agg_index].add_block(block, std::slice::from_ref(value));
@@ -758,19 +828,38 @@ impl MVEngine {
         }
     }
 
-    fn compute_group_key(&self, row: &RowMap) -> GroupKey {
+    /// Point the source columns at their positions in `registry`.
+    fn resolve_columns(&mut self, registry: &Arc<ColumnRegistry>) {
+        if self
+            .resolved_for
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, registry))
+        {
+            return;
+        }
+
+        let feeds = self
+            .agg_feeds
+            .iter_mut()
+            .filter_map(|f| f.source_col.as_mut());
+        let keys = self.group_key_extractors.iter_mut().map(|e| match e {
+            GroupKeyExtractor::Column(c) | GroupKeyExtractor::Window(c, _) => c,
+        });
+        for column in feeds.chain(keys).chain(self.time_column.as_mut()) {
+            column.id = registry.get_id(&column.name);
+        }
+        self.resolved_for = Some(registry.clone());
+    }
+
+    fn compute_group_key<R: SourceRow>(&self, row: &R) -> GroupKey {
         let mut key = GroupKey::new();
         for ext in &self.group_key_extractors {
             match ext {
                 GroupKeyExtractor::Column(source_col) => {
-                    let v = row.get(source_col.as_str()).cloned().unwrap_or(Value::Null);
-                    key.push(v);
+                    key.push(row.column(source_col).clone());
                 }
                 GroupKeyExtractor::Window(source_col, interval_seconds) => {
-                    let ts = row
-                        .get(source_col.as_str())
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
+                    let ts = row.column(source_col).as_i64().unwrap_or(0);
                     let window_start = to_start_of_interval(ts, *interval_seconds);
                     key.push(Value::DateTime(window_start));
                 }

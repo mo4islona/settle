@@ -5,9 +5,7 @@ use smallvec::smallvec;
 use crate::error::Result;
 use crate::schema::ast::TableDef;
 use crate::storage::{self, PendingWrites, StorageBackend, StorageWriteBatch};
-use crate::types::{
-    BlockNumber, ChangeOp, ChangeRecord, ChangeSchema, ColumnRegistry, Row, RowMap, Value,
-};
+use crate::types::{BlockNumber, ChangeOp, ChangeRecord, ChangeSchema, ColumnRegistry, Row, Value};
 
 /// Manages ingestion, storage, and rollback for a single raw table.
 pub struct RawTableEngine {
@@ -42,39 +40,37 @@ impl RawTableEngine {
         &self.registry
     }
 
-    /// Ingest a batch of rows for a given block number.
-    /// Encodes directly from RowMaps using the column registry (no intermediate Row objects).
-    /// Returns change records (one Insert per row).
-    pub fn ingest(&self, block: BlockNumber, row_maps: &[RowMap]) -> Result<Vec<ChangeRecord>> {
-        if row_maps.is_empty() {
+    /// Ingest the rows of one block, in the column order of the table.
+    /// Returns one Insert per row.
+    pub fn ingest(&self, block: BlockNumber, rows: &[Row]) -> Result<Vec<ChangeRecord>> {
+        if rows.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Encode directly from RowMaps — no Row conversion needed
-        let encoded = storage::encode_rows_from_maps(row_maps, &self.registry);
-        self.storage.put_raw_rows(&self.def.name, block, &encoded)?;
+        self.storage
+            .put_raw_rows(&self.def.name, block, &self.encode(rows))?;
 
-        Ok(self.insert_changes(block, row_maps))
+        Ok(self.insert_changes(block, rows))
+    }
+
+    fn encode(&self, rows: &[Row]) -> Vec<u8> {
+        debug_assert!(
+            rows.iter()
+                .all(|r| r.registry().names() == self.registry.names())
+        );
+        storage::encode_rows(rows)
     }
 
     /// One Insert per row, with the columns in schema order.
-    fn insert_changes(&self, block: BlockNumber, row_maps: &[RowMap]) -> Vec<ChangeRecord> {
-        let columns = self.registry.names();
-
-        row_maps
-            .iter()
+    fn insert_changes(&self, block: BlockNumber, rows: &[Row]) -> Vec<ChangeRecord> {
+        rows.iter()
             .enumerate()
             .map(|(idx, row)| {
-                let values = columns
-                    .iter()
-                    .map(|name| row.get(name).cloned().unwrap_or(Value::Null))
-                    .collect();
-
                 ChangeRecord::new(
                     ChangeOp::Insert,
                     self.change_schema.clone(),
                     smallvec![Value::UInt64(block), Value::UInt64(idx as u64)],
-                    values,
+                    row.values().into(),
                     None,
                 )
             })
@@ -83,12 +79,12 @@ impl RawTableEngine {
 
     /// Ingest rows without creating change records (for virtual tables).
     /// Stores the rows for replay but skips the expensive change record allocation.
-    pub fn ingest_no_changes(&self, block: BlockNumber, row_maps: &[RowMap]) -> Result<()> {
-        if row_maps.is_empty() {
+    pub fn ingest_no_changes(&self, block: BlockNumber, rows: &[Row]) -> Result<()> {
+        if rows.is_empty() {
             return Ok(());
         }
-        let encoded = storage::encode_rows_from_maps(row_maps, &self.registry);
-        self.storage.put_raw_rows(&self.def.name, block, &encoded)?;
+        self.storage
+            .put_raw_rows(&self.def.name, block, &self.encode(rows))?;
         Ok(())
     }
 
@@ -97,22 +93,21 @@ impl RawTableEngine {
     pub fn ingest_to_batch(
         &self,
         block: BlockNumber,
-        row_maps: &[RowMap],
+        rows: &[Row],
         batch: &mut StorageWriteBatch,
         virtual_table: bool,
     ) -> Result<Vec<ChangeRecord>> {
-        if row_maps.is_empty() {
+        if rows.is_empty() {
             return Ok(Vec::new());
         }
 
-        let encoded = storage::encode_rows_from_maps(row_maps, &self.registry);
-        batch.put_raw_rows(&self.def.name, block, encoded);
+        batch.put_raw_rows(&self.def.name, block, self.encode(rows));
 
         if virtual_table {
             return Ok(Vec::new());
         }
 
-        Ok(self.insert_changes(block, row_maps))
+        Ok(self.insert_changes(block, rows))
     }
 
     /// Roll back all rows where block_number > fork_point.
@@ -191,7 +186,7 @@ mod tests {
     use super::*;
     use crate::schema::ast::ColumnDef;
     use crate::storage::memory::MemoryBackend;
-    use crate::types::ColumnType;
+    use crate::types::{ColumnType, RowMap};
 
     fn test_table_def() -> TableDef {
         TableDef {
@@ -221,13 +216,22 @@ mod tests {
         ])
     }
 
+    fn rows(engine: &RawTableEngine, maps: Vec<RowMap>) -> Vec<Row> {
+        maps.into_iter()
+            .map(|m| Row::from_owned_map(engine.registry().clone(), m))
+            .collect()
+    }
+
     #[test]
     fn ingest_produces_insert_changes() {
         let storage = Arc::new(MemoryBackend::new());
         let engine = RawTableEngine::new(test_table_def(), storage);
 
-        let rows = vec![make_row_map("alice", 10.0), make_row_map("bob", 20.0)];
-        let changes = engine.ingest(1000, &rows).unwrap();
+        let batch = rows(
+            &engine,
+            vec![make_row_map("alice", 10.0), make_row_map("bob", 20.0)],
+        );
+        let changes = engine.ingest(1000, &batch).unwrap();
 
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].operation, ChangeOp::Insert);
@@ -254,8 +258,12 @@ mod tests {
         let storage = Arc::new(MemoryBackend::new());
         let engine = RawTableEngine::new(test_table_def(), storage);
 
-        engine.ingest(1000, &[make_row_map("alice", 10.0)]).unwrap();
-        engine.ingest(1001, &[make_row_map("bob", 20.0)]).unwrap();
+        engine
+            .ingest(1000, &rows(&engine, vec![make_row_map("alice", 10.0)]))
+            .unwrap();
+        engine
+            .ingest(1001, &rows(&engine, vec![make_row_map("bob", 20.0)]))
+            .unwrap();
 
         let rows = engine.get_rows(1000, 1001, usize::MAX).unwrap();
         assert_eq!(rows.len(), 2);
@@ -268,12 +276,19 @@ mod tests {
         let storage = Arc::new(MemoryBackend::new());
         let engine = RawTableEngine::new(test_table_def(), storage);
 
-        engine.ingest(1000, &[make_row_map("alice", 10.0)]).unwrap();
-        engine.ingest(1001, &[make_row_map("bob", 20.0)]).unwrap();
+        engine
+            .ingest(1000, &rows(&engine, vec![make_row_map("alice", 10.0)]))
+            .unwrap();
+        engine
+            .ingest(1001, &rows(&engine, vec![make_row_map("bob", 20.0)]))
+            .unwrap();
         engine
             .ingest(
                 1002,
-                &[make_row_map("carol", 30.0), make_row_map("dave", 40.0)],
+                &rows(
+                    &engine,
+                    vec![make_row_map("carol", 30.0), make_row_map("dave", 40.0)],
+                ),
             )
             .unwrap();
 
@@ -311,8 +326,13 @@ mod tests {
             ("user".to_string(), Value::String("alice".into())),
             ("extra".to_string(), Value::UInt64(7)),
         ]);
-        engine.ingest(1000, &[make_row_map("bob", 1.0)]).unwrap();
-        let insert = engine.ingest(1001, &[row]).unwrap().remove(0);
+        engine
+            .ingest(1000, &rows(&engine, vec![make_row_map("bob", 1.0)]))
+            .unwrap();
+        let insert = engine
+            .ingest(1001, &rows(&engine, vec![row]))
+            .unwrap()
+            .remove(0);
         let delete = engine.rollback(1000).unwrap().remove(0);
 
         let columns = |r: &ChangeRecord| {
@@ -336,7 +356,9 @@ mod tests {
         let storage = Arc::new(MemoryBackend::new());
         let engine = RawTableEngine::new(test_table_def(), storage);
 
-        engine.ingest(1000, &[make_row_map("alice", 10.0)]).unwrap();
+        engine
+            .ingest(1000, &rows(&engine, vec![make_row_map("alice", 10.0)]))
+            .unwrap();
 
         let changes = engine.rollback(1000).unwrap();
         assert!(changes.is_empty());
@@ -351,9 +373,15 @@ mod tests {
         let engine = RawTableEngine::new(test_table_def(), storage);
 
         // Ingest 3 blocks
-        engine.ingest(1000, &[make_row_map("alice", 10.0)]).unwrap();
-        engine.ingest(1001, &[make_row_map("bob", 20.0)]).unwrap();
-        engine.ingest(1002, &[make_row_map("carol", 30.0)]).unwrap();
+        engine
+            .ingest(1000, &rows(&engine, vec![make_row_map("alice", 10.0)]))
+            .unwrap();
+        engine
+            .ingest(1001, &rows(&engine, vec![make_row_map("bob", 20.0)]))
+            .unwrap();
+        engine
+            .ingest(1002, &rows(&engine, vec![make_row_map("carol", 30.0)]))
+            .unwrap();
 
         // Rollback block 1002
         let rollback_changes = engine.rollback(1001).unwrap();
@@ -364,7 +392,9 @@ mod tests {
         );
 
         // Re-ingest block 1002 with different data (reorg)
-        let new_changes = engine.ingest(1002, &[make_row_map("eve", 50.0)]).unwrap();
+        let new_changes = engine
+            .ingest(1002, &rows(&engine, vec![make_row_map("eve", 50.0)]))
+            .unwrap();
         assert_eq!(new_changes.len(), 1);
         assert_eq!(
             new_changes[0].get("user"),

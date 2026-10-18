@@ -14,7 +14,10 @@ use crate::storage::memory::MemoryBackend;
 #[cfg(feature = "rocksdb")]
 use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
 use crate::storage::{PendingWrites, StorageBackend, StorageWriteBatch, format, journal};
-use crate::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, PerfNode, RowMap, Value};
+use crate::types::{
+    BlockCursor, BlockNumber, ChangeBatch, ChangeRecord, ColumnRegistry, PerfNode, Row, RowMap,
+    Value,
+};
 
 /// Configuration for opening a Settle instance.
 #[non_exhaustive]
@@ -202,6 +205,28 @@ pub struct IngestInput {
     pub rollback_chain: Vec<BlockCursor>,
     /// Finalized head cursor (from ctx.head.finalized). Required.
     pub finalized_head: BlockCursor,
+}
+
+/// The rows of one table by block, in the column order of the table.
+pub type BlockRows = BTreeMap<BlockNumber, Vec<Row>>;
+
+/// Input for [`Settle::ingest_rows`]: [`IngestInput`] with the rows in the
+/// column order of their table, which skips the lookup of each column by
+/// name.
+pub struct IngestRows {
+    /// Table name → rows, built on [`Settle::table_registry`]. If the table
+    /// has a `block_number` column, it holds the block.
+    pub data: std::collections::HashMap<String, BlockRows>,
+    /// Unfinalized blocks with hashes (from ctx.state.rollbackChain).
+    pub rollback_chain: Vec<BlockCursor>,
+    /// Finalized head cursor (from ctx.head.finalized). Required.
+    pub finalized_head: BlockCursor,
+}
+
+/// The rows of an ingest, by column name or by position.
+enum InputData {
+    Maps(std::collections::HashMap<String, Vec<RowMap>>),
+    Rows(std::collections::HashMap<String, BlockRows>),
 }
 
 /// Result of `handle_fork()`.
@@ -854,7 +879,36 @@ impl Settle {
     /// ingest detects the fork again.
     ///
     /// Each row in `data` must contain a `block_number` field (UInt64).
-    pub fn ingest(&mut self, mut input: IngestInput) -> Result<Option<ChangeBatch>> {
+    pub fn ingest(&mut self, input: IngestInput) -> Result<Option<ChangeBatch>> {
+        let IngestInput {
+            data,
+            rollback_chain,
+            finalized_head,
+        } = input;
+        self.ingest_data(InputData::Maps(data), rollback_chain, finalized_head)
+    }
+
+    /// [`Settle::ingest`] with positional rows.
+    pub fn ingest_rows(&mut self, input: IngestRows) -> Result<Option<ChangeBatch>> {
+        let IngestRows {
+            data,
+            rollback_chain,
+            finalized_head,
+        } = input;
+        self.ingest_data(InputData::Rows(data), rollback_chain, finalized_head)
+    }
+
+    /// The columns of a table, in the order of the rows of [`IngestRows`].
+    pub fn table_registry(&self, table: &str) -> Option<&Arc<ColumnRegistry>> {
+        self.engine.table_registry(table)
+    }
+
+    fn ingest_data(
+        &mut self,
+        data: InputData,
+        rollback_chain: Vec<BlockCursor>,
+        finalized_head: BlockCursor,
+    ) -> Result<Option<ChangeBatch>> {
         // 0. Poison gate. Any prior immediate-commit failure made in-memory
         //    state diverge from disk; reject all further work so the caller
         //    drops and reopens rather than silently producing stale writes.
@@ -876,10 +930,10 @@ impl Settle {
         //    latest is allowed — some chains (Solana) skip block numbers and
         //    finality may come from an out-of-band source.
         let current_finalized = self.engine.finalized_block();
-        if input.finalized_head.number < current_finalized {
+        if finalized_head.number < current_finalized {
             return Err(Error::InvalidOperation(format!(
                 "finalized_head.number ({}) < current finalized_block ({}); finality must be monotonic",
-                input.finalized_head.number, current_finalized
+                finalized_head.number, current_finalized
             )));
         }
 
@@ -891,13 +945,13 @@ impl Settle {
         let mut pending_changes: Vec<ChangeRecord> = Vec::new();
         let mut block_perf: Vec<PerfNode> = Vec::new();
 
-        let fork_point = self.detect_fork(&input)?;
+        let fork_point = self.detect_fork(&rollback_chain, &finalized_head)?;
         // The latest block once the fork is rolled back; None on an empty database.
         let recovery_block = fork_point.or(self.engine.latest_block_if_any());
 
         // Checked before the fork rollback, which cannot be undone: a bad
         // input then leaves the instance as it was.
-        let tables = self.group_input_rows(std::mem::take(&mut input.data), recovery_block)?;
+        let tables = self.group_input_rows(data, recovery_block)?;
 
         if let Some(fork_point) = fork_point {
             let changes = self.rollback_engine(fork_point, &mut write_batch)?;
@@ -960,15 +1014,11 @@ impl Settle {
         );
 
         // 2. Store rollback chain hashes (including finalized head)
-        let mut chain: Vec<(BlockNumber, String)> = input
-            .rollback_chain
-            .iter()
-            .map(|c| (c.number, c.hash.clone()))
+        let mut chain: Vec<(BlockNumber, String)> = rollback_chain
+            .into_iter()
+            .map(|c| (c.number, c.hash))
             .collect();
-        chain.push((
-            input.finalized_head.number,
-            input.finalized_head.hash.clone(),
-        ));
+        chain.push((finalized_head.number, finalized_head.hash));
         self.engine.set_rollback_chain(&chain);
 
         // 3. Finalize in memory, then write a checkpoint into write_batch.
@@ -984,7 +1034,7 @@ impl Settle {
         //    put and recovery replays raw rows from it. Any lag (tip
         //    operation), interval elapse, or a deferral-unsafe pipeline writes
         //    one, catching the durable watermark up to finality.
-        let target_finalized = input.finalized_head.number;
+        let target_finalized = finalized_head.number;
         let checkpoint = {
             let latest = self.engine.latest_block();
             let durable = self.engine.durable_block();
@@ -1044,15 +1094,18 @@ impl Settle {
     /// past the latest block, is no fork. The fork point is the highest
     /// supplied block below the lowest conflict whose hash matches, else 0;
     /// Err if that is below finality.
-    fn detect_fork(&self, input: &IngestInput) -> Result<Option<BlockNumber>> {
+    fn detect_fork(
+        &self,
+        rollback_chain: &[BlockCursor],
+        finalized_head: &BlockCursor,
+    ) -> Result<Option<BlockNumber>> {
         let Some(current_latest) = self.engine.latest_block_if_any() else {
             return Ok(None);
         };
 
-        let supplied: Vec<(BlockNumber, &str)> = input
-            .rollback_chain
+        let supplied: Vec<(BlockNumber, &str)> = rollback_chain
             .iter()
-            .chain(std::iter::once(&input.finalized_head))
+            .chain(std::iter::once(finalized_head))
             .map(|c| (c.number, c.hash.as_str()))
             .collect();
         let Some(conflict) = self.engine.lowest_hash_conflict(&supplied, current_latest) else {
@@ -1087,9 +1140,9 @@ impl Settle {
     /// block once a detected fork is rolled back, None on an empty database.
     fn group_input_rows(
         &self,
-        data: std::collections::HashMap<String, Vec<RowMap>>,
+        data: InputData,
         latest: Option<BlockNumber>,
-    ) -> Result<Vec<(String, BTreeMap<BlockNumber, Vec<RowMap>>)>> {
+    ) -> Result<Vec<(String, BlockRows)>> {
         // Dedup guard: reject any block at or below the current
         // (post-fork-detection) latest. Re-ingesting an already-processed
         // block would double reducer/MV aggregates.
@@ -1098,15 +1151,26 @@ impl Settle {
         // in-line fork detection to also delete duplicate content at the
         // fork point is not supported.
         if let Some(latest) = latest {
-            let min_input = data
-                .values()
-                .flat_map(|rows| {
-                    rows.iter().filter_map(|r| match r.get("block_number") {
-                        Some(Value::UInt64(n)) => Some(*n),
-                        _ => None,
+            let min_input = match &data {
+                InputData::Maps(data) => data
+                    .values()
+                    .flat_map(|rows| {
+                        rows.iter().filter_map(|r| match r.get("block_number") {
+                            Some(Value::UInt64(n)) => Some(*n),
+                            _ => None,
+                        })
                     })
-                })
-                .min();
+                    .min(),
+                InputData::Rows(data) => data
+                    .values()
+                    .filter_map(|blocks| {
+                        blocks
+                            .iter()
+                            .find(|(_, rows)| !rows.is_empty())
+                            .map(|(block, _)| *block)
+                    })
+                    .min(),
+            };
             if let Some(min) = min_input
                 && min <= latest
             {
@@ -1117,37 +1181,101 @@ impl Settle {
             }
         }
 
-        // Rows move into per-block buckets by value, without a RowMap clone.
-        let mut tables: Vec<(String, Vec<RowMap>)> = data.into_iter().collect();
-        tables.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut grouped = match data {
+            InputData::Maps(data) => {
+                let mut tables: Vec<_> = data.into_iter().collect();
+                tables.sort_by(|a, b| a.0.cmp(&b.0));
+                tables
+                    .into_iter()
+                    .map(|(table, maps)| {
+                        let by_block = self.rows_from_maps(&table, maps)?;
+                        Ok((table, by_block))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            InputData::Rows(data) => {
+                let mut tables: Vec<_> = data.into_iter().collect();
+                tables.sort_by(|a, b| a.0.cmp(&b.0));
+                tables
+                    .into_iter()
+                    .map(|(table, by_block)| {
+                        let by_block = self.check_rows(&table, by_block)?;
+                        Ok((table, by_block))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        grouped.retain(|(_, by_block)| !by_block.is_empty());
+        Ok(grouped)
+    }
 
-        let mut grouped = Vec::with_capacity(tables.len());
-        for (table, rows) in tables {
-            let mut by_block: BTreeMap<BlockNumber, Vec<RowMap>> = BTreeMap::new();
-            for row in rows {
-                let block = match row.get("block_number") {
-                    Some(Value::UInt64(n)) => *n,
-                    Some(other) => {
-                        return Err(Error::InvalidOperation(format!(
-                            "row in table '{table}' has invalid block_number type: expected UInt64, got {}",
-                            other.type_name()
-                        )));
-                    }
-                    None => {
-                        return Err(Error::InvalidOperation(format!(
-                            "row in table '{table}' missing block_number"
-                        )));
-                    }
-                };
+    /// Rows by column name to rows by block in the column order of `table`.
+    fn rows_from_maps(&self, table: &str, maps: Vec<RowMap>) -> Result<BlockRows> {
+        let registry = self.engine.table_registry(table);
+        let has_rows = !maps.is_empty();
+
+        let mut by_block = BlockRows::new();
+        for map in maps {
+            let block = match map.get("block_number") {
+                Some(Value::UInt64(n)) => *n,
+                Some(other) => {
+                    return Err(Error::InvalidOperation(format!(
+                        "row in table '{table}' has invalid block_number type: expected UInt64, got {}",
+                        other.type_name()
+                    )));
+                }
+                None => {
+                    return Err(Error::InvalidOperation(format!(
+                        "row in table '{table}' missing block_number"
+                    )));
+                }
+            };
+            if let Some(registry) = registry {
+                let row = Row::from_owned_map(registry.clone(), map);
                 by_block.entry(block).or_default().push(row);
             }
-
-            if !by_block.is_empty() && !self.engine.has_table(&table) {
-                return Err(Error::InvalidOperation(format!("unknown table: {table}")));
-            }
-            grouped.push((table, by_block));
         }
-        Ok(grouped)
+
+        if has_rows && registry.is_none() {
+            return Err(Error::InvalidOperation(format!("unknown table: {table}")));
+        }
+        Ok(by_block)
+    }
+
+    /// Err unless the rows of `table` have its columns and, if it has a
+    /// `block_number` column, their block in it.
+    fn check_rows(&self, table: &str, mut by_block: BlockRows) -> Result<BlockRows> {
+        by_block.retain(|_, rows| !rows.is_empty());
+        if by_block.is_empty() {
+            return Ok(by_block);
+        }
+
+        let Some(registry) = self.engine.table_registry(table) else {
+            return Err(Error::InvalidOperation(format!("unknown table: {table}")));
+        };
+        let block_column = registry.get_id("block_number");
+
+        for (&block, rows) in &by_block {
+            for row in rows {
+                let same_columns = Arc::ptr_eq(row.registry(), registry)
+                    || row.registry().names() == registry.names();
+                if !same_columns {
+                    return Err(Error::InvalidOperation(format!(
+                        "rows of table '{table}' must have its columns: build them on \
+                         Settle::table_registry"
+                    )));
+                }
+
+                let Some(id) = block_column else { continue };
+                let value = &row.values()[id as usize];
+                if !matches!(value, Value::UInt64(n) if *n == block) {
+                    return Err(Error::InvalidOperation(format!(
+                        "row of table '{table}' at block {block} has block_number {value:?}"
+                    )));
+                }
+            }
+        }
+        Ok(by_block)
     }
 
     /// Roll the engine back to `fork_point`, from the state after the newest
@@ -1328,3 +1456,7 @@ mod format_tests;
 #[cfg(all(test, feature = "rocksdb"))]
 #[path = "backfill_tests.rs"]
 mod backfill_tests;
+
+#[cfg(all(test, feature = "rocksdb", feature = "lua"))]
+#[path = "db_rows_tests.rs"]
+mod rows_tests;
