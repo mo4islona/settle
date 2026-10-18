@@ -27,7 +27,7 @@ enum PipelineNode {
 }
 
 /// A reducer or MV. Each finalizes only its own state and writes disjoint
-/// storage keys, so the nodes run in parallel on the rayon pool.
+/// storage keys, so the branches finalize in parallel on the rayon pool.
 trait FinalizeNode {
     fn advance_finality(&mut self, block: BlockNumber);
     fn write_checkpoint(&mut self, finalized: BlockNumber, batch: &mut StorageWriteBatch);
@@ -116,6 +116,12 @@ struct PipelineBranch {
 }
 
 impl PipelineBranch {
+    /// The reducer, then its MVs.
+    fn nodes(&mut self) -> impl Iterator<Item = NodeMut<'_>> {
+        let mvs = self.mv_entries.iter_mut().map(|(_, mv)| mv as NodeMut<'_>);
+        std::iter::once(&mut self.reducer as NodeMut<'_>).chain(mvs)
+    }
+
     /// Run the reducer on its source rows and feed its output to the branch's
     /// MVs.
     #[cfg(feature = "rayon")]
@@ -566,14 +572,8 @@ impl SettleEngine {
         let mut output_rows: HashMap<String, Vec<Row>> = HashMap::new();
         output_rows.insert(table.to_string(), rows);
 
-        // Check if parallel branch execution is possible:
-        // - 2+ branches, all reducers source from raw tables (not from each other),
-        //   and no external reducers (which require main-thread JS callbacks).
         #[cfg(feature = "rayon")]
-        let can_parallelize = self.branches.len() >= 2
-            && self.branches.iter().all(|b| {
-                self.raw_tables.contains_key(b.reducer.source()) && !b.reducer.is_external()
-            });
+        let can_parallelize = self.parallel_branches();
         #[cfg(not(feature = "rayon"))]
         let can_parallelize = false;
 
@@ -1073,16 +1073,9 @@ impl SettleEngine {
             return;
         }
 
-        let mut nodes = self.finalize_nodes();
-        #[cfg(feature = "rayon")]
-        nodes
-            .par_iter_mut()
-            .with_max_len(1)
-            .for_each(|node| node.advance_finality(block));
-        #[cfg(not(feature = "rayon"))]
-        for node in &mut nodes {
-            node.advance_finality(block);
-        }
+        // Finality writes nothing to storage.
+        let mut unused = StorageWriteBatch::new();
+        self.finalize_nodes(&mut unused, |node, _| node.advance_finality(block));
 
         self.finalized_block = block;
         self.has_finalized = true;
@@ -1099,30 +1092,7 @@ impl SettleEngine {
         }
 
         let finalized = self.finalized_block;
-        let mut nodes = self.finalize_nodes();
-        #[cfg(feature = "rayon")]
-        if let [node] = nodes.as_mut_slice() {
-            node.write_checkpoint(finalized, batch);
-        } else {
-            // One task per node: the default split could put the two heaviest
-            // nodes, a reducer and its MV, in one task on one worker.
-            let sub_batches: Vec<StorageWriteBatch> = nodes
-                .par_iter_mut()
-                .with_max_len(1)
-                .map(|node| {
-                    let mut sub = StorageWriteBatch::new();
-                    node.write_checkpoint(finalized, &mut sub);
-                    sub
-                })
-                .collect();
-            for sub in sub_batches {
-                batch.ops.extend(sub.ops);
-            }
-        }
-        #[cfg(not(feature = "rayon"))]
-        for node in &mut nodes {
-            node.write_checkpoint(finalized, batch);
-        }
+        self.finalize_nodes(batch, |node, batch| node.write_checkpoint(finalized, batch));
 
         // On gappy chains finality can run ahead of the data. Without data
         // nothing is durable.
@@ -1169,22 +1139,63 @@ impl SettleEngine {
         self.raw_retention_blocks = blocks;
     }
 
-    /// Every reducer and MV.
-    fn finalize_nodes(&mut self) -> Vec<NodeMut<'_>> {
-        let mut nodes: Vec<NodeMut<'_>> = Vec::new();
-        for branch in &mut self.branches {
-            nodes.push(&mut branch.reducer);
-            for (_, mv) in &mut branch.mv_entries {
-                nodes.push(mv);
+    /// Whether the branches process in parallel: 2+ branches, all reducers
+    /// source from raw tables (not from each other), and no external
+    /// reducers (which require main-thread JS callbacks).
+    #[cfg(feature = "rayon")]
+    fn parallel_branches(&self) -> bool {
+        self.branches.len() >= 2
+            && self.branches.iter().all(|b| {
+                self.raw_tables.contains_key(b.reducer.source()) && !b.reducer.is_external()
+            })
+    }
+
+    /// Run `step` on every reducer and MV, on the thread that processed its
+    /// blocks: the branches that process in parallel get a task each, with a
+    /// write batch of its own, and the other nodes run on this thread. On
+    /// another core the state of a node is not in cache, and that costs more
+    /// than a parallel run saves.
+    fn finalize_nodes<F>(&mut self, batch: &mut StorageWriteBatch, step: F)
+    where
+        F: Fn(NodeMut<'_>, &mut StorageWriteBatch) + Sync,
+    {
+        #[cfg(feature = "rayon")]
+        let parallel = self.parallel_branches();
+        #[cfg(not(feature = "rayon"))]
+        let parallel = false;
+
+        if parallel {
+            #[cfg(feature = "rayon")]
+            {
+                let sub_batches: Vec<StorageWriteBatch> = self
+                    .branches
+                    .par_iter_mut()
+                    .map(|branch| {
+                        let mut sub = StorageWriteBatch::new();
+                        for node in branch.nodes() {
+                            step(node, &mut sub);
+                        }
+                        sub
+                    })
+                    .collect();
+                for sub in sub_batches {
+                    batch.ops.extend(sub.ops);
+                }
+            }
+        } else {
+            for branch in &mut self.branches {
+                for node in branch.nodes() {
+                    step(node, batch);
+                }
             }
         }
+
         for reducer in self.reducers.values_mut() {
-            nodes.push(reducer);
+            step(reducer, batch);
         }
         for mv in self.mvs.values_mut() {
-            nodes.push(mv);
+            step(mv, batch);
         }
-        nodes
     }
 
     /// Fork resolution stops at finality, so hashes below it only take
