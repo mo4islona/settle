@@ -4,6 +4,7 @@
 //!     (RocksDB WAL, ack, fork-tracking), then rows are forwarded to PG.
 //!
 //! Each batch: BLOCKS_PER_BATCH (20) × ROWS_PER_BLOCK (50) = 1000 rows.
+//! Each batch goes to PG in one transaction.
 //!
 //! Run with: `cargo bench --bench vs_postgres_raw` (Docker required)
 
@@ -87,7 +88,9 @@ fn pg_insert_transfers(pg: &PgRuntime, first_block: u64, rows: &[RowMap]) -> any
 fn run_pg_only(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<()> {
     let mut block_no = 1u64;
     for chunk in rows.chunks(BATCH_SIZE) {
+        pg.begin()?;
         pg_insert_transfers(pg, block_no, chunk)?;
+        pg.commit()?;
         block_no += BLOCKS_PER_BATCH as u64;
     }
     Ok(())
@@ -114,7 +117,9 @@ fn run_settle_pg(db: &mut Settle, pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Re
             .map(|(b, c)| ("transfers".to_string(), b, c.to_vec()))
             .collect();
         ingest_blocks(db, items)?;
+        pg.begin()?;
         pg_insert_transfers(pg, block_no, chunk)?;
+        pg.commit()?;
         block_no += BLOCKS_PER_BATCH as u64;
     }
     Ok(())
@@ -132,7 +137,7 @@ fn main() -> anyhow::Result<()> {
     );
     eprintln!("workload: vs_postgres_raw");
     eprintln!("  config: {config}");
-    let mut pg_baseline = PgBaseline::open("vs_postgres_raw", 1, &config)?;
+    let mut pg_baseline = PgBaseline::open("vs_postgres_raw", 2, &config)?;
 
     // postgres_only
     let case = pg_baseline.case("postgres_only", || {

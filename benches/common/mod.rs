@@ -388,6 +388,415 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+// ─── Fork bookkeeping in Postgres ──────────────────────────────────────────
+
+/// rindexer prunes its block hashes once per this many blocks.
+const PRUNE_INTERVAL: u64 = 50;
+
+const NETWORK: &str = "bench";
+
+const LAST_SYNCED_SCHEMA: &str = "
+CREATE TABLE last_synced_block (
+    network           TEXT PRIMARY KEY,
+    last_synced_block NUMERIC
+);
+INSERT INTO last_synced_block VALUES ('bench', 0);
+";
+
+const BLOCK_HASHES_SCHEMA: &str = "
+CREATE TABLE reorg_block_hashes (
+    network      TEXT     NOT NULL,
+    block_number BIGINT   NOT NULL,
+    block_hash   CHAR(66) NOT NULL,
+    parent_hash  CHAR(66) NOT NULL,
+    PRIMARY KEY (network, block_number)
+);
+";
+
+const PONDER_SCHEMA: &str = "
+CREATE SEQUENCE _reorg_operation_id;
+CREATE TABLE _ponder_checkpoint (
+    chain_name           TEXT PRIMARY KEY,
+    chain_id             BIGINT NOT NULL,
+    safe_checkpoint      VARCHAR(75) NOT NULL,
+    latest_checkpoint    VARCHAR(75) NOT NULL,
+    finalized_checkpoint VARCHAR(75) NOT NULL
+);
+";
+
+/// What a Postgres-only indexer at the chain tip keeps so that it can undo a
+/// reorg. Settle keeps this itself, so without it a pure Postgres case skips
+/// work that its Settle counterpart does. All of it is written in the
+/// transaction of the block it belongs to. A backfill keeps none of it:
+/// Ponder creates its triggers after the backfill, and rindexer stores the
+/// hashes of live blocks only.
+///
+/// `PG_FORKS` selects the variants a bench runs: a comma list of `off`,
+/// `blocks` and `undo`, or `all`. The default is `off`.
+#[derive(Clone, Copy, PartialEq)]
+pub enum PgForks {
+    Off,
+    /// rindexer: a row per unfinalized block in `reorg_block_hashes`, pruned
+    /// below finality once per `PRUNE_INTERVAL` blocks, and the last synced
+    /// block. Undoing the data of a reorg is left to the indexer.
+    Blocks,
+    /// Ponder: a trigger copies each row that an INSERT, UPDATE or DELETE
+    /// touches into `_reorg__<table>`, and the copies get the checkpoint of
+    /// their block when it ends. A reorg restores the rows from the copies.
+    /// Ponder keeps block hashes in memory only.
+    Undo,
+}
+
+impl PgForks {
+    pub fn from_env() -> anyhow::Result<Vec<PgForks>> {
+        let value = std::env::var("PG_FORKS").unwrap_or_default();
+        let mut variants = Vec::new();
+        for name in value.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            let named: &[PgForks] = match name {
+                "off" => &[PgForks::Off],
+                "blocks" => &[PgForks::Blocks],
+                "undo" => &[PgForks::Undo],
+                "all" => &[PgForks::Off, PgForks::Blocks, PgForks::Undo],
+                other => anyhow::bail!("PG_FORKS={other}: expected off, blocks, undo or all"),
+            };
+            for &variant in named {
+                if !variants.contains(&variant) {
+                    variants.push(variant);
+                }
+            }
+        }
+        if variants.is_empty() {
+            variants.push(PgForks::Off);
+        }
+        Ok(variants)
+    }
+
+    /// The suffix of a case label.
+    pub fn label(self) -> &'static str {
+        match self {
+            PgForks::Off => "",
+            PgForks::Blocks => "+blocks",
+            PgForks::Undo => "+undo",
+        }
+    }
+
+    /// Creates the bookkeeping tables. `tables` are the tables the indexer
+    /// writes; the undo log covers all of them, as Ponder's does.
+    pub fn setup(self, pg: &PgRuntime, tables: &[&str]) -> anyhow::Result<ForkLog> {
+        let mut log = ForkLog {
+            forks: self,
+            tables: Vec::new(),
+        };
+        match self {
+            PgForks::Off => {}
+            PgForks::Blocks => {
+                pg.batch_execute(BLOCK_HASHES_SCHEMA)?;
+                pg.batch_execute(LAST_SYNCED_SCHEMA)?;
+            }
+            PgForks::Undo => {
+                pg.batch_execute(PONDER_SCHEMA)?;
+                let zero = checkpoint(0);
+                pg.batch_execute(&format!(
+                    "INSERT INTO _ponder_checkpoint VALUES ('{NETWORK}', 1, '{zero}', '{zero}', '{zero}')"
+                ))?;
+                for &name in tables {
+                    let table = UndoTable::read(pg, name)?;
+                    pg.batch_execute(&table.create_sql())?;
+                    pg.batch_execute(&table.create_trigger_sql())?;
+                    log.tables.push(table);
+                }
+            }
+        }
+        Ok(log)
+    }
+}
+
+/// The fork bookkeeping of one Postgres run.
+pub struct ForkLog {
+    forks: PgForks,
+    tables: Vec<UndoTable>,
+}
+
+impl ForkLog {
+    /// Whether `rollback` undoes the data too, so the indexer has nothing
+    /// left to undo.
+    pub fn undoes_data(&self) -> bool {
+        self.forks == PgForks::Undo
+    }
+
+    /// The indexer wrote the blocks `first..=last`; `finalized` is the
+    /// finalized head after them.
+    pub fn record(
+        &self,
+        pg: &PgRuntime,
+        first: u64,
+        last: u64,
+        finalized: u64,
+    ) -> anyhow::Result<()> {
+        match self.forks {
+            PgForks::Off => Ok(()),
+            PgForks::Blocks => record_block_hashes(pg, first, last, finalized),
+            PgForks::Undo => self.commit_undo(pg, last, finalized),
+        }
+    }
+
+    /// A reorg dropped the blocks above `fork_point`.
+    pub fn rollback(&self, pg: &PgRuntime, fork_point: u64) -> anyhow::Result<()> {
+        match self.forks {
+            PgForks::Off => Ok(()),
+            PgForks::Blocks => {
+                let fork_point = fork_point as i64;
+                pg.execute(
+                    "DELETE FROM reorg_block_hashes WHERE network = $1 AND block_number > $2",
+                    &[&NETWORK, &fork_point],
+                )?;
+                pg.execute(
+                    "UPDATE last_synced_block SET last_synced_block = $1::bigint WHERE network = $2",
+                    &[&fork_point, &NETWORK],
+                )?;
+                Ok(())
+            }
+            PgForks::Undo => self.revert_undo(pg, fork_point),
+        }
+    }
+
+    /// Ponder's `commitBlock` and `finalize`, once per batch instead of once
+    /// per block: the benches write a batch with one statement per table.
+    fn commit_undo(&self, pg: &PgRuntime, last: u64, finalized: u64) -> anyhow::Result<()> {
+        let latest = checkpoint(last);
+        let finalized = checkpoint(finalized);
+        let pending = checkpoint(u64::MAX);
+
+        for table in &self.tables {
+            let sql = format!(
+                "UPDATE \"{}\" SET checkpoint = $1 WHERE checkpoint = $2",
+                table.undo_name()
+            );
+            pg.execute(&sql, &[&latest, &pending])?;
+        }
+        for table in &self.tables {
+            let sql = format!("DELETE FROM \"{}\" WHERE checkpoint <= $1", table.undo_name());
+            pg.execute(&sql, &[&finalized])?;
+        }
+        pg.execute(
+            "UPDATE _ponder_checkpoint SET latest_checkpoint = $1, \
+             safe_checkpoint = $2, finalized_checkpoint = $2 WHERE chain_name = $3",
+            &[&latest, &finalized, &NETWORK],
+        )?;
+        Ok(())
+    }
+
+    /// Ponder drops the triggers, so that the revert itself is not logged,
+    /// and creates them again, in the same transaction.
+    fn revert_undo(&self, pg: &PgRuntime, fork_point: u64) -> anyhow::Result<()> {
+        for table in &self.tables {
+            pg.batch_execute(&format!("DROP TRIGGER _reorg_trigger ON \"{}\"", table.name))?;
+        }
+
+        let fork_checkpoint = checkpoint(fork_point);
+        for table in &self.tables {
+            if table.primary_key.is_empty() {
+                // Raw rows without a key: they go by block number.
+                let sql = format!("DELETE FROM \"{}\" WHERE checkpoint > $1", table.undo_name());
+                pg.execute(&sql, &[&fork_checkpoint])?;
+                let sql = format!("DELETE FROM \"{}\" WHERE block_number > $1", table.name);
+                pg.execute(&sql, &[&(fork_point as i64)])?;
+            } else {
+                pg.execute(&table.revert_sql(), &[&fork_checkpoint])?;
+            }
+        }
+
+        for table in &self.tables {
+            pg.batch_execute(&table.create_trigger_sql())?;
+        }
+        Ok(())
+    }
+}
+
+fn record_block_hashes(
+    pg: &PgRuntime,
+    first: u64,
+    last: u64,
+    finalized: u64,
+) -> anyhow::Result<()> {
+    // rindexer writes one row per block; a batch goes in one statement.
+    let hot_from = first.max(finalized.saturating_add(1));
+    if hot_from <= last {
+        let numbers: Vec<i64> = (hot_from..=last).map(|b| b as i64).collect();
+        let hashes: Vec<String> = (hot_from..=last).map(block_hash).collect();
+        let parents: Vec<String> = (hot_from..=last).map(|b| block_hash(b - 1)).collect();
+        pg.execute(
+            "INSERT INTO reorg_block_hashes (network, block_number, block_hash, parent_hash) \
+             SELECT $1, * FROM unnest($2::bigint[], $3::text[], $4::text[]) \
+             ON CONFLICT (network, block_number) DO UPDATE \
+             SET block_hash = EXCLUDED.block_hash, parent_hash = EXCLUDED.parent_hash",
+            &[&NETWORK, &numbers, &hashes, &parents],
+        )?;
+    }
+
+    let prune_due = last / PRUNE_INTERVAL > first.saturating_sub(1) / PRUNE_INTERVAL;
+    if prune_due {
+        pg.execute(
+            "DELETE FROM reorg_block_hashes WHERE network = $1 AND block_number <= $2",
+            &[&NETWORK, &(finalized as i64)],
+        )?;
+    }
+
+    pg.execute(
+        "UPDATE last_synced_block SET last_synced_block = $1::bigint \
+         WHERE network = $2 AND $1::bigint > last_synced_block",
+        &[&(last as i64), &NETWORK],
+    )?;
+    Ok(())
+}
+
+/// A table under Ponder's undo log.
+struct UndoTable {
+    name: String,
+    columns: Vec<String>,
+    primary_key: Vec<String>,
+}
+
+impl UndoTable {
+    fn read(pg: &PgRuntime, name: &str) -> anyhow::Result<Self> {
+        let columns = pg.rt.block_on(pg.client.query(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1::text ORDER BY ordinal_position",
+            &[&name],
+        ))?;
+        let primary_key = pg.rt.block_on(pg.client.query(
+            "SELECT a.attname::text FROM pg_index i \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+             WHERE i.indrelid = $1::text::regclass AND i.indisprimary",
+            &[&name],
+        ))?;
+        Ok(Self {
+            name: name.to_string(),
+            columns: columns.iter().map(|row| row.get(0)).collect(),
+            primary_key: primary_key.iter().map(|row| row.get(0)).collect(),
+        })
+    }
+
+    fn undo_name(&self) -> String {
+        format!("_reorg__{}", self.name)
+    }
+
+    fn create_sql(&self) -> String {
+        let undo = self.undo_name();
+        format!(
+            "CREATE TABLE \"{undo}\" ( \
+                 LIKE \"{}\", \
+                 operation_id INTEGER NOT NULL PRIMARY KEY DEFAULT nextval('_reorg_operation_id'), \
+                 operation INTEGER NOT NULL, \
+                 checkpoint VARCHAR(75) NOT NULL \
+             ); \
+             CREATE INDEX ON \"{undo}\" (checkpoint);",
+            self.name
+        )
+    }
+
+    fn create_trigger_sql(&self) -> String {
+        let undo = self.undo_name();
+        let columns = self.quoted_columns("");
+        let new = self.quoted_columns("NEW.");
+        let old = self.quoted_columns("OLD.");
+        let pending = checkpoint(u64::MAX);
+        format!(
+            "CREATE OR REPLACE FUNCTION \"{undo}_fn\"() RETURNS TRIGGER AS $$ \
+             BEGIN \
+             IF TG_OP = 'INSERT' THEN \
+             INSERT INTO \"{undo}\" ({columns}, operation, checkpoint) VALUES ({new}, 0, '{pending}'); \
+             ELSIF TG_OP = 'UPDATE' THEN \
+             INSERT INTO \"{undo}\" ({columns}, operation, checkpoint) VALUES ({old}, 1, '{pending}'); \
+             ELSIF TG_OP = 'DELETE' THEN \
+             INSERT INTO \"{undo}\" ({columns}, operation, checkpoint) VALUES ({old}, 2, '{pending}'); \
+             END IF; \
+             RETURN NULL; \
+             END; \
+             $$ LANGUAGE plpgsql; \
+             CREATE TRIGGER _reorg_trigger AFTER INSERT OR UPDATE OR DELETE ON \"{}\" \
+             FOR EACH ROW EXECUTE PROCEDURE \"{undo}_fn\"();",
+            self.name
+        )
+    }
+
+    /// Ponder's revert: the first logged operation on each key after the
+    /// fork point holds the row as it was there.
+    fn revert_sql(&self) -> String {
+        let undo = self.undo_name();
+        let key = self.quoted_key("");
+        let key_join = |left: &str, right: &str| {
+            self.primary_key
+                .iter()
+                .map(|c| format!("{left}.\"{c}\" = {right}.\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let columns = self.quoted_columns("");
+        let logged_columns = self.quoted_columns("reverted1.");
+        let set = self
+            .columns
+            .iter()
+            .map(|c| format!("\"{c}\" = EXCLUDED.\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "WITH reverted1 AS ( \
+                 DELETE FROM \"{undo}\" WHERE checkpoint > $1 RETURNING * \
+             ), reverted2 AS ( \
+                 SELECT {key}, MIN(operation_id) AS operation_id FROM reverted1 GROUP BY {key} \
+             ), reverted3 AS ( \
+                 SELECT {logged_columns}, reverted1.operation FROM reverted2 \
+                 INNER JOIN reverted1 ON {} AND reverted2.operation_id = reverted1.operation_id \
+             ), inserted AS ( \
+                 DELETE FROM \"{name}\" AS t WHERE EXISTS ( \
+                     SELECT * FROM reverted3 WHERE {} AND operation = 0 \
+                 ) RETURNING * \
+             ), updated_or_deleted AS ( \
+                 INSERT INTO \"{name}\" SELECT {columns} FROM reverted3 \
+                 WHERE operation = 1 OR operation = 2 \
+                 ON CONFLICT ({key}) DO UPDATE SET {set} RETURNING * \
+             ) SELECT COUNT(*) FROM reverted1",
+            key_join("reverted2", "reverted1"),
+            key_join("t", "reverted3"),
+            name = self.name,
+        )
+    }
+
+    fn quoted_columns(&self, prefix: &str) -> String {
+        self.columns
+            .iter()
+            .map(|c| format!("{prefix}\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn quoted_key(&self, prefix: &str) -> String {
+        self.primary_key
+            .iter()
+            .map(|c| format!("{prefix}\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Ponder's checkpoints are 75-character strings that sort by block.
+fn checkpoint(block: u64) -> String {
+    format!("{block:075}")
+}
+
+/// A 32-byte hash as `0x` hex. Its value does not change the cost; its
+/// length does.
+fn block_hash(height: u64) -> String {
+    let h = height.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    format!(
+        "0x{h:016x}{:016x}{:016x}{:016x}",
+        h.rotate_left(16),
+        h.rotate_left(32),
+        h.rotate_left(48)
+    )
+}
+
 // ─── Multi-row INSERT/UPSERT helpers ───────────────────────────────────────
 
 /// Build `INSERT INTO <table> (<cols>) VALUES ($1, $2, ...), ($N+1, ...)` for

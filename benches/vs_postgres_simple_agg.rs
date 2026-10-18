@@ -16,6 +16,8 @@
 //! `SETTLE_JOURNAL=1` turns on the journal (`Config::applied_sequence`) for
 //! the RocksDB cases.
 //!
+//! Each batch goes to PG in one transaction.
+//!
 //! Run with: `cargo bench --bench vs_postgres_simple_agg` (Docker required)
 
 use std::collections::HashMap;
@@ -316,8 +318,10 @@ fn pg_upsert_balances_from_changes(
 fn run_pg_only_per_row(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<()> {
     let mut block_no = 1u64;
     for chunk in rows.chunks(BATCH_SIZE) {
+        pg.begin()?;
         pg_insert_transfers(pg, block_no, chunk)?;
         pg_upsert_balances_per_row(pg, chunk)?;
+        pg.commit()?;
         block_no += BLOCKS_PER_BATCH as u64;
     }
     Ok(())
@@ -326,10 +330,26 @@ fn run_pg_only_per_row(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<()> {
 fn run_pg_only_batch(pg: &PgRuntime, rows: &[RowMap]) -> anyhow::Result<()> {
     let mut block_no = 1u64;
     for chunk in rows.chunks(BATCH_SIZE) {
+        pg.begin()?;
         pg_insert_transfers(pg, block_no, chunk)?;
         pg_upsert_balances_batch(pg, chunk)?;
+        pg.commit()?;
         block_no += BLOCKS_PER_BATCH as u64;
     }
+    Ok(())
+}
+
+/// The PG side of a Settle pipeline applies one batch in one transaction.
+fn pg_apply(
+    pg: &PgRuntime,
+    first_block: u64,
+    rows: &[RowMap],
+    batch: &ChangeBatch,
+) -> anyhow::Result<()> {
+    pg.begin()?;
+    pg_insert_transfers(pg, first_block, rows)?;
+    pg_upsert_balances_from_changes(pg, batch.records_for("balances"))?;
+    pg.commit()?;
     Ok(())
 }
 
@@ -412,8 +432,7 @@ fn run_settle_pg_timed(
         .expect("non-empty batch");
         settle_total += t.elapsed();
 
-        pg_insert_transfers(pg, block_no, chunk)?;
-        pg_upsert_balances_from_changes(pg, batch.records_for("balances"))?;
+        pg_apply(pg, block_no, chunk, &batch)?;
         block_no += BLOCKS_PER_BATCH as u64;
     }
     Ok(settle_total)
@@ -437,9 +456,7 @@ fn run_settle_pg_pipelined(
             let mut busy = Duration::ZERO;
             for (block_no, chunk, batch) in batch_rx {
                 let t = Instant::now();
-                let applied = pg_insert_transfers(pg, block_no, chunk)
-                    .and_then(|()| pg_upsert_balances_from_changes(pg, batch.records_for("balances")))
-                    .map(|()| batch.sequence);
+                let applied = pg_apply(pg, block_no, chunk, &batch).map(|()| batch.sequence);
                 busy += t.elapsed();
                 if applied_tx.send(applied).is_err() {
                     break;
@@ -507,7 +524,7 @@ fn main() -> anyhow::Result<()> {
     );
     eprintln!("workload: vs_postgres_simple_agg");
     eprintln!("  config: {config}");
-    let mut pg_baseline = PgBaseline::open("vs_postgres_simple_agg", 1, &config)?;
+    let mut pg_baseline = PgBaseline::open("vs_postgres_simple_agg", 2, &config)?;
 
     // postgres_only (no Settle) — PG handles everything, settle portion = 0
     let pg_only: [(&str, fn(&PgRuntime, &[RowMap]) -> anyhow::Result<()>); 2] = [
