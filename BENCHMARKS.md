@@ -84,10 +84,11 @@ consumer would do them.
 | `backfill` | 100 blocks × 50 rows | at the batch tip | 4 ingests, 20K rows |
 | `tip` | 1 block × 50 rows | 64 blocks behind | 200 ingests, 10K rows |
 
-The `msgpack` group counts what the napi binding does with an ingest: the rows
-arrive as one msgpack buffer, and the count includes its decode
-(`decode_table_rows_from_msgpack`) and `Settle::ingest_rows`. The other groups
-call `Settle::ingest` with rows by name, as a Rust caller does.
+The `napi` group counts what the napi binding does in Rust with an ingest: it
+decodes the rows from the arrays that `codec.ts` fills (`js_codec::decode_ingest`),
+calls `Settle::ingest_rows`, and encodes the change batch for JS
+(`js_codec::encode_batch`). The JS side of the boundary is not counted. The
+other groups call `Settle::ingest` with rows by name, as a Rust caller does.
 
 Memory storage only: RocksDB flushes and compacts on its own threads, which
 neither tool counts. Rayon runs on the bench thread for the same reason. The
@@ -218,6 +219,54 @@ from one 2–3 ms measurement per run. Through the napi binding
 (`spikes/runtime-spike.mjs`, 100 / 100K groups), time per row: External JS
 −3.4% / −9.9%, Lua −4.6% / −9.5%, EventRules −13% / −12%. Most of the External
 cost is still the JS object marshal: 3.1 of 3.4 µs per row at 100 groups.
+
+### Binary bridge for the TS binding (2026-10-18)
+
+The napi binding used to move values one at a time: `ingest` rows went as a
+msgpack buffer that JS encoded, the change batch came back as msgpack that JS
+decoded and then walked to turn safe BigInts into numbers, and an External
+reducer got its groups as JS objects that Rust built field by field with napi
+calls, and read its states and emits back the same way. Now each direction of
+each call moves one set of typed arrays and one joined string
+(`src/js_codec/mod.rs`, `bindings/typescript/settle/src/codec.ts`). JS builds
+its objects with generated code, one function per set of field names, so
+objects of one table or reducer share one shape. An External reducer gets the
+row indices of its groups instead of copies of the rows, and writes its emits
+straight into the engine's `Emits` by position.
+
+Wall clock through the napi binding (`spikes/runtime-spike.mjs`: 200K rows,
+1,000 rows per ingest, the same PnL reducer in each runtime; median of three
+alternating rounds, each the median of five runs), µs per row, 100 / 100K
+groups:
+
+| Variant | Before | After | Change |
+|---|---:|---:|---:|
+| MV only | 0.764 / 2.872 | 0.378 / 1.665 | −51% / −42% |
+| EventRules | 1.388 / 5.400 | 0.883 / 4.174 | −36% / −23% |
+| Lua | 2.075 / 6.080 | 1.627 / 4.677 | −22% / −23% |
+| External JS | 3.312 / 9.220 | 0.886 / 4.202 | −73% / −54% |
+
+Every variant gives the same final view as before. The External JS ingest by
+step, µs per row, 100 / 100K groups: JS encode 0.267 / 0.272 → 0.051 / 0.093,
+native ingest 2.857 / 7.321 → 0.821 / 3.485 (the JS callback in it 0.094 /
+0.382 → 0.091 / 0.210, now with the decode of its groups), JS decode 0.110 /
+1.108 → 0.007 / 0.090. An External JS reducer now costs about what EventRules
+does.
+
+The Rust half of an ingest, Gungraun, the old msgpack path (positional decode,
+`ingest_rows`, msgpack encode of the batch) against the `napi` group, in one
+binary:
+
+| Case | msgpack | Codec | Change |
+|---|---:|---:|---:|
+| `napi_backfill mv_sum` | 378.0M | 314.0M | −16.9% |
+| `napi_backfill event_rules` | 579.4M | 515.1M | −11.1% |
+| `napi_backfill polymarket` | 1,847.2M | 1,742.1M | −5.7% |
+| `napi_tip mv_sum` | 187.3M | 156.5M | −16.4% |
+| `napi_tip polymarket` | 915.9M | 865.0M | −5.6% |
+
+The cases that the binding does not run moved by −0.5% to +1.0%, with the same
+allocated bytes.
 
 Each case leaves its profiles under `target/gungraun/settle/instructions/ingest/<mode>.<workload>/`.
 `callgrind_annotate --inclusive=yes callgrind.<mode>.<workload>.out` shows where

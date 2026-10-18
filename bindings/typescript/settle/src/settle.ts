@@ -1,4 +1,4 @@
-import { Decoder, Encoder } from '@msgpack/msgpack'
+import { readBatch, TableWriter } from './codec'
 import type { ReducerCtx } from './ddl'
 // Import from src/native/ directly — not copied to dist/ to avoid stale binaries
 import { Settle as NativeSettle } from '../src/native/native.js'
@@ -7,36 +7,18 @@ import {
   SettlePendingAckError,
   SettleWrongAckSequenceError,
 } from './errors'
-import { groupBatchCallback } from './reducer-callback'
+import { nativeBatchCallback } from './reducer-callback'
 
-const encoder = new Encoder({ useBigInt64: true })
-const decoder = new Decoder({ useBigInt64: true })
-
-const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER)
+/** A change batch as native code returns it: `[buffer, strings, others]`. */
+type EncodedBatch = [ArrayBuffer, string, unknown[] | null]
 
 /**
- * Decode a change batch. 64-bit integers decode as BigInt, so none loses
- * precision; each one that a number holds exactly becomes a number again.
+ * Decode a change batch. An integer beyond `Number.MAX_SAFE_INTEGER`
+ * arrives as a BigInt, so none loses precision.
  */
-function decodeBatch(buf: Uint8Array): ChangeBatch {
-  return toSafeNumbers(decoder.decode(buf)) as ChangeBatch
-}
-
-function toSafeNumbers(value: unknown): unknown {
-  if (typeof value === 'bigint') {
-    return value >= -MAX_SAFE && value <= MAX_SAFE ? Number(value) : value
-  }
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      value[i] = toSafeNumbers(value[i])
-    }
-  } else if (value !== null && typeof value === 'object' && !ArrayBuffer.isView(value)) {
-    const fields = value as Record<string, unknown>
-    for (const key in fields) {
-      fields[key] = toSafeNumbers(fields[key])
-    }
-  }
-  return value
+function decodeBatch(encoded: object): ChangeBatch {
+  const [buffer, strings, others] = encoded as EncodedBatch
+  return readBatch(buffer, strings, others)
 }
 
 // ─── Types ───────────────────────────────────────────────────────
@@ -207,6 +189,9 @@ export interface ISettle {
 
 export class Settle implements ISettle {
   #native: InstanceType<typeof NativeSettle>
+  #rows = new TableWriter()
+  /** The columns of each table name, or null for a name that the schema lacks. */
+  #columns = new Map<string, readonly string[] | null>()
 
   private constructor(native: InstanceType<typeof NativeSettle>) {
     this.#native = native
@@ -218,13 +203,12 @@ export class Settle implements ISettle {
 
   async ingest(input: IngestInput): Promise<ChangeBatch | null> {
     const t0 = performance.now()
-    const encoded = Buffer.from(encoder.encode(input.data))
+    const rows = this.#rows.encode(input.data, (table) => this.#tableColumns(table))
     const encodeMs = performance.now() - t0
 
-    let buf: ReturnType<InstanceType<typeof NativeSettle>['ingest']>
+    let encoded: ReturnType<InstanceType<typeof NativeSettle>['ingest']>
     try {
-      buf = this.#native.ingest({
-        data: encoded,
+      encoded = this.#native.ingest(rows, {
         rollbackChain: input.rollbackChain,
         finalizedHead: input.finalizedHead,
       })
@@ -233,19 +217,24 @@ export class Settle implements ISettle {
     }
 
     const t1 = performance.now()
-    const batch = buf ? decodeBatch(buf) : null
+    const batch = encoded ? decodeBatch(encoded) : null
     const decodeMs = performance.now() - t1
 
     if (batch) {
-      batch.perf.unshift(
-        { kind: 'pipeline', name: 'msgpack_encode', durationMs: encodeMs, children: [] },
-      )
-      batch.perf.push(
-        { kind: 'pipeline', name: 'msgpack_decode', durationMs: decodeMs, children: [] },
-      )
+      batch.perf.unshift({ kind: 'pipeline', name: 'encode', durationMs: encodeMs, children: [] })
+      batch.perf.push({ kind: 'pipeline', name: 'decode', durationMs: decodeMs, children: [] })
     }
 
     return batch
+  }
+
+  #tableColumns(table: string): readonly string[] | null {
+    let columns = this.#columns.get(table)
+    if (columns === undefined) {
+      columns = this.#native.tableColumns(table) ?? null
+      this.#columns.set(table, columns)
+    }
+    return columns
   }
 
   resolveForkCursor(previousBlocks: SettleCursor[]): SettleCursor | null {
@@ -308,7 +297,7 @@ export class Settle implements ISettle {
   ): void {
     const { reduce } = options
 
-    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce)
+    const batchFn = nativeBatchCallback<TState, TRow, TEmit>(reduce)
 
     try {
       this.#native.registerReducer(
@@ -329,7 +318,7 @@ export class Settle implements ISettle {
     name: string,
     reduce: (state: ReducerCtx<TState, TEmit>, row: TRow) => void,
   ): void {
-    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce)
+    const batchFn = nativeBatchCallback<TState, TRow, TEmit>(reduce)
 
     try {
       this.#native.registerReducerCallback(name, batchFn)

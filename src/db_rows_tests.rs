@@ -1,5 +1,6 @@
 use super::*;
-use crate::msgpack_conv::{decode_data_from_msgpack, decode_table_rows_from_msgpack};
+use crate::js_codec::{self, Decoder, Strings};
+use crate::msgpack_conv::decode_data_from_msgpack;
 use crate::test_helpers::cursor;
 use std::collections::HashMap;
 
@@ -133,9 +134,9 @@ impl Chain {
         }
     }
 
-    /// The next ingest: the msgpack data, the rollback chain and the
+    /// The next ingest: the rows by table, the rollback chain and the
     /// finalized head.
-    fn next_ingest(&mut self) -> (Vec<u8>, Vec<BlockCursor>, BlockCursor) {
+    fn next_ingest(&mut self) -> (Tables, Vec<BlockCursor>, BlockCursor) {
         let latest = self.hashes.keys().next_back().copied().unwrap_or(0);
 
         // A fork replaces the blocks above a block that is not final.
@@ -149,7 +150,7 @@ impl Chain {
 
         let forked = first <= latest;
         let last = first + self.rng.below(4);
-        let mut tables: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
+        let mut tables = Tables::new();
         for block in first..=last {
             self.hashes
                 .insert(block, format!("0x{block:x}-{}", self.epoch));
@@ -166,7 +167,6 @@ impl Chain {
                     .push(self.transfer(block));
             }
         }
-        let data = rmp_serde::to_vec(&tables).unwrap();
 
         // The chain must hold a common ancestor at or above finality.
         if !forked {
@@ -175,7 +175,7 @@ impl Chain {
         let chain = (self.finalized + 1..=last)
             .map(|b| self.cursor(b))
             .collect();
-        (data, chain, self.cursor(self.finalized))
+        (tables, chain, self.cursor(self.finalized))
     }
 
     fn swap(&mut self, block: BlockNumber) -> serde_json::Value {
@@ -197,8 +197,9 @@ impl Chain {
             "block_number": block,
             "user": user,
             "side": side,
-            "amount": (1 + self.rng.below(50)) as f64,
-            "price": (100 + self.rng.below(20)) as f64 / 4.0,
+            // Not whole: JS sends a whole number as an integer.
+            "amount": (1 + self.rng.below(50)) as f64 + 0.25,
+            "price": (100 + self.rng.below(20)) as f64 / 4.0 + 0.125,
         })
     }
 
@@ -221,16 +222,76 @@ fn canonical(batch: &ChangeBatch) -> String {
     )
 }
 
+type Tables = HashMap<&'static str, Vec<serde_json::Value>>;
+
+/// The arrays that `TableWriter` in `codec.ts` fills for `tables`.
+struct Encoded {
+    ints: Vec<u32>,
+    tags: Vec<u8>,
+    nums: Vec<f64>,
+    strings: String,
+}
+
+impl Encoded {
+    fn new(db: &Settle, tables: &Tables) -> Self {
+        let mut encoded = Self {
+            ints: vec![0, 0, tables.len() as u32],
+            tags: Vec::new(),
+            nums: Vec::new(),
+            strings: String::new(),
+        };
+        for (table, rows) in tables {
+            let width = db.table_registry(table).unwrap().len() + 1;
+            encoded.ints.extend([table.len() as u32, rows.len() as u32, width as u32]);
+            encoded.strings.push_str(table);
+        }
+        for (table, rows) in tables {
+            let columns = db.table_registry(table).unwrap().names().to_vec();
+            for row in rows {
+                encoded.put(&row["block_number"]);
+                for column in &columns {
+                    encoded.put(&row[column.as_str()]);
+                }
+            }
+        }
+        encoded.ints[0] = encoded.ints.len() as u32;
+        encoded.ints[1] = encoded.tags.len() as u32;
+        encoded
+    }
+
+    fn put(&mut self, value: &serde_json::Value) {
+        let (tag, num) = match value {
+            serde_json::Value::Null => (js_codec::NULL, 0.0),
+            serde_json::Value::Number(n) => (js_codec::NUMBER, n.as_f64().unwrap()),
+            serde_json::Value::String(text) => {
+                assert!(text.is_ascii());
+                self.strings.push_str(text);
+                (js_codec::STRING, text.len() as f64)
+            }
+            other => panic!("no JS value for {other}"),
+        };
+        self.tags.push(tag);
+        self.nums.push(num);
+    }
+
+    fn decode(&self, db: &Settle) -> HashMap<String, BlockRows> {
+        let strings = Strings::Ascii(&self.strings);
+        let mut dec = Decoder::new(&self.ints[2..], &self.tags, &self.nums, strings, true).unwrap();
+        let mut no_others = |i: usize| -> std::result::Result<Value, String> { panic!("host value {i}") };
+        js_codec::decode_ingest(&mut dec, |t| db.table_registry(t), &mut no_others).unwrap()
+    }
+}
+
 /// Ingest by name and by position, and ack.
 fn ingest_both(
     by_name: &mut Settle,
     by_position: &mut Settle,
-    data: &[u8],
+    tables: &Tables,
     rollback_chain: Vec<BlockCursor>,
     finalized_head: BlockCursor,
 ) -> (Option<String>, Option<String>) {
-    let maps = decode_data_from_msgpack(data).unwrap();
-    let rows = decode_table_rows_from_msgpack(data, |t| by_position.table_registry(t)).unwrap();
+    let maps = decode_data_from_msgpack(&rmp_serde::to_vec(tables).unwrap()).unwrap();
+    let rows = Encoded::new(by_position, tables).decode(by_position);
 
     let a = by_name
         .ingest(IngestInput {
@@ -259,9 +320,9 @@ fn open(dir: &std::path::Path) -> Settle {
     Settle::open(Config::with_data_dir(SCHEMA, dir.to_str().unwrap()).collect_perf(false)).unwrap()
 }
 
-/// The positional path of the bindings (msgpack → `ingest_rows`) produces
-/// the same change batches as rows by name, through forks, sliding expiry
-/// and a reopen that replays the unfinalized blocks.
+/// The positional path of the napi binding (`js_codec::decode_ingest` →
+/// `ingest_rows`) produces the same change batches as rows by name, through
+/// forks, sliding expiry and a reopen that replays the unfinalized blocks.
 #[test]
 fn rows_by_position_match_rows_by_name() {
     for seed in 1..=4 {
