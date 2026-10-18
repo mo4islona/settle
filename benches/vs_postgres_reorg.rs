@@ -42,6 +42,8 @@
 //!    cost grows with per-asset history. settle pays neither — it picks the
 //!    surviving extremum out of its in-memory unfinalized window.
 //!    => THIS is the real, unriggable structural win. It is the HEADLINE.
+//!    => An undo log (`PG_FORKS=undo`, Ponder's way) avoids the rescan: it
+//!       restores the old rows, at the price of a logged copy of every write.
 //!
 //! Fairness rules honored here:
 //!  - All contenders MUST converge to byte-identical final per-asset aggregates;
@@ -58,6 +60,13 @@
 //!  - We capture `EXPLAIN (ANALYZE)` on the PG reorg statements so the audit
 //!    can confirm index usage / whether a scan happened — printed once.
 //!
+//! PG commits each block, as an indexer at the tip does; the undo of a reorg
+//! and its replacement blocks commit together. `PG_FORKS` adds the fork
+//! bookkeeping of the PG side (`common::PgForks`): `blocks` keeps rindexer's
+//! block hashes next to the strategies above, `undo` replaces them with
+//! Ponder's undo log (`pg_summary_undo`). Settle keeps its block hashes in
+//! every case.
+//!
 //! Run with: `cargo bench --bench vs_postgres_reorg` (Docker required).
 
 use std::collections::HashMap;
@@ -71,7 +80,10 @@ use tokio_postgres::types::ToSql;
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{build_multi_insert, print_result_split, PgBaseline, PgCase, PgRuntime, PgStats};
+use common::{
+    build_multi_insert, print_result_split, ForkLog, PgBaseline, PgCase, PgForks, PgRuntime,
+    PgStats,
+};
 
 // ─── Workload shape ─────────────────────────────────────────────────────────
 //
@@ -875,94 +887,97 @@ fn pg_read_noninvertible(pg: &PgRuntime) -> anyhow::Result<HashMap<String, (f64,
 }
 
 // ===========================================================================
-// PG drivers — replay the SAME schedule. `reversible` selects the additive
-// reorg strategy; the non-invertible driver has only one correct strategy.
+// PG drivers — replay the SAME schedule. `AdditiveUndo` selects the additive
+// reorg strategy; the non-invertible driver rescans unless an undo log
+// (`PgForks::Undo`) restores the rows. PG commits each block; the undo of a
+// reorg and its replacement blocks commit together.
 // ===========================================================================
 
-fn run_pg_additive(pg: &PgRuntime, reorg: Reorg, reversible: bool) -> anyhow::Result<Duration> {
-    pg.batch_execute("BEGIN")?;
-    let mut wall = Duration::ZERO;
-    let mut tx_rows = 0usize;
+/// How the additive PG indexer undoes a reorg.
+#[derive(Clone, Copy, PartialEq)]
+enum AdditiveUndo {
+    /// Reverse deltas over the forked rows.
+    Reversible,
+    /// GROUP BY over the surviving rows: the rig.
+    Naive,
+    /// Ponder's undo log restores the rows (`PgForks::Undo`).
+    Log,
+}
+
+fn run_pg_additive(
+    pg: &PgRuntime,
+    reorg: Reorg,
+    undo: AdditiveUndo,
+    forks: &ForkLog,
+) -> anyhow::Result<()> {
     for block in 1..=NUM_BLOCKS as u64 {
+        // A reorg does not move finality back, so the replayed blocks use it too.
+        let finalized = block.saturating_sub(FINALITY_WINDOW);
         let rows = gen_block(block, 0);
-        let t = Instant::now();
+        pg.begin()?;
         pg_insert_block(pg, block, &rows)?;
         pg_additive_apply_block(pg, &rows, 1.0)?;
-        wall += t.elapsed();
-        tx_rows += rows.len();
+        forks.record(pg, block, block, finalized)?;
+        pg.commit()?;
 
         if reorg.fires_at(block) {
             let fork_point = block - REORG_DEPTH as u64;
-            // Determine affected assets (for the naive strategy) BEFORE delete.
-            let affected: Vec<String> = if reversible {
-                Vec::new()
-            } else {
-                let rows = pg.query(
-                    "SELECT DISTINCT asset_id FROM trades WHERE block_number > $1",
-                    &[&(fork_point as i64)],
-                )?;
-                rows.iter().map(|r| r.get::<_, String>(0)).collect()
-            };
-            let t = Instant::now();
-            if reversible {
-                pg_additive_reorg_reversible(pg, fork_point)?;
-            } else {
-                pg_additive_reorg_naive(pg, fork_point, &affected)?;
+            pg.begin()?;
+            match undo {
+                AdditiveUndo::Reversible => pg_additive_reorg_reversible(pg, fork_point)?,
+                AdditiveUndo::Naive => {
+                    // The affected assets, before their forked rows go.
+                    let rows = pg.query(
+                        "SELECT DISTINCT asset_id FROM trades WHERE block_number > $1",
+                        &[&(fork_point as i64)],
+                    )?;
+                    let affected: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+                    pg_additive_reorg_naive(pg, fork_point, &affected)?;
+                }
+                AdditiveUndo::Log => {}
             }
-            // Re-ingest replacement blocks.
+            forks.rollback(pg, fork_point)?;
             for vb in (fork_point + 1)..=block {
                 let rows = gen_block(vb, 1);
                 pg_insert_block(pg, vb, &rows)?;
                 pg_additive_apply_block(pg, &rows, 1.0)?;
-                tx_rows += rows.len();
+                forks.record(pg, vb, vb, finalized)?;
             }
-            wall += t.elapsed();
-        }
-
-        if tx_rows > 50_000 {
-            pg.batch_execute("COMMIT")?;
-            pg.batch_execute("BEGIN")?;
-            tx_rows = 0;
+            pg.commit()?;
         }
     }
-    pg.batch_execute("COMMIT")?;
-    Ok(wall)
+    Ok(())
 }
 
-fn run_pg_noninvertible(pg: &PgRuntime, reorg: Reorg) -> anyhow::Result<(Duration, u64)> {
-    pg.batch_execute("BEGIN")?;
-    let mut wall = Duration::ZERO;
-    let mut tx_rows = 0usize;
+/// Returns the number of asset rescans.
+fn run_pg_noninvertible(pg: &PgRuntime, reorg: Reorg, forks: &ForkLog) -> anyhow::Result<u64> {
     let mut rescans = 0u64;
     for block in 1..=NUM_BLOCKS as u64 {
+        let finalized = block.saturating_sub(FINALITY_WINDOW);
         let rows = gen_block(block, 0);
-        let t = Instant::now();
+        pg.begin()?;
         pg_insert_block(pg, block, &rows)?;
         pg_noninvertible_apply_block(pg, block, &rows)?;
-        wall += t.elapsed();
-        tx_rows += rows.len();
+        forks.record(pg, block, block, finalized)?;
+        pg.commit()?;
 
         if reorg.fires_at(block) {
             let fork_point = block - REORG_DEPTH as u64;
-            let t = Instant::now();
-            rescans += pg_noninvertible_reorg(pg, fork_point)?;
+            pg.begin()?;
+            if !forks.undoes_data() {
+                rescans += pg_noninvertible_reorg(pg, fork_point)?;
+            }
+            forks.rollback(pg, fork_point)?;
             for vb in (fork_point + 1)..=block {
                 let rows = gen_block(vb, 1);
                 pg_insert_block(pg, vb, &rows)?;
                 pg_noninvertible_apply_block(pg, vb, &rows)?;
-                tx_rows += rows.len();
+                forks.record(pg, vb, vb, finalized)?;
             }
-            wall += t.elapsed();
-        }
-
-        if tx_rows > 50_000 {
-            pg.batch_execute("COMMIT")?;
-            pg.batch_execute("BEGIN")?;
-            tx_rows = 0;
+            pg.commit()?;
         }
     }
-    pg.batch_execute("COMMIT")?;
-    Ok((wall, rescans))
+    Ok(rescans)
 }
 
 // ===========================================================================
@@ -1007,18 +1022,49 @@ fn print_pg(label: &str, rows: usize, elapsed: Duration, stats: PgStats) {
     print_result_split(label, rows, elapsed, Duration::ZERO, stats);
 }
 
+/// The additive PG contenders: with an undo log, the log undoes the reorg.
+fn additive_contenders(pg_forks: &[PgForks]) -> Vec<(AdditiveUndo, PgForks)> {
+    let mut contenders = Vec::new();
+    for &forks in pg_forks {
+        if forks == PgForks::Undo {
+            contenders.push((AdditiveUndo::Log, forks));
+        } else {
+            contenders.push((AdditiveUndo::Reversible, forks));
+            contenders.push((AdditiveUndo::Naive, forks));
+        }
+    }
+    contenders
+}
+
+fn additive_label(undo: AdditiveUndo, forks: PgForks) -> String {
+    match undo {
+        AdditiveUndo::Reversible => format!("pg_summary_reversible{}", forks.label()),
+        AdditiveUndo::Naive => format!("pg_summary_naive(rig){}", forks.label()),
+        AdditiveUndo::Log => "pg_summary_undo".to_string(),
+    }
+}
+
+fn noninvertible_label(forks: PgForks) -> String {
+    match forks {
+        PgForks::Undo => "pg_summary_undo".to_string(),
+        _ => format!("pg_summary{}", forks.label()),
+    }
+}
+
 fn pg_additive_case(
     pg_baseline: &mut PgBaseline,
     reorg: Reorg,
-    reversible: bool,
+    undo: AdditiveUndo,
+    forks: PgForks,
 ) -> anyhow::Result<PgCase<HashMap<String, (f64, i64)>>> {
-    let kind = if reversible { "reversible" } else { "naive" };
-    pg_baseline.case(&format!("additive {} {kind}", reorg.label()), || {
+    let label = format!("additive {} {}", reorg.label(), additive_label(undo, forks));
+    pg_baseline.case(&label, || {
         let pg = PgRuntime::start()?;
         pg.batch_execute(PG_SCHEMA_ADDITIVE)?;
+        let fork_log = forks.setup(&pg, &["trades", "asset_volume"])?;
         pg.take_stats();
         let t = Instant::now();
-        let _ = run_pg_additive(&pg, reorg, reversible)?;
+        run_pg_additive(&pg, reorg, undo, &fork_log)?;
         let elapsed = t.elapsed();
         let stats = pg.take_stats();
         Ok(PgCase {
@@ -1029,29 +1075,32 @@ fn pg_additive_case(
     })
 }
 
-fn run_additive_suite(pg_baseline: &mut PgBaseline, reorg: Reorg) -> anyhow::Result<()> {
+fn run_additive_suite(
+    pg_baseline: &mut PgBaseline,
+    pg_forks: &[PgForks],
+    reorg: Reorg,
+) -> anyhow::Result<()> {
     let total_rows = NUM_BLOCKS * ROWS_PER_BLOCK;
     eprintln!("\n=== ADDITIVE (SUM volume / COUNT) — {} ===", reorg.label());
     eprintln!(
         "    (expectation: settle at PARITY-to-slightly-slower vs pg_summary_reversible)"
     );
 
-    // --- pg_summary_reversible: the competent additive indexer (HEADLINE PG) ---
-    let rev = pg_additive_case(pg_baseline, reorg, true)?;
-    print_pg("pg_summary_reversible", total_rows, rev.elapsed, rev.stats);
-
-    // --- pg_summary_naive: GROUP-BY-over-survivors (the RIG; NOT the headline) ---
-    let naive = pg_additive_case(pg_baseline, reorg, false)?;
-    print_pg(
-        "pg_summary_naive(rig)",
-        total_rows,
-        naive.elapsed,
-        naive.stats,
-    );
-    eprintln!(
-        "      ^ naive reorg rows_read={} GROWS with stream length; this is the strawman.",
-        naive.stats.rows_read
-    );
+    // pg_summary_reversible is the competent additive indexer (HEADLINE PG);
+    // pg_summary_naive rescans the survivors (the RIG; NOT the headline).
+    let mut pg_cases = Vec::new();
+    for (undo, forks) in additive_contenders(pg_forks) {
+        let case = pg_additive_case(pg_baseline, reorg, undo, forks)?;
+        let label = additive_label(undo, forks);
+        print_pg(&label, total_rows, case.elapsed, case.stats);
+        if undo == AdditiveUndo::Naive {
+            eprintln!(
+                "      ^ naive reorg rows_read={} GROWS with stream length; this is the strawman.",
+                case.stats.rows_read
+            );
+        }
+        pg_cases.push((undo, label, case));
+    }
 
     // --- settle (mem reference + rocks headline) ---
     for storage in [Storage::Memory, Storage::Rocks] {
@@ -1067,35 +1116,41 @@ fn run_additive_suite(pg_baseline: &mut PgBaseline, reorg: Reorg) -> anyhow::Res
         // No PG forwarding in this measurement: settle column carries it all.
         print_result_split(&lbl, total_rows, settle_t, settle_t, PgStats::default());
         eprintln!("    {note}");
-        // Cross-engine convergence: settle == reversible PG == naive PG == model.
-        assert_map_eq_f1i1("refmodel vs pg_reversible", &expected, &rev.output)?;
-        assert_map_eq_f1i1("refmodel vs pg_naive", &expected, &naive.output)?;
 
-        // FAIRNESS GATE: on additive aggregates settle must NOT beat the
-        // competent reversible PG — mechanistically it can't. We only assert
-        // this on the durable (rocks) headline, and only loosely (settle is
-        // allowed to be FASTER only within noise; a large win = contamination).
-        if matches!(storage, Storage::Rocks) {
-            let settle_s = settle_t.as_secs_f64();
-            let pg_s = rev.elapsed.as_secs_f64();
-            if settle_s < pg_s * 0.75 {
-                eprintln!(
-                    "    *** WARNING: settle additive ({settle_s:.3}s) is >25% faster than \
-                     pg_summary_reversible ({pg_s:.3}s). On a cleanly-reversible aggregate this \
-                     should NOT happen — suspect machine load or a measurement bug, NOT a real win."
-                );
-            } else {
-                eprintln!(
-                    "    [gate] settle {settle_s:.3}s vs pg_reversible {pg_s:.3}s — \
-                     parity-to-slower as expected (no spurious additive win)."
-                );
+        for (undo, pg_label, case) in &pg_cases {
+            // Cross-engine convergence: settle == every PG contender == model.
+            assert_map_eq_f1i1(&format!("refmodel vs {pg_label}"), &expected, &case.output)?;
+
+            // FAIRNESS GATE: on additive aggregates settle must NOT beat a
+            // competent PG indexer — mechanistically it can't. We only assert
+            // this on the durable (rocks) headline, and only loosely (settle is
+            // allowed to be FASTER only within noise; a large win = contamination).
+            if matches!(storage, Storage::Rocks) && *undo != AdditiveUndo::Naive {
+                let settle_s = settle_t.as_secs_f64();
+                let pg_s = case.elapsed.as_secs_f64();
+                if settle_s < pg_s * 0.75 {
+                    eprintln!(
+                        "    *** WARNING: settle additive ({settle_s:.3}s) is >25% faster than \
+                         {pg_label} ({pg_s:.3}s). On a cleanly-reversible aggregate this \
+                         should NOT happen — suspect machine load or a measurement bug, NOT a real win."
+                    );
+                } else {
+                    eprintln!(
+                        "    [gate] settle {settle_s:.3}s vs {pg_label} {pg_s:.3}s — \
+                         parity-to-slower as expected (no spurious additive win)."
+                    );
+                }
             }
         }
     }
     Ok(())
 }
 
-fn run_noninvertible_suite(pg_baseline: &mut PgBaseline, reorg: Reorg) -> anyhow::Result<()> {
+fn run_noninvertible_suite(
+    pg_baseline: &mut PgBaseline,
+    pg_forks: &[PgForks],
+    reorg: Reorg,
+) -> anyhow::Result<()> {
     let total_rows = NUM_BLOCKS * ROWS_PER_BLOCK;
     eprintln!(
         "\n=== NON-INVERTIBLE (MAX/MIN/last price = OHLC hi/lo/close) — {} ===",
@@ -1105,34 +1160,40 @@ fn run_noninvertible_suite(pg_baseline: &mut PgBaseline, reorg: Reorg) -> anyhow
         "    (expectation: settle's REAL structural win; PG must rescan survivors on min/max)"
     );
 
-    // --- pg (HEADLINE PG): correct, window-scoped, skip-rescan-when-extremum-survives ---
-    let summary = pg_baseline.case(&format!("noninvert {} pg_summary", reorg.label()), || {
-        let pg = PgRuntime::start()?;
-        pg.batch_execute(PG_SCHEMA_NONINVERTIBLE)?;
-        pg.take_stats();
-        let t = Instant::now();
-        let (_, rescans) = run_pg_noninvertible(&pg, reorg)?;
-        let elapsed = t.elapsed();
-        let stats = pg.take_stats();
-        Ok(PgCase {
-            elapsed,
-            stats,
-            output: (rescans, pg_read_noninvertible(&pg)?),
-        })
-    })?;
-    let (rescans, pg_state) = &summary.output;
-    print_pg("pg_summary", total_rows, summary.elapsed, summary.stats);
-    eprintln!(
-        "      ^ {} asset-rescans triggered; reorg rows_read={} (grows with per-asset history).",
-        rescans, summary.stats.rows_read
-    );
+    // pg_summary (HEADLINE PG): correct, window-scoped, skips the rescan when
+    // the extremum survives. pg_summary_undo restores the rows from Ponder's
+    // undo log instead and never rescans.
+    let mut pg_cases = Vec::new();
+    for &forks in pg_forks {
+        let label = noninvertible_label(forks);
+        let summary = pg_baseline.case(&format!("noninvert {} {label}", reorg.label()), || {
+            let pg = PgRuntime::start()?;
+            pg.batch_execute(PG_SCHEMA_NONINVERTIBLE)?;
+            let fork_log = forks.setup(&pg, &["trades", "asset_price"])?;
+            pg.take_stats();
+            let t = Instant::now();
+            let rescans = run_pg_noninvertible(&pg, reorg, &fork_log)?;
+            let elapsed = t.elapsed();
+            let stats = pg.take_stats();
+            Ok(PgCase {
+                elapsed,
+                stats,
+                output: (rescans, pg_read_noninvertible(&pg)?),
+            })
+        })?;
+        print_pg(&label, total_rows, summary.elapsed, summary.stats);
+        eprintln!(
+            "      ^ {} asset-rescans triggered; reorg rows_read={} (grows with per-asset history).",
+            summary.output.0, summary.stats.rows_read
+        );
+        pg_cases.push((label, summary));
+    }
 
     // --- settle (mem reference + rocks headline) ---
     for storage in [Storage::Memory, Storage::Rocks] {
         let (settle_t, mirror, model) = run_settle_noninvertible(storage, reorg)?;
         let expected = model.noninvertible();
         assert_map_eq_f3("settle.mirror vs refmodel", &expected, &mirror)?;
-        assert_map_eq_f3("refmodel vs pg", &expected, pg_state)?;
         let lbl = format!("settle_{}[noninvert]", storage.label());
         let note = match storage {
             Storage::Memory => "  (in-memory, NO durability — not comparable to PG)",
@@ -1140,14 +1201,17 @@ fn run_noninvertible_suite(pg_baseline: &mut PgBaseline, reorg: Reorg) -> anyhow
         };
         print_result_split(&lbl, total_rows, settle_t, settle_t, PgStats::default());
         eprintln!("    {note}");
-        if matches!(storage, Storage::Rocks) && !matches!(reorg, Reorg::None) {
-            let settle_s = settle_t.as_secs_f64();
-            let pg_s = summary.elapsed.as_secs_f64();
-            let ratio = pg_s / settle_s.max(1e-9);
-            eprintln!(
-                "    [headline] settle {settle_s:.3}s vs pg {pg_s:.3}s  => settle {ratio:.2}x \
-                 (settle reverts via window split_off; PG rescans survivors for min/max)."
-            );
+
+        for (pg_label, summary) in &pg_cases {
+            assert_map_eq_f3(&format!("refmodel vs {pg_label}"), &expected, &summary.output.1)?;
+            if matches!(storage, Storage::Rocks) && !matches!(reorg, Reorg::None) {
+                let settle_s = settle_t.as_secs_f64();
+                let pg_s = summary.elapsed.as_secs_f64();
+                let ratio = pg_s / settle_s.max(1e-9);
+                eprintln!(
+                    "    [headline] settle {settle_s:.3}s vs {pg_label} {pg_s:.3}s  => settle {ratio:.2}x"
+                );
+            }
         }
     }
     Ok(())
@@ -1161,7 +1225,8 @@ fn main() -> anyhow::Result<()> {
     );
     eprintln!("workload: vs_postgres_reorg  (tip indexing with reorgs)");
     eprintln!("  config: {config}");
-    let mut pg_baseline = PgBaseline::open("vs_postgres_reorg", 1, &config)?;
+    let mut pg_baseline = PgBaseline::open("vs_postgres_reorg", 2, &config)?;
+    let pg_forks = PgForks::from_env()?;
     eprintln!(
         "  HEADLINE = settle-rocks vs PG-on-disk. settle-mem is a no-durability reference only."
     );
@@ -1188,14 +1253,14 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("\n############ NON-INVERTIBLE WORKLOAD (the honest win) ############");
     for &reorg in &schedule {
-        run_noninvertible_suite(&mut pg_baseline, reorg)?;
+        run_noninvertible_suite(&mut pg_baseline, &pg_forks, reorg)?;
     }
 
     eprintln!(
         "\n############ ADDITIVE WORKLOAD (parity — settle does NOT win here) ############"
     );
     for &reorg in &schedule {
-        run_additive_suite(&mut pg_baseline, reorg)?;
+        run_additive_suite(&mut pg_baseline, &pg_forks, reorg)?;
     }
 
     eprintln!(
