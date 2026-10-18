@@ -5,9 +5,9 @@ use napi::bindgen_prelude::*;
 use napi::sys;
 use napi_derive::napi;
 
-use crate::db::{Config, IngestInput as IngestInputInner, Settle as Inner};
+use crate::db::{Config, IngestRows, Settle as Inner};
 use crate::error::Error as SettleError;
-use crate::msgpack_conv::{decode_data_from_msgpack, encode_batch_to_msgpack};
+use crate::msgpack_conv::{decode_table_rows_from_msgpack, encode_batch_to_msgpack};
 use crate::reducer_runtime::external::install_context;
 use crate::schema::ast::{ReducerBody, ReducerDef, StateField};
 use crate::types::{BlockCursor, ColumnType};
@@ -360,7 +360,8 @@ impl Settle {
     #[napi]
     pub fn ingest(&mut self, env: Env, input: IngestInput) -> Result<Option<Buffer>> {
         let data =
-            decode_data_from_msgpack(&input.data).map_err(|e| Error::new(Status::InvalidArg, e))?;
+            decode_table_rows_from_msgpack(&input.data, |table| self.inner.table_registry(table))
+                .map_err(|e| Error::new(Status::InvalidArg, e))?;
 
         let rollback_chain = input
             .rollback_chain
@@ -372,7 +373,7 @@ impl Settle {
             })
             .collect();
 
-        let ingest_input = IngestInputInner {
+        let ingest_input = IngestRows {
             data,
             rollback_chain,
             finalized_head: BlockCursor {
@@ -388,7 +389,10 @@ impl Settle {
             None
         };
 
-        let batch = self.inner.ingest(ingest_input).map_err(settle_err_to_napi)?;
+        let batch = self
+            .inner
+            .ingest_rows(ingest_input)
+            .map_err(settle_err_to_napi)?;
 
         Ok(batch.map(|b| Buffer::from(encode_batch_to_msgpack(&b))))
     }
