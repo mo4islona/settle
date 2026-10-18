@@ -148,8 +148,8 @@ fn position_reducer() -> FnReducerRuntime {
             cb -= sold * avg_cost;
         }
 
-        state.insert("quantity".into(), Value::Float64(qty));
-        state.insert("cost_basis".into(), Value::Float64(cb));
+        state.set("quantity", Value::Float64(qty));
+        state.set("cost_basis", Value::Float64(cb));
 
         let mut emit = HashMap::new();
         emit.insert("user_addr".into(), Value::String(user.to_string()));
@@ -158,7 +158,7 @@ fn position_reducer() -> FnReducerRuntime {
         emit.insert("quantity".into(), Value::Float64(qty));
         emit.insert("cost_basis".into(), Value::Float64(cb));
         emit.insert("realized_delta".into(), Value::Float64(realized_delta));
-        vec![emit]
+        state.emit(emit)
     })
 }
 

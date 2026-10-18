@@ -8,11 +8,9 @@
 //! The batched path sends all groups for a block in a single JS call,
 //! avoiding per-row FFI overhead.
 
-use std::collections::HashMap;
+use crate::types::{ColumnRegistry, Row, Value};
 
-use crate::types::{Row, RowMap, Value};
-
-use super::{GroupBatch, ReducerRuntime};
+use super::{Emits, GroupBatch, GroupState, ReducerRuntime};
 
 /// The largest integer that a JS number holds exactly: 2^53 - 1. Larger
 /// integers cross to JS as BigInt.
@@ -59,7 +57,7 @@ mod napi_bridge {
     use napi::sys;
 
     use crate::json_conv::value_to_json;
-    use crate::types::{Row, Value};
+    use crate::types::{ColumnRegistry, Row, Value};
 
     use super::{GroupBatch, MAX_SAFE_INTEGER, bigint_to_value, legacy_emit_row};
 
@@ -108,7 +106,7 @@ mod napi_bridge {
     }
 
     /// Called by ExternalRuntime::process_grouped to invoke the JS callback.
-    pub fn call_js_batch(reducer_id: &str, groups: &mut [GroupBatch]) {
+    pub fn call_js_batch(reducer_id: &str, groups: &mut [GroupBatch], fields: &ColumnRegistry) {
         EXTERNAL_CTX.with(|cell| {
             let ctx = cell.borrow();
             let ctx = ctx
@@ -131,7 +129,7 @@ mod napi_bridge {
             let js_fn = unsafe { napi::JsFunction::from_raw_unchecked(env.raw(), raw_value) };
 
             // Marshal groups → JS
-            let js_input = groups_to_js(&env, groups);
+            let js_input = groups_to_js(&env, groups, fields);
 
             // Single JS call
             let js_result = js_fn
@@ -139,18 +137,22 @@ mod napi_bridge {
                 .expect("external reducer callback threw an exception");
 
             // Unmarshal result
-            js_result_to_groups(&env, js_result, groups);
+            js_result_to_groups(&env, js_result, groups, fields);
         });
     }
 
     // ── Marshalling: Rust → JS ─────────────────────────────────────
 
-    fn groups_to_js(env: &napi::Env, groups: &[GroupBatch]) -> napi::JsObject {
+    fn groups_to_js(
+        env: &napi::Env,
+        groups: &[GroupBatch],
+        fields: &ColumnRegistry,
+    ) -> napi::JsObject {
         let mut js_array = env.create_array_with_length(groups.len()).unwrap();
         for (i, group) in groups.iter().enumerate() {
             let mut group_obj = env.create_object().unwrap();
 
-            let state_obj = value_map_to_js(env, &group.state);
+            let state_obj = state_to_js(env, fields, &group.state);
             group_obj.set_named_property("state", state_obj).unwrap();
 
             let mut rows_array = env.create_array_with_length(group.rows.len()).unwrap();
@@ -165,11 +167,11 @@ mod napi_bridge {
         js_array
     }
 
-    fn value_map_to_js(env: &napi::Env, map: &HashMap<String, Value>) -> napi::JsObject {
+    fn state_to_js(env: &napi::Env, fields: &ColumnRegistry, state: &[Value]) -> napi::JsObject {
         let mut obj = env.create_object().unwrap();
-        for (key, val) in map {
+        for (name, val) in fields.names().iter().zip(state) {
             let js_val = value_to_napi(env, val);
-            obj.set_named_property(key, js_val).unwrap();
+            obj.set_named_property(name, js_val).unwrap();
         }
         obj
     }
@@ -210,7 +212,12 @@ mod napi_bridge {
 
     // ── Marshalling: JS → Rust ─────────────────────────────────────
 
-    fn js_result_to_groups(env: &napi::Env, result: napi::JsUnknown, groups: &mut [GroupBatch]) {
+    fn js_result_to_groups(
+        env: &napi::Env,
+        result: napi::JsUnknown,
+        groups: &mut [GroupBatch],
+        fields: &ColumnRegistry,
+    ) {
         let result_obj: napi::JsObject = result
             .coerce_to_object()
             .expect("external reducer must return an array");
@@ -224,7 +231,12 @@ mod napi_bridge {
             let js_state: napi::JsObject = group_result
                 .get_named_property("state")
                 .expect("result group missing 'state'");
-            group.state = js_object_to_value_map(env, &js_state);
+            for (value, name) in group.state.iter_mut().zip(fields.names()) {
+                let js_value: napi::JsUnknown = js_state
+                    .get_named_property(name)
+                    .expect("failed to read a state field");
+                *value = napi_to_value(env, js_value);
+            }
 
             let js_emits: napi::JsObject = group_result
                 .get_named_property("emits")
@@ -255,8 +267,8 @@ mod napi_bridge {
         }
     }
 
-    fn js_object_to_value_map(env: &napi::Env, obj: &napi::JsObject) -> HashMap<String, Value> {
-        let mut map = HashMap::new();
+    fn js_object_to_value_map(env: &napi::Env, obj: &napi::JsObject) -> crate::types::RowMap {
+        let mut map = crate::types::RowMap::new();
 
         let keys = obj.get_property_names().expect("failed to get object keys");
         let len = keys.get_array_length().expect("keys not an array");
@@ -338,7 +350,7 @@ mod wasm_bridge {
     use wasm_bindgen::prelude::*;
 
     use crate::json_conv::value_to_json;
-    use crate::types::{Row, Value};
+    use crate::types::{ColumnRegistry, Row, RowMap, Value};
 
     use super::{GroupBatch, MAX_SAFE_INTEGER, bigint_to_value, legacy_emit_row};
 
@@ -363,7 +375,7 @@ mod wasm_bridge {
         }
     }
 
-    pub fn call_js_batch(reducer_id: &str, groups: &mut [GroupBatch]) {
+    pub fn call_js_batch(reducer_id: &str, groups: &mut [GroupBatch], fields: &ColumnRegistry) {
         WASM_CTX.with(|cell| {
             let ctx = cell.borrow();
             let ctx = ctx
@@ -374,17 +386,17 @@ mod wasm_bridge {
                 .get(reducer_id)
                 .unwrap_or_else(|| panic!("no callback for reducer '{reducer_id}'"));
 
-            let js_input = groups_to_js(groups);
+            let js_input = groups_to_js(groups, fields);
 
             let result = func
                 .call1(&JsValue::NULL, &js_input)
                 .expect("external reducer callback threw an exception");
 
-            js_result_to_groups(result, groups);
+            js_result_to_groups(result, groups, fields);
         });
     }
 
-    fn groups_to_js(groups: &[GroupBatch]) -> JsValue {
+    fn groups_to_js(groups: &[GroupBatch], fields: &ColumnRegistry) -> JsValue {
         let arr = js_sys::Array::new();
         for group in groups {
             let obj = js_sys::Object::new();
@@ -392,7 +404,7 @@ mod wasm_bridge {
             js_sys::Reflect::set(
                 &obj,
                 &JsValue::from_str("state"),
-                &value_map_to_js(&group.state),
+                &state_to_js(fields, &group.state),
             )
             .unwrap();
 
@@ -407,10 +419,10 @@ mod wasm_bridge {
         arr.into()
     }
 
-    fn value_map_to_js(map: &HashMap<String, Value>) -> JsValue {
+    fn state_to_js(fields: &ColumnRegistry, state: &[Value]) -> JsValue {
         let obj = js_sys::Object::new();
-        for (k, v) in map {
-            js_sys::Reflect::set(&obj, &JsValue::from_str(k), &value_to_js(v)).unwrap();
+        for (name, v) in fields.names().iter().zip(state) {
+            js_sys::Reflect::set(&obj, &JsValue::from_str(name), &value_to_js(v)).unwrap();
         }
         obj.into()
     }
@@ -443,7 +455,7 @@ mod wasm_bridge {
         }
     }
 
-    fn js_result_to_groups(result: JsValue, groups: &mut [GroupBatch]) {
+    fn js_result_to_groups(result: JsValue, groups: &mut [GroupBatch], fields: &ColumnRegistry) {
         let arr: js_sys::Array = result
             .dyn_into()
             .expect("external reducer result must be an array");
@@ -452,7 +464,11 @@ mod wasm_bridge {
             let item_obj: js_sys::Object = item.dyn_into().expect("result item must be an object");
 
             let js_state = js_sys::Reflect::get(&item_obj, &JsValue::from_str("state")).unwrap();
-            group.state = js_to_value_map(js_state);
+            for (value, name) in group.state.iter_mut().zip(fields.names()) {
+                let js_value = js_sys::Reflect::get(&js_state, &JsValue::from_str(name))
+                    .unwrap_or(JsValue::NULL);
+                *value = js_to_value(js_value);
+            }
 
             let js_emits = js_sys::Reflect::get(&item_obj, &JsValue::from_str("emits")).unwrap();
             let emits_arr: js_sys::Array = js_emits.dyn_into().expect("emits must be an array");
@@ -496,8 +512,8 @@ mod wasm_bridge {
             .unwrap_or_else(|| Value::String(decimal()))
     }
 
-    fn js_to_value_map(val: JsValue) -> HashMap<String, Value> {
-        let mut map = HashMap::new();
+    fn js_to_value_map(val: JsValue) -> RowMap {
+        let mut map = RowMap::new();
         if val.is_null() || val.is_undefined() {
             return map;
         }
@@ -553,8 +569,17 @@ pub mod test_bridge {
     use std::cell::RefCell;
 
     use super::GroupBatch;
+    use crate::types::{ColumnRegistry, Row, RowMap, Value};
 
-    type TestCallback = Box<dyn Fn(&mut [GroupBatch])>;
+    /// A group as a host callback sees it: the state by field name, as JS
+    /// does.
+    pub struct HostGroup {
+        pub state: RowMap,
+        pub rows: Vec<Row>,
+        pub emits: Vec<(usize, RowMap)>,
+    }
+
+    type TestCallback = Box<dyn Fn(&mut [HostGroup])>;
 
     thread_local! {
         pub(super) static TEST_CTX: RefCell<Option<TestCallback>> = RefCell::new(None);
@@ -570,18 +595,51 @@ pub mod test_bridge {
     }
 
     /// Install a Rust callback as the `ExternalRuntime` context for the current
-    /// thread. The callback receives the `GroupBatch` slice for each block,
-    /// processes rows, and fills `group.emits` — identical to the JS contract.
-    pub fn install_test_context(f: impl Fn(&mut [GroupBatch]) + 'static) -> TestContextGuard {
+    /// thread. The callback receives the groups of each block, processes
+    /// rows, and fills `group.emits` — identical to the JS contract.
+    pub fn install_test_context(f: impl Fn(&mut [HostGroup]) + 'static) -> TestContextGuard {
         TEST_CTX.with(|cell| {
             *cell.borrow_mut() = Some(Box::new(f));
         });
         TestContextGuard
     }
+
+    /// Run the test callback on `groups`, with each state by name.
+    pub(super) fn call(groups: &mut [GroupBatch], fields: &ColumnRegistry) {
+        let names = fields.names();
+        let mut host: Vec<HostGroup> = groups
+            .iter_mut()
+            .map(|group| HostGroup {
+                state: names
+                    .iter()
+                    .cloned()
+                    .zip(group.state.iter().cloned())
+                    .collect(),
+                rows: std::mem::take(&mut group.rows),
+                emits: Vec::new(),
+            })
+            .collect();
+
+        TEST_CTX.with(|cell| {
+            let borrow = cell.borrow();
+            let cb = borrow
+                .as_ref()
+                .expect("ExternalRuntime::process_grouped() called without install_test_context");
+            cb(&mut host);
+        });
+
+        for (group, mut host) in groups.iter_mut().zip(host) {
+            for (value, name) in group.state.iter_mut().zip(names) {
+                *value = host.state.remove(name).unwrap_or(Value::Null);
+            }
+            group.rows = host.rows;
+            group.emits = host.emits;
+        }
+    }
 }
 
 #[cfg(test)]
-pub use test_bridge::{TestContextGuard, install_test_context};
+pub use test_bridge::{HostGroup, TestContextGuard, install_test_context};
 
 /// Whether the callback context on the current thread holds a callback for
 /// `reducer_id`. Replay skips an external reducer without one.
@@ -637,9 +695,10 @@ impl ExternalRuntime {
 impl ReducerRuntime for ExternalRuntime {
     fn process(
         &self,
-        _state: &mut HashMap<String, Value>,
+        _state: GroupState<'_>,
         _row: &Row,
-    ) -> crate::error::Result<Vec<RowMap>> {
+        _emits: &mut Emits,
+    ) -> crate::error::Result<()> {
         panic!(
             "ExternalRuntime::process() should not be called directly; \
              use_batched_processing() returns true"
@@ -654,7 +713,11 @@ impl ReducerRuntime for ExternalRuntime {
         !callback_installed(&self.reducer_id)
     }
 
-    fn process_grouped(&self, groups: &mut [GroupBatch]) -> crate::error::Result<()> {
+    fn process_grouped(
+        &self,
+        groups: &mut [GroupBatch],
+        fields: &ColumnRegistry,
+    ) -> crate::error::Result<()> {
         if self.missing_host_callback() {
             return Err(crate::error::Error::InvalidOperation(format!(
                 "external reducer '{}' has no callback: register it before the first ingest",
@@ -663,28 +726,22 @@ impl ReducerRuntime for ExternalRuntime {
         }
         #[cfg(feature = "napi")]
         {
-            napi_bridge::call_js_batch(&self.reducer_id, groups);
+            napi_bridge::call_js_batch(&self.reducer_id, groups, fields);
             return Ok(());
         }
         #[cfg(all(feature = "wasm", not(feature = "napi")))]
         {
-            wasm_bridge::call_js_batch(&self.reducer_id, groups);
+            wasm_bridge::call_js_batch(&self.reducer_id, groups, fields);
             return Ok(());
         }
         #[cfg(test)]
         {
-            test_bridge::TEST_CTX.with(|cell| {
-                let borrow = cell.borrow();
-                let cb = borrow.as_ref().expect(
-                    "ExternalRuntime::process_grouped() called without install_test_context",
-                );
-                cb(groups);
-            });
+            test_bridge::call(groups, fields);
             return Ok(());
         }
         #[cfg(not(any(feature = "napi", feature = "wasm")))]
         {
-            let _ = groups;
+            let _ = (groups, fields);
             panic!("ExternalRuntime requires the 'napi' or 'wasm' feature");
         }
         #[allow(unreachable_code)]

@@ -11,9 +11,12 @@ pub type BlockNumber = u64;
 /// Column index within a ColumnRegistry.
 pub type ColumnId = u16;
 
+/// The most columns that a registry holds: one per `ColumnId`.
+pub const MAX_COLUMNS: usize = ColumnId::MAX as usize + 1;
+
 /// Maps column names to integer indices and vice versa.
 /// Created once per table/pipeline stage; shared via Arc across all Rows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ColumnRegistry {
     names: Vec<String>,
     /// FxHash: the keys are schema names, and each input column looks one up.
@@ -22,6 +25,7 @@ pub struct ColumnRegistry {
 
 impl ColumnRegistry {
     pub fn new(names: Vec<String>) -> Self {
+        debug_assert!(names.len() <= MAX_COLUMNS);
         let indices = names
             .iter()
             .enumerate()
@@ -44,6 +48,28 @@ impl ColumnRegistry {
 
     pub fn names(&self) -> &[String] {
         &self.names
+    }
+
+    /// The position of `name`, added at the end if the registry lacks it.
+    /// None if the registry is full.
+    pub fn get_or_push(&mut self, name: &str) -> Option<ColumnId> {
+        if let Some(id) = self.get_id(name) {
+            return Some(id);
+        }
+        let id = ColumnId::try_from(self.names.len()).ok()?;
+        self.names.push(name.to_string());
+        self.indices.insert(name.to_string(), id);
+        Some(id)
+    }
+
+    /// Keep only the first `len` columns.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.names.len() {
+            return;
+        }
+        for name in self.names.drain(len..) {
+            self.indices.remove(&name);
+        }
     }
 }
 
@@ -803,6 +829,19 @@ impl ChangeBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry stops at one name per `ColumnId`: a further name gets no
+    /// position, rather than one that wraps onto position 0.
+    #[test]
+    fn registry_stops_at_the_column_id_range() {
+        let names = (0..MAX_COLUMNS - 1).map(|i| format!("c{i}")).collect();
+        let mut registry = ColumnRegistry::new(names);
+
+        assert_eq!(registry.get_or_push("last"), Some(ColumnId::MAX));
+        assert_eq!(registry.get_or_push("one_more"), None);
+        assert_eq!(registry.get_or_push("c0"), Some(0));
+        assert_eq!(registry.len(), MAX_COLUMNS);
+    }
 
     #[test]
     fn value_numeric_conversions() {

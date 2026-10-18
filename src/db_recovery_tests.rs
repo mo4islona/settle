@@ -171,15 +171,21 @@ struct FailingSum {
 }
 
 impl crate::reducer_runtime::ReducerRuntime for FailingSum {
-    fn process(&self, state: &mut HashMap<String, Value>, row: &crate::types::Row) -> Result<Vec<RowMap>> {
+    fn process(
+        &self,
+        mut state: crate::reducer_runtime::GroupState<'_>,
+        row: &crate::types::Row,
+        emits: &mut crate::reducer_runtime::Emits,
+    ) -> Result<()> {
         let amount = row.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
         if amount == self.poison {
             return Err(Error::Reducer("unlucky amount".into()));
         }
 
         let total = state.get("total").and_then(|v| v.as_u64()).unwrap_or(0) + amount;
-        state.insert("total".into(), Value::UInt64(total));
-        Ok(vec![HashMap::from([("total".to_string(), Value::UInt64(total))])])
+        state.set("total", Value::UInt64(total));
+        emits.push_named([("total", Value::UInt64(total))]);
+        Ok(())
     }
 
     fn use_batched_processing(&self) -> bool {

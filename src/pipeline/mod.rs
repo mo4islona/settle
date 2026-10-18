@@ -75,7 +75,7 @@ use std::rc::Rc;
 use crate::db::{Config, Settle};
 use crate::error::{Error, Result};
 use crate::reducer_runtime::fn_reducer::FnReducerRuntime;
-use crate::types::{Row, Value};
+use crate::types::Row;
 
 pub use column::{
     ColumnType, base58, boolean, bytes, datetime, float64, int64, json, string, uint256, uint64,
@@ -238,11 +238,7 @@ impl Pipeline {
                 ))
             })?;
             let runtime =
-                FnReducerRuntime::new(move |state: &mut HashMap<String, Value>, row: &Row| {
-                    let mut ctx = StateCtx::new(state);
-                    reduce(&mut ctx, row);
-                    ctx.into_emits()
-                });
+                FnReducerRuntime::new(move |ctx: &mut StateCtx<'_>, row: &Row| reduce(ctx, row));
             db.register_reducer_callback(&spec.name, Box::new(runtime))?;
         }
 
