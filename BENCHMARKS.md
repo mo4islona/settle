@@ -268,6 +268,79 @@ binary:
 The cases that the binding does not run moved by −0.5% to +1.0%, with the same
 allocated bytes.
 
+### Reducer groups, and finality on the processing thread (2026-10-18)
+
+Finality and checkpoints ran each reducer and MV as a rayon task of its own.
+Unless two or more branches process in parallel, every node processes on the
+calling thread, so a task on a worker found the node's state cold in cache: at
+100K groups the MV finality of a one-branch pipeline took seven times as long
+as on the calling thread, and the ingest waited for it. Now a node finalizes on
+the thread that processed it; branches that process in parallel get one task
+each.
+
+A reducer kept the state of its groups in a hash map, a `BTreeMap` of snapshots
+per group, and the keys that each block touched in hash sets: about eight
+lookups and three copies of the key per touched group per block, and a new key
+`Vec` per row. Now the groups sit in a slab, found by one lookup per row
+through a reused key buffer, and each keeps its state from before each block
+above finality. A rollback restores the first such state above the fork point,
+and a checkpoint writes the first one above finality, else the current state:
+neither reads storage or the unacked batches.
+
+Wall clock, `spikes/runtime_spike.rs` (Rust, Memory backend, 200K rows, 1,000
+rows per ingest, the same PnL reducer in each runtime; median of three
+alternating rounds, each the median of three runs), µs per row, 100 / 100K
+groups:
+
+| Variant | Before | After | Change |
+|---|---:|---:|---:|
+| MV only | 0.443 / 1.461 | 0.437 / 1.441 | −1% / −1% |
+| EventRules | 1.022 / 3.272 | 0.712 / 2.100 | −30% / −36% |
+| Lua | 1.695 / 4.180 | 1.394 / 2.891 | −18% / −31% |
+| Rust closure | 0.930 / 3.668 | 0.645 / 2.084 | −31% / −43% |
+
+Every variant gives the same final view as before. Above the MV-only floor, a
+reducer at 100K groups now costs 0.64 µs per row instead of 2.2. The same spike
+on RocksDB (`SPIKE_ROCKS=<dir>`): time per row −18% to −28% at 100 groups, −31%
+to −40% at 100K groups, MV only within noise.
+
+Through the napi binding (`spikes/runtime-spike.mjs`, the same rows and
+reducer; each round the median of five runs), µs per row, 100 / 100K groups:
+
+| Variant | Before | After | Change |
+|---|---:|---:|---:|
+| MV only | 0.377 / 1.653 | 0.382 / 1.612 | +1% / −2% |
+| EventRules | 0.902 / 4.235 | 0.625 / 2.311 | −31% / −45% |
+| Lua | 1.675 / 4.828 | 1.394 / 3.189 | −17% / −34% |
+| External JS | 0.917 / 4.149 | 0.623 / 2.449 | −32% / −41% |
+
+The native ingest of External JS went from 0.847 / 3.876 to 0.562 / 2.110 µs
+per row; the JS callback in it stayed at 0.09 / 0.19.
+
+`throughput`, rows per second, median of three alternating rounds: full
+pipeline EventRules / Lua / Rust closure +5% / +7% / +11% (Memory) and +3% / +4%
+/ +7% (RocksDB); reducer-only +8% / +13% / +20%; 100K group keys (EventRules)
++11% / +13%; the Polymarket single-reducer cases +5% to +7%; the Polymarket full
+pipeline and 1M traders −4% to +5%, inside the spread of their rounds; cases
+without a reducer −2% to +4%. `profile_polymarket_realistic` (finality 32
+blocks behind the tip): +35%.
+
+Gungraun:
+
+| Case | Before | After | Change |
+|---|---:|---:|---:|
+| `backfill event_rules` | 519.2M | 462.1M | −11.0% |
+| `backfill polymarket` | 1,740.0M | 1,648.4M | −5.3% |
+| `tip event_rules` | 254.3M | 229.5M | −9.7% |
+| `tip polymarket` | 856.4M | 815.7M | −4.8% |
+| `napi_backfill event_rules` | 517.7M | 462.3M | −10.7% |
+| `napi_backfill polymarket` | 1,746.0M | 1,649.4M | −5.5% |
+| `napi_tip polymarket` | 865.9M | 819.2M | −5.4% |
+| cases without a reducer | | | −0.8% to +0.2% |
+
+Instruction counts hardly show the finality change: it removes cache misses,
+not instructions.
+
 Each case leaves its profiles under `target/gungraun/settle/instructions/ingest/<mode>.<workload>/`.
 `callgrind_annotate --inclusive=yes callgrind.<mode>.<workload>.out` shows where
 the instructions go; `dhat.<mode>.<workload>.out` opens in Valgrind's `dh_view.html`.

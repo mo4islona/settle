@@ -6,7 +6,7 @@ pub mod rocks;
 
 use crate::error::{Error, Result};
 use crate::types::{BlockNumber, ColumnRegistry, GroupKey, Row, RowMap, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// An operation to be committed atomically as part of a WriteBatch.
@@ -154,37 +154,17 @@ impl StorageWriteBatch {
 }
 
 /// Write batches that are made but not committed yet, oldest first. Disk
-/// lacks their raw rows and reducer checkpoints, so a rollback reads storage
-/// through them: it then sees what disk holds once they all commit.
+/// lacks their raw rows, so a rollback reads storage through them: it then
+/// sees what disk holds once they all commit.
 #[derive(Default)]
 pub struct PendingWrites<'a> {
     batches: Vec<&'a StorageWriteBatch>,
-    /// Reducer → group key → newest pending finalized state.
-    reducer_finalized: HashMap<&'a str, HashMap<&'a [u8], &'a [u8]>>,
 }
 
 impl<'a> PendingWrites<'a> {
     pub fn new(batches: impl IntoIterator<Item = &'a StorageWriteBatch>) -> Self {
-        let batches: Vec<&StorageWriteBatch> = batches.into_iter().collect();
-
-        let mut reducer_finalized: HashMap<&str, HashMap<&[u8], &[u8]>> = HashMap::new();
-        for op in batches.iter().copied().flat_map(|b| &b.ops) {
-            if let BatchOp::SetReducerFinalized {
-                reducer,
-                group_key,
-                state,
-            } = op
-            {
-                reducer_finalized
-                    .entry(reducer.as_str())
-                    .or_default()
-                    .insert(group_key.as_slice(), state.as_slice());
-            }
-        }
-
         Self {
-            batches,
-            reducer_finalized,
+            batches: batches.into_iter().collect(),
         }
     }
 
@@ -231,11 +211,6 @@ impl<'a> PendingWrites<'a> {
         }
         rows.into_iter().collect()
     }
-
-    /// The newest finalized state of the group that a pending batch writes.
-    pub fn reducer_finalized(&self, reducer: &str, group_key: &[u8]) -> Option<&'a [u8]> {
-        self.reducer_finalized.get(reducer)?.get(group_key).copied()
-    }
 }
 
 /// Serialized state blob (MessagePack-encoded).
@@ -248,6 +223,14 @@ pub type GroupKeyBytes = Vec<u8>;
 /// Uses the fast tag-based binary codec (no msgpack string/marker overhead).
 pub fn encode_group_key(key: &[Value]) -> GroupKeyBytes {
     encode_values(key)
+}
+
+/// [`encode_group_key`] of the values of `key`, appended to `buf`.
+pub fn write_group_key<'a>(buf: &mut Vec<u8>, key: impl ExactSizeIterator<Item = &'a Value>) {
+    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    for v in key {
+        encode_value(buf, v);
+    }
 }
 
 /// Decode a group key from storage bytes.
