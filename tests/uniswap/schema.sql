@@ -90,36 +90,32 @@ GROUP BY pool, window_start;
 
 -- Wallet PnL tracker: sources from swap_prices (chained reducer).
 -- Price resolution is already done; this reducer only tracks positions.
--- Groups by sender so each wallet has its own small positions state.
+-- One group per wallet and token, not a map of tokens per wallet: a swap
+-- then costs the same however many tokens the wallet holds.
 CREATE REDUCER wallet_pnl
 SOURCE swap_prices
-GROUP BY sender
+GROUP BY sender, token
 STATE (
-    positions JSON DEFAULT '{}'
+    balance  Float64 DEFAULT 0,
+    cost_usd Float64 DEFAULT 0
 )
 LANGUAGE lua
 PROCESS $$
-    local pos_key = row.token
-    local pos = state.positions[pos_key]
-    if not pos then pos = { balance = 0, cost_usd = 0 } end
-
     local pnl = 0
     if row.base_delta > 0 then
         -- Buy: accumulate cost basis
-        pos.balance = pos.balance + row.base_delta
-        pos.cost_usd = pos.cost_usd + row.base_delta * row.price_usd
-    elseif row.base_delta < 0 and pos.balance > 0 then
+        state.balance = state.balance + row.base_delta
+        state.cost_usd = state.cost_usd + row.base_delta * row.price_usd
+    elseif row.base_delta < 0 and state.balance > 0 then
         -- Sell: realize PnL vs average cost
         local sold = math.abs(row.base_delta)
-        local avg_cost = pos.cost_usd / pos.balance
+        local avg_cost = state.cost_usd / state.balance
         pnl = sold * (row.price_usd - avg_cost)
-        pos.balance = pos.balance - sold
-        pos.cost_usd = pos.cost_usd - sold * avg_cost
+        state.balance = state.balance - sold
+        state.cost_usd = state.cost_usd - sold * avg_cost
     end
 
-    state.positions[pos_key] = pos
-
-    emit({sender = row.sender, pool = row.pool, realized_pnl = pnl, position = pos.balance})
+    emit({sender = row.sender, pool = row.pool, realized_pnl = pnl, position = state.balance})
 $$;
 
 -- Aggregate PnL per wallet per pool

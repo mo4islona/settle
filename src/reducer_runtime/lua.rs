@@ -219,7 +219,7 @@ impl ReducerRuntime for LuaRuntime {
     /// once per group, not once per row: the conversion of a JSON map costs
     /// time for each of its entries. Until the block ends, a table in the
     /// state keeps what JSON drops, such as NaN or the integer keys of a
-    /// table that is not a list.
+    /// table that is not a list, and two fields can share one table.
     fn process_grouped(
         &self,
         block: &mut GroupedRows<'_>,
@@ -242,10 +242,23 @@ impl LuaRuntime {
     /// wrapper returns the state that it takes, so the state of one call is
     /// the arguments of the next.
     fn call_grouped(&self, block: &mut GroupedRows<'_>) -> crate::error::Result<()> {
+        let globals = self.lua.globals();
+        let processed = self.call_groups(block, &globals);
+
+        // `call` fills the registry table in place.
         let row_table: mlua::Table = self
             .lua
             .registry_value(&self.row_key)
             .map_err(reducer_error)?;
+        globals.raw_set("row", row_table).map_err(reducer_error)?;
+        processed
+    }
+
+    fn call_groups(
+        &self,
+        block: &mut GroupedRows<'_>,
+        globals: &mlua::Table,
+    ) -> crate::error::Result<()> {
         let call: mlua::Function = self
             .lua
             .registry_value(&self.call_key)
@@ -262,8 +275,10 @@ impl LuaRuntime {
 
             for &index in &order[group.rows.clone()] {
                 self.emits.borrow_mut().set_source(index);
-                marshal_row_to_lua(&self.lua, &row_table, &rows[index], &self.accessed_fields)
-                    .map_err(reducer_error)?;
+                // A new table for each row: the state, which stays in Lua
+                // until the block ends, can keep the row.
+                let row_table = self.row_table(&rows[index]).map_err(reducer_error)?;
+                globals.raw_set("row", row_table).map_err(reducer_error)?;
                 state = lua_call_hoisted(&call, state).map_err(reducer_error)?;
                 self.emits.borrow_mut().check()?;
             }
@@ -273,9 +288,21 @@ impl LuaRuntime {
         Ok(())
     }
 
+    /// A new Lua table that holds `row`.
+    fn row_table(&self, row: &Row) -> LuaResult<mlua::Table> {
+        let fields = match self.accessed_fields.len() {
+            0 => row.values().len(),
+            accessed => accessed,
+        };
+        let row_table = self.lua.create_table_with_capacity(0, fields)?;
+        marshal_row_to_lua(&self.lua, &row_table, row, &self.accessed_fields)?;
+        Ok(row_table)
+    }
+
     /// Run the script on `row`, with the engine's emit buffer in `self.emits`.
     fn call(&self, state: GroupState<'_>, row: &Row) -> LuaResult<()> {
         let row_table: mlua::Table = self.lua.registry_value(&self.row_key)?;
+        row_table.clear()?;
         marshal_row_to_lua(&self.lua, &row_table, row, &self.accessed_fields)?;
 
         let call: mlua::Function = self.lua.registry_value(&self.call_key)?;
@@ -296,7 +323,7 @@ impl LuaRuntime {
 
 // --- Perf-visible phases: each #[inline(never)] fn is a distinct frame in perf/flamegraph ---
 
-/// Phase 1: Marshal Row (Rust) → Lua row table
+/// Phase 1: Marshal Row (Rust) → an empty Lua row table
 #[inline(never)]
 fn marshal_row_to_lua(
     lua: &Lua,
@@ -304,7 +331,6 @@ fn marshal_row_to_lua(
     row: &Row,
     accessed_fields: &HashSet<String>,
 ) -> LuaResult<()> {
-    row_table.clear()?;
     if accessed_fields.is_empty() {
         for (k, v) in row.iter() {
             row_table.raw_set(k, value_to_lua(lua, v)?)?;
@@ -787,6 +813,40 @@ mod tests {
             runtime.run(&mut state, &row).unwrap();
         }
         assert_eq!(state["n"], Value::Int64(1_100_000));
+    }
+
+    /// A block gives each row a table of its own; a call on one row after it
+    /// reads that row, not the last row of the block.
+    #[test]
+    fn lua_call_after_a_block_reads_its_own_row() {
+        let fields = ["n".to_string()];
+        let runtime = LuaRuntime::with_state_fields(
+            "state.n = row.a; emit({a = row.a})",
+            &fields,
+            &[("n".to_string(), ColumnType::Int64)],
+            &["a".to_string()],
+            &[],
+        );
+        let columns = Arc::new(ColumnRegistry::new(vec!["a".into()]));
+        let row = |a| Row::from_values(columns.clone(), vec![Value::Int64(a)]);
+
+        let rows = [row(1)];
+        let mut block = GroupedRows {
+            rows: &rows,
+            order: vec![0],
+            groups: vec![crate::reducer_runtime::GroupBatch {
+                state: vec![Value::Int64(0)],
+                rows: 0..1,
+            }],
+        };
+        let registry = ColumnRegistry::new(fields.to_vec());
+        runtime
+            .process_grouped(&mut block, &registry, &mut Emits::default())
+            .unwrap();
+
+        let mut state = HashMap::from([("n".to_string(), Value::Int64(0))]);
+        let out = runtime.run(&mut state, &row(2)).unwrap();
+        assert_eq!(out[0]["a"], Value::Int64(2));
     }
 
     #[test]

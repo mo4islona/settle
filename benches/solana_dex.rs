@@ -17,7 +17,8 @@
 //!   slot in each ingest with finality 32 blocks back.
 //!
 //! Run: `cargo bench --bench solana_dex`
-//! Env: `SDEX_SLOTS` (12000, ~3M swaps), `SDEX_RUNTIMES` (fn,lua,er),
+//! Env: `SDEX_SLOTS` (12000, ~3M swaps), `SDEX_RUNTIMES` (fn,lua,er; fn,lua
+//! with `SDEX_POSITIONS=json`),
 //! `SDEX_MODES` (backfill,tip), `SDEX_STORAGE` (rocks | memory),
 //! `SDEX_BATCH_SLOTS` (100), `SDEX_POSITIONS` (pair | json),
 //! `RAYON_NUM_THREADS`.
@@ -248,7 +249,8 @@ fn schema(runtime: &str, json: bool) -> String {
         ("lua", false) => (LUA[0], LUA[1]),
         ("lua", true) => (LUA[0], LUA[2]),
         ("er", false) => (EVENT_RULES[0], EVENT_RULES[1]),
-        (other, _) => panic!("no {other} reducers with SDEX_POSITIONS={json}"),
+        (other, true) => panic!("no {other} reducers with SDEX_POSITIONS=json"),
+        (other, false) => panic!("no {other} reducers"),
     };
     [TABLES, pool_prices, positions, VIEWS].join("\n")
 }
@@ -678,11 +680,12 @@ fn main() {
         return;
     }
 
-    let runtimes = env_list("SDEX_RUNTIMES", "fn,lua,er");
+    let json = std::env::var("SDEX_POSITIONS").is_ok_and(|v| v == "json");
+    // EventRules have no maps.
+    let runtimes = env_list("SDEX_RUNTIMES", if json { "fn,lua" } else { "fn,lua,er" });
     let modes = env_list("SDEX_MODES", "backfill,tip");
     let storage = std::env::var("SDEX_STORAGE").unwrap_or_else(|_| "rocks".into());
     let batch_slots = env_usize("SDEX_BATCH_SLOTS", 100);
-    let json = std::env::var("SDEX_POSITIONS").is_ok_and(|v| v == "json");
     eprintln!(
         "storage {storage}, {batch_slots} slots in each backfill ingest, \
          rayon threads {}",

@@ -1111,6 +1111,44 @@ mod tests {
         );
     }
 
+    /// A row that the state keeps stays as it was when the next row of the
+    /// block comes, as it did when the state converted after each row.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_state_keeps_a_row_of_the_block() {
+        let def = ReducerDef {
+            state: vec![StateField {
+                name: "last".to_string(),
+                column_type: ColumnType::JSON,
+                default: "'{}'".to_string(),
+            }],
+            body: ReducerBody::Lua {
+                script: r#"
+                    emit({previous = state.last.amount or 0.0})
+                    state.last = row
+                "#
+                .to_string(),
+            },
+            ..external_counter_def()
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
+        let mut engine = ReducerEngine::new(def, storage, &reg, &[]);
+
+        let rows = [event("alice", 1.0), event("bob", 5.0), event("alice", 2.0)];
+        let output = engine.process_block(1000, &rows).unwrap();
+        assert_eq!(
+            user_values(&output, "previous"),
+            expected(&[("alice", 0.0), ("bob", 0.0), ("alice", 1.0)])
+        );
+
+        let output = engine.process_block(1001, &[event("alice", 3.0)]).unwrap();
+        assert_eq!(
+            user_values(&output, "previous"),
+            expected(&[("alice", 2.0)])
+        );
+    }
+
     // ─── FnReducerRuntime tests ─────────────────────────────────
 
     fn pnl_fn_runtime() -> crate::reducer_runtime::fn_reducer::FnReducerRuntime {
