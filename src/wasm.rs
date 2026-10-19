@@ -165,8 +165,8 @@ impl Settle {
         if !self.inner.reducer_is_external(name) {
             return Err(JsError::new(&format!(
                 "registerReducerCallback: reducer '{name}' is not declared \
-                 LANGUAGE EXTERNAL — Lua and EventRules reducers have their \
-                 own embedded runtime and ignore host callbacks",
+                 LANGUAGE EXTERNAL — a Lua reducer has its own embedded \
+                 runtime and ignores host callbacks",
             )));
         }
         if self.external_callbacks.contains_key(name) {

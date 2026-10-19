@@ -49,7 +49,7 @@ Targets **Phase 1 (PoC)** scope.
 - [x] `block_groups: BTreeMap<BlockNumber, HashSet<GroupKey>>` for O(log N) rollback (Step 18)
 - [x] toStartOfInterval time windowing
 
-### Step 7: Reducer Runtime — Event Rules — DONE
+### Step 7: Reducer Runtime — Event Rules — DONE, later REMOVED (ADR-10)
 
 - [x] Expression evaluator (arithmetic, comparison, IF/CASE)
 - [x] WHEN/THEN blocks, LET bindings, SET state mutations, EMIT columns, ALWAYS EMIT

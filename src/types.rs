@@ -357,19 +357,6 @@ impl Value {
         }
     }
 
-    pub fn is_truthy(&self) -> bool {
-        match self {
-            Value::Boolean(v) => *v,
-            Value::UInt64(v) => *v != 0,
-            Value::Int64(v) => *v != 0,
-            Value::Float64(v) => *v != 0.0,
-            Value::String(v) => !v.is_empty(),
-            Value::JSON(v) => !v.is_null(),
-            Value::Null => false,
-            _ => true,
-        }
-    }
-
     pub fn column_type(&self) -> Option<ColumnType> {
         match self {
             Value::UInt64(_) => Some(ColumnType::UInt64),
@@ -854,19 +841,6 @@ mod tests {
         assert_eq!(Value::Int64(-10).as_u64(), Some(-10i64 as u64));
         assert_eq!(Value::Float64(1.0).as_str(), None);
         assert_eq!(Value::String("hi".into()).as_str(), Some("hi"));
-    }
-
-    #[test]
-    fn value_truthiness() {
-        assert!(Value::Boolean(true).is_truthy());
-        assert!(!Value::Boolean(false).is_truthy());
-        assert!(Value::UInt64(1).is_truthy());
-        assert!(!Value::UInt64(0).is_truthy());
-        assert!(Value::Float64(0.1).is_truthy());
-        assert!(!Value::Float64(0.0).is_truthy());
-        assert!(Value::String("x".into()).is_truthy());
-        assert!(!Value::String(String::new()).is_truthy());
-        assert!(!Value::Null.is_truthy());
     }
 
     #[test]

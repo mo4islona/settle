@@ -1,5 +1,6 @@
 use super::test_helpers::*;
 use super::*;
+use crate::reducer_runtime::fn_reducer::FnReducerRuntime;
 use crate::types::{ChangeOp, RowMap};
 use std::collections::HashMap;
 
@@ -118,14 +119,8 @@ fn group_by_column_left_null_by_an_emit_comes_from_the_input_row() {
         CREATE REDUCER passthrough
         SOURCE events
         GROUP BY user
-        STATE (n UInt64 DEFAULT 0)
-            WHEN 1 = 1 THEN
-                SET state.n = state.n + 1
-                EMIT seen = state.n
-            ALWAYS EMIT
-                row.missing AS user,
-                row.amount AS amount
-        END;
+        STATE ()
+        LANGUAGE EXTERNAL;
 
         CREATE MATERIALIZED VIEW amounts AS
         SELECT user, sum(amount) AS amount
@@ -133,6 +128,15 @@ fn group_by_column_left_null_by_an_emit_comes_from_the_input_row() {
         GROUP BY user;
     "#;
     let mut db = Settle::open(Config::new(schema)).unwrap();
+    // A Lua emit cannot hold a Null: nil leaves the key out.
+    let passthrough = FnReducerRuntime::new(|state, row| {
+        state.emit(HashMap::from([
+            ("user".to_string(), Value::Null),
+            ("amount".to_string(), row.get("amount").cloned().unwrap()),
+        ]));
+    });
+    db.register_reducer_callback("passthrough", Box::new(passthrough))
+        .unwrap();
 
     let rows = vec![event("alice", 1), event("bob", 2), event("alice", 3)];
     let mut amounts = View::default();

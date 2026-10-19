@@ -51,16 +51,18 @@ const SCHEMA: &str = r#"
         quantity Float64 DEFAULT 0,
         cost_basis Float64 DEFAULT 0
     )
-        WHEN row.side = 'buy' THEN
-            SET state.quantity = state.quantity + row.amount
-            SET state.cost_basis = state.cost_basis + row.amount * row.price
-            EMIT trade_pnl = 0
-        WHEN row.side = 'sell' THEN
-            SET state.quantity = state.quantity - row.amount
-            EMIT trade_pnl = row.amount * row.price
-        ALWAYS EMIT
-            state.quantity AS position_size
-    END;
+    LANGUAGE lua
+    PROCESS $$
+        local trade_pnl = 0
+        if row.side == "buy" then
+            state.quantity = state.quantity + row.amount
+            state.cost_basis = state.cost_basis + row.amount * row.price
+        elseif row.side == "sell" then
+            state.quantity = state.quantity - row.amount
+            trade_pnl = row.amount * row.price
+        end
+        emit { trade_pnl = trade_pnl, position_size = state.quantity }
+    $$;
 
     CREATE MATERIALIZED VIEW position_summary AS
     SELECT

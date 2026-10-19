@@ -193,7 +193,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | REQ-20 | C | Aggregate unit tests and the random fold oracle. |
 | REQ-21 | C | Unit tests and golden scenarios. |
 | REQ-22 | C | The sliding-window oracle with random forks. |
-| REQ-23 | P | Pairwise differentials exist (closure against event rules, external against event rules, JS against Lua). No test compares all runtimes. The differentials against event rules move to Lua (GAP-45). |
+| REQ-23 | P | Pairwise differentials exist (closure against Lua, JS against Lua). No test compares all runtimes. A WHEN clause fails with INVALID_SCHEMA. |
 | REQ-24 | P | A cycle test and one chained reopen test. Chained reducers are absent from the random histories. |
 | REQ-25 | C | Format tests for each refused and each allowed change. |
 | REQ-26 | U | known-violated (GAP-2). |
@@ -306,7 +306,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 
 | ID | Statement | Violated | Priority | First test |
 |---|---|---|---|---|
-| GAP-1 | Settle checks no value type at ingest. An aggregate skips each value outside its numeric mode without an error. Event-rules arithmetic, Lua floats and every number from a JS callback are Float64, so an integer view column drops them. | REQ-27, INV-27, INV-28, FM-4, FM-19, FM-48 | P1 | An external reducer emits a UInt64 state field `n`, and a view sums `n`. Expect the sum of `n`. The code shows that the sum stays empty today, but no test confirms it yet. |
+| GAP-1 | Settle checks no value type at ingest. An aggregate skips each value outside its numeric mode without an error. Lua floats and every number from a JS callback are Float64, so an integer view column drops them. | REQ-27, INV-27, INV-28, FM-4, FM-19, FM-48 | P1 | An external reducer emits a UInt64 state field `n`, and a view sums `n`. Expect the sum of `n`. The code shows that the sum stays empty today, but no test confirms it yet. |
 | GAP-2 | The schema accepts constructs that Settle ignores: WHERE, HAVING, joins, ORDER BY, LIMIT and DISTINCT. It does not match GROUP BY to the key items. It accepts duplicate names, a view with no aggregate, numeric aggregates over columns with no numeric mode, and defaults that do not parse. | REQ-26 | P1 | Open a view with a WHERE clause. Expect INVALID_SCHEMA. |
 | GAP-3 | An open sets `F` to `D`. The reported finality goes back, a smaller finalized head passes, and a fork can undo blocks that were final. | REQ-5, INV-10, INV-11, INV-47, WP-24, CN-20 | P1 | Use a checkpoint interval of 3, reach `F = 49` with `D < 49`, reopen. Expect the finalized cursor at 49. |
 | GAP-4 | Input can terminate the process. A Lua compile error or a failed module load panics at open. The parser can panic on some non-ASCII text. The builders panic on some arguments. The JS boundary has no unwind guard. | REQ-42, FM-1, FM-41, FM-47, WP-73 | P1 | Open a schema with a Lua syntax error. Expect INVALID_SCHEMA, not a panic. |
@@ -349,7 +349,6 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | GAP-42 | The layout check lets the virtual flag and the runtime kind change. | CN-32 | P3 | Make a stored table virtual and reopen. Expect INCOMPATIBLE_STORAGE. |
 | GAP-43 | No memory gauge, no open-phase report and no store gauge exists. | OB-10, OB-11, OB-12 | P3 | Read each gauge after a run and compare it with a probe. |
 | GAP-44 | The type names `Bytes`, `JSON` and `JSONB` probably fail in a CREATE TABLE statement, so raw tables cannot have these types. This is known-suspect. | REQ-1, IB-62 | P2 | Open `CREATE TABLE t (block_number UInt64, doc JSON)`. Expect success. |
-| GAP-45 | The code still has the event-rules runtime and its grammar. A reducer with a WHEN clause opens and runs. | REQ-23 | P2 | A reducer with a WHEN clause. Expect INVALID_SCHEMA. Then move the tests and benches that use event rules to Lua (ADR-10). |
 
 ## Build order
 
@@ -417,3 +416,4 @@ A per-PR gate stays within P-GATE-PR-BUDGET of CI time. CT-6, CT-7 and the long 
 | ID | Closed on | Resolution |
 |---|---|---|
 | GAP-27 | 2026-10-19 | Event-rules arithmetic was Float64 only. ADR-10 removes the runtime, and GAP-45 holds the rest of the deviation. |
+| GAP-45 | 2026-10-20 | The event-rules runtime and its grammar are removed. A reducer with a WHEN clause fails with INVALID_SCHEMA, and the message names Lua. The tests and benches that used event rules use Lua. |

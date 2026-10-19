@@ -44,8 +44,8 @@ enum Workload {
     MvSumStored,
     /// `min`/`max`/`last` MV: aggregates with no reverse delta.
     MvMinMax,
-    /// EventRules reducer feeding a `last` MV.
-    EventRules,
+    /// A Lua reducer feeding a `last` MV.
+    Lua,
     /// The Polymarket schema: two Lua reducers and their MVs.
     Polymarket,
 }
@@ -53,7 +53,7 @@ enum Workload {
 impl Workload {
     fn table(self) -> &'static str {
         match self {
-            Workload::MvSum | Workload::MvSumStored | Workload::EventRules => "transfers",
+            Workload::MvSum | Workload::MvSumStored | Workload::Lua => "transfers",
             Workload::MvMinMax => "trades",
             Workload::Polymarket => "orders",
         }
@@ -89,19 +89,17 @@ impl Workload {
                 SELECT asset_id, max(price) AS hi, min(price) AS lo, last(price) AS last_price
                 FROM trades GROUP BY asset_id;"
                 .to_string(),
-            Workload::EventRules => format!(
+            Workload::Lua => format!(
                 "CREATE VIRTUAL TABLE {transfers}
                 CREATE REDUCER user_balance
                 SOURCE transfers
                 GROUP BY from_addr
                 STATE (balance Float64 DEFAULT 0)
-                    WHEN 1 = 1 THEN
-                        SET state.balance = state.balance + row.value
-                        EMIT _dummy = 0
-                    ALWAYS EMIT
-                        row.from_addr AS from_addr,
-                        state.balance AS balance
-                END;
+                LANGUAGE lua
+                PROCESS $$
+                    state.balance = state.balance + row.value
+                    emit {{ balance = state.balance }}
+                $$;
                 CREATE MATERIALIZED VIEW balances AS
                 SELECT from_addr, last(balance) AS balance
                 FROM user_balance GROUP BY from_addr;"
@@ -112,7 +110,7 @@ impl Workload {
 
     fn row(self, i: u64) -> RowMap {
         match self {
-            Workload::MvSum | Workload::MvSumStored | Workload::EventRules => HashMap::from([
+            Workload::MvSum | Workload::MvSumStored | Workload::Lua => HashMap::from([
                 (
                     "from_addr".into(),
                     Value::String(format!("0xfrom{:06x}", i % 10_000)),
@@ -302,7 +300,7 @@ fn ingest_all(case: &'static mut Prepared) -> usize {
 #[bench::mv_sum(args = (Workload::MvSum), setup = prepare_backfill)]
 #[bench::mv_sum_stored(args = (Workload::MvSumStored), setup = prepare_backfill)]
 #[bench::mv_minmax(args = (Workload::MvMinMax), setup = prepare_backfill)]
-#[bench::event_rules(args = (Workload::EventRules), setup = prepare_backfill)]
+#[bench::lua(args = (Workload::Lua), setup = prepare_backfill)]
 #[bench::polymarket(args = (Workload::Polymarket), setup = prepare_backfill)]
 fn backfill(case: &'static mut Prepared) -> usize {
     ingest_all(case)
@@ -312,7 +310,7 @@ fn backfill(case: &'static mut Prepared) -> usize {
 #[bench::mv_sum(args = (Workload::MvSum), setup = prepare_tip)]
 #[bench::mv_sum_stored(args = (Workload::MvSumStored), setup = prepare_tip)]
 #[bench::mv_minmax(args = (Workload::MvMinMax), setup = prepare_tip)]
-#[bench::event_rules(args = (Workload::EventRules), setup = prepare_tip)]
+#[bench::lua(args = (Workload::Lua), setup = prepare_tip)]
 #[bench::polymarket(args = (Workload::Polymarket), setup = prepare_tip)]
 fn tip(case: &'static mut Prepared) -> usize {
     ingest_all(case)
@@ -629,7 +627,7 @@ fn ingest_all_napi(case: &'static mut PreparedNapi) -> usize {
 
 #[library_benchmark]
 #[bench::mv_sum(args = (Workload::MvSum), setup = prepare_napi_backfill)]
-#[bench::event_rules(args = (Workload::EventRules), setup = prepare_napi_backfill)]
+#[bench::lua(args = (Workload::Lua), setup = prepare_napi_backfill)]
 #[bench::polymarket(args = (Workload::Polymarket), setup = prepare_napi_backfill)]
 fn napi_backfill(case: &'static mut PreparedNapi) -> usize {
     ingest_all_napi(case)

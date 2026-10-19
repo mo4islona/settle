@@ -50,7 +50,7 @@ The conditions:
 | `,fin` | Backfill. Each batch is final, and Settle writes a checkpoint of its state after each batch. |
 | `,backfill` | The same as `,fin`, but Settle writes the checkpoint only one time in 1,000 blocks. Settle cannot delay the checkpoint of an External reducer, so with `fn` this mode is the same as `,fin`. |
 | `fn` | A reducer in user code (`LANGUAGE EXTERNAL`). In this bench it is a Rust closure. In the TS binding it is a JS callback. |
-| `er` | An EventRules reducer: declarative rules, with no user code. |
+| `lua` | A Lua reducer in the schema, with no host code. |
 | `mv` | No reducer. A materialized view calculates `sum()` from the raw rows. |
 
 ### Summary
@@ -60,8 +60,8 @@ RocksDB. A negative difference shows that Settle → PG is faster.
 
 | Workload | Mode | PG only | Settle → PG | Difference |
 |---|---|---:|---:|---:|
-| Sum for each user (`simple_agg`) | backfill (`,backfill`) | 0.850s | 0.776–0.806s | −5% to −9% |
-| | tip | 0.850s | 0.772–0.784s | −8% to −9% |
+| Sum for each user (`simple_agg`) | backfill (`,backfill`) | 0.850s | 0.773–0.802s | −6% to −9% |
+| | tip | 0.850s | 0.774–0.794s | −7% to −9% |
 | PnL with 3 projections (`stateful`) | backfill (`,fin`) | 2.978s | 2.145s | −28% |
 | | tip | 2.978s | 2.112s | −29% |
 | Raw rows, no aggregates (`raw`), serial | tip | 0.216s | 0.263s | +22% |
@@ -79,7 +79,7 @@ works. Thus Settle → PG is faster only when Settle removes work from Postgres:
   time.
 
 In serial mode, the Settle time adds to the Postgres time. For the sum for
-each user, Settle → PG is then 2% to 24% slower than PG only.
+each user, Settle → PG is then 3% to 27% slower than PG only.
 
 ### Raw passthrough (`vs_postgres_raw`)
 
@@ -104,22 +104,23 @@ There are two PG-only variants:
 - `pg_only_per_row`, 5.56s: one upsert for each row.
 
 The values in parentheses are the difference from `pg_only_batch`. The last
-column shows how long Postgres works in pipelined mode.
+column shows how long Postgres works in pipelined mode. The Settle rows ran on
+2026-10-20.
 
 | Mode | Reducer | Serial | Pipelined | Postgres time, pipelined |
 |---|---|---:|---:|---:|
-| tip | `fn` | 0.911s (+7%) | 0.784s (−8%) | 0.766s |
-| | `er` | 0.896s (+5%) | 0.784s (−8%) | 0.766s |
-| | `mv` | 0.870s (+2%) | 0.772s (−9%) | 0.754s |
-| `,fin` | `fn` | 1.040s (+22%) | 0.805s (−5%) | 0.776s |
-| | `er` | 1.042s (+23%) | 0.794s (−7%) | 0.767s |
-| | `mv` | 0.963s (+13%) | 0.794s (−7%) | 0.770s |
-| `,backfill` | `fn` | 1.052s (+24%) | 0.806s (−5%) | 0.776s |
-| | `er` | 0.895s (+5%) | 0.786s (−8%) | 0.763s |
-| | `mv` | 0.870s (+2%) | 0.776s (−9%) | 0.753s |
+| tip | `fn` | 0.935s (+10%) | 0.790s (−7%) | 0.774s |
+| | `lua` | 0.946s (+11%) | 0.794s (−7%) | 0.774s |
+| | `mv` | 0.872s (+3%) | 0.774s (−9%) | 0.756s |
+| `,fin` | `fn` | 1.026s (+21%) | 0.790s (−7%) | 0.763s |
+| | `lua` | 1.081s (+27%) | 0.800s (−6%) | 0.766s |
+| | `mv` | 0.921s (+8%) | 0.801s (−6%) | 0.774s |
+| `,backfill` | `fn` | 1.040s (+22%) | 0.802s (−6%) | 0.774s |
+| | `lua` | 0.969s (+14%) | 0.794s (−7%) | 0.770s |
+| | `mv` | 0.878s (+3%) | 0.773s (−9%) | 0.755s |
 
 - The checkpoint after each batch (`,fin`) adds the most time to `fn` and
-  `er`. With `,backfill`, `er` and `mv` write fewer checkpoints. `fn` is
+  `lua`. With `,backfill`, `lua` and `mv` write fewer checkpoints. `fn` is
   External, so it cannot.
 - In each batch, no user occurs more than one time (5,000 rows, 5,000 keys).
   Thus Settle cannot merge rows, and Postgres receives the same number of rows
@@ -220,9 +221,9 @@ A backfill does not keep this data. Thus the other workloads do not use it.
 This file has no JS numbers against Postgres. In these benches, `fn` is a
 Rust closure in the position where the TS binding puts a JS callback. Thus
 the runs do not include the napi call. Through the binding, an External JS
-reducer takes approximately the same time as EventRules (see
-[History](#history), 2026-10-18). Thus the `er` rows are the best estimate
-for JS.
+reducer takes 2.45 µs for each row at 100K groups, and a Rust closure takes
+2.08 µs (see [History](#history), 2026-10-18). Thus the `fn` rows are the best
+estimate for JS, with approximately 20% more Settle time.
 
 ### Limits
 
@@ -266,20 +267,21 @@ the median of three runs. The ± value is half the range of the three runs.
 | Raw ingestion | 200K | 2,070K ±3% | 741K ±2% | >100K |
 | Raw + MV | 200K | 1,051K ±3% | 569K ±1% | >50K |
 | Ingest + persist (Raw + MV) | 100K | 1,347K ±2% | 1,102K ±3% | >20K |
-| Full pipeline — EventRules | 100K | 698K ±2% | 363K ±1% | >50K |
 | Full pipeline — Lua | 50K | 473K ±2% | 285K ±2% | >30K |
 | Full pipeline — Rust closure | 50K | 768K ±2% | 376K ±2% | >30K |
-| Reducer only — EventRules | 200K | 1,776K ±3% | — | >200K |
 | Reducer only — Lua | 200K | 788K ±3% | — | >100K |
 | Reducer only — Rust closure | 200K | 2,161K ±3% | — | >100K |
-| 100K unique group keys | 100K | 607K ±1% | 556K ±3% | — |
+| 100K unique group keys (Lua) | 100K | 429K ±2% | 394K ±3% | — |
 | Polymarket: market_stats only | 200K | 290K ±1% | 263K ±1% | >160K |
 | Polymarket: insider_classifier only | 200K | 472K ±2% | 429K ±0% | >300K |
 | Polymarket: full pipeline | 200K | 216K ±5% | 198K ±17% | >150K |
 | Polymarket: 1M traders | 500K | 192K ±12% | 189K ±2% | >75K |
 
-A rollback of 75 blocks (10,050 rows) takes 2.5 ms on Memory and 2.8 ms on
+A rollback of 75 blocks (10,050 rows) takes 2.4 ms on Memory and 2.5 ms on
 RocksDB. The target is less than 10 ms.
+
+The row with 100K unique group keys and the rollback time ran on 2026-10-20.
+Before, these benches used an event-rules reducer.
 
 ## Instruction counts
 
@@ -340,7 +342,7 @@ from a steady state. The count includes `ack` and the drop of each
 | `mv_sum` | A `sum` MV on a virtual table |
 | `mv_sum_stored` | The same, on a stored table. A stored table also emits a change record for each raw row. |
 | `mv_minmax` | A `min`/`max`/`last` MV over 1,000 assets |
-| `event_rules` | An EventRules reducer → a `last` MV |
+| `lua` | A Lua reducer → a `last` MV |
 | `polymarket` | `tests/polymarket/schema.sql`: two Lua reducers and their MVs |
 
 | Mode | Each ingest | Finality | Counted |
@@ -359,18 +361,20 @@ by name, as a Rust caller does.
 | `backfill mv_sum` | 311M | 15.6K | 65.5 MB | 229K | 11.5 |
 | `backfill mv_sum_stored` | 372M | 18.6K | 100.1 MB | 290K | 14.5 |
 | `backfill mv_minmax` | 175M | 8.8K | 24.5 MB | 85K | 4.2 |
-| `backfill event_rules` | 460M | 23.0K | 78.6 MB | 415K | 20.8 |
+| `backfill lua` | 638M | 31.9K | 89.0 MB | 563K | 28.1 |
 | `backfill polymarket` | 1,639M | 81.9K | 168.8 MB | 930K | 46.5 |
 | `tip mv_sum` | 149M | 14.9K | 28.6 MB | 128K | 12.8 |
 | `tip mv_sum_stored` | 176M | 17.6K | 41.6 MB | 160K | 16.0 |
 | `tip mv_minmax` | 166M | 16.6K | 33.0 MB | 128K | 12.8 |
-| `tip event_rules` | 228M | 22.8K | 35.1 MB | 222K | 22.2 |
+| `tip lua` | 320M | 32.0K | 40.4 MB | 296K | 29.6 |
 | `tip polymarket` | 811M | 81.1K | 78.6 MB | 483K | 48.3 |
 | `napi_backfill mv_sum` | 314M | 15.7K | 72.1 MB | 269K | 13.5 |
-| `napi_backfill event_rules` | 461M | 23.0K | 85.2 MB | 455K | 22.8 |
+| `napi_backfill lua` | 642M | 32.1K | 95.7 MB | 603K | 30.2 |
 | `napi_backfill polymarket` | 1,644M | 82.2K | 183.3 MB | 990K | 49.5 |
 | `napi_tip mv_sum` | 156M | 15.6K | 33.3 MB | 157K | 15.7 |
 | `napi_tip polymarket` | 817M | 81.7K | 88.0 MB | 522K | 52.2 |
+
+The `lua` rows ran on 2026-10-20.
 
 ### Scale
 

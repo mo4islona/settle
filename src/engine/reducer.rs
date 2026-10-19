@@ -4,7 +4,6 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crate::error::{Error, Result};
-use crate::reducer_runtime::event_rules::EventRulesRuntime;
 #[cfg(feature = "lua")]
 use crate::reducer_runtime::lua::LuaRuntime;
 use crate::reducer_runtime::{Emits, GroupBatch, GroupState, GroupedRows, ReducerRuntime};
@@ -198,7 +197,6 @@ impl ReducerEngine {
         modules: &[(String, String)],
     ) -> Box<dyn ReducerRuntime> {
         match &def.body {
-            ReducerBody::EventRules { .. } => Box::new(EventRulesRuntime::new(&def.body)),
             #[cfg(feature = "lua")]
             ReducerBody::Lua { script } => {
                 let requiredmodules: Vec<(String, String)> = def
@@ -266,7 +264,7 @@ impl ReducerEngine {
     ///
     /// Two code paths:
     /// - **Per-row** (default): iterates rows in order, calls `process()` per row.
-    ///   No extra allocations. Used by Lua and EventRules.
+    ///   No extra allocations. Used by Lua.
     /// - **Batched**: groups rows by key, calls `process_grouped()` once per block.
     ///   Used by external (host-language) reducers to minimize FFI overhead.
     pub fn process_block(&mut self, block: BlockNumber, rows: &[Row]) -> Result<Vec<Row>> {
@@ -586,6 +584,24 @@ mod tests {
     use crate::types::RowMap;
     use crate::types::ColumnType;
 
+    /// The PnL of a trader; a sell before any buy has an average cost of 0.
+    #[cfg(feature = "lua")]
+    const PNL_LUA: &str = r#"
+        local trade_pnl = 0
+        if row.side == "buy" then
+            state.quantity = state.quantity + row.amount
+            state.cost_basis = state.cost_basis + row.amount * row.price
+        elseif row.side == "sell" then
+            local avg_cost = 0
+            if state.quantity ~= 0 then avg_cost = state.cost_basis / state.quantity end
+            state.quantity = state.quantity - row.amount
+            state.cost_basis = state.cost_basis - row.amount * avg_cost
+            trade_pnl = row.amount * (row.price - avg_cost)
+        end
+        emit { trade_pnl = trade_pnl, position_size = state.quantity }
+    "#;
+
+    #[cfg(feature = "lua")]
     fn pnl_reducer_def() -> ReducerDef {
         ReducerDef {
             name: "pnl_tracker".to_string(),
@@ -604,92 +620,8 @@ mod tests {
                 },
             ],
             requires: vec![],
-            body: ReducerBody::EventRules {
-                when_blocks: vec![
-                    WhenBlock {
-                        condition: Expr::BinaryOp {
-                            left: Box::new(Expr::RowRef("side".into())),
-                            op: BinaryOp::Eq,
-                            right: Box::new(Expr::Literal("buy".into())),
-                        },
-                        lets: vec![],
-                        sets: vec![
-                            (
-                                "quantity".into(),
-                                Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("quantity".into())),
-                                    op: BinaryOp::Add,
-                                    right: Box::new(Expr::RowRef("amount".into())),
-                                },
-                            ),
-                            (
-                                "cost_basis".into(),
-                                Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("cost_basis".into())),
-                                    op: BinaryOp::Add,
-                                    right: Box::new(Expr::BinaryOp {
-                                        left: Box::new(Expr::RowRef("amount".into())),
-                                        op: BinaryOp::Mul,
-                                        right: Box::new(Expr::RowRef("price".into())),
-                                    }),
-                                },
-                            ),
-                        ],
-                        emits: vec![("trade_pnl".into(), Expr::Int(0))],
-                    },
-                    WhenBlock {
-                        condition: Expr::BinaryOp {
-                            left: Box::new(Expr::RowRef("side".into())),
-                            op: BinaryOp::Eq,
-                            right: Box::new(Expr::Literal("sell".into())),
-                        },
-                        lets: vec![(
-                            "avg_cost".into(),
-                            Expr::BinaryOp {
-                                left: Box::new(Expr::StateRef("cost_basis".into())),
-                                op: BinaryOp::Div,
-                                right: Box::new(Expr::StateRef("quantity".into())),
-                            },
-                        )],
-                        sets: vec![
-                            (
-                                "quantity".into(),
-                                Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("quantity".into())),
-                                    op: BinaryOp::Sub,
-                                    right: Box::new(Expr::RowRef("amount".into())),
-                                },
-                            ),
-                            (
-                                "cost_basis".into(),
-                                Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("cost_basis".into())),
-                                    op: BinaryOp::Sub,
-                                    right: Box::new(Expr::BinaryOp {
-                                        left: Box::new(Expr::RowRef("amount".into())),
-                                        op: BinaryOp::Mul,
-                                        right: Box::new(Expr::ColumnRef("avg_cost".into())),
-                                    }),
-                                },
-                            ),
-                        ],
-                        emits: vec![(
-                            "trade_pnl".into(),
-                            Expr::BinaryOp {
-                                left: Box::new(Expr::RowRef("amount".into())),
-                                op: BinaryOp::Mul,
-                                right: Box::new(Expr::BinaryOp {
-                                    left: Box::new(Expr::RowRef("price".into())),
-                                    op: BinaryOp::Sub,
-                                    right: Box::new(Expr::ColumnRef("avg_cost".into())),
-                                }),
-                            },
-                        )],
-                    },
-                ],
-                always_emit: Some(AlwaysEmit {
-                    emits: vec![("position_size".into(), Expr::StateRef("quantity".into()))],
-                }),
+            body: ReducerBody::Lua {
+                script: PNL_LUA.to_string(),
             },
         }
     }
@@ -715,6 +647,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "lua")]
     #[test]
     fn reducer_processes_rows_and_emits_output() {
         let storage = Arc::new(MemoryBackend::new());
@@ -729,7 +662,7 @@ mod tests {
         assert_eq!(output.len(), 2);
 
         // Both emits should have trade_pnl = 0 (buys)
-        assert_eq!(output[0].get("trade_pnl"), Some(&Value::UInt64(0)));
+        assert_eq!(output[0].get("trade_pnl"), Some(&Value::Int64(0)));
         assert_eq!(output[0].get("position_size"), Some(&Value::Float64(10.0)));
         // user group-by column should be forwarded
         assert_eq!(output[0].get("user"), Some(&Value::String("alice".into())));
@@ -737,6 +670,7 @@ mod tests {
         assert_eq!(output[1].get("position_size"), Some(&Value::Float64(15.0)));
     }
 
+    #[cfg(feature = "lua")]
     #[test]
     fn reducer_state_persists_across_blocks() {
         let storage = Arc::new(MemoryBackend::new());
@@ -758,6 +692,7 @@ mod tests {
         assert_eq!(output[0].get("position_size"), Some(&Value::Float64(5.0)));
     }
 
+    #[cfg(feature = "lua")]
     #[test]
     fn reducer_rollback_restores_state() {
         let storage = Arc::new(MemoryBackend::new());
@@ -788,6 +723,7 @@ mod tests {
         assert_eq!(output[0].get("position_size"), Some(&Value::Float64(7.0)));
     }
 
+    #[cfg(feature = "lua")]
     #[test]
     fn reducer_multiple_groups() {
         let storage = Arc::new(MemoryBackend::new());
@@ -816,6 +752,7 @@ mod tests {
         assert_eq!(bob_out.get("position_size"), Some(&Value::Float64(5.0)));
     }
 
+    #[cfg(feature = "lua")]
     #[test]
     fn reducer_finalize_then_rollback() {
         let storage = Arc::new(MemoryBackend::new());
@@ -857,6 +794,7 @@ mod tests {
     /// Under deferral a finalize drops the undo entries up to finality, and
     /// the next checkpoint persists the state as of finality, not the state
     /// of a later block.
+    #[cfg(feature = "lua")]
     #[test]
     fn deferred_finalize_persists_the_state_as_of_finality() {
         let storage = Arc::new(MemoryBackend::new());
@@ -895,6 +833,7 @@ mod tests {
     /// A new group reads storage only when storage holds a state of the
     /// reducer: not on a fresh database, but after a reopen or a `reload`
     /// once a checkpoint is stored.
+    #[cfg(feature = "lua")]
     #[test]
     fn new_groups_read_storage_once_it_holds_state() {
         let storage = Arc::new(MemoryBackend::new());
@@ -1212,8 +1151,9 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lua")]
     #[test]
-    fn fn_reducer_produces_same_output_as_event_rules() {
+    fn fn_reducer_produces_same_output_as_lua() {
         let storage = Arc::new(MemoryBackend::new());
         let mut fn_engine = ReducerEngine::with_runtime(
             pnl_external_def(),
@@ -1223,7 +1163,7 @@ mod tests {
         );
 
         let storage2 = Arc::new(MemoryBackend::new());
-        let mut er_engine = ReducerEngine::new(pnl_reducer_def(), storage2, &trade_registry(), &[]);
+        let mut lua_engine = ReducerEngine::new(pnl_reducer_def(), storage2, &trade_registry(), &[]);
 
         let rows = vec![
             make_trade("alice", "buy", 10.0, 2000.0),
@@ -1231,10 +1171,10 @@ mod tests {
         ];
 
         let fn_out = fn_engine.process_block(1000, &rows).unwrap();
-        let er_out = er_engine.process_block(1000, &rows).unwrap();
+        let lua_out = lua_engine.process_block(1000, &rows).unwrap();
 
-        assert_eq!(fn_out.len(), er_out.len());
-        for (f, e) in fn_out.iter().zip(er_out.iter()) {
+        assert_eq!(fn_out.len(), lua_out.len());
+        for (f, e) in fn_out.iter().zip(lua_out.iter()) {
             let f_pos = f.get("position_size").unwrap().as_f64().unwrap();
             let e_pos = e.get("position_size").unwrap().as_f64().unwrap();
             assert!(

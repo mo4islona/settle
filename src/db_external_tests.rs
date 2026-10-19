@@ -116,9 +116,9 @@ fn external_reducer_rollback() {
 }
 
 #[test]
-fn external_reducer_matches_event_rules() {
-    // Run same workload through EventRules and FnReducer, compare MV output
-    let mut er_db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
+fn external_reducer_matches_lua() {
+    // Run same workload through Lua and FnReducer, compare MV output
+    let mut lua_db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
     let mut fn_db = open_with_fn_reducer();
 
     let trades = vec![
@@ -131,8 +131,8 @@ fn external_reducer_matches_event_rules() {
         make_trade("bob", "sell", 10.0, 1600.0),
     ];
 
-    let er_batch = ingest_blocks(
-        &mut er_db,
+    let lua_batch = ingest_blocks(
+        &mut lua_db,
         vec![
             ("trades".into(), 1000, trades.clone()),
             ("trades".into(), 1001, trades2.clone()),
@@ -151,28 +151,28 @@ fn external_reducer_matches_event_rules() {
     .unwrap()
     .unwrap();
 
-    let er_mv = er_batch.records_for("position_summary");
+    let lua_mv = lua_batch.records_for("position_summary");
     let fn_mv = fn_batch.records_for("position_summary");
-    assert_eq!(er_mv.len(), fn_mv.len());
+    assert_eq!(lua_mv.len(), fn_mv.len());
 
-    for er_rec in er_mv.iter() {
-        let key = er_rec.key("user").unwrap();
+    for lua_rec in lua_mv.iter() {
+        let key = lua_rec.key("user").unwrap();
         let fn_rec = fn_mv.iter().find(|r| r.key("user") == Some(key)).unwrap();
 
-        let er_pnl = er_rec.get("total_pnl").unwrap().as_f64().unwrap();
+        let lua_pnl = lua_rec.get("total_pnl").unwrap().as_f64().unwrap();
         let fn_pnl = fn_rec.get("total_pnl").unwrap().as_f64().unwrap();
         assert!(
-            (er_pnl - fn_pnl).abs() < 0.01,
-            "PnL mismatch for {key:?}: EventRules={er_pnl}, FnReducer={fn_pnl}"
+            (lua_pnl - fn_pnl).abs() < 0.01,
+            "PnL mismatch for {key:?}: Lua={lua_pnl}, FnReducer={fn_pnl}"
         );
 
         assert_eq!(
-            er_rec.get("current_position"),
+            lua_rec.get("current_position"),
             fn_rec.get("current_position"),
             "position mismatch for {key:?}"
         );
         assert_eq!(
-            er_rec.get("trade_count"),
+            lua_rec.get("trade_count"),
             fn_rec.get("trade_count"),
             "trade_count mismatch for {key:?}"
         );
@@ -700,10 +700,10 @@ fn chained_reducers_survive_reopen() {
     use crate::reducer_runtime::external::install_test_context;
     use crate::storage::memory::MemoryBackend;
 
-    let event_rules = "WHEN row.amount > 0 THEN EMIT amount = row.amount END;";
+    let lua = "LANGUAGE lua PROCESS $$ if row.amount > 0 then emit { amount = row.amount } end $$;";
     let external = "LANGUAGE EXTERNAL;";
     let cases = [
-        (event_rules, &["counter"][..]),
+        (lua, &["counter"][..]),
         (external, &["upstream", "counter"]),
         (external, &["counter", "upstream"]),
     ];
