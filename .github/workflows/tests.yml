@@ -11,6 +11,23 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  spec:
+    name: Spec quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The freshness checks compare commit dates of the spec documents.
+          fetch-depth: 0
+
+      - name: Annotate spec findings
+        if: hashFiles('spec/README.md') != ''
+        run: python3 spec/tools/check_spec.py --format github || true
+
+      - name: Check spec
+        if: hashFiles('spec/README.md') != ''
+        run: python3 spec/tools/check_spec.py
+
   rust:
     name: Rust (lib + integration + e2e PG)
     runs-on: ubuntu-latest
