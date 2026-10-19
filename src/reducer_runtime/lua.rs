@@ -4,9 +4,9 @@ use std::rc::Rc;
 
 use mlua::{Lua, MultiValue, RegistryKey, Result as LuaResult, Value as LuaValue};
 
-use crate::types::{ColumnType, Row, Value};
+use crate::types::{ColumnRegistry, ColumnType, Row, Value};
 
-use super::{Emits, GroupState, ReducerRuntime, set_at};
+use super::{Emits, GroupState, GroupedRows, ReducerRuntime, set_at};
 
 /// Lua runtime for reducer process functions.
 ///
@@ -207,11 +207,72 @@ impl ReducerRuntime for LuaRuntime {
         std::mem::swap(&mut *self.emits.borrow_mut(), emits);
         let processed = self.call(state, row);
         std::mem::swap(&mut *self.emits.borrow_mut(), emits);
-        processed.map_err(|e| crate::error::Error::Reducer(e.to_string()))
+        processed.map_err(reducer_error)
+    }
+
+    fn use_batched_processing(&self) -> bool {
+        !self.state_fields.is_empty()
+    }
+
+    /// A group's state stays in Lua for all its rows of the block, as the
+    /// state of an external reducer stays in JS. It converts to Lua and back
+    /// once per group, not once per row: the conversion of a JSON map costs
+    /// time for each of its entries. Until the block ends, a table in the
+    /// state keeps what JSON drops, such as NaN or the integer keys of a
+    /// table that is not a list.
+    fn process_grouped(
+        &self,
+        block: &mut GroupedRows<'_>,
+        _fields: &ColumnRegistry,
+        emits: &mut Emits,
+    ) -> crate::error::Result<()> {
+        std::mem::swap(&mut *self.emits.borrow_mut(), emits);
+        let processed = self.call_grouped(block);
+        std::mem::swap(&mut *self.emits.borrow_mut(), emits);
+        processed
     }
 }
 
+fn reducer_error(e: mlua::Error) -> crate::error::Error {
+    crate::error::Error::Reducer(e.to_string())
+}
+
 impl LuaRuntime {
+    /// `process_grouped` with the engine's emit buffer in `self.emits`. The
+    /// wrapper returns the state that it takes, so the state of one call is
+    /// the arguments of the next.
+    fn call_grouped(&self, block: &mut GroupedRows<'_>) -> crate::error::Result<()> {
+        let row_table: mlua::Table = self
+            .lua
+            .registry_value(&self.row_key)
+            .map_err(reducer_error)?;
+        let call: mlua::Function = self
+            .lua
+            .registry_value(&self.call_key)
+            .map_err(reducer_error)?;
+
+        let GroupedRows {
+            rows,
+            order,
+            groups,
+        } = block;
+        for group in groups.iter_mut() {
+            let mut state =
+                serialize_state_hoisted(&self.lua, &group.state).map_err(reducer_error)?;
+
+            for &index in &order[group.rows.clone()] {
+                self.emits.borrow_mut().set_source(index);
+                marshal_row_to_lua(&self.lua, &row_table, &rows[index], &self.accessed_fields)
+                    .map_err(reducer_error)?;
+                state = lua_call_hoisted(&call, state).map_err(reducer_error)?;
+                self.emits.borrow_mut().check()?;
+            }
+
+            deserialize_state_hoisted(state, &mut group.state, &self.state_types);
+        }
+        Ok(())
+    }
+
     /// Run the script on `row`, with the engine's emit buffer in `self.emits`.
     fn call(&self, state: GroupState<'_>, row: &Row) -> LuaResult<()> {
         let row_table: mlua::Table = self.lua.registry_value(&self.row_key)?;
@@ -413,7 +474,7 @@ fn register_json_module(lua: &Lua) -> LuaResult<()> {
 /// An emitted Lua table as values by the columns of `emits`.
 fn lua_table_to_values(table: &mlua::Table, emits: &mut Emits) -> LuaResult<Vec<Value>> {
     let mut values = Vec::new();
-    table.for_each(|k: mlua::String, v: LuaValue| {
+    table.for_each(|k: mlua::LuaString, v: LuaValue| {
         if let Some(id) = emits.column(&k.to_str()?) {
             set_at(&mut values, id, lua_to_value(&v));
         }
@@ -505,7 +566,7 @@ fn lua_value_to_json(val: &LuaValue) -> serde_json::Value {
     }
 }
 
-fn lua_string_to_rust(s: &mlua::String) -> String {
+fn lua_string_to_rust(s: &mlua::LuaString) -> String {
     s.to_str().map(|s| s.to_string()).unwrap_or_default()
 }
 
@@ -590,6 +651,7 @@ fn is_lua_array(table: &mlua::Table) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::*;
     use crate::types::RowMap;
@@ -658,6 +720,73 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(out.get("doubled"), Some(&Value::Float64(10.0)));
+    }
+
+    /// Rows of one table share their columns: no field of a row, also not
+    /// one that the script set, reaches the next.
+    #[test]
+    fn lua_row_holds_no_field_of_the_row_before() {
+        let runtime = LuaRuntime::new(
+            r#"
+            if row.a == 1 then row.extra = "x" end
+            emit({has_b = row.b ~= nil, extra = row.extra or "nil"})
+            "#,
+        );
+        let columns = Arc::new(ColumnRegistry::new(vec!["a".into(), "b".into()]));
+        let first = Row::from_values(columns.clone(), vec![Value::Int64(1), Value::Int64(2)]);
+        let second = Row::from_values(columns, vec![Value::Int64(3), Value::Null]);
+        let mut state = HashMap::new();
+
+        let out = runtime.run(&mut state, &first).unwrap();
+        assert_eq!(out[0]["has_b"], Value::Boolean(true));
+        assert_eq!(out[0]["extra"], Value::String("x".into()));
+
+        let out = runtime.run(&mut state, &second).unwrap();
+        assert_eq!(out[0]["has_b"], Value::Boolean(false));
+        assert_eq!(out[0]["extra"], Value::String("nil".into()));
+    }
+
+    #[test]
+    fn lua_row_after_a_failed_row_holds_none_of_its_fields() {
+        let runtime = LuaRuntime::new(
+            r#"
+            if row.a == 1 then
+                row.extra = "x"
+                error("boom")
+            end
+            emit({b = row.b or "nil", extra = row.extra or "nil"})
+            "#,
+        );
+        let columns = Arc::new(ColumnRegistry::new(vec!["a".into(), "b".into()]));
+        let failing = Row::from_values(columns.clone(), vec![Value::Int64(1), Value::Int64(2)]);
+        let next = Row::from_values(columns, vec![Value::Int64(3), Value::Null]);
+        let mut state = HashMap::new();
+
+        assert!(runtime.run(&mut state, &failing).is_err());
+        let out = runtime.run(&mut state, &next).unwrap();
+        assert_eq!(out[0]["b"], Value::String("nil".into()));
+        assert_eq!(out[0]["extra"], Value::String("nil".into()));
+    }
+
+    /// The Lua stack holds 1,000,000 slots. Before mlua 0.12.2,
+    /// `Table::clear` left one on it for each row.
+    #[test]
+    fn lua_runs_more_rows_than_the_lua_stack_has_slots() {
+        let runtime = LuaRuntime::with_state_fields(
+            "state.n = state.n + row.a",
+            &["n".to_string()],
+            &[("n".to_string(), ColumnType::Int64)],
+            &["a".to_string()],
+            &[],
+        );
+        let columns = Arc::new(ColumnRegistry::new(vec!["a".into()]));
+        let row = Row::from_values(columns, vec![Value::Int64(1)]);
+        let mut state = HashMap::from([("n".to_string(), Value::Int64(0))]);
+
+        for _ in 0..1_100_000 {
+            runtime.run(&mut state, &row).unwrap();
+        }
+        assert_eq!(state["n"], Value::Int64(1_100_000));
     }
 
     #[test]

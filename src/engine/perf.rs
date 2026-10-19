@@ -35,20 +35,14 @@ impl PerfTimer {
 }
 
 /// One "ingest" node for the per-block trees of an ingest. The durations are
-/// summed into the first tree, matched by position two levels deep: every
-/// block runs the same pipeline.
+/// summed into the first tree at every depth, nodes matched by kind and
+/// name: a block whose reducer emits nothing has no nodes for its MVs.
 pub(crate) fn merge_blocks(blocks: Vec<PerfNode>) -> Option<PerfNode> {
     let mut blocks = blocks.into_iter();
     let mut merged = blocks.next()?;
 
     for node in blocks {
-        merged.duration_ms += node.duration_ms;
-        for (child, total) in node.children.into_iter().zip(&mut merged.children) {
-            total.duration_ms += child.duration_ms;
-            for (grandchild, total) in child.children.into_iter().zip(&mut total.children) {
-                total.duration_ms += grandchild.duration_ms;
-            }
-        }
+        add_durations(&mut merged, node);
     }
 
     Some(PerfNode {
@@ -57,6 +51,20 @@ pub(crate) fn merge_blocks(blocks: Vec<PerfNode>) -> Option<PerfNode> {
         duration_ms: merged.duration_ms,
         children: vec![merged],
     })
+}
+
+fn add_durations(total: &mut PerfNode, node: PerfNode) {
+    total.duration_ms += node.duration_ms;
+    for child in node.children {
+        let same = total
+            .children
+            .iter_mut()
+            .find(|t| t.kind == child.kind && t.name == child.name);
+        match same {
+            Some(same) => add_durations(same, child),
+            None => total.children.push(child),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -75,4 +83,46 @@ fn now() -> Started {}
 #[cfg(target_arch = "wasm32")]
 fn elapsed_ms(_: Started) -> f64 {
     0.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(kind: PerfNodeKind, name: &str, duration_ms: f64, children: Vec<PerfNode>) -> PerfNode {
+        PerfNode {
+            kind,
+            name: name.to_string(),
+            duration_ms,
+            children,
+        }
+    }
+
+    fn block(reducer_ms: f64, views: Vec<PerfNode>) -> PerfNode {
+        let raw = node(PerfNodeKind::RawTable, "swaps", 1.0, vec![]);
+        let reducer = node(PerfNodeKind::Reducer, "positions", reducer_ms, views);
+        node(PerfNodeKind::Pipeline, "block", 10.0, vec![raw, reducer])
+    }
+
+    /// An MV under a reducer sums over all blocks, also when the first block
+    /// has no node for it.
+    #[test]
+    fn blocks_sum_at_every_depth() {
+        let view = |ms| vec![node(PerfNodeKind::MV, "wallet_pnl", ms, vec![])];
+        let blocks = vec![
+            block(2.0, vec![]),
+            block(3.0, view(4.0)),
+            block(5.0, view(6.0)),
+        ];
+
+        let ingest = merge_blocks(blocks).unwrap();
+
+        let merged = &ingest.children[0];
+        assert_eq!(merged.duration_ms, 30.0);
+        assert_eq!(merged.children[0].duration_ms, 3.0);
+        let reducer = &merged.children[1];
+        assert_eq!(reducer.duration_ms, 10.0);
+        assert_eq!(reducer.children.len(), 1);
+        assert_eq!(reducer.children[0].duration_ms, 10.0);
+    }
 }
