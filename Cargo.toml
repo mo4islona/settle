@@ -12,7 +12,7 @@ serde_json = "1"
 thiserror = "2"
 sqlparser = { version = "0.55", features = ["visitor"] }
 rmp-serde = "1"
-mlua = { version = "0.10", features = ["lua54", "vendored"], optional = true }
+mlua = { version = "0.12", features = ["lua54", "vendored"], optional = true }
 rocksdb = { version = "0.22", optional = true }
 rustc-hash = "2"
 smallvec = { version = "1", features = ["serde"] }
@@ -138,6 +138,10 @@ harness = false
 
 [[bench]]
 name = "tip_rocks"
+harness = false
+
+[[bench]]
+name = "solana_dex"
 harness = false
 
 [profile.bench]

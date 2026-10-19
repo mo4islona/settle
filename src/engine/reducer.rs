@@ -968,6 +968,149 @@ mod tests {
         assert_eq!(output[1].get("total"), Some(&Value::Float64(30.0)));
     }
 
+    /// `external_counter` in Lua, which fails on an amount of 13.
+    #[cfg(feature = "lua")]
+    fn lua_counter() -> ReducerEngine {
+        let def = ReducerDef {
+            body: ReducerBody::Lua {
+                script: r#"
+                    if row.amount == 13 then error("unlucky amount") end
+                    state.count = state.count + row.amount
+                    emit({count = state.count})
+                "#
+                .to_string(),
+            },
+            ..external_counter_def()
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
+        ReducerEngine::new(def, storage, &reg, &[])
+    }
+
+    #[cfg(feature = "lua")]
+    fn user_values(output: &[Row], column: &str) -> Vec<(String, Value)> {
+        output
+            .iter()
+            .map(|row| {
+                let user = row.get("user").and_then(|v| v.as_str()).unwrap();
+                (user.to_string(), row.get(column).cloned().unwrap())
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "lua")]
+    fn expected(rows: &[(&str, f64)]) -> Vec<(String, Value)> {
+        rows.iter()
+            .map(|&(user, value)| (user.to_string(), Value::Float64(value)))
+            .collect()
+    }
+
+    /// Lua runs a block group by group: each emit keeps the place of its
+    /// row, and each group keeps its state across rows, blocks and rollback.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_groups_keep_input_order_and_state() {
+        let mut engine = lua_counter();
+
+        let rows = [event("alice", 1.0), event("bob", 10.0), event("alice", 2.0)];
+        let output = engine.process_block(1000, &rows).unwrap();
+        assert_eq!(
+            user_values(&output, "count"),
+            expected(&[("alice", 1.0), ("bob", 10.0), ("alice", 3.0)])
+        );
+
+        let output = engine.process_block(1001, &[event("alice", 5.0)]).unwrap();
+        assert_eq!(user_values(&output, "count"), expected(&[("alice", 8.0)]));
+
+        engine.rollback(1000);
+        let rows = [event("bob", 1.0), event("alice", 1.0)];
+        let output = engine.process_block(1001, &rows).unwrap();
+        assert_eq!(
+            user_values(&output, "count"),
+            expected(&[("bob", 11.0), ("alice", 4.0)])
+        );
+    }
+
+    /// A block that fails in its second group rolls back both groups: also
+    /// the first, which had finished.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_failed_block_rolls_back_every_group() {
+        let mut engine = lua_counter();
+        engine
+            .process_block(1000, &[event("alice", 1.0), event("bob", 10.0)])
+            .unwrap();
+
+        let rows = [event("bob", 2.0), event("alice", 5.0), event("alice", 13.0)];
+        assert!(engine.process_block(1001, &rows).is_err());
+        engine.rollback(1000);
+
+        let rows = [event("alice", 5.0), event("bob", 2.0)];
+        let output = engine.process_block(1001, &rows).unwrap();
+        assert_eq!(
+            user_values(&output, "count"),
+            expected(&[("alice", 6.0), ("bob", 12.0)])
+        );
+    }
+
+    /// A JSON state carries from row to row of its group in a block, and
+    /// from the engine's JSON into the next block.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_json_state_carries_across_rows_and_blocks() {
+        let def = ReducerDef {
+            name: "holdings".to_string(),
+            source: "trades".to_string(),
+            group_by: vec!["user".to_string()],
+            state: vec![StateField {
+                name: "book".to_string(),
+                column_type: ColumnType::JSON,
+                default: "'{}'".to_string(),
+            }],
+            requires: vec![],
+            body: ReducerBody::Lua {
+                script: r#"
+                    local held = (state.book[row.token] or 0) + row.amount
+                    state.book[row.token] = held
+                    emit({held = held})
+                "#
+                .to_string(),
+            },
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let registry = Arc::new(ColumnRegistry::new(
+            ["user", "token", "amount"].map(String::from).to_vec(),
+        ));
+        let mut engine = ReducerEngine::new(def, storage, &registry, &[]);
+        let trade = |user: &str, token: &str, amount: f64| {
+            let values = vec![
+                Value::String(user.into()),
+                Value::String(token.into()),
+                Value::Float64(amount),
+            ];
+            Row::from_values(registry.clone(), values)
+        };
+
+        let rows = [
+            trade("alice", "A", 1.0),
+            trade("bob", "A", 7.0),
+            trade("alice", "B", 2.0),
+            trade("alice", "A", 3.0),
+        ];
+        let output = engine.process_block(1000, &rows).unwrap();
+        assert_eq!(
+            user_values(&output, "held"),
+            expected(&[("alice", 1.0), ("bob", 7.0), ("alice", 2.0), ("alice", 4.0)])
+        );
+
+        let rows = [trade("alice", "A", 1.0), trade("alice", "B", 1.0)];
+        let output = engine.process_block(1001, &rows).unwrap();
+        assert_eq!(
+            user_values(&output, "held"),
+            expected(&[("alice", 5.0), ("alice", 3.0)])
+        );
+    }
+
     // ─── FnReducerRuntime tests ─────────────────────────────────
 
     fn pnl_fn_runtime() -> crate::reducer_runtime::fn_reducer::FnReducerRuntime {
