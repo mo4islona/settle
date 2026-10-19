@@ -1,0 +1,5 @@
+# Suppressions for spec/tools/check_spec.py.
+#
+# Format: check | file-glob | message-regex  # justification
+# Each entry MUST carry a written justification after '#'. An entry without one is an error.
+# Suppress only a judgment call. Tune a check that reports an artifact; do not suppress it.
