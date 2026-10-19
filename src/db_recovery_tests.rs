@@ -67,12 +67,15 @@ const REDUCER_SCHEMA: &str = r#"
     STATE (
         balance Float64 DEFAULT 0
     )
-        WHEN row.amount > 0 THEN
-            SET state.balance = state.balance + row.amount
-            EMIT seen = row.amount
-        ALWAYS EMIT
-            state.balance AS balance
-    END;
+    LANGUAGE lua
+    PROCESS $$
+        local seen = nil
+        if row.amount > 0 then
+            state.balance = state.balance + row.amount
+            seen = row.amount
+        end
+        emit { seen = seen, balance = state.balance }
+    $$;
 
     CREATE MATERIALIZED VIEW pool_summary AS
     SELECT

@@ -1,4 +1,3 @@
-pub mod event_rules;
 pub mod external;
 pub mod fn_reducer;
 #[cfg(feature = "lua")]
@@ -9,7 +8,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::types::{ColumnId, ColumnRegistry, Row, Value};
-#[cfg(test)]
+#[cfg(all(test, feature = "lua"))]
 use crate::types::RowMap;
 
 /// The most distinct column names that the emits of a reducer use. Each
@@ -153,7 +152,7 @@ pub fn set_at(values: &mut Vec<Value>, id: ColumnId, value: Value) {
 
 /// `process` with the state and the emits by name, for tests. The state
 /// fields are `fields`, else the keys of `state` in name order.
-#[cfg(test)]
+#[cfg(all(test, feature = "lua"))]
 pub(crate) fn run_by_name(
     runtime: &dyn ReducerRuntime,
     fields: Option<&[String]>,

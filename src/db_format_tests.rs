@@ -23,11 +23,14 @@ const SCHEMA: &str = r#"
         sum_a UInt64 DEFAULT 0,
         sum_b UInt64 DEFAULT 0
     )
-        WHEN row.a >= 0 THEN
-            SET state.sum_a = state.sum_a + row.a
-            SET state.sum_b = state.sum_b + row.b
-            EMIT balance_a = state.sum_a
-    END;
+    LANGUAGE lua
+    PROCESS $$
+        if row.a >= 0 then
+            state.sum_a = state.sum_a + row.a
+            state.sum_b = state.sum_b + row.b
+            emit { balance_a = state.sum_a }
+        end
+    $$;
 
     CREATE MATERIALIZED VIEW totals AS
     SELECT user, sum(a) AS total_a
@@ -150,7 +153,7 @@ fn logic_aliases_and_new_objects_may_change() {
     let storage = storage_with_data();
 
     let changed = SCHEMA
-        .replace("WHEN row.a >= 0", "WHEN row.a > 5")
+        .replace("if row.a >= 0", "if row.a > 5")
         .replace("sum_b UInt64 DEFAULT 0", "sum_b UInt64 DEFAULT 7")
         .replace("sum(a) AS total_a", "sum(a) AS total_a_renamed")
         + r#"
@@ -274,10 +277,11 @@ fn reducer_def(state: &str) -> ReducerDef {
         SOURCE transfers
         GROUP BY user
         STATE ({state})
-            WHEN row.a >= 0 THEN
-                SET state.x = state.x + row.a
-                EMIT x = state.x
-        END;
+        LANGUAGE lua
+        PROCESS $$
+            state.x = state.x + row.a
+            emit {{ x = state.x }}
+        $$;
         "#
     );
     parse_schema(&sql).unwrap().reducers.remove(0)

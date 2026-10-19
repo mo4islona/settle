@@ -219,7 +219,7 @@ pub struct MVEngine {
     removed_groups: Vec<GroupKey>,
     /// Group keys whose stored state changed since the last checkpoint, which
     /// `write_checkpoint` persists. Under backfill deferral keys wait here for
-    /// several finalizations. See docs/backfill-mode-design.md.
+    /// several finalizations. See spec/decisions/ADR-2-finality-and-durable-watermark.md.
     pending_durable: FxHashSet<GroupKey>,
     /// The groups that the blocks of the current ingest touched, with their
     /// values from before it. `take_changes` emits one record per group: the
@@ -456,7 +456,7 @@ impl MVEngine {
     }
 
     /// Whether this MV uses a sliding window. Sliding-window MVs are excluded
-    /// from backfill persist-deferral: see docs/backfill-mode-design.md.
+    /// from backfill persist-deferral: see spec/decisions/ADR-2-finality-and-durable-watermark.md.
     pub fn is_sliding(&self) -> bool {
         self.sliding_window.is_some()
     }

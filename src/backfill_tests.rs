@@ -1,9 +1,9 @@
 //! Backfill-mode (durable checkpoint ≠ finality) crash-safety tests.
 //!
 //! These exercise the deferral path of `Config::backfill_checkpoint_interval`
-//! and the invariants in docs/backfill-mode-design.md: recovery anchored on the
-//! durable watermark, gappy-chain clamping, and the sliding/external deferral
-//! exclusions.
+//! and the invariants of spec/decisions/ADR-2-finality-and-durable-watermark.md:
+//! recovery anchored on the durable watermark, gappy-chain clamping, and the
+//! sliding/external deferral exclusions.
 //!
 //! Gated on `feature = "rocksdb"` (drop+reopen needs real persistence).
 

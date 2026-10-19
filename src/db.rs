@@ -57,7 +57,8 @@ pub struct Config {
     /// (no sliding-window MV, no external reducer), derived-state persistence
     /// is deferred and only flushed every `interval` blocks. Recovery replays
     /// raw rows from the last durable checkpoint, so a crash mid-interval costs
-    /// extra replay but never loses data. See docs/backfill-mode-design.md.
+    /// extra replay but never loses data. See
+    /// spec/decisions/ADR-2-finality-and-durable-watermark.md.
     pub backfill_checkpoint_interval: u64,
     /// Build the `ChangeBatch::perf` timing tree on ingest. Default `true`.
     pub collect_perf: bool,
@@ -536,8 +537,8 @@ impl Settle {
             )));
         }
         // The reducer must be declared `LANGUAGE EXTERNAL`. Attaching a
-        // callback to a Lua/EventRules reducer silently never invokes it
-        // (those bodies have their own embedded runtime) — fail loud
+        // callback to a Lua reducer silently never invokes it (that
+        // body has its own embedded runtime) — fail loud
         // rather than let the caller think a callback is wired up.
         if !self.engine.reducer_is_external(name) {
             return Err(Error::InvalidOperation(format!(
@@ -613,8 +614,8 @@ impl Settle {
 
     /// Whether the named reducer is declared `LANGUAGE EXTERNAL` — only
     /// these can have a host-language callback attached via
-    /// `register_reducer_callback`. Returns false for Lua / EventRules
-    /// reducers and for unknown names.
+    /// `register_reducer_callback`. Returns false for Lua reducers and
+    /// for unknown names.
     pub fn reducer_is_external(&self, name: &str) -> bool {
         self.engine.reducer_is_external(name)
     }

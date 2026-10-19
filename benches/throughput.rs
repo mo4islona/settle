@@ -42,45 +42,6 @@ const RAW_WITH_MV_SCHEMA: &str = r#"
     GROUP BY from_addr;
 "#;
 
-const REDUCER_EVENT_RULES_SCHEMA: &str = r#"
-    CREATE TABLE trades (
-        block_number UInt64,
-        user         String,
-        side         String,
-        amount       Float64,
-        price        Float64
-    );
-
-    CREATE REDUCER pnl
-    SOURCE trades
-    GROUP BY user
-    STATE (
-        quantity   Float64 DEFAULT 0,
-        cost_basis Float64 DEFAULT 0
-    )
-        WHEN row.side = 'buy' THEN
-            SET state.quantity = state.quantity + row.amount
-            SET state.cost_basis = state.cost_basis + row.amount * row.price
-            EMIT trade_pnl = 0
-        WHEN row.side = 'sell' THEN
-            LET avg_cost = state.cost_basis / state.quantity
-            SET state.quantity = state.quantity - row.amount
-            SET state.cost_basis = state.cost_basis - row.amount * avg_cost
-            EMIT trade_pnl = row.amount * (row.price - avg_cost)
-        ALWAYS EMIT
-            state.quantity AS position_size
-    END;
-
-    CREATE MATERIALIZED VIEW position_summary AS
-    SELECT
-        user,
-        sum(trade_pnl)       AS total_pnl,
-        last(position_size)  AS current_position,
-        count()              AS trade_count
-    FROM pnl
-    GROUP BY user;
-"#;
-
 const REDUCER_LUA_SCHEMA: &str = r#"
     CREATE TABLE trades (
         block_number UInt64,
@@ -150,7 +111,7 @@ const REDUCER_FN_SCHEMA: &str = r#"
     GROUP BY user;
 "#;
 
-/// Build a PnL FnReducerRuntime — same logic as the Lua/EventRules versions.
+/// Build a PnL FnReducerRuntime — same logic as the Lua version.
 fn pnl_fn_runtime() -> FnReducerRuntime {
     FnReducerRuntime::new(|state, row| {
         let side = row.get("side").and_then(|v| v.as_str()).unwrap_or("");
@@ -339,50 +300,6 @@ fn bench_raw_with_mv(backend: Backend) -> BenchResult {
     }
 }
 
-fn bench_full_pipeline_event_rules(backend: Backend) -> BenchResult {
-    let total_rows = 100_000;
-    let batch_size = 50;
-    let num_users = 100;
-    let (cfg, _dir) = make_config(REDUCER_EVENT_RULES_SCHEMA, backend);
-    let mut db = Settle::open(cfg).unwrap();
-
-    let rows: Vec<RowMap> = (0..total_rows)
-        .map(|i| {
-            let user = format!("user{}", i % num_users);
-            let side = if i / num_users < 5 {
-                "buy"
-            } else if i % 3 == 0 {
-                "sell"
-            } else {
-                "buy"
-            };
-            make_trade(
-                &user,
-                side,
-                1.0 + (i as f64 * 0.01),
-                2000.0 + (i as f64 * 0.1),
-            )
-        })
-        .collect();
-
-    let start = Instant::now();
-    for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        ingest_one(&mut db, "trades", block as u64 + 1, chunk.to_vec()).unwrap();
-    }
-    let elapsed = start.elapsed();
-
-    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
-    BenchResult {
-        name: format!("Full pipeline — Event Rules [{}]", backend),
-        backend: backend.to_string(),
-        total_rows,
-        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
-        rows_per_sec,
-        pass: rows_per_sec > 50_000.0,
-        target: ">50K rows/sec".to_string(),
-    }
-}
-
 fn bench_full_pipeline_lua(backend: Backend) -> BenchResult {
     let total_rows = 50_000;
     let batch_size = 50;
@@ -488,61 +405,6 @@ fn process_maps(
         .map(|m| Row::from_map(registry.clone(), m))
         .collect();
     engine.process_block(block, &rows).unwrap();
-}
-
-fn bench_reducer_event_rules_only() -> BenchResult {
-    let total_rows = 200_000;
-    let batch_size = 100;
-    let num_users = 100;
-
-    let schema = parse_schema(REDUCER_EVENT_RULES_SCHEMA).unwrap();
-    let storage = Arc::new(MemoryBackend::new());
-    let reducer_def = schema.reducers[0].clone();
-    let source_table = &schema.tables[0];
-    let source_names: Vec<String> = source_table
-        .columns
-        .iter()
-        .map(|c| c.name.clone())
-        .collect();
-    let source_registry = ColumnRegistry::new(source_names);
-    let registry = Arc::new(source_registry.clone());
-    let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]);
-
-    let rows: Vec<RowMap> = (0..total_rows)
-        .map(|i| {
-            let user = format!("user{}", i % num_users);
-            let side = if i / num_users < 5 {
-                "buy"
-            } else if i % 3 == 0 {
-                "sell"
-            } else {
-                "buy"
-            };
-            make_trade(
-                &user,
-                side,
-                1.0 + (i as f64 * 0.01),
-                2000.0 + (i as f64 * 0.1),
-            )
-        })
-        .collect();
-
-    let start = Instant::now();
-    for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        process_maps(&mut engine, block as u64, chunk, &registry);
-    }
-    let elapsed = start.elapsed();
-
-    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
-    BenchResult {
-        name: "Reducer-only — Event Rules [Memory]".to_string(),
-        backend: "Memory".to_string(),
-        total_rows,
-        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
-        rows_per_sec,
-        pass: rows_per_sec > 200_000.0,
-        target: ">200K rows/sec".to_string(),
-    }
 }
 
 fn bench_reducer_lua_only() -> BenchResult {
@@ -664,7 +526,7 @@ fn bench_rollback(backend: Backend) -> BenchResult {
     let num_blocks = 75;
     let rows_per_block = 134; // ~10K total rows
     let num_users = 50;
-    let (cfg, _dir) = make_config(REDUCER_EVENT_RULES_SCHEMA, backend);
+    let (cfg, _dir) = make_config(REDUCER_LUA_SCHEMA, backend);
     let mut db = Settle::open(cfg).unwrap();
 
     let total_rows = num_blocks * rows_per_block;
@@ -756,7 +618,7 @@ fn bench_ingest(backend: Backend) -> BenchResult {
 fn bench_many_group_keys(backend: Backend) -> BenchResult {
     let num_keys = 100_000;
     let batch_size = 1000;
-    let (cfg, _dir) = make_config(REDUCER_EVENT_RULES_SCHEMA, backend);
+    let (cfg, _dir) = make_config(REDUCER_LUA_SCHEMA, backend);
     let mut db = Settle::open(cfg).unwrap();
 
     let start = Instant::now();
@@ -1123,9 +985,6 @@ fn run_backend_benchmarks(backend: Backend) -> Vec<BenchResult> {
     let r = bench_raw_with_mv(backend);
     r.print();
     results.push(r);
-    let r = bench_full_pipeline_event_rules(backend);
-    r.print();
-    results.push(r);
     let r = bench_full_pipeline_lua(backend);
     r.print();
     results.push(r);
@@ -1167,9 +1026,6 @@ fn main() {
     println!("--- Memory ---");
     results.extend(run_backend_benchmarks(Backend::Memory));
     println!("\n  Reducer-only:");
-    let r = bench_reducer_event_rules_only();
-    r.print();
-    results.push(r);
     let r = bench_reducer_lua_only();
     r.print();
     results.push(r);

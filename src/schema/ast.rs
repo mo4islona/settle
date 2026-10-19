@@ -89,60 +89,7 @@ pub struct StateField {
 }
 
 #[derive(Debug, Clone)]
-pub enum Expr {
-    Literal(String),
-    Float(f64),
-    Int(i64),
-    ColumnRef(String),
-    StateRef(String),
-    RowRef(String),
-    BinaryOp {
-        left: Box<Expr>,
-        op: BinaryOp,
-        right: Box<Expr>,
-    },
-    If {
-        condition: Box<Expr>,
-        then_expr: Box<Expr>,
-        else_expr: Box<Expr>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum BinaryOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Eq,
-    Neq,
-    Gt,
-    Lt,
-    Gte,
-    Lte,
-    And,
-    Or,
-}
-
-#[derive(Debug, Clone)]
-pub struct WhenBlock {
-    pub condition: Expr,
-    pub lets: Vec<(String, Expr)>,
-    pub sets: Vec<(String, Expr)>,
-    pub emits: Vec<(String, Expr)>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AlwaysEmit {
-    pub emits: Vec<(String, Expr)>,
-}
-
-#[derive(Debug, Clone)]
 pub enum ReducerBody {
-    EventRules {
-        when_blocks: Vec<WhenBlock>,
-        always_emit: Option<AlwaysEmit>,
-    },
     Lua {
         script: String,
     },

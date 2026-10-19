@@ -78,7 +78,7 @@ FROM transfers
 GROUP BY from_addr;
 "#;
 
-const SETTLE_SCHEMA_ER: &str = r#"
+const SETTLE_SCHEMA_LUA: &str = r#"
 CREATE VIRTUAL TABLE transfers (
     block_number UInt64,
     from_addr    String,
@@ -92,13 +92,11 @@ GROUP BY from_addr
 STATE (
     balance Float64 DEFAULT 0
 )
-    WHEN 1 = 1 THEN
-        SET state.balance = state.balance + row.value
-        EMIT _dummy = 0
-    ALWAYS EMIT
-        row.from_addr AS from_addr,
-        state.balance AS balance
-END;
+LANGUAGE lua
+PROCESS $$
+    state.balance = state.balance + row.value
+    emit { balance = state.balance }
+$$;
 
 CREATE MATERIALIZED VIEW balances AS
 SELECT
@@ -193,12 +191,12 @@ fn open_settle_db_fn(
     Ok((db, dir))
 }
 
-fn open_settle_db_eventrules(
+fn open_settle_db_lua(
     storage: Storage,
     checkpoint_interval: u64,
     depth: usize,
 ) -> anyhow::Result<(Settle, Option<tempfile::TempDir>)> {
-    let (cfg, dir) = make_cfg(SETTLE_SCHEMA_ER, storage, checkpoint_interval, depth);
+    let (cfg, dir) = make_cfg(SETTLE_SCHEMA_LUA, storage, checkpoint_interval, depth);
     let db = Settle::open(cfg)?;
     Ok((db, dir))
 }
@@ -557,7 +555,7 @@ fn main() -> anyhow::Result<()> {
     //  - ",fin"     no-lag backfill, persist every finalize (durable == finality).
     //  - ",backfill" no-lag backfill + checkpoint_interval=100 → derived-state
     //               persistence DEFERRED (the historical-load fast path). Only
-    //               effective for deferral-safe pipelines (er, mv); the fn
+    //               effective for deferral-safe pipelines (lua, mv); the fn
     //               pipeline is LANGUAGE EXTERNAL so deferral stays off by design,
     //               so its ",backfill" row should ≈ its ",fin" row.
     // interval=1000 > BLOCKS_PER_BATCH (100): a checkpoint fires roughly every
@@ -570,7 +568,7 @@ fn main() -> anyhow::Result<()> {
     type Open = fn(Storage, u64, usize) -> anyhow::Result<(Settle, Option<tempfile::TempDir>)>;
     let styles: [(&str, Open); 3] = [
         ("fn", open_settle_db_fn),
-        ("er", open_settle_db_eventrules),
+        ("lua", open_settle_db_lua),
         ("mv", open_settle_db_mv_only),
     ];
     // Depth 1 acks each batch before the next ingest; depth 2 overlaps the

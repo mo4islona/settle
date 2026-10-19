@@ -7,11 +7,11 @@
 //   node bench/solana-dex.mjs /path/sdex.bin [cases]
 //
 // Cases: `<runtime>,<mode>` separated by spaces; runtimes `js` (JS callbacks,
-// LANGUAGE EXTERNAL), `lua`, `er` (EventRules) and `floor` (the same logic
-// in plain JS Maps, no Settle: what the JS work alone costs); modes
-// `backfill` and `tip` as in the Rust bench. Each case runs in a process of
-// its own. Env: SDEX_BATCH_SLOTS (100), SDEX_STORAGE (rocks | memory),
-// SDEX_POSITIONS (pair | json: the positions of a wallet in one JSON map).
+// LANGUAGE EXTERNAL), `lua` and `floor` (the same logic in plain JS Maps, no
+// Settle: what the JS work alone costs); modes `backfill` and `tip` as in the
+// Rust bench. Each case runs in a process of its own. Env: SDEX_BATCH_SLOTS
+// (100), SDEX_STORAGE (rocks | memory), SDEX_POSITIONS (pair | json: the
+// positions of a wallet in one JSON map).
 
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -32,8 +32,8 @@ const BATCH_SLOTS = Number(process.env.SDEX_BATCH_SLOTS ?? 100)
 const STORAGE = process.env.SDEX_STORAGE ?? 'rocks'
 const JSON_POSITIONS = process.env.SDEX_POSITIONS === 'json'
 const ALL_CASES = [
-  'js,backfill', 'lua,backfill', 'er,backfill', 'floor,backfill',
-  'js,tip', 'lua,tip', 'er,tip',
+  'js,backfill', 'lua,backfill', 'floor,backfill',
+  'js,tip', 'lua,tip',
 ]
 
 // ─── The swaps ───────────────────────────────────────────────────────
@@ -390,7 +390,7 @@ class Split {
 const cursor = (slot) => ({ number: slot, hash: `0x${slot.toString(16).padStart(16, '0')}` })
 
 function open(runtime) {
-  const dir = { js: 'external', lua: 'lua', er: 'er' }[runtime]
+  const dir = { js: 'external', lua: 'lua' }[runtime]
   const positionsFile = JSON_POSITIONS ? 'positions_json.sql' : 'positions.sql'
   const schema = [
     SQL('tables.sql'),
@@ -577,7 +577,7 @@ if (rest[0] === '--case') {
   const result = await runCase(data, runtime, mode)
   process.stdout.write(`\n${JSON.stringify(result)}\n`)
 } else {
-  // EventRules have no maps; the floor does not change.
+  // The floor does not change.
   const defaults = JSON_POSITIONS ? ALL_CASES.filter((c) => /^(js|lua),/.test(c)) : ALL_CASES
   const cases = rest.length ? rest : defaults
   console.log(

@@ -1,7 +1,7 @@
 /**
- * Three-way benchmark: Lua vs EventRules vs External (JS callback) reducers.
+ * Two-way benchmark: Lua vs External (JS callback) reducers.
  *
- * All three use the same PnL workload:
+ * Both use the same PnL workload:
  * - 100K rows, 100 users, buy/sell trades
  * - Same state: {quantity, cost_basis}
  * - Same emit: {trade_pnl, position_size}
@@ -33,28 +33,6 @@ const MV_SCHEMA = `
     count()              AS trade_count
   FROM pnl
   GROUP BY user;
-`
-
-const EVENT_RULES_REDUCER = `
-  CREATE REDUCER pnl
-  SOURCE trades
-  GROUP BY user
-  STATE (
-    quantity   Float64 DEFAULT 0,
-    cost_basis Float64 DEFAULT 0
-  )
-    WHEN row.side = 'buy' THEN
-      SET state.quantity = state.quantity + row.amount
-      SET state.cost_basis = state.cost_basis + row.amount * row.price
-      EMIT trade_pnl = 0
-    WHEN row.side = 'sell' THEN
-      LET avg_cost = state.cost_basis / state.quantity
-      SET state.quantity = state.quantity - row.amount
-      SET state.cost_basis = state.cost_basis - row.amount * avg_cost
-      EMIT trade_pnl = row.amount * (row.price - avg_cost)
-    ALWAYS EMIT
-      state.quantity AS position_size
-  END;
 `
 
 const LUA_REDUCER = `
@@ -166,21 +144,14 @@ console.log(
 
 const trades = generateTrades(TOTAL_ROWS, NUM_USERS)
 
-// 1. Event Rules
-{
-  const db = Settle.open({ schema: TABLE_SCHEMA + EVENT_RULES_REDUCER + MV_SCHEMA })
-  const r = await runBenchmark('Full pipeline — Event Rules', db, trades, BATCH_SIZE)
-  printResult(r)
-}
-
-// 2. Lua
+// 1. Lua
 {
   const db = Settle.open({ schema: TABLE_SCHEMA + LUA_REDUCER + MV_SCHEMA })
   const r = await runBenchmark('Full pipeline — Lua', db, trades, BATCH_SIZE)
   printResult(r)
 }
 
-// 3. External (JS callback)
+// 2. External (JS callback)
 {
   const db = Settle.open({ schema: TABLE_SCHEMA + EXTERNAL_REDUCER_PLACEHOLDER + MV_SCHEMA })
 

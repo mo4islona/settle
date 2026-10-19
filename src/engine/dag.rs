@@ -442,8 +442,8 @@ impl SettleEngine {
 
     /// Whether the named reducer's `ReducerDef::body` is `External` —
     /// i.e. callable from a host-language callback. Returns false for
-    /// `Lua` / `EventRules` reducers (which have their own embedded
-    /// runtime and ignore any host-side callback), and for unknown names.
+    /// `Lua` reducers (which have their own embedded runtime and ignore
+    /// any host-side callback), and for unknown names.
     pub fn reducer_is_external(&self, name: &str) -> bool {
         if let Some(idx) = self.branch_index.get(name) {
             self.branches[*idx].reducer.is_external()
@@ -1414,7 +1414,7 @@ impl SettleEngine {
 /// Backfill persist-deferral is only allowed when the pipeline has no
 /// sliding-window MV (not tested with deferral) and no external reducer
 /// (replay skips them, so deferred state can't be rebuilt).
-/// See docs/backfill-mode-design.md.
+/// See spec/decisions/ADR-2-finality-and-durable-watermark.md.
 fn compute_defer_allowed(
     branches: &[PipelineBranch],
     reducers: &HashMap<String, ReducerEngine>,
@@ -1552,6 +1552,7 @@ mod tests {
     use crate::storage::memory::MemoryBackend;
     use crate::types::{ColumnType, ChangeOp, RowMap, Value};
 
+    #[cfg(feature = "lua")]
     fn dex_schema() -> Schema {
         Schema {
             modules: vec![],
@@ -1598,92 +1599,22 @@ mod tests {
                     },
                 ],
                 requires: vec![],
-                body: ReducerBody::EventRules {
-                    when_blocks: vec![
-                        WhenBlock {
-                            condition: Expr::BinaryOp {
-                                left: Box::new(Expr::RowRef("side".into())),
-                                op: BinaryOp::Eq,
-                                right: Box::new(Expr::Literal("buy".into())),
-                            },
-                            lets: vec![],
-                            sets: vec![
-                                (
-                                    "quantity".into(),
-                                    Expr::BinaryOp {
-                                        left: Box::new(Expr::StateRef("quantity".into())),
-                                        op: BinaryOp::Add,
-                                        right: Box::new(Expr::RowRef("amount".into())),
-                                    },
-                                ),
-                                (
-                                    "cost_basis".into(),
-                                    Expr::BinaryOp {
-                                        left: Box::new(Expr::StateRef("cost_basis".into())),
-                                        op: BinaryOp::Add,
-                                        right: Box::new(Expr::BinaryOp {
-                                            left: Box::new(Expr::RowRef("amount".into())),
-                                            op: BinaryOp::Mul,
-                                            right: Box::new(Expr::RowRef("price".into())),
-                                        }),
-                                    },
-                                ),
-                            ],
-                            emits: vec![("trade_pnl".into(), Expr::Int(0))],
-                        },
-                        WhenBlock {
-                            condition: Expr::BinaryOp {
-                                left: Box::new(Expr::RowRef("side".into())),
-                                op: BinaryOp::Eq,
-                                right: Box::new(Expr::Literal("sell".into())),
-                            },
-                            lets: vec![(
-                                "avg_cost".into(),
-                                Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("cost_basis".into())),
-                                    op: BinaryOp::Div,
-                                    right: Box::new(Expr::StateRef("quantity".into())),
-                                },
-                            )],
-                            sets: vec![
-                                (
-                                    "quantity".into(),
-                                    Expr::BinaryOp {
-                                        left: Box::new(Expr::StateRef("quantity".into())),
-                                        op: BinaryOp::Sub,
-                                        right: Box::new(Expr::RowRef("amount".into())),
-                                    },
-                                ),
-                                (
-                                    "cost_basis".into(),
-                                    Expr::BinaryOp {
-                                        left: Box::new(Expr::StateRef("cost_basis".into())),
-                                        op: BinaryOp::Sub,
-                                        right: Box::new(Expr::BinaryOp {
-                                            left: Box::new(Expr::RowRef("amount".into())),
-                                            op: BinaryOp::Mul,
-                                            right: Box::new(Expr::ColumnRef("avg_cost".into())),
-                                        }),
-                                    },
-                                ),
-                            ],
-                            emits: vec![(
-                                "trade_pnl".into(),
-                                Expr::BinaryOp {
-                                    left: Box::new(Expr::RowRef("amount".into())),
-                                    op: BinaryOp::Mul,
-                                    right: Box::new(Expr::BinaryOp {
-                                        left: Box::new(Expr::RowRef("price".into())),
-                                        op: BinaryOp::Sub,
-                                        right: Box::new(Expr::ColumnRef("avg_cost".into())),
-                                    }),
-                                },
-                            )],
-                        },
-                    ],
-                    always_emit: Some(AlwaysEmit {
-                        emits: vec![("position_size".into(), Expr::StateRef("quantity".into()))],
-                    }),
+                body: ReducerBody::Lua {
+                    script: r#"
+                        local trade_pnl = 0
+                        if row.side == "buy" then
+                            state.quantity = state.quantity + row.amount
+                            state.cost_basis = state.cost_basis + row.amount * row.price
+                        elseif row.side == "sell" then
+                            local avg_cost = 0
+                            if state.quantity ~= 0 then avg_cost = state.cost_basis / state.quantity end
+                            state.quantity = state.quantity - row.amount
+                            state.cost_basis = state.cost_basis - row.amount * avg_cost
+                            trade_pnl = row.amount * (row.price - avg_cost)
+                        end
+                        emit { trade_pnl = trade_pnl, position_size = state.quantity }
+                    "#
+                    .to_string(),
                 },
             }],
             materialized_views: vec![MVDef {
@@ -1750,6 +1681,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lua")]
     fn make_trade(user: &str, side: &str, amount: f64, price: f64) -> RowMap {
         HashMap::from([
             ("user".to_string(), Value::String(user.to_string())),
@@ -1790,6 +1722,7 @@ mod tests {
         assert_eq!(mv_changes[0].get("total"), Some(&Value::Float64(300.0)));
     }
 
+    #[cfg(feature = "lua")]
     #[test]
     fn full_pipeline_raw_reducer_mv() {
         let storage = Arc::new(MemoryBackend::new());
@@ -1988,6 +1921,7 @@ mod tests {
         assert_eq!(mv.get("total"), Some(&Value::Float64(300.0)));
     }
 
+    #[cfg(feature = "lua")]
     #[test]
     fn full_pipeline_rollback_and_reingest() {
         let storage = Arc::new(MemoryBackend::new());
@@ -2354,6 +2288,7 @@ mod tests {
     }
 
     /// add_reducer must update mv_branch_index so process_batch can find branch MVs.
+    #[cfg(feature = "lua")]
     #[test]
     fn add_reducer_updates_mv_branch_index() {
         // Schema with a table and MV but no reducer
@@ -2410,21 +2345,12 @@ mod tests {
                 default: "0".to_string(),
             }],
             requires: vec![],
-            body: ReducerBody::EventRules {
-                when_blocks: vec![WhenBlock {
-                    condition: Expr::Int(1), // always true
-                    lets: vec![],
-                    sets: vec![(
-                        "count".to_string(),
-                        Expr::BinaryOp {
-                            left: Box::new(Expr::StateRef("count".into())),
-                            op: BinaryOp::Add,
-                            right: Box::new(Expr::Int(1)),
-                        },
-                    )],
-                    emits: vec![("count".to_string(), Expr::StateRef("count".into()))],
-                }],
-                always_emit: None,
+            body: ReducerBody::Lua {
+                script: r#"
+                    state.count = state.count + 1
+                    emit { count = state.count }
+                "#
+                .to_string(),
             },
         };
         engine.add_reducer(reducer_def, storage).unwrap();
@@ -2452,6 +2378,7 @@ mod tests {
 
     /// replay_reducer_chain must replay ONLY the target reducer,
     /// not double-process other reducers that were already replayed.
+    #[cfg(feature = "lua")]
     #[test]
     fn replay_reducer_chain_does_not_double_replay() {
         // Schema with two reducers: counter_a and counter_b, each with an MV
@@ -2486,21 +2413,12 @@ mod tests {
                         default: "0".to_string(),
                     }],
                     requires: vec![],
-                    body: ReducerBody::EventRules {
-                        when_blocks: vec![WhenBlock {
-                            condition: Expr::Int(1),
-                            lets: vec![],
-                            sets: vec![(
-                                "total".to_string(),
-                                Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("total".into())),
-                                    op: BinaryOp::Add,
-                                    right: Box::new(Expr::RowRef("amount".into())),
-                                },
-                            )],
-                            emits: vec![("total".to_string(), Expr::StateRef("total".into()))],
-                        }],
-                        always_emit: None,
+                    body: ReducerBody::Lua {
+                        script: r#"
+                            state.total = state.total + row.amount
+                            emit { total = state.total }
+                        "#
+                        .to_string(),
                     },
                 },
                 ReducerDef {
@@ -2513,21 +2431,12 @@ mod tests {
                         default: "0".to_string(),
                     }],
                     requires: vec![],
-                    body: ReducerBody::EventRules {
-                        when_blocks: vec![WhenBlock {
-                            condition: Expr::Int(1),
-                            lets: vec![],
-                            sets: vec![(
-                                "total".to_string(),
-                                Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("total".into())),
-                                    op: BinaryOp::Add,
-                                    right: Box::new(Expr::RowRef("amount".into())),
-                                },
-                            )],
-                            emits: vec![("total".to_string(), Expr::StateRef("total".into()))],
-                        }],
-                        always_emit: None,
+                    body: ReducerBody::Lua {
+                        script: r#"
+                            state.total = state.total + row.amount
+                            emit { total = state.total }
+                        "#
+                        .to_string(),
                     },
                 },
             ],

@@ -313,8 +313,8 @@ impl Settle {
                 Status::InvalidArg,
                 format!(
                     "registerReducerCallback: reducer '{name}' is not declared \
-                     LANGUAGE EXTERNAL — Lua and EventRules reducers have their \
-                     own embedded runtime and ignore host callbacks",
+                     LANGUAGE EXTERNAL — a Lua reducer has its own embedded \
+                     runtime and ignores host callbacks",
                 ),
             ));
         }

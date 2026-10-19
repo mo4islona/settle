@@ -8,17 +8,15 @@
 //! - `positions` (GROUP BY trader, token): average-cost PnL, feeds the PnL
 //!   of each wallet and its open positions, about a million groups. With
 //!   `SDEX_POSITIONS=json`, GROUP BY trader with the positions of the wallet
-//!   in a JSON map, as tests/uniswap/schema.sql keeps them (no EventRules).
+//!   in a JSON map, as tests/uniswap/schema.sql keeps them.
 //!
-//! Runtimes: `fn` (Rust closures, LANGUAGE EXTERNAL), `lua`, `er`
-//! (EventRules). Modes:
+//! Runtimes: `fn` (Rust closures, LANGUAGE EXTERNAL), `lua`. Modes:
 //! - `backfill`: 100 slots in each ingest, finality at the batch tip.
 //! - `tip`: the first 80% of the slots as a backfill (not timed), then one
 //!   slot in each ingest with finality 32 blocks back.
 //!
 //! Run: `cargo bench --bench solana_dex`
-//! Env: `SDEX_SLOTS` (12000, ~3M swaps), `SDEX_RUNTIMES` (fn,lua,er; fn,lua
-//! with `SDEX_POSITIONS=json`),
+//! Env: `SDEX_SLOTS` (12000, ~3M swaps), `SDEX_RUNTIMES` (fn,lua),
 //! `SDEX_MODES` (backfill,tip), `SDEX_STORAGE` (rocks | memory),
 //! `SDEX_BATCH_SLOTS` (100), `SDEX_POSITIONS` (pair | json),
 //! `RAYON_NUM_THREADS`.
@@ -43,10 +41,6 @@ const LUA: [&str; 3] = [
     include_str!("solana_dex/lua/pool_prices.sql"),
     include_str!("solana_dex/lua/positions.sql"),
     include_str!("solana_dex/lua/positions_json.sql"),
-];
-const EVENT_RULES: [&str; 2] = [
-    include_str!("solana_dex/er/pool_prices.sql"),
-    include_str!("solana_dex/er/positions.sql"),
 ];
 const EXTERNAL: [&str; 3] = [
     include_str!("solana_dex/external/pool_prices.sql"),
@@ -248,9 +242,7 @@ fn schema(runtime: &str, json: bool) -> String {
         ("fn", true) => (EXTERNAL[0], EXTERNAL[2]),
         ("lua", false) => (LUA[0], LUA[1]),
         ("lua", true) => (LUA[0], LUA[2]),
-        ("er", false) => (EVENT_RULES[0], EVENT_RULES[1]),
-        (other, true) => panic!("no {other} reducers with SDEX_POSITIONS=json"),
-        (other, false) => panic!("no {other} reducers"),
+        (other, _) => panic!("no {other} reducers"),
     };
     [TABLES, pool_prices, positions, VIEWS].join("\n")
 }
@@ -681,8 +673,7 @@ fn main() {
     }
 
     let json = std::env::var("SDEX_POSITIONS").is_ok_and(|v| v == "json");
-    // EventRules have no maps.
-    let runtimes = env_list("SDEX_RUNTIMES", if json { "fn,lua" } else { "fn,lua,er" });
+    let runtimes = env_list("SDEX_RUNTIMES", "fn,lua");
     let modes = env_list("SDEX_MODES", "backfill,tip");
     let storage = std::env::var("SDEX_STORAGE").unwrap_or_else(|_| "rocks".into());
     let batch_slots = env_usize("SDEX_BATCH_SLOTS", 100);

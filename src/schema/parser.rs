@@ -728,8 +728,7 @@ fn parse_reducer_block(input: &str) -> Result<(ReducerDef, usize), Error> {
         pos = skip_ws(input, new_pos);
     }
 
-    // Body: either LANGUAGE lua PROCESS $$...$$ or LANGUAGE EXTERNAL or WHEN blocks
-    let (mut body, new_pos) = parse_reducer_body(input, pos)?;
+    let (mut body, new_pos) = parse_reducer_body(input, pos, &name)?;
     pos = new_pos;
 
     // Fill in External id with reducer name if empty
@@ -739,12 +738,6 @@ fn parse_reducer_block(input: &str) -> Result<(ReducerDef, usize), Error> {
         }
     }
 
-    // Skip optional END keyword and trailing semicolon
-    pos = skip_ws(input, pos);
-    let remaining_upper = input[pos..].to_uppercase();
-    if remaining_upper.starts_with("END") {
-        pos += 3;
-    }
     pos = skip_ws(input, pos);
     if pos < len && bytes[pos] == b';' {
         pos += 1;
@@ -808,7 +801,11 @@ fn parse_state_block(input: &str, start: usize) -> Result<(Vec<StateField>, usiz
     Ok((fields, pos))
 }
 
-fn parse_reducer_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Error> {
+fn parse_reducer_body(
+    input: &str,
+    start: usize,
+    reducer: &str,
+) -> Result<(ReducerBody, usize), Error> {
     let upper = input[start..].to_uppercase();
     if upper.starts_with("LANGUAGE") {
         // Check for LANGUAGE EXTERNAL vs LANGUAGE LUA
@@ -819,10 +816,13 @@ fn parse_reducer_body(input: &str, start: usize) -> Result<(ReducerBody, usize),
             parse_lua_body(input, start)
         }
     } else if upper.starts_with("WHEN") || upper.starts_with("ALWAYS") {
-        parse_event_rules_body(input, start)
+        Err(Error::Schema(format!(
+            "reducer '{reducer}': event rules (WHEN ... THEN) are not supported; \
+             write the body in Lua: LANGUAGE lua PROCESS $$ ... $$"
+        )))
     } else {
         Err(Error::Schema(format!(
-            "expected WHEN, LANGUAGE, or LANGUAGE EXTERNAL after STATE, got: '{}'",
+            "expected LANGUAGE lua or LANGUAGE EXTERNAL after STATE, got: '{}'",
             &input[start..std::cmp::min(start + 30, input.len())]
         )))
     }
@@ -853,467 +853,10 @@ fn parse_lua_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Err
     let (script, new_pos) = read_dollar_quoted(input, pos)?;
     #[cfg(not(feature = "lua"))]
     return Err(Error::Schema(
-        "Lua reducers require the 'lua' feature. Use LANGUAGE EXTERNAL or event rules instead."
-            .into(),
+        "Lua reducers require the 'lua' feature. Use LANGUAGE EXTERNAL instead.".into(),
     ));
     #[cfg(feature = "lua")]
     Ok((ReducerBody::Lua { script }, new_pos))
-}
-
-fn parse_event_rules_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Error> {
-    let mut pos = start;
-    let mut when_blocks = Vec::new();
-    let mut always_emit = None;
-
-    loop {
-        pos = skip_ws(input, pos);
-        let upper = input[pos..].to_uppercase();
-
-        if upper.starts_with("WHEN") {
-            let (block, new_pos) = parse_when_block(input, pos)?;
-            when_blocks.push(block);
-            pos = new_pos;
-        } else if upper.starts_with("ALWAYS") {
-            let (ae, new_pos) = parse_always_emit(input, pos)?;
-            always_emit = Some(ae);
-            pos = new_pos;
-            break;
-        } else {
-            break;
-        }
-    }
-
-    if when_blocks.is_empty() {
-        return Err(Error::Schema(
-            "reducer must have at least one WHEN block".into(),
-        ));
-    }
-
-    Ok((
-        ReducerBody::EventRules {
-            when_blocks,
-            always_emit,
-        },
-        pos,
-    ))
-}
-
-fn parse_when_block(input: &str, start: usize) -> Result<(WhenBlock, usize), Error> {
-    let mut pos = start;
-    pos = skip_keyword(input, pos, "WHEN")?;
-    pos = skip_ws(input, pos);
-
-    // Read condition up to THEN
-    let (condition_str, new_pos) = read_until_keyword(input, pos, "THEN")?;
-    let condition = parse_expr(&condition_str)?;
-    pos = new_pos;
-    pos = skip_keyword(input, pos, "THEN")?;
-    pos = skip_ws(input, pos);
-
-    let mut lets = Vec::new();
-    let mut sets = Vec::new();
-    let mut emits = Vec::new();
-
-    loop {
-        pos = skip_ws(input, pos);
-        let upper = input[pos..].to_uppercase();
-
-        if upper.starts_with("LET ") {
-            let (l, new_pos) = parse_let_clause(input, pos)?;
-            lets.push(l);
-            pos = new_pos;
-        } else if upper.starts_with("SET ") {
-            let (s, new_pos) = parse_set_clause(input, pos)?;
-            sets.extend(s);
-            pos = new_pos;
-        } else if upper.starts_with("EMIT ") {
-            let (e, new_pos) = parse_emit_clause(input, pos)?;
-            emits.extend(e);
-            pos = new_pos;
-        } else {
-            break;
-        }
-    }
-
-    Ok((
-        WhenBlock {
-            condition,
-            lets,
-            sets,
-            emits,
-        },
-        pos,
-    ))
-}
-
-fn parse_always_emit(input: &str, start: usize) -> Result<(AlwaysEmit, usize), Error> {
-    let mut pos = start;
-    pos = skip_keyword(input, pos, "ALWAYS")?;
-    pos = skip_ws(input, pos);
-    pos = skip_keyword(input, pos, "EMIT")?;
-    pos = skip_ws(input, pos);
-
-    let (emits, new_pos) = parse_emit_list(input, pos)?;
-    Ok((AlwaysEmit { emits }, new_pos))
-}
-
-fn parse_let_clause(input: &str, start: usize) -> Result<((String, Expr), usize), Error> {
-    let mut pos = start;
-    pos = skip_keyword(input, pos, "LET")?;
-    pos = skip_ws(input, pos);
-
-    let (name, new_pos) = read_identifier(input, pos)?;
-    pos = skip_ws(input, new_pos);
-
-    if pos < input.len() && input.as_bytes()[pos] == b'=' {
-        pos += 1;
-    } else {
-        return Err(Error::Schema(format!("expected '=' after LET {name}")));
-    }
-    pos = skip_ws(input, pos);
-
-    let (expr_str, new_pos) = read_expr_until_clause_boundary(input, pos)?;
-    let expr = parse_expr(&expr_str)?;
-
-    Ok(((name, expr), new_pos))
-}
-
-fn parse_set_clause(input: &str, start: usize) -> Result<(Vec<(String, Expr)>, usize), Error> {
-    let mut pos = start;
-    pos = skip_keyword(input, pos, "SET")?;
-    pos = skip_ws(input, pos);
-
-    let mut assignments = Vec::new();
-
-    loop {
-        pos = skip_ws(input, pos);
-
-        // Read "state.field = expr"
-        let (field_ref, new_pos) = read_dotted_name(input, pos)?;
-        pos = skip_ws(input, new_pos);
-
-        if pos < input.len() && input.as_bytes()[pos] == b'=' {
-            pos += 1;
-        } else {
-            return Err(Error::Schema(format!("expected '=' after SET {field_ref}")));
-        }
-        pos = skip_ws(input, pos);
-
-        let (expr_str, new_pos) = read_expr_until_comma_or_clause(input, pos)?;
-        let expr = parse_expr(&expr_str)?;
-        pos = new_pos;
-
-        // Strip "state." prefix
-        let field_name = field_ref
-            .strip_prefix("state.")
-            .unwrap_or(&field_ref)
-            .to_string();
-        assignments.push((field_name, expr));
-
-        pos = skip_ws(input, pos);
-        if pos < input.len() && input.as_bytes()[pos] == b',' {
-            pos += 1;
-        } else {
-            break;
-        }
-    }
-
-    Ok((assignments, pos))
-}
-
-fn parse_emit_clause(input: &str, start: usize) -> Result<(Vec<(String, Expr)>, usize), Error> {
-    let mut pos = start;
-    pos = skip_keyword(input, pos, "EMIT")?;
-    pos = skip_ws(input, pos);
-    parse_emit_list(input, pos)
-}
-
-fn parse_emit_list(input: &str, start: usize) -> Result<(Vec<(String, Expr)>, usize), Error> {
-    let mut pos = start;
-    let mut emits = Vec::new();
-
-    loop {
-        pos = skip_ws(input, pos);
-
-        let (expr_str, new_pos) = read_expr_until_comma_or_clause(input, pos)?;
-        pos = new_pos;
-
-        // Check for "expr AS alias" or "name = expr"
-        let trimmed = expr_str.trim();
-        if let Some(eq_pos) = trimmed.find('=') {
-            // name = expr form
-            let name = trimmed[..eq_pos].trim().to_string();
-            let expr = parse_expr(trimmed[eq_pos + 1..].trim())?;
-            emits.push((name, expr));
-        } else if let Some((expr_part, alias)) = split_as_alias(trimmed) {
-            let expr = parse_expr(expr_part)?;
-            emits.push((alias.to_string(), expr));
-        } else {
-            let expr = parse_expr(trimmed)?;
-            // Use expression text as name fallback
-            let name = trimmed.replace("state.", "").replace("row.", "");
-            emits.push((name, expr));
-        }
-
-        pos = skip_ws(input, pos);
-        if pos < input.len() && input.as_bytes()[pos] == b',' {
-            pos += 1;
-        } else {
-            break;
-        }
-    }
-
-    Ok((emits, pos))
-}
-
-fn split_as_alias(s: &str) -> Option<(&str, &str)> {
-    // Find " AS " (case-insensitive) that's not inside parens.
-    // Uses char_indices() for correct byte offsets with non-ASCII input.
-    let upper = s.to_uppercase();
-    let mut depth = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {}
-        }
-        if depth == 0 && upper[i..].starts_with(" AS ") {
-            return Some((s[..i].trim(), s[i + 4..].trim()));
-        }
-    }
-    None
-}
-
-// --- Expression parser ---
-
-pub fn parse_expr(input: &str) -> Result<Expr, Error> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err(Error::Schema("empty expression".into()));
-    }
-    parse_or_expr(input)
-}
-
-fn parse_or_expr(input: &str) -> Result<Expr, Error> {
-    let parts = split_binary_op(input, &[" OR ", " or "]);
-    if parts.len() == 1 {
-        return parse_and_expr(parts[0].trim());
-    }
-    let mut expr = parse_and_expr(parts[0].trim())?;
-    for part in &parts[1..] {
-        let right = parse_and_expr(part.trim())?;
-        expr = Expr::BinaryOp {
-            left: Box::new(expr),
-            op: BinaryOp::Or,
-            right: Box::new(right),
-        };
-    }
-    Ok(expr)
-}
-
-fn parse_and_expr(input: &str) -> Result<Expr, Error> {
-    let parts = split_binary_op(input, &[" AND ", " and "]);
-    if parts.len() == 1 {
-        return parse_comparison_expr(parts[0].trim());
-    }
-    let mut expr = parse_comparison_expr(parts[0].trim())?;
-    for part in &parts[1..] {
-        let right = parse_comparison_expr(part.trim())?;
-        expr = Expr::BinaryOp {
-            left: Box::new(expr),
-            op: BinaryOp::And,
-            right: Box::new(right),
-        };
-    }
-    Ok(expr)
-}
-
-fn parse_comparison_expr(input: &str) -> Result<Expr, Error> {
-    // Check for IF(cond, then, else) at top level
-    let upper = input.to_uppercase();
-    if upper.starts_with("IF(") || upper.starts_with("IF (") {
-        return parse_if_expr(input);
-    }
-
-    // Try comparison operators: >=, <=, !=, =, >, <
-    for (op_str, op) in &[
-        (">=", BinaryOp::Gte),
-        ("<=", BinaryOp::Lte),
-        ("!=", BinaryOp::Neq),
-        ("=", BinaryOp::Eq),
-        (">", BinaryOp::Gt),
-        ("<", BinaryOp::Lt),
-    ] {
-        if let Some((left, right)) = split_at_op_outside_parens(input, op_str) {
-            return Ok(Expr::BinaryOp {
-                left: Box::new(parse_additive_expr(left.trim())?),
-                op: op.clone(),
-                right: Box::new(parse_additive_expr(right.trim())?),
-            });
-        }
-    }
-
-    parse_additive_expr(input)
-}
-
-fn parse_if_expr(input: &str) -> Result<Expr, Error> {
-    // IF(cond, then, else)
-    let inner_start = input
-        .find('(')
-        .ok_or_else(|| Error::Schema("IF missing '('".into()))?
-        + 1;
-    let inner_end = rfind_matching_paren(input, inner_start - 1)?;
-    let inner = &input[inner_start..inner_end];
-
-    // Split on commas at depth 0
-    let parts = split_top_level_commas(inner);
-    if parts.len() != 3 {
-        return Err(Error::Schema(format!(
-            "IF() requires 3 arguments, got {}: '{inner}'",
-            parts.len()
-        )));
-    }
-
-    Ok(Expr::If {
-        condition: Box::new(parse_expr(parts[0])?),
-        then_expr: Box::new(parse_expr(parts[1])?),
-        else_expr: Box::new(parse_expr(parts[2])?),
-    })
-}
-
-fn parse_additive_expr(input: &str) -> Result<Expr, Error> {
-    let input = input.trim();
-
-    // Split on + or - at top level (not inside parens), right-to-left for left-assoc
-    let mut depth = 0i32;
-    let bytes = input.as_bytes();
-    let mut last_op_pos = None;
-
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b'+' | b'-' if depth == 0 && i > 0 => {
-                // Make sure it's not part of a comparison operator or scientific notation
-                if i + 1 < bytes.len() && (bytes[i + 1] == b'=' || bytes[i + 1] == b'>') {
-                    continue;
-                }
-                // Check it's not a unary minus (preceded by operator or start)
-                let prev = bytes[i - 1];
-                if prev == b'(' || prev == b'=' || prev == b',' || prev == b'*' || prev == b'/' {
-                    continue;
-                }
-                last_op_pos = Some(i);
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(pos) = last_op_pos {
-        let left = &input[..pos];
-        let right = &input[pos + 1..];
-        let op = if bytes[pos] == b'+' {
-            BinaryOp::Add
-        } else {
-            BinaryOp::Sub
-        };
-        return Ok(Expr::BinaryOp {
-            left: Box::new(parse_additive_expr(left.trim())?),
-            op,
-            right: Box::new(parse_multiplicative_expr(right.trim())?),
-        });
-    }
-
-    parse_multiplicative_expr(input)
-}
-
-fn parse_multiplicative_expr(input: &str) -> Result<Expr, Error> {
-    let input = input.trim();
-
-    let mut depth = 0i32;
-    let bytes = input.as_bytes();
-    let mut last_op_pos = None;
-
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b'*' | b'/' if depth == 0 => {
-                last_op_pos = Some(i);
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(pos) = last_op_pos {
-        let left = &input[..pos];
-        let right = &input[pos + 1..];
-        let op = if bytes[pos] == b'*' {
-            BinaryOp::Mul
-        } else {
-            BinaryOp::Div
-        };
-        return Ok(Expr::BinaryOp {
-            left: Box::new(parse_multiplicative_expr(left.trim())?),
-            op,
-            right: Box::new(parse_atom_expr(right.trim())?),
-        });
-    }
-
-    parse_atom_expr(input)
-}
-
-fn parse_atom_expr(input: &str) -> Result<Expr, Error> {
-    let input = input.trim();
-
-    if input.is_empty() {
-        return Err(Error::Schema("unexpected empty expression".into()));
-    }
-
-    // Parenthesized expression
-    if input.starts_with('(') && input.ends_with(')') {
-        let inner = &input[1..input.len() - 1];
-        // Verify parens are balanced
-        if is_balanced_parens(inner) {
-            return parse_expr(inner);
-        }
-    }
-
-    // IF function
-    let upper = input.to_uppercase();
-    if upper.starts_with("IF(") || upper.starts_with("IF (") {
-        return parse_if_expr(input);
-    }
-
-    // Numeric literals
-    if let Ok(v) = input.parse::<i64>() {
-        return Ok(Expr::Int(v));
-    }
-    if let Ok(v) = input.parse::<f64>() {
-        return Ok(Expr::Float(v));
-    }
-
-    // String literals
-    if (input.starts_with('\'') && input.ends_with('\''))
-        || (input.starts_with('"') && input.ends_with('"'))
-    {
-        return Ok(Expr::Literal(input[1..input.len() - 1].to_string()));
-    }
-
-    // state.xxx or row.xxx or plain column ref
-    if let Some(field) = input.strip_prefix("state.") {
-        return Ok(Expr::StateRef(field.to_string()));
-    }
-    if let Some(field) = input.strip_prefix("row.") {
-        return Ok(Expr::RowRef(field.to_string()));
-    }
-
-    // Plain identifier
-    if input.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return Ok(Expr::ColumnRef(input.to_string()));
-    }
-
-    Err(Error::Schema(format!("cannot parse expression: '{input}'")))
 }
 
 // --- Utility functions ---
@@ -1363,21 +906,6 @@ fn read_identifier(input: &str, pos: usize) -> Result<(String, usize), Error> {
             "expected identifier at position {pos}, got: '{}'",
             &input[pos..std::cmp::min(pos + 10, input.len())]
         )));
-    }
-    Ok((input[start..p].to_string(), p))
-}
-
-fn read_dotted_name(input: &str, pos: usize) -> Result<(String, usize), Error> {
-    let bytes = input.as_bytes();
-    let start = pos;
-    let mut p = pos;
-    while p < bytes.len()
-        && (bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_' || bytes[p] == b'.')
-    {
-        p += 1;
-    }
-    if p == start {
-        return Err(Error::Schema(format!("expected name at position {pos}")));
     }
     Ok((input[start..p].to_string(), p))
 }
@@ -1455,118 +983,6 @@ fn read_dollar_quoted(input: &str, pos: usize) -> Result<(String, usize), Error>
     Ok((input[start..end].to_string(), end + 2))
 }
 
-fn read_until_keyword(input: &str, pos: usize, keyword: &str) -> Result<(String, usize), Error> {
-    let remaining = &input[pos..];
-    let upper = remaining.to_uppercase();
-    let kw_upper = keyword.to_uppercase();
-
-    // Search for the keyword preceded by whitespace and followed by whitespace
-    let mut search_from = 0;
-    while search_from < upper.len() {
-        if let Some(idx) = upper[search_from..].find(&kw_upper) {
-            let abs_idx = search_from + idx;
-            let before_ok = abs_idx == 0 || remaining.as_bytes()[abs_idx - 1].is_ascii_whitespace();
-            let after_pos = abs_idx + kw_upper.len();
-            let after_ok = after_pos >= remaining.len()
-                || remaining.as_bytes()[after_pos].is_ascii_whitespace();
-
-            if before_ok && after_ok {
-                return Ok((input[pos..pos + abs_idx].trim().to_string(), pos + abs_idx));
-            }
-            search_from = abs_idx + 1;
-        } else {
-            break;
-        }
-    }
-
-    Err(Error::Schema(format!("expected '{keyword}' not found")))
-}
-
-fn read_expr_until_clause_boundary(input: &str, pos: usize) -> Result<(String, usize), Error> {
-    read_expr_until_any(input, pos, &["WHEN", "ALWAYS", "SET", "EMIT", "LET"])
-}
-
-fn read_expr_until_comma_or_clause(input: &str, pos: usize) -> Result<(String, usize), Error> {
-    let bytes = input.as_bytes();
-    let mut p = pos;
-    let mut depth = 0i32;
-
-    while p < bytes.len() {
-        match bytes[p] {
-            b'(' => {
-                depth += 1;
-                p += 1;
-            }
-            b')' => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-                p += 1;
-            }
-            b',' if depth == 0 => break,
-            b';' if depth == 0 => break,
-            _ if depth == 0 => {
-                // Check for clause keywords
-                let remaining_upper = input[p..].to_uppercase();
-                for kw in &["WHEN ", "ALWAYS ", "SET ", "EMIT ", "LET ", "END;", "END "] {
-                    if remaining_upper.starts_with(kw) {
-                        let trimmed = input[pos..p].trim();
-                        if !trimmed.is_empty() {
-                            return Ok((trimmed.to_string(), p));
-                        }
-                    }
-                }
-                p += 1;
-            }
-            _ => {
-                p += 1;
-            }
-        }
-    }
-
-    let result = input[pos..p].trim().to_string();
-    Ok((result, p))
-}
-
-fn read_expr_until_any(
-    input: &str,
-    pos: usize,
-    keywords: &[&str],
-) -> Result<(String, usize), Error> {
-    let bytes = input.as_bytes();
-    let mut p = pos;
-    let mut depth = 0i32;
-
-    while p < bytes.len() {
-        match bytes[p] {
-            b'(' => depth += 1,
-            b')' => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-            }
-            b';' if depth == 0 => break,
-            _ if depth == 0 => {
-                let remaining_upper = input[p..].to_uppercase();
-                for kw in keywords {
-                    let kw_space = format!("{kw} ");
-                    if remaining_upper.starts_with(&kw_space)
-                        || remaining_upper.starts_with(&format!("{kw}\n"))
-                    {
-                        return Ok((input[pos..p].trim().to_string(), p));
-                    }
-                }
-            }
-            _ => {}
-        }
-        p += 1;
-    }
-
-    Ok((input[pos..p].trim().to_string(), p))
-}
-
 fn str_to_column_type(s: &str) -> Result<ColumnType, Error> {
     match s.to_lowercase().as_str() {
         "uint64" => Ok(ColumnType::UInt64),
@@ -1581,150 +997,6 @@ fn str_to_column_type(s: &str) -> Result<ColumnType, Error> {
         "json" | "jsonb" => Ok(ColumnType::JSON),
         _ => Err(Error::Schema(format!("unknown type: '{s}'"))),
     }
-}
-
-fn split_binary_op<'a>(input: &'a str, ops: &[&str]) -> Vec<&'a str> {
-    let mut parts = Vec::new();
-    let mut last = 0;
-    let mut depth = 0i32;
-    let bytes = input.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth -= 1;
-                i += 1;
-            }
-            // Skip quoted strings to avoid matching operators inside them
-            q @ (b'\'' | b'"') => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == q {
-                        i += 1;
-                        if i < bytes.len() && bytes[i] == q {
-                            i += 1; // doubled-quote escape
-                        } else {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            // Operators are pure ASCII — match case-insensitively on raw bytes
-            // to avoid to_uppercase() byte-length misalignment with non-ASCII input.
-            _ if depth == 0 => {
-                let mut matched = false;
-                for op in ops {
-                    let ob = op.as_bytes();
-                    if i + ob.len() <= bytes.len()
-                        && bytes[i..i + ob.len()].eq_ignore_ascii_case(ob)
-                    {
-                        parts.push(&input[last..i]);
-                        last = i + ob.len();
-                        i = last;
-                        matched = true;
-                        break;
-                    }
-                }
-                if !matched {
-                    i += 1;
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    parts.push(&input[last..]);
-    parts
-}
-
-fn split_at_op_outside_parens<'a>(input: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
-    let mut depth = 0i32;
-    let bytes = input.as_bytes();
-    let op_bytes = op.as_bytes();
-
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            _ if depth == 0 && i + op_bytes.len() <= bytes.len() => {
-                if &bytes[i..i + op_bytes.len()] == op_bytes {
-                    // For '=', make sure it's not part of >=, <=, !=
-                    if op == "=" && i > 0 {
-                        let prev = bytes[i - 1];
-                        if prev == b'>' || prev == b'<' || prev == b'!' {
-                            continue;
-                        }
-                    }
-                    return Some((&input[..i], &input[i + op.len()..]));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn split_top_level_commas(input: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut last = 0;
-
-    for (i, b) in input.bytes().enumerate() {
-        match b {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(input[last..i].trim());
-                last = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(input[last..].trim());
-    parts
-}
-
-fn rfind_matching_paren(input: &str, open_pos: usize) -> Result<usize, Error> {
-    let bytes = input.as_bytes();
-    let mut depth = 0i32;
-    for i in open_pos..bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    Err(Error::Schema("unmatched parenthesis".into()))
-}
-
-fn is_balanced_parens(input: &str) -> bool {
-    let mut depth = 0i32;
-    for b in input.bytes() {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    depth == 0
 }
 
 // --- Schema validation ---
@@ -1793,20 +1065,6 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
                 "reducer '{}': cannot source from itself",
                 reducer.name
             )));
-        }
-
-        // The state of a group is a value per STATE field: a SET of another
-        // name would hold nowhere.
-        if let ReducerBody::EventRules { when_blocks, .. } = &reducer.body {
-            let sets = when_blocks.iter().flat_map(|block| &block.sets);
-            for (field, _) in sets {
-                if !reducer.state.iter().any(|f| f.name == *field) {
-                    return Err(Error::Schema(format!(
-                        "reducer '{}': SET state.{field} is not a STATE field",
-                        reducer.name
-                    )));
-                }
-            }
         }
 
         // Validate GROUP BY columns against source table (only when source is a table;
@@ -2016,81 +1274,29 @@ mod tests {
         }
     }
 
+    /// ADR-10: event rules are gone, and the error names Lua.
     #[test]
-    fn parse_event_rules_reducer() {
-        let sql = r#"
-            CREATE TABLE trades (
-                block_number UInt64,
-                block_time   DateTime,
-                user         String,
-                token        String,
-                side         String,
-                amount       Float64,
-                price        Float64
-            );
+    fn rejects_an_event_rules_body() {
+        let reducer = |body: &str| {
+            format!(
+                "CREATE TABLE trades (block_number UInt64, user String, amount Float64);
+                 CREATE REDUCER pnl
+                   SOURCE trades
+                   GROUP BY user
+                   STATE (qty Float64 DEFAULT 0)
+                   {body};"
+            )
+        };
 
-            CREATE REDUCER pnl_tracker
-              SOURCE trades
-              GROUP BY user, token
-              STATE (
-                quantity   Float64 DEFAULT 0,
-                cost_basis Float64 DEFAULT 0
-              )
-
-              WHEN row.side = 'buy' THEN
-                SET state.quantity   = state.quantity + row.amount,
-                    state.cost_basis = state.cost_basis + row.amount * row.price
-                EMIT trade_pnl = 0
-
-              WHEN row.side = 'sell' THEN
-                LET avg_cost = state.cost_basis / state.quantity
-                SET state.quantity   = state.quantity - row.amount,
-                    state.cost_basis = state.cost_basis - row.amount * avg_cost
-                EMIT trade_pnl = row.amount * (row.price - avg_cost)
-
-              ALWAYS EMIT
-                state.quantity AS position_size,
-                IF(state.quantity > 0, state.cost_basis / state.quantity, 0) AS avg_cost;
-        "#;
-        let schema = parse_schema(sql).unwrap();
-        assert_eq!(schema.tables.len(), 1);
-        assert_eq!(schema.reducers.len(), 1);
-
-        let r = &schema.reducers[0];
-        assert_eq!(r.name, "pnl_tracker");
-        assert_eq!(r.source, "trades");
-        assert_eq!(r.group_by, vec!["user", "token"]);
-        assert_eq!(r.state.len(), 2);
-        assert_eq!(r.state[0].name, "quantity");
-        assert_eq!(r.state[0].column_type, ColumnType::Float64);
-        assert_eq!(r.state[0].default, "0");
-        assert_eq!(r.state[1].name, "cost_basis");
-
-        match &r.body {
-            ReducerBody::EventRules {
-                when_blocks,
-                always_emit,
-            } => {
-                assert_eq!(when_blocks.len(), 2);
-
-                // Buy block
-                assert_eq!(when_blocks[0].sets.len(), 2);
-                assert_eq!(when_blocks[0].emits.len(), 1);
-                assert_eq!(when_blocks[0].lets.len(), 0);
-
-                // Sell block
-                assert_eq!(when_blocks[1].lets.len(), 1);
-                assert_eq!(when_blocks[1].lets[0].0, "avg_cost");
-                assert_eq!(when_blocks[1].sets.len(), 2);
-                assert_eq!(when_blocks[1].emits.len(), 1);
-
-                // Always emit
-                let ae = always_emit.as_ref().unwrap();
-                assert_eq!(ae.emits.len(), 2);
-                assert_eq!(ae.emits[0].0, "position_size");
-                assert_eq!(ae.emits[1].0, "avg_cost");
-            }
-            _ => panic!("expected EventRules"),
+        for body in [
+            "WHEN row.amount > 0 THEN SET state.qty = state.qty + row.amount EMIT qty = state.qty",
+            "ALWAYS EMIT state.qty AS qty",
+        ] {
+            let err = parse_schema(&reducer(body)).unwrap_err();
+            assert!(matches!(err, Error::Schema(_)), "{body}: {err}");
+            let message = err.to_string();
+            assert!(message.contains("reducer 'pnl'"), "{message}");
+            assert!(message.contains("LANGUAGE lua"), "{message}");
         }
     }
 
@@ -2224,38 +1430,14 @@ mod tests {
               SOURCE nonexistent_table
               GROUP BY user
               STATE (qty Float64 DEFAULT 0)
-
-              WHEN row.side = 'buy' THEN
-                SET state.qty = state.qty + 1
-                EMIT count = state.qty;
+              LANGUAGE lua
+              PROCESS $$
+                state.qty = state.qty + 1
+                emit { count = state.qty }
+              $$;
         "#;
         let err = parse_schema(sql).unwrap_err();
         assert!(err.to_string().contains("nonexistent_table"));
-    }
-
-    /// A group's state holds the STATE fields only: a SET of another name
-    /// would be lost at the next restore of the state.
-    #[test]
-    fn validation_rejects_set_of_an_undeclared_state_field() {
-        let sql = r#"
-            CREATE TABLE trades (block_number UInt64, user String, price Float64);
-
-            CREATE REDUCER r
-              SOURCE trades
-              GROUP BY user
-              STATE (qty Float64 DEFAULT 0)
-
-              WHEN row.price > 0 THEN
-                SET state.qty = state.qty + 1
-                SET state.total = state.qty
-                EMIT count = state.qty;
-        "#;
-        let err = parse_schema(sql).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("reducer 'r': SET state.total is not a STATE field"),
-            "{err}"
-        );
     }
 
     /// A stored row holds its column count, and a column position, in a u16.
@@ -2301,10 +1483,11 @@ mod tests {
               SOURCE trades
               GROUP BY user, nonexistent_col
               STATE (qty Float64 DEFAULT 0)
-
-              WHEN row.price > 0 THEN
-                SET state.qty = state.qty + 1
-                EMIT count = state.qty;
+              LANGUAGE lua
+              PROCESS $$
+                state.qty = state.qty + 1
+                emit { count = state.qty }
+              $$;
         "#;
         let err = parse_schema(sql).unwrap_err();
         assert!(err.to_string().contains("nonexistent_col"));
@@ -2333,21 +1516,27 @@ mod tests {
                 quantity   Float64 DEFAULT 0,
                 cost_basis Float64 DEFAULT 0
               )
-
-              WHEN row.amount_in > 0 THEN
-                LET avg_cost = state.cost_basis / state.quantity
-                SET state.quantity   = state.quantity - row.amount_in,
-                    state.cost_basis = state.cost_basis - row.amount_in * avg_cost
-                EMIT trade_pnl = row.amount_in * (row.price - avg_cost)
-
-              WHEN row.amount_out > 0 THEN
-                SET state.quantity   = state.quantity + row.amount_out,
-                    state.cost_basis = state.cost_basis + row.amount_out * row.price
-                EMIT trade_pnl = 0
-
-              ALWAYS EMIT
-                state.quantity AS position_size,
-                IF(state.quantity > 0, state.cost_basis / state.quantity, 0) AS avg_cost;
+              LANGUAGE lua
+              PROCESS $$
+                local trade_pnl = nil
+                if row.amount_in > 0 then
+                  local avg_cost = state.cost_basis / state.quantity
+                  state.quantity = state.quantity - row.amount_in
+                  state.cost_basis = state.cost_basis - row.amount_in * avg_cost
+                  trade_pnl = row.amount_in * (row.price - avg_cost)
+                elseif row.amount_out > 0 then
+                  state.quantity = state.quantity + row.amount_out
+                  state.cost_basis = state.cost_basis + row.amount_out * row.price
+                  trade_pnl = 0
+                end
+                local avg_cost = 0
+                if state.quantity > 0 then avg_cost = state.cost_basis / state.quantity end
+                emit {
+                  trade_pnl = trade_pnl,
+                  position_size = state.quantity,
+                  avg_cost = avg_cost,
+                }
+              $$;
 
             CREATE MATERIALIZED VIEW pnl_5m AS
               SELECT
@@ -2389,170 +1578,12 @@ mod tests {
         assert_eq!(schema.materialized_views[2].name, "volume_5m");
     }
 
-    #[test]
-    fn parse_expr_arithmetic() {
-        let expr = parse_expr("state.quantity + row.amount").unwrap();
-        match expr {
-            Expr::BinaryOp {
-                left,
-                op: BinaryOp::Add,
-                right,
-            } => {
-                assert!(matches!(*left, Expr::StateRef(ref s) if s == "quantity"));
-                assert!(matches!(*right, Expr::RowRef(ref s) if s == "amount"));
-            }
-            _ => panic!("expected BinaryOp::Add, got {expr:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_expr_multiply_and_subtract() {
-        let expr = parse_expr("row.amount * (row.price - avg_cost)").unwrap();
-        match expr {
-            Expr::BinaryOp {
-                op: BinaryOp::Mul, ..
-            } => {}
-            _ => panic!("expected Mul at top level, got {expr:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_expr_if_function() {
-        let expr =
-            parse_expr("IF(state.quantity > 0, state.cost_basis / state.quantity, 0)").unwrap();
-        match expr {
-            Expr::If {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                assert!(matches!(
-                    *condition,
-                    Expr::BinaryOp {
-                        op: BinaryOp::Gt,
-                        ..
-                    }
-                ));
-                assert!(matches!(
-                    *then_expr,
-                    Expr::BinaryOp {
-                        op: BinaryOp::Div,
-                        ..
-                    }
-                ));
-                assert!(matches!(*else_expr, Expr::Int(0)));
-            }
-            _ => panic!("expected If, got {expr:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_expr_string_comparison() {
-        let expr = parse_expr("row.side = 'buy'").unwrap();
-        match expr {
-            Expr::BinaryOp {
-                left,
-                op: BinaryOp::Eq,
-                right,
-            } => {
-                assert!(matches!(*left, Expr::RowRef(ref s) if s == "side"));
-                assert!(matches!(*right, Expr::Literal(ref s) if s == "buy"));
-            }
-            _ => panic!("expected Eq, got {expr:?}"),
-        }
-    }
-
-    /// Issue #8: OR conditions must be parsed correctly.
-    #[test]
-    fn parse_expr_or_condition() {
-        let expr = parse_expr("row.side = 'buy' OR row.side = 'sell'").unwrap();
-        match expr {
-            Expr::BinaryOp {
-                op: BinaryOp::Or,
-                left,
-                right,
-            } => {
-                match *left {
-                    Expr::BinaryOp {
-                        op: BinaryOp::Eq, ..
-                    } => {}
-                    other => panic!("expected Eq on left, got {other:?}"),
-                }
-                match *right {
-                    Expr::BinaryOp {
-                        op: BinaryOp::Eq, ..
-                    } => {}
-                    other => panic!("expected Eq on right, got {other:?}"),
-                }
-            }
-            other => panic!("expected Or, got {other:?}"),
-        }
-    }
-
-    /// Issue #8: OR has lower precedence than AND.
-    #[test]
-    fn parse_expr_or_and_precedence() {
-        // "a = 1 OR b = 2 AND c = 3" should parse as "a = 1 OR (b = 2 AND c = 3)"
-        let expr = parse_expr("row.a = '1' OR row.b = '2' AND row.c = '3'").unwrap();
-        match expr {
-            Expr::BinaryOp {
-                op: BinaryOp::Or,
-                right,
-                ..
-            } => match *right {
-                Expr::BinaryOp {
-                    op: BinaryOp::And, ..
-                } => {}
-                other => panic!("expected And on right side of Or, got {other:?}"),
-            },
-            other => panic!("expected Or at top level, got {other:?}"),
-        }
-    }
-
-    /// split_binary_op must not panic on multibyte UTF-8 in quoted strings.
-    #[test]
-    fn parse_expr_multibyte_utf8_in_condition() {
-        let expr = parse_expr("row.msg = 'café' OR row.msg = 'naïve'").unwrap();
-        match expr {
-            Expr::BinaryOp {
-                op: BinaryOp::Or, ..
-            } => {}
-            other => panic!("expected Or, got {other:?}"),
-        }
-    }
-
-    /// to_uppercase() changes byte length for some chars (e.g. 'ß' → "SS").
-    /// split_binary_op must handle this without index misalignment.
-    #[test]
-    fn parse_expr_uppercase_length_change() {
-        // 'ß' is 2 bytes, uppercases to "SS" (2 bytes → 2 chars but same byte count here).
-        // Use a more extreme case: column named with non-ASCII that changes length.
-        let expr = parse_expr("row.x = 'straße' AND row.y = '1'").unwrap();
-        match expr {
-            Expr::BinaryOp {
-                op: BinaryOp::And, ..
-            } => {}
-            other => panic!("expected And, got {other:?}"),
-        }
-    }
-
     /// Issue #24: read_token must handle SQL doubled-quote escaping.
     #[test]
     fn read_token_handles_doubled_quotes() {
         let (token, end) = read_token("'it''s fine' rest", 0).unwrap();
         assert_eq!(token, "'it''s fine'");
         assert_eq!(end, 12);
-    }
-
-    /// Issue #23: split_as_alias must handle non-ASCII characters before AS keyword.
-    #[test]
-    fn parse_mv_with_non_ascii_alias_source() {
-        // Non-ASCII chars before AS keyword — would panic with char-count indexing
-        let result = split_as_alias("SUM(café) AS total");
-        assert!(result.is_some());
-        let (expr, alias) = result.unwrap();
-        assert_eq!(expr, "SUM(café)");
-        assert_eq!(alias, "total");
     }
 
     #[test]
@@ -2596,10 +1627,10 @@ mod tests {
               STATE (
                 total_received Uint256 DEFAULT 0
               )
-
-              WHEN row.amount > 0 THEN
-                SET state.total_received = state.total_received + row.amount
-                EMIT balance = state.total_received;
+              LANGUAGE lua
+              PROCESS $$
+                emit { balance = state.total_received }
+              $$;
         "#;
         let schema = parse_schema(sql).unwrap();
         assert_eq!(schema.reducers.len(), 1);
