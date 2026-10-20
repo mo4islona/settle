@@ -87,6 +87,43 @@ fn a_module_that_does_not_load_fails_the_open() {
     }
 }
 
+/// A module can set a metatable on the globals: the setup of the runtime after
+/// the module, and the next module, do not go through it.
+#[test]
+fn a_module_that_guards_the_globals_does_not_break_the_open() {
+    for name in ["state", "row", "emit", "util"] {
+        let schema = format!(
+            "CREATE TABLE swaps (block_number UInt64, pool String, amount UInt64); \
+             CREATE MODULE guard LANGUAGE lua AS $$ \
+                 setmetatable(_G, {{ __newindex = function(_, key) \
+                     if key == '{name}' then error('blocked') end \
+                 end }}) \
+                 return {{}} \
+             $$; \
+             CREATE MODULE util LANGUAGE lua AS $$ return {{ one = 1 }} $$; \
+             CREATE REDUCER r SOURCE swaps GROUP BY pool STATE (n UInt64 DEFAULT 0) \
+             REQUIRE guard, util LANGUAGE lua PROCESS $$ \
+                 state.n = state.n + row.amount * util.one \
+                 emit {{ n = state.n }} \
+             $$; \
+             CREATE MATERIALIZED VIEW v AS SELECT pool, last(n) AS total FROM r GROUP BY pool;"
+        );
+        let mut db = Settle::open(Config::new(&schema)).unwrap();
+
+        let row = HashMap::from([
+            ("pool".to_string(), Value::String("ETH".into())),
+            ("amount".to_string(), Value::UInt64(5)),
+        ]);
+        let batch = ingest_one(&mut db, "swaps", 1, vec![row]).unwrap().unwrap();
+        let totals: Vec<_> = batch
+            .records_for("v")
+            .iter()
+            .filter_map(|r| r.get("total").and_then(Value::as_u64))
+            .collect();
+        assert_eq!(totals, [5], "{name}");
+    }
+}
+
 /// Each change of the case mapping: a character whose uppercase has another
 /// length in UTF-8, inserted at each position, and the characters whose
 /// uppercase is an ASCII letter in place of that letter.

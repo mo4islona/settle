@@ -103,38 +103,37 @@ impl LuaRuntime {
         modules: &[(String, String)],
     ) -> Result<Self> {
         let lua = Lua::new();
+        let not_set_up = |e| Error::Schema(format!("the Lua runtime does not set up: {e}"));
 
         // Sandbox: remove dangerous globals
-        sandbox(&lua).expect("failed to sandbox Lua");
+        sandbox(&lua).map_err(not_set_up)?;
 
         // Provide json module
-        register_json_module(&lua).expect("failed to register json module");
+        register_json_module(&lua).map_err(not_set_up)?;
 
-        // Load required modules: execute each script once, store return value as global
+        // Load required modules: execute each script once, store return value as global.
+        // A module can set a metatable on the globals: from here on, the setup
+        // writes them raw.
         for (name, code) in modules {
             let not_loaded = |e| Error::Schema(format!("module '{name}' does not load: {e}"));
             let result: LuaValue = lua.load(code.as_str()).eval().map_err(not_loaded)?;
             lua.globals()
-                .set(name.as_str(), result)
+                .raw_set(name.as_str(), result)
                 .map_err(not_loaded)?;
         }
 
         // Create persistent state and row tables as globals
-        let state_table = lua.create_table().expect("failed to create state table");
+        let state_table = lua.create_table().map_err(not_set_up)?;
         lua.globals()
-            .set("state", state_table.clone())
-            .expect("failed to set state global");
-        let state_key = lua
-            .create_registry_value(state_table)
-            .expect("failed to store state in registry");
+            .raw_set("state", state_table.clone())
+            .map_err(not_set_up)?;
+        let state_key = lua.create_registry_value(state_table).map_err(not_set_up)?;
 
-        let row_table = lua.create_table().expect("failed to create row table");
+        let row_table = lua.create_table().map_err(not_set_up)?;
         lua.globals()
-            .set("row", row_table.clone())
-            .expect("failed to set row global");
-        let row_key = lua
-            .create_registry_value(row_table)
-            .expect("failed to store row in registry");
+            .raw_set("row", row_table.clone())
+            .map_err(not_set_up)?;
+        let row_key = lua.create_registry_value(row_table).map_err(not_set_up)?;
 
         // Register `emit` as a Rust callback. Each emit({...}) call goes into
         // the emit buffer at once — no Lua table accumulation.
@@ -149,10 +148,8 @@ impl LuaRuntime {
                 }
                 Ok(())
             })
-            .expect("failed to create emit function");
-        lua.globals()
-            .set("emit", emit_fn)
-            .expect("failed to set emit global");
+            .map_err(not_set_up)?;
+        lua.globals().raw_set("emit", emit_fn).map_err(not_set_up)?;
 
         // Spare maps for the time between groups.
         let names = ColumnRegistry::new(map_fields.iter().map(|(name, _)| name.clone()).collect());
@@ -170,7 +167,7 @@ impl LuaRuntime {
                 lua.create_userdata(field).map(LuaValue::UserData)
             })
             .collect::<LuaResult<_>>()
-            .expect("failed to create the Map fields");
+            .map_err(not_set_up)?;
 
         // Pre-compile wrapper: calls user function and returns state fields.
         // Using string concat (not format!) to avoid issues with {} in Lua scripts.
@@ -228,9 +225,7 @@ impl LuaRuntime {
             .load(&call_src)
             .call(map_args)
             .map_err(|e| Error::Schema(format!("the body does not compile: {e}")))?;
-        let call_key = lua
-            .create_registry_value(call_func)
-            .expect("failed to store call function in registry");
+        let call_key = lua.create_registry_value(call_func).map_err(not_set_up)?;
 
         // Determine which row fields the script actually accesses.
         // Only those fields will be marshalled to Lua per row.
