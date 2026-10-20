@@ -664,6 +664,11 @@ impl MVEngine {
         }
     }
 
+    #[cfg(test)]
+    pub fn first_unfinal_block(&self) -> Option<BlockNumber> {
+        self.block_groups.keys().next().copied()
+    }
+
     /// Merge the blocks up to `block` into finalized state. The groups whose
     /// stored state changed wait in `pending_durable` for `write_checkpoint`.
     /// A sliding window keeps its blocks apart until they expire, final or

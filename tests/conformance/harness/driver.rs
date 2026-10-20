@@ -90,8 +90,6 @@ struct Run<'s> {
     seen: BTreeMap<String, u64>,
     /// The view deletes of the current batch that merge a compensation update (GAP-47).
     merged: HashSet<(String, model::Key)>,
-    /// From an open to the next ingest, Settle reports `D` as its finality (GAP-3).
-    finality_lags: bool,
     log: Vec<String>,
 }
 
@@ -126,7 +124,6 @@ impl<'s> Run<'s> {
             hits: Hits::default(),
             seen: BTreeMap::new(),
             merged: HashSet::new(),
-            finality_lags: false,
             log: Vec::new(),
         }
     }
@@ -158,7 +155,6 @@ impl<'s> Run<'s> {
                 .map(|b| b.seq),
             places: self.model.places(),
             max_unacked: self.cfg.depth,
-            finality_lags: self.finality_lags,
         }
     }
 
@@ -185,11 +181,8 @@ impl<'s> Run<'s> {
                     self.ledger.record(self.schema, table, table_rows);
                 }
                 let actual = self.db().ingest(input);
-                if self.call(&before, expected, actual) {
-                    self.finality_lags = false;
-                    if self.model.in_line_fork() {
-                        self.saw("in-line fork");
-                    }
+                if self.call(&before, expected, actual) && self.model.in_line_fork() {
+                    self.saw("in-line fork");
                 }
             }
             Step::Fork { chain, .. } => {
@@ -278,7 +271,6 @@ impl<'s> Run<'s> {
         self.applied_unacked.clear();
         self.projected = self.target.clone();
         self.validator.reopen();
-        self.finality_lags = true;
     }
 
     /// Compares one ingest or fork call; true when it succeeded.
@@ -364,13 +356,10 @@ impl<'s> Run<'s> {
             ));
         }
         if expected.finalized != actual.finalized {
-            if !self.gap3_head(&actual.finalized) {
-                self.fail(format!(
-                    "finalized head {:?}, the model {:?}",
-                    actual.finalized, expected.finalized
-                ));
-            }
-            self.hits.hit(Gap::Gap3);
+            self.fail(format!(
+                "finalized head {:?}, the model {:?}",
+                actual.finalized, expected.finalized
+            ));
         }
 
         let by_key = |batch: &Batch| -> HashMap<(String, model::Key), Record> {
@@ -462,17 +451,9 @@ impl<'s> Run<'s> {
         }
     }
 
-    /// After an open Settle reports `(D, H(D))` as its finalized head (GAP-3).
-    fn gap3_head(&self, head: &Option<Cursor>) -> bool {
-        let st = &self.model.st;
-        let durable = st.d.unwrap_or(0);
-        let expected = st.h.get(&durable).map(|h| (durable, h.clone()));
-        self.finality_lags && durable < st.f && *head == expected
-    }
-
     /// The status reads, twice (INV-13, INV-30).
     fn compare_status(&mut self) {
-        let mut expected = self.model.status();
+        let expected = self.model.status();
         let db = self.db.as_ref().expect("an open instance");
         let actual = status(db);
         if actual != status(db) {
@@ -490,16 +471,6 @@ impl<'s> Run<'s> {
             return;
         }
 
-        let lags = (actual.finalized_block, &actual.finalized_cursor)
-            != (expected.finalized_block, &expected.finalized_cursor);
-        if lags
-            && self.gap3_head(&actual.finalized_cursor)
-            && actual.finalized_block == expected.durable_block
-        {
-            self.hits.hit(Gap::Gap3);
-            expected.finalized_block = actual.finalized_block;
-            expected.finalized_cursor = actual.finalized_cursor.clone();
-        }
         if actual != expected {
             self.fail(format!("status {actual:#?}\nthe model {expected:#?}"));
         }

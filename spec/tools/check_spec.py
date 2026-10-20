@@ -140,7 +140,7 @@ CHECKS = {
     "adr-date-mismatch": (E, "The log date equals the date in the file's Status line."),
     "adr-id-mismatch": (E, "File name, heading and log row agree on the number."),
     "adr-bad-status": (E, "Every ADR has a status from the allowed set."),
-    "adr-log-order": (W, "Accepted rows run in ascending number and date order."),
+    "adr-log-order": (W, "Accepted rows run in ascending number order. A proposal can be accepted after a later record."),
     "adr-title-drift": (I, "The log title equals the ADR heading."),
     "req-missing-tag": (E, "Every REQ carries an RFC 2119 tag."),
     "req-missing-acceptance": (E, "Every REQ carries an Acceptance field."),
@@ -703,10 +703,10 @@ class Checker:
         for n, (rel, _, _) in sorted(files.items()):
             if n not in rows:
                 self.add("adr-missing-row", rel, 1, f"ADR-{n} has no row in {DECISION_LOG}")
-        for (n1, d1, _), (n2, d2, line) in zip(accepted, accepted[1:]):
-            if n2 < n1 or (d1 and d2 and d2 < d1):
+        for (n1, _, _), (n2, _, line) in zip(accepted, accepted[1:]):
+            if n2 < n1:
                 self.add("adr-log-order", DECISION_LOG, line,
-                         f"ADR-{n2} follows ADR-{n1} out of number or date order")
+                         f"ADR-{n2} follows ADR-{n1} out of number order")
 
     # ── normative text ──
 

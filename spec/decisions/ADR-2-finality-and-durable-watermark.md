@@ -17,7 +17,7 @@ Several defects came from fork detection. An omitted chain counted as a fork and
 - The finality lag, not the history, bounds the memory for undo data.
 - A source that contradicts its finality stops the host with FORK_BELOW_FINALITY. The host cannot repair it without a new database.
 - A host that supplies no hashes gets no fork detection (FM-24).
-- The floor must also hold across a reopen. Today it does not (GAP-3, ADR-7).
+- The floor must also hold across a reopen (ADR-7).
 - Shapes: REQ-4, REQ-5, WP-10, WP-11, WP-13, INV-11, NG-7.
 
 ## 2. Finality can run ahead of the latest block
@@ -47,5 +47,5 @@ A first design stored the finality watermark and wrote derived state only at the
 - A crash replays up to P-CHECKPOINT-INTERVAL extra blocks. The raw rows above `D` must stay (RS-1).
 - External reducers cannot defer: a replay at open cannot run them before the host attaches their code (ADR-5).
 - Sliding views do not defer: they were not tested with deferral, and they would gain little (OQ-5).
-- A reopen restores `F` from the stored `D`, so finality goes back at a reopen (GAP-3). ADR-7 proposes the fix.
+- A reopen restores `F` from the stored `D`, so finality goes back at a reopen. ADR-7 stores `F` as well.
 - Shapes: REQ-16, WP-40, WP-41, WP-42, INV-44, DEF-84.

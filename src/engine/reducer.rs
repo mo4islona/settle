@@ -500,6 +500,11 @@ impl ReducerEngine {
         self.emit_growth.clear();
     }
 
+    #[cfg(test)]
+    pub fn first_unfinal_block(&self) -> Option<BlockNumber> {
+        self.block_groups.keys().next().copied()
+    }
+
     /// Merge the blocks up to `block` into finalized state: they can no longer
     /// roll back, so their undo entries go. Their groups wait in
     /// `pending_durable` for `write_checkpoint`.

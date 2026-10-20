@@ -39,9 +39,6 @@ pub struct Host {
     pub newest: Option<u64>,
     pub places: usize,
     pub max_unacked: usize,
-    /// After a reopen Settle reports `D` as its finality (GAP-3) until the
-    /// next ingest. A call that finality alone rejects would pass there.
-    pub finality_lags: bool,
 }
 
 pub struct Sim<'s> {
@@ -84,7 +81,7 @@ impl<'s> Sim<'s> {
             return step;
         }
         if roll < 25
-            && let Some(step) = self.invalid(st, host)
+            && let Some(step) = self.invalid(st)
         {
             return step;
         }
@@ -181,13 +178,13 @@ impl<'s> Sim<'s> {
     }
 
     /// A call that the spec rejects, and that changes nothing.
-    fn invalid(&mut self, st: &State, host: &Host) -> Option<Step> {
+    fn invalid(&mut self, st: &State) -> Option<Step> {
         let l = st.l?;
         let chain = self.recent_chain(st);
         let fin = (st.f, self.source_hash(st.f));
 
         match self.rng.below(5) {
-            0 if st.f > 0 && !host.finality_lags => {
+            0 if st.f > 0 => {
                 let lower = st.f - 1 - self.rng.below(st.f.min(3));
                 let fin = (lower, self.source_hash(lower));
                 Some(Step::Ingest {
@@ -229,7 +226,7 @@ impl<'s> Sim<'s> {
                     what: "no ancestor",
                 })
             }
-            4 if st.f > 0 && st.f <= l && !host.finality_lags => {
+            4 if st.f > 0 && st.f <= l => {
                 let mut chain = chain;
                 chain.push((st.f, format!("0xbad{:x}", st.f)));
                 Some(Step::Ingest {

@@ -177,9 +177,9 @@ pub struct SettleEngine {
     /// is then only in memory, rebuilt from raw rows on recovery).
     finalized_block: BlockNumber,
     /// Highest block whose derived reducer/MV state is actually persisted to
-    /// disk. Invariant `durable_block <= min(finalized_block, latest)`. Written
-    /// to disk as `META_FINALIZED_BLOCK` so recovery replays from
-    /// here. Equals `finalized_block` unless backfill deferral is active.
+    /// disk. Invariant `durable_block <= min(finalized_block, latest)`.
+    /// Recovery replays from here. Equals `finalized_block` unless backfill
+    /// deferral is active.
     /// None until a checkpoint covers data: `Some(0)` means block 0
     /// is durable, which an empty database must not claim.
     durable_block: Option<BlockNumber>,
@@ -1199,9 +1199,10 @@ impl SettleEngine {
     }
 
     /// Fork resolution stops at finality, so hashes below it only take
-    /// memory and storage. Two of them stay: a reopen restarts
-    /// finality at the durable block and reads its hash, and on gappy chains
-    /// `latest_cursor` reads the hash of a latest block below finality.
+    /// memory and storage. Two of them stay: a reopen of a store without the
+    /// finality key restarts finality at the durable block and reads its
+    /// hash, and on gappy chains `latest_cursor` reads the hash of a latest
+    /// block below finality.
     fn prune_block_hashes(&mut self) {
         let finalized = self.finalized_block;
         let anchors = [self.durable_block, self.latest_block];
@@ -1262,8 +1263,8 @@ impl SettleEngine {
     }
 
     /// Highest block whose derived state is durably persisted, or None if no
-    /// data is. Written to disk as `META_FINALIZED_BLOCK` so recovery replays
-    /// raw rows from the block after it, or from block 0 without it.
+    /// data is. Recovery replays raw rows from the block after it, or from
+    /// block 0 without it.
     pub fn durable_block(&self) -> Option<BlockNumber> {
         self.durable_block
     }
@@ -1277,6 +1278,26 @@ impl SettleEngine {
     /// (no sliding-window MV, no external reducer).
     pub fn defer_allowed(&self) -> bool {
         self.defer_allowed
+    }
+
+    /// The lowest block that a reducer or an MV still holds as unfinal.
+    #[cfg(test)]
+    pub fn first_unfinal_block(&self) -> Option<BlockNumber> {
+        let reducers = self
+            .branches
+            .iter()
+            .map(|b| &b.reducer)
+            .chain(self.reducers.values());
+        let mvs = self
+            .branches
+            .iter()
+            .flat_map(|b| b.mv_entries.iter().map(|(_, mv)| mv))
+            .chain(self.mvs.values());
+
+        reducers
+            .filter_map(ReducerEngine::first_unfinal_block)
+            .chain(mvs.filter_map(MVEngine::first_unfinal_block))
+            .min()
     }
 
     /// True once finality advanced at least once (or state was restored).
@@ -1297,11 +1318,10 @@ impl SettleEngine {
         self.latest_block = Some(block);
     }
 
-    pub fn set_finalized_block(&mut self, block: BlockNumber) {
+    /// Restore the durable block of a reopened store, with finality at it
+    /// until the replay of the blocks above it is done.
+    pub fn restore_durable_block(&mut self, block: BlockNumber) {
         self.finalized_block = block;
-        // On-disk `META_FINALIZED_BLOCK` is the DURABLE watermark, so restoring
-        // it sets durable == finalized: derived state on disk is exactly
-        // as-of-`block`, and recovery replays raw rows from block+1.
         self.durable_block = Some(block);
         // Restored state is on disk already: advancing to the same block
         // again has nothing to do.

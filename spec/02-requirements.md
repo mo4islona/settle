@@ -41,7 +41,7 @@ When the source replaces recent blocks, Settle undoes their effect on the target
 *Acceptance:* After a random history of ingests and forks above finality, the target equals a recomputation over the chain that remains (CT-1). The two fork paths give the same target.
 *Trace:* ADR-2; TR-2, WP-10, WP-11, WP-14, INV-20.
 
-**REQ-5 — Irreversible finality.** [MUST — intent, currently violated by GAP-3 after a reopen]
+**REQ-5 — Irreversible finality.** [MUST]
 The host reports a finalized head with every ingest call. Within a run, blocks at or below the finality watermark never change. Across a reopen, the same holds for the finality watermark of the last durable commit. Settle refuses a fork whose common ancestor lies below the watermark.
 *Acceptance:* A fork below finality fails with FORK_BELOW_FINALITY and changes nothing. After a reopen, the finalized cursor equals the finalized cursor of the last durable commit.
 *Trace:* ADR-2, ADR-7; WP-13, WP-20, INV-10, INV-11, INV-47.

@@ -240,7 +240,9 @@ pub struct ForkResult {
 
 // Metadata keys for persistence
 const META_LATEST_BLOCK: &str = "latest_block";
-const META_FINALIZED_BLOCK: &str = "finalized_block";
+/// The durable block `D`. The name is from before deferral, when `D` was `F`.
+const META_DURABLE_BLOCK: &str = "finalized_block";
+const META_FINALITY_BLOCK: &str = "finality_block";
 const META_BLOCK_HASHES: &str = "block_hashes";
 const META_NEXT_SEQUENCE: &str = "next_sequence";
 
@@ -312,7 +314,7 @@ fn recover_journal(storage: &dyn StorageBackend, applied: Option<u64>) -> Result
 fn has_data(storage: &dyn StorageBackend) -> Result<bool> {
     for key in [
         META_LATEST_BLOCK,
-        META_FINALIZED_BLOCK,
+        META_DURABLE_BLOCK,
         META_BLOCK_HASHES,
         META_NEXT_SEQUENCE,
     ] {
@@ -430,8 +432,8 @@ impl Settle {
         if let Some(block) = meta_u64(storage.as_ref(), META_LATEST_BLOCK)? {
             engine.set_latest_block(block);
         }
-        if let Some(block) = meta_u64(storage.as_ref(), META_FINALIZED_BLOCK)? {
-            engine.set_finalized_block(block);
+        if let Some(block) = meta_u64(storage.as_ref(), META_DURABLE_BLOCK)? {
+            engine.restore_durable_block(block);
         }
         engine.restore_block_hashes(storage.get_block_hashes()?.into_iter().collect());
 
@@ -442,6 +444,12 @@ impl Settle {
         let latest = engine.latest_block();
         if latest >= replay_from {
             engine.replay_unfinalized(replay_from, latest)?;
+        }
+        // Under deferral, and on a gappy chain, finality is above the durable
+        // block: the replayed blocks up to it become final again. A store
+        // without the key restarts finality at the durable block.
+        if let Some(block) = meta_u64(storage.as_ref(), META_FINALITY_BLOCK)? {
+            engine.advance_finality(block);
         }
 
         let mut buffer = ChangeBuffer::new(config.max_buffer_size);
@@ -1031,7 +1039,7 @@ impl Settle {
         //    Backfill deferral: when the ingest is no-lag (finalized head at the
         //    batch tip — historical backfill), the pipeline is deferral-safe,
         //    and the checkpoint interval hasn't elapsed, no checkpoint is
-        //    written. The durable watermark (META_FINALIZED_BLOCK) then stays
+        //    written. The durable watermark (META_DURABLE_BLOCK) then stays
         //    put and recovery replays raw rows from it. Any lag (tip
         //    operation), interval elapse, or a deferral-unsafe pipeline writes
         //    one, catching the durable watermark up to finality.
@@ -1391,26 +1399,26 @@ impl Settle {
         self.guard_no_pending()
     }
 
-    /// Append engine metadata (latest_block, durable watermark, the block
-    /// hashes that changed) and the stamp to a write batch for atomic commit.
+    /// Append engine metadata (latest_block, the durable and the finality
+    /// watermarks, the block hashes that changed) and the stamp to a write
+    /// batch for atomic commit.
     ///
-    /// `META_FINALIZED_BLOCK` stores the engine's DURABLE watermark, not the
-    /// in-memory finality watermark. Under backfill deferral the two diverge:
-    /// derived state on disk is only as-of `durable_block`, so recovery must
-    /// replay raw rows from `durable_block + 1`. On disk the field's meaning is
-    /// exactly "state is durable as of this block" — for non-deferred operation
-    /// `durable_block == finalized_block`, so this is back-compatible with DBs
-    /// written before backfill mode existed. The client still sees the true
-    /// finality watermark via `finalized_cursor()` in the ChangeBatch. The key
-    /// stays absent until data is durable, and recovery then replays from 0.
-    /// `META_LATEST_BLOCK` stays absent until a block exists: a stored 0 reads
-    /// back as block 0.
+    /// Under backfill deferral the two watermarks diverge: derived state on
+    /// disk is only as-of `durable_block`, so recovery must replay raw rows
+    /// from `durable_block + 1`, and then restores finality from
+    /// `META_FINALITY_BLOCK`. The durable key stays absent until data is
+    /// durable, and recovery then replays from 0. `META_LATEST_BLOCK` stays
+    /// absent until a block exists: a stored 0 reads back as block 0.
     fn append_meta_to_batch(&mut self, batch: &mut StorageWriteBatch) {
         if let Some(latest) = self.engine.latest_block_if_any() {
             batch.put_meta(META_LATEST_BLOCK, &latest.to_be_bytes());
         }
         if let Some(durable) = self.engine.durable_block() {
-            batch.put_meta(META_FINALIZED_BLOCK, &durable.to_be_bytes());
+            batch.put_meta(META_DURABLE_BLOCK, &durable.to_be_bytes());
+        }
+        if self.engine.has_finalized() {
+            let finalized = self.engine.finalized_block();
+            batch.put_meta(META_FINALITY_BLOCK, &finalized.to_be_bytes());
         }
         for (block, hash) in self.engine.take_hash_changes() {
             match hash {
@@ -1426,3 +1434,51 @@ impl Settle {
 #[path = "db_external_tests.rs"]
 mod external_tests;
 
+#[cfg(all(test, feature = "lua"))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::storage::memory::MemoryBackend;
+    use crate::test_helpers::ingest_with_finalized;
+
+    const SCHEMA: &str = "
+        CREATE TABLE swaps (block_number UInt64, pool String, amount UInt64);
+        CREATE REDUCER running SOURCE swaps GROUP BY pool
+        STATE (total UInt64 DEFAULT 0)
+        LANGUAGE lua
+        PROCESS $$ state.total = state.total + row.amount emit { total = state.total } $$;
+        CREATE MATERIALIZED VIEW pools AS
+        SELECT pool, sum(amount) AS volume, last(total) AS total FROM running GROUP BY pool;
+    ";
+
+    /// Under deferral the durable block stays at 0 while finality reaches 49.
+    /// The open replays blocks 1 to 49, and they are final at once (RS-12).
+    #[test]
+    fn reopen_keeps_no_unfinal_state_at_or_below_finality() {
+        let storage = Arc::new(MemoryBackend::new());
+        let open = || {
+            let config = Config::new(SCHEMA)
+                .storage(storage.clone())
+                .backfill_checkpoint_interval(1000);
+            Settle::open(config).unwrap()
+        };
+        let row = RowMap::from([
+            ("pool".to_string(), Value::String("ETH".to_string())),
+            ("amount".to_string(), Value::UInt64(1)),
+        ]);
+
+        {
+            let mut db = open();
+            for block in 0..50 {
+                let rows = vec![("swaps".to_string(), block, vec![row.clone()])];
+                ingest_with_finalized(&mut db, rows, block).unwrap();
+            }
+            assert_eq!((db.durable_block(), db.finalized_block()), (0, 49));
+        }
+
+        let db = open();
+        assert_eq!(db.finalized_block(), 49);
+        assert_eq!(db.engine.first_unfinal_block(), None);
+    }
+}

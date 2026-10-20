@@ -179,7 +179,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | REQ-2 | C | Validation tests compare the state after a failed ingest with the state before it. |
 | REQ-3 | P | CT-1 checks each record against the model and the target. known-violated for raw deletes (GAP-10). |
 | REQ-4 | C | CT-1 sends forks by both paths, also as hash conflicts, against the model. |
-| REQ-5 | P | known-violated: an open restores `F` as `D`, below the `F` of the last durable commit (GAP-3). |
+| REQ-5 | C | CT-1 sends forks below finality and smaller finalized heads, also after a reopen, with deferral and with gappy chains. A test reopens at `F = 49` with `D = 48`. |
 | REQ-6 | C | Gappy chains are in the differential and in the ack tests. |
 | REQ-7 | P | Many tests use virtual tables. No test checks the absence of their records after a fork. |
 | REQ-8 | U | known-violated (GAP-16). |
@@ -224,8 +224,8 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | INV-7 | CT-2, CT-7 | P | Tests of the purge margin. |
 | INV-8 | CT-1, CT-4 | C | Tests of the emit limit and of columns that shrink. |
 | INV-9 | CT-1 | P | CT-1 compares the derived state with the model for raw and virtual tables, Lua reducers with Map state, and the Int and Float modes. Chained and external reducers and the BigInt mode are not in CT-1. |
-| INV-10 | CT-1, CT-2 | P | known-violated (GAP-3). CT-1 checks `F` after every call. |
-| INV-11 | CT-1, CT-2 | P | In a running process: C. known-violated after a reopen (GAP-3). |
+| INV-10 | CT-1, CT-2 | C | CT-1 checks `F` after every call, also after a reopen. |
+| INV-11 | CT-1, CT-2 | C | CT-1 sends forks below finality, also after a reopen. |
 | INV-12 | CT-4, CT-8 | P | known-violated for attach (GAP-31). |
 | INV-13 | CT-1 | C | CT-1 reads each status twice after every call. |
 | INV-14 | CT-4 | P | Dedup tests, also for block 0. No test for a second table of an accepted block. |
@@ -243,8 +243,8 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | INV-27 | CT-1, CT-4 | P | known-violated (GAP-1). A validator checks the type of every value for input of the right types. |
 | INV-28 | CT-1 | U | known-violated (GAP-1, GAP-26). |
 | INV-29 | CT-1 | C | The input ledger checks raw records and the key items of views. |
-| INV-30 | CT-1, CT-5 | P | CT-1 compares every status read with the model after every call. known-violated for the finalized cursor after an open (GAP-3). |
-| INV-31 | CT-1 | P | CT-1 compares the heads of every batch with the model. known-violated for the finalized head after an open (GAP-3). |
+| INV-30 | CT-1, CT-5 | P | CT-1 compares every status read with the model after every call. The JS bindings lack some of the reads (GAP-15). |
+| INV-31 | CT-1 | C | CT-1 compares the heads of every batch with the model. |
 | INV-32 | CT-1 | C | CT-1 compares every sequence with the model. |
 | INV-33 | CT-5 | U | known-violated (GAP-11). |
 | INV-35 | CT-12 | U | No test. |
@@ -256,7 +256,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | INV-44 | CT-2 | C | Deferred schemas in the differential and in the backfill tests. |
 | INV-45 | CT-11 | C | Format tests. |
 | INV-46 | CT-8 | P | Corrupt view and reducer state. Raw rows only in unit tests. |
-| INV-47 | CT-2 | U | known-violated (GAP-3). |
+| INV-47 | CT-1, CT-2 | C | CT-1 compares the finalized cursor after each reopen with the model, with deferral and with gappy chains. |
 | INV-48 | CT-2 | P | Purge tests. No metamorphic run over the margins. |
 | INV-49 | CT-3 | U | No power-loss store (GAP-33). |
 | LIV-1 | CT-6 | P | Scale cases double the input, by hand on the host. |
@@ -310,7 +310,6 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 |---|---|---|---|---|
 | GAP-1 | Settle checks no value type at ingest. An aggregate skips each value outside its numeric mode without an error. Lua floats and every number from a JS callback are Float64, so an integer view column drops them. | REQ-27, INV-27, INV-28, FM-4, FM-19, FM-48 | P1 | An external reducer emits a UInt64 state field `n`, and a view sums `n`. Expect the sum of `n`. The code shows that the sum stays empty today, but no test confirms it yet. |
 | GAP-2 | The schema accepts constructs that Settle ignores: WHERE, HAVING, joins, ORDER BY, LIMIT and DISTINCT. It does not match GROUP BY to the key items. It accepts duplicate names, a view with no aggregate, numeric aggregates over columns with no numeric mode, and defaults that do not parse. | REQ-26 | P1 | Open a view with a WHERE clause. Expect INVALID_SCHEMA. |
-| GAP-3 | An open sets `F` to `D`. The reported finality goes back, a smaller finalized head passes, and a fork can undo blocks that were final. | REQ-5, INV-10, INV-11, INV-47, WP-24, CN-20 | P1 | Use a checkpoint interval of 3, reach `F = 49` with `D < 49`, reopen. Expect the finalized cursor at 49. |
 | GAP-4 | Input can terminate the process. A Lua compile error or a failed module load panics at open. The parser can panic on some non-ASCII text. The builders panic on some arguments. The JS boundary has no unwind guard. | REQ-42, FM-1, FM-41, FM-47, WP-73 | P1 | Open a schema with a Lua syntax error. Expect INVALID_SCHEMA, not a panic. |
 | GAP-5 | A reducer body has no CPU bound and no memory bound. An endless Lua loop blocks an ingest call forever. | LIV-10, FM-42 | P2 | A Lua body `while true do end`. Expect REDUCER_FAILED within P-REDUCER-STEPS. |
 | GAP-6 | Resident memory has no bound. Reducer groups never leave memory, and an open loads every view group. | REQ-41, PF-1, RS-20 | P1 | Measure the bytes for each group at 1M groups. Then expect a run at P-W-GROUPS below P-MEMORY-CEILING. |
@@ -329,7 +328,6 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | GAP-19 | An open commits the journal before its second format check, so a failed open can change the store. | CN-30 | P3 | A journal with a layout that the schema refuses. Expect the store unchanged after the failed open. |
 | GAP-20 | A reducer that the host registers at run time feeds no view, so its output is not visible. After a crash during deferral, its replay covers blocks that the running instance never gave it. | WP-61, INV-43 | P3 | Register a reducer during deferral, crash, reopen. Expect the same state as with no crash. |
 | GAP-21 | Each expiry in a sliding view refolds the window, so the cost of a tip block grows with the window. | PF-4 | P2 | SC-6 at three widths. Expect a cost for each block that does not grow with the width. |
-| GAP-22 | The replayed tail stays as unfinal data until the next ingest call. | RS-12 | P3 | Measure the memory after an open of a long tail. Expect only final state for blocks at or below `F`. |
 | GAP-23 | The browser entry imports a module that the package does not ship. | REQ-32 | P2 | Pack the package, install it, and load the browser entry. |
 | GAP-24 | The release workflow points at a package directory that does not exist. | REQ-31 | P2 | Run the release build on a test tag. |
 | GAP-25 | The public documents show calls that the API removed. | REQ-30, REQ-31 | P3 | Compile each example of the public documents. |
@@ -357,11 +355,11 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | ID | Phase | Content | Done when |
 |---|---|---|---|
 | BO-1 | Harness skeleton | HC-4, HC-9 and HC-10. Run CT-1 on the schemas of the current tests. | CT-1 runs in CI, and the matrix shows its first results. |
-| BO-2 | P1 correctness | GAP-1, GAP-2, GAP-3 and GAP-4. Measure for GAP-6. | Each closure has its failing test first, and the matrix rows move to C. |
+| BO-2 | P1 correctness | GAP-1, GAP-2 and GAP-4. Measure for GAP-6. | Each closure has its failing test first, and the matrix rows move to C. |
 | BO-3 | Crash harness | HC-7 and HC-8 (GAP-33). CT-3 at each kill point. | INV-40, INV-41, INV-42 and INV-49 are C. |
 | BO-4 | Robustness | GAP-5, GAP-7, GAP-8, GAP-16, GAP-17 and GAP-31. HC-11 (GAP-34). | FM-1 is C, and CT-9 runs nightly. |
 | BO-5 | Binding parity | HC-17. GAP-9, GAP-12, GAP-13, GAP-14, GAP-15, GAP-23, GAP-24, GAP-28, GAP-29 and GAP-38. | CT-5 compares all bindings in CI. |
-| BO-6 | Performance regime | GAP-6, GAP-21 and GAP-22. HC-15 and the gates of GAP-37. Ratify ADR-9. | Each SLO row has a gate. |
+| BO-6 | Performance regime | GAP-6 and GAP-21. HC-15 and the gates of GAP-37. Ratify ADR-9. | Each SLO row has a gate. |
 
 Each phase ends with an update of the matrices and the gap register in the same change.
 

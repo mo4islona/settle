@@ -22,7 +22,7 @@ Bands: 1–9 raw rows · 10–19 derived state · 20–29 space and memory.
 
 **RS-11 — Unfinal data.** For each block above `F`, Settle keeps undo data. This is the state of each reducer group before each block that changed it, and the contribution of the block to each view group. The size of this data grows with `L − F` and with the groups that each block changes.
 
-**RS-12 — Replay.** An open replays the blocks above `D` (DEF-87). It reads at most P-REPLAY-CHUNK blocks with rows per table at a time. So the raw rows of the tail are never in memory all at once. The work of a replay is linear in the tail (LIV-3). The replayed tail stays as unfinal data until the next ingest call moves `F` (GAP-22).
+**RS-12 — Replay.** An open replays the blocks above `D` (DEF-87). It reads at most P-REPLAY-CHUNK blocks with rows per table at a time. So the raw rows of the tail are never in memory all at once. The work of a replay is linear in the tail (LIV-3). After the replay, the replayed blocks at or below `F` are final (ADR-7).
 
 **RS-13 — Sliding windows.** For a sliding view, the store holds one record for each final block in the window. The expired-block stash keeps each block that left the window until the block that pushed it out is final (ADR-4). Then the stash entry and the window record of the expired block go away (LIV-8).
 
@@ -54,5 +54,5 @@ The intent is a ceiling P-MEMORY-CEILING that the host can compute from the conf
 - **With finality:** finality frees the unfinal data (RS-11, LIV-6) and the hashes below `F` (RS-14).
 - **With forks:** a rollback removes the unfinal data above the fork point and restores the stash entries above it (WP-14). It reads raw rows only above `D` (RS-4).
 - **With deferral:** `D` can lag `F` by up to P-CHECKPOINT-INTERVAL blocks. The purge follows `D`, so the store keeps more raw rows, and the replay tail grows by the interval.
-- **With a reopen:** the open sets the replay tail to the blocks above `D`. With GAP-3 and GAP-22 open, this tail stays as unfinal data until the next ingest call.
+- **With a reopen:** the open sets the replay tail to the blocks above `D`. Only the blocks of the tail above `F` stay as unfinal data.
 - **With liveness:** LIV-7, LIV-8 and LIV-9 bound how fast the space comes back.
