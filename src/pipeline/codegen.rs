@@ -126,12 +126,28 @@ pub(crate) fn view_to_sql(v: &ViewSpec) -> Result<String> {
         }
     }
 
+    // GROUP BY names an interval key by each of its names in the select list.
+    let mut group_by: Vec<&str> = Vec::with_capacity(group_by_cols.len());
+    for col in &group_by_cols {
+        let names: Vec<&str> = v
+            .projections
+            .iter()
+            .filter(|(_, proj)| matches!(proj, Projection::Key(k) if &k.column == col))
+            .map(|(alias, _)| alias.as_str())
+            .collect();
+        if interval_defs.contains_key(col) && !names.is_empty() {
+            group_by.extend(names);
+        } else {
+            group_by.push(col.as_str());
+        }
+    }
+
     let mut sql = format!(
         "CREATE MATERIALIZED VIEW {} AS SELECT {} FROM {} GROUP BY {}",
         v.name,
         select_items.join(", "),
         v.source,
-        group_by_cols.join(", ")
+        group_by.join(", ")
     );
 
     if let Some(sw) = &v.sliding_window {
@@ -319,7 +335,7 @@ mod tests {
             sql.contains("toStartOfInterval(ts, INTERVAL 3600 SECOND) AS bucket"),
             "{sql}"
         );
-        assert!(sql.contains("GROUP BY ts_interval"));
+        assert!(sql.contains("GROUP BY bucket"), "{sql}");
     }
 
     #[test]

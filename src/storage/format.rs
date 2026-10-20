@@ -103,7 +103,7 @@ impl Layout {
         let Some(stored) = storage.get_meta(&key)? else {
             return Ok(Some((key, self.text.clone().into_bytes())));
         };
-        if stored == self.text.as_bytes() {
+        if stored == self.text.as_bytes() || self.is_stored_with_group_by(&stored) {
             return Ok(None);
         }
 
@@ -114,6 +114,26 @@ impl Layout {
              new name, or rebuild the database from the source data",
             self.kind, self.name, self.text, self.kind
         )))
+    }
+}
+
+impl Layout {
+    /// A view layout from before GROUP BY left it: this layout with a
+    /// `group_by` field. The engine grouped by the select list then too.
+    fn is_stored_with_group_by(&self, stored: &[u8]) -> bool {
+        if self.key_space != "mv" {
+            return false;
+        }
+        let Ok(serde_json::Value::Object(mut stored)) = serde_json::from_slice(stored) else {
+            return false;
+        };
+        if stored.remove("group_by").is_none() {
+            return false;
+        }
+
+        let current: serde_json::Value =
+            serde_json::from_str(&self.text).expect("a layout is JSON");
+        serde_json::Value::Object(stored) == current
     }
 }
 
@@ -132,11 +152,12 @@ struct ReducerLayout<'a> {
     state: Vec<TypedName<'a>>,
 }
 
+/// No GROUP BY: it names the key items of `select` by their output names,
+/// which can change (IB-68, CN-32).
 #[derive(Serialize)]
 struct MvLayout<'a> {
     source: &'a str,
     select: Vec<SelectLayout<'a>>,
-    group_by: &'a [String],
     sliding_window: Option<SlidingLayout<'a>>,
 }
 
@@ -217,7 +238,6 @@ fn mv_layout(def: &MVDef) -> Layout {
     let layout = MvLayout {
         source: &def.source,
         select: def.select.iter().map(|item| select_layout(&item.expr)).collect(),
-        group_by: &def.group_by,
         sliding_window: def.sliding_window.as_ref().map(|w| SlidingLayout {
             seconds: w.interval_seconds,
             time_column: &w.time_column,

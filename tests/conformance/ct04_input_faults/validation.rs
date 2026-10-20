@@ -159,7 +159,7 @@ fn failed_ingest_does_not_leak_changes_to_buffer() {
     let schema = r#"
         CREATE TABLE t (block_number UInt64, x Float64);
         CREATE MATERIALIZED VIEW mv AS
-          SELECT SUM(x) AS total FROM t GROUP BY x;
+          SELECT SUM(x) AS total FROM t;
     "#;
     let mut db = Settle::open(Config::new(schema)).unwrap();
 

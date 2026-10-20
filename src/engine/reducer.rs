@@ -137,7 +137,7 @@ impl ReducerEngine {
         modules: &[(String, String)],
     ) -> Result<Self> {
         let runtime = Self::make_runtime(&def, source_registry, modules)?;
-        Ok(Self::build(def, storage, source_registry, runtime))
+        Self::build(def, storage, source_registry, runtime)
     }
 
     /// Create a ReducerEngine that sources from another reducer's output,
@@ -149,7 +149,7 @@ impl ReducerEngine {
     ) -> Result<Self> {
         let empty_registry = ColumnRegistry::default();
         let runtime = Self::make_runtime(&def, &empty_registry, modules)?;
-        Ok(Self::build(def, storage, &empty_registry, runtime))
+        Self::build(def, storage, &empty_registry, runtime)
     }
 
     /// Create a ReducerEngine with a custom runtime (for FnReducerRuntime / external).
@@ -158,16 +158,17 @@ impl ReducerEngine {
         storage: Arc<dyn StorageBackend>,
         source_registry: &ColumnRegistry,
         runtime: Box<dyn ReducerRuntime>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::build(def, storage, source_registry, runtime)
     }
 
+    /// Err(Schema) if a DEFAULT is not a value of its type.
     fn build(
         def: ReducerDef,
         storage: Arc<dyn StorageBackend>,
         source_registry: &ColumnRegistry,
         runtime: Box<dyn ReducerRuntime>,
-    ) -> Self {
+    ) -> Result<Self> {
         let field_names = |map: bool| {
             let names = def.state.iter().filter(|f| f.map == map);
             ColumnRegistry::new(names.map(|f| f.name.clone()).collect())
@@ -178,8 +179,15 @@ impl ReducerEngine {
             .state
             .iter()
             .filter(|f| !f.map)
-            .map(|f| parse_default(&f.default, &f.column_type))
-            .collect();
+            .map(|f| {
+                f.default_value().map_err(|e| {
+                    Error::Schema(format!(
+                        "reducer '{}': state field '{}': {e}",
+                        def.name, f.name
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
         let group_by_ids = def
             .group_by
             .iter()
@@ -188,7 +196,7 @@ impl ReducerEngine {
         let emits = Emits::with_columns(&def.group_by);
         let reads_storage = stores_state(storage.as_ref(), &def.name);
 
-        Self {
+        Ok(Self {
             def,
             runtime,
             storage,
@@ -204,7 +212,7 @@ impl ReducerEngine {
             source_registry: Arc::new(source_registry.clone()),
             emits,
             emit_growth: BTreeMap::new(),
-        }
+        })
     }
 
     /// Build a runtime for the given reducer definition. Err(Schema) if its
@@ -643,28 +651,6 @@ fn decode_state(bytes: &[u8], reducer_name: &str, fields: usize) -> Result<Vec<V
         )));
     }
     Ok(values)
-}
-
-fn parse_default(default_str: &str, column_type: &crate::types::ColumnType) -> Value {
-    use crate::types::ColumnType;
-    match column_type {
-        ColumnType::Float64 => Value::Float64(default_str.parse::<f64>().unwrap_or(0.0)),
-        ColumnType::UInt64 => Value::UInt64(default_str.parse::<u64>().unwrap_or(0)),
-        ColumnType::Int64 => Value::Int64(default_str.parse::<i64>().unwrap_or(0)),
-        ColumnType::String => {
-            // Strip surrounding quotes
-            let s = default_str.trim_matches('\'').trim_matches('"');
-            Value::String(s.to_string())
-        }
-        ColumnType::Boolean => Value::Boolean(default_str == "true" || default_str == "1"),
-        ColumnType::JSON => {
-            let s = default_str.trim_matches('\'').trim_matches('"');
-            let json_val = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
-            Value::JSON(json_val)
-        }
-        ColumnType::DateTime => Value::DateTime(default_str.parse::<i64>().unwrap_or(0)),
-        ColumnType::Uint256 | ColumnType::Bytes | ColumnType::Base58 => column_type.default_value(),
-    }
 }
 
 #[cfg(test)]
@@ -1265,7 +1251,7 @@ mod tests {
             storage.clone(),
             &trade_registry(),
             Box::new(pnl_fn_runtime()),
-        );
+        ).unwrap();
 
         let storage2 = Arc::new(MemoryBackend::new());
         let mut lua_engine =
@@ -1300,7 +1286,7 @@ mod tests {
             storage,
             &trade_registry(),
             Box::new(pnl_fn_runtime()),
-        );
+        ).unwrap();
 
         engine
             .process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)])
@@ -1322,7 +1308,7 @@ mod tests {
             storage,
             &trade_registry(),
             Box::new(pnl_fn_runtime()),
-        );
+        ).unwrap();
 
         engine
             .process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)])
@@ -1350,7 +1336,7 @@ mod tests {
             storage,
             &trade_registry(),
             Box::new(pnl_fn_runtime()),
-        );
+        ).unwrap();
 
         let rows = vec![
             make_trade("alice", "buy", 10.0, 2000.0),
@@ -1405,18 +1391,26 @@ mod tests {
         assert!(engine.is_external()); // def.body unchanged
     }
 
-    /// parse_default must handle DateTime explicitly (not fall through to wildcard).
     #[test]
-    fn parse_default_datetime() {
-        let val = parse_default("1700000000", &ColumnType::DateTime);
-        assert_eq!(val, Value::DateTime(1700000000));
-    }
+    fn default_of_each_type() {
+        let default = |text: &str, column_type| {
+            let field = StateField {
+                name: "f".into(),
+                column_type,
+                default: text.into(),
+                map: false,
+            };
+            field.default_value().unwrap()
+        };
+        let mut sixteen = [0u8; 32];
+        sixteen[31] = 16;
 
-    /// parse_default for Uint256 returns zero (no hex parsing, just type default).
-    #[test]
-    fn parse_default_uint256() {
-        let val = parse_default("0", &ColumnType::Uint256);
-        assert_eq!(val, Value::Uint256([0u8; 32]));
+        assert_eq!(default("1700000000", ColumnType::DateTime), Value::DateTime(1700000000));
+        assert_eq!(default("0", ColumnType::Uint256), Value::Uint256([0u8; 32]));
+        assert_eq!(default("0x10", ColumnType::Uint256), Value::Uint256(sixteen));
+        assert_eq!(default("'it''s'", ColumnType::String), Value::String("it's".into()));
+        assert_eq!(default("FALSE", ColumnType::Boolean), Value::Boolean(false));
+        assert_eq!(default("''", ColumnType::Bytes), Value::Bytes(Vec::new()));
     }
 
     /// An external reducer `counter` over `events`, grouped by user.
@@ -1582,7 +1576,7 @@ mod tests {
         };
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
-        let mut engine = ReducerEngine::with_runtime(def, storage, &reg, Box::new(runtime));
+        let mut engine = ReducerEngine::with_runtime(def, storage, &reg, Box::new(runtime)).unwrap();
 
         let err = engine.process_block(1, &[event("alice", 1.0)]).unwrap_err();
         assert!(err.to_string().contains("distinct emit columns"), "{err}");
@@ -1747,7 +1741,7 @@ mod tests {
         };
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
-        let mut engine = ReducerEngine::with_runtime(def, storage, &reg, Box::new(runtime));
+        let mut engine = ReducerEngine::with_runtime(def, storage, &reg, Box::new(runtime)).unwrap();
 
         engine.process_block(1, &[event("alice", 1.0)]).unwrap();
         engine.process_block(2, &[event("alice", 2.0)]).unwrap();

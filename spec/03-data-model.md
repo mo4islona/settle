@@ -92,7 +92,7 @@ Bands: 1–19 chain and input · 20–39 pipeline · 40–59 derived values · 6
 |---|---|
 | Raw table | The column names and types, in order. |
 | Reducer | The source, the group-by columns, and the state field names and types, in order. |
-| View | The source, and the select list: each key column, each aggregate as a function and a column, each window as a column and an interval. Also the group-by list and the sliding window: the width and the time column. |
+| View | The source, and the select list: each key column, each aggregate as a function and a column, each window as a column and an interval. Also the sliding window: the width and the time column. The GROUP BY list names the key items by their output names (IB-68), so it is not in the layout. A view layout that an earlier version stored with its GROUP BY list matches the same layout without the list. |
 
 The layout does not contain reducer bodies, defaults, output names, the virtual flag or the runtime kind.
 

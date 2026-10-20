@@ -19,6 +19,6 @@ The files only gain new records. An accepted record changes only when a later re
 | [ADR-11](ADR-11-body-change-keeps-results.md) | A body change keeps the results of accepted rows | Proposed | — |
 | [ADR-12](ADR-12-map-state-fields.md) | Map state fields | Accepted (2026-10-20) | 2026-10-20 |
 | [ADR-13](ADR-13-no-common-ancestor-fails.md) | A fork with no common ancestor fails on both paths | Proposed | — |
-| [ADR-14](ADR-14-refuse-unexecuted-constructs.md) | Refuse schema constructs that Settle does not execute | Proposed | — |
+| [ADR-14](ADR-14-refuse-unexecuted-constructs.md) | Refuse schema constructs that Settle does not execute | Accepted (2026-10-20) | 2026-10-20 |
 | [ADR-15](ADR-15-exact-value-conversion.md) | Check and convert value types at each boundary | Proposed | — |
 | [ADR-16](ADR-16-remove-inert-buffer.md) | Remove the inert buffer setting and gauges | Proposed | — |
