@@ -495,6 +495,9 @@ impl StorageBackend for FailFirstCommitBackend {
     fn delete_reducer_states_up_to(&self, reducer: &str, group_key: &[u8], up_to: BlockNumber) -> settle::error::Result<()> {
         self.inner.delete_reducer_states_up_to(reducer, group_key, up_to)
     }
+    fn get_reducer_map_entries(&self, reducer: &str, group_key: &[u8]) -> settle::error::Result<Vec<settle::storage::MapEntry>> {
+        self.inner.get_reducer_map_entries(reducer, group_key)
+    }
     fn put_mv_state(&self, view: &str, group_key: &[u8], state: &[u8]) -> settle::error::Result<()> {
         self.inner.put_mv_state(view, group_key, state)
     }
@@ -637,6 +640,7 @@ impl StorageBackend for AlwaysFailCommit {
     fn get_reducer_finalized(&self, r: &str, k: &[u8]) -> settle::error::Result<Option<Vec<u8>>> { self.inner.get_reducer_finalized(r, k) }
     fn set_reducer_finalized(&self, r: &str, k: &[u8], s: &[u8]) -> settle::error::Result<()> { self.inner.set_reducer_finalized(r, k, s) }
     fn delete_reducer_states_up_to(&self, r: &str, k: &[u8], u: BlockNumber) -> settle::error::Result<()> { self.inner.delete_reducer_states_up_to(r, k, u) }
+    fn get_reducer_map_entries(&self, r: &str, k: &[u8]) -> settle::error::Result<Vec<settle::storage::MapEntry>> { self.inner.get_reducer_map_entries(r, k) }
     fn put_mv_state(&self, v: &str, k: &[u8], s: &[u8]) -> settle::error::Result<()> { self.inner.put_mv_state(v, k, s) }
     fn get_mv_state(&self, v: &str, k: &[u8]) -> settle::error::Result<Option<Vec<u8>>> { self.inner.get_mv_state(v, k) }
     fn delete_mv_state(&self, v: &str, k: &[u8]) -> settle::error::Result<()> { self.inner.delete_mv_state(v, k) }
@@ -858,6 +862,7 @@ fn register_reducer_rejects_duplicate_name() {
             name: "volume".into(),
             column_type: ColumnType::UInt64,
             default: "0".into(),
+            map: false,
         }],
         body: ReducerBody::External {
             id: "market_stats".into(),

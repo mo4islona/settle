@@ -5,6 +5,10 @@
 //! within minutes, ten DEX programs, and sells that come out of the
 //! positions that the wallets bought. Deterministic for a seed.
 //!
+//! Quotes are SOL, USDC, USDT and a few hub tokens that other established
+//! tokens trade against, as BONK or JUP. The swaps carry no oracle price:
+//! the pipeline prices each token in USDC from the swaps themselves.
+//!
 //! `write` saves it for the Node bench, which then sees the same swaps
 //! (`bindings/typescript/settle/bench/solana-dex.mjs` reads the format).
 
@@ -46,10 +50,15 @@ const ESTABLISHED_DEXES: &[(usize, f64)] = &[
 ];
 const SOL_DEXES: &[(usize, f64)] = &[(3, 0.35), (1, 0.25), (8, 0.15), (4, 0.15), (9, 0.10)];
 
-/// (quote: 0 SOL, 1 USDC, 2 USDT, share) for each kind of base token.
+/// (quote: 0 SOL, 1 USDC, 2 USDT, 3 a hub token, share) for each kind of
+/// base token.
 const MEME_QUOTES: &[(usize, f64)] = &[(0, 0.97), (1, 0.03)];
-const ESTABLISHED_QUOTES: &[(usize, f64)] = &[(0, 0.80), (1, 0.17), (2, 0.03)];
+const ESTABLISHED_QUOTES: &[(usize, f64)] = &[(0, 0.70), (1, 0.15), (2, 0.03), (3, 0.12)];
 const SOL_QUOTES: &[(usize, f64)] = &[(1, 0.85), (2, 0.15)];
+const STABLE_QUOTES: &[(usize, f64)] = &[(1, 1.0)];
+
+/// The most traded established tokens; the others also trade against them.
+const HUBS: usize = 16;
 
 const FIRST_SLOT: u64 = 370_000_000;
 const FIRST_TIMESTAMP_MS: u64 = 1_760_000_000_000;
@@ -68,6 +77,8 @@ const MEME_BIRTHS_PER_SLOT: f64 = 0.2;
 /// The mean distance from the newest memecoin of the one a swap trades.
 const MEME_RECENCY: f64 = 120.0;
 const SOL_SHARE: f64 = 0.10;
+/// USDT against USDC.
+const STABLE_SHARE: f64 = 0.02;
 const ESTABLISHED_SHARE: f64 = 0.52;
 
 /// Positions that the generator remembers for each wallet, to sell later.
@@ -78,7 +89,6 @@ const TRANSFER_SELLS: f64 = 0.03;
 pub struct Block {
     pub slot: u64,
     pub timestamp_ms: u64,
-    pub sol_usd: f64,
     pub swaps: Range<usize>,
 }
 
@@ -201,9 +211,16 @@ fn address(kind: u64, index: u64) -> String {
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Sol,
+    Stable,
     Established,
     Meme,
 }
+
+/// The index in `Generator::tokens` of SOL, USDT and the first established
+/// token.
+const SOL_TOKEN: usize = 0;
+const USDT_TOKEN: usize = 1;
+const FIRST_ESTABLISHED: usize = 2;
 
 struct Token {
     name: u32,
@@ -240,11 +257,18 @@ impl Generator {
         let quotes = [SOL, USDC, USDT].map(|q| intern(q.to_string()));
 
         let mut rng = Rng(seed);
-        let mut tokens = vec![Token {
-            name: quotes[0],
-            kind: Kind::Sol,
-            price_usd: 0.0,
-        }];
+        let mut tokens = vec![
+            Token {
+                name: quotes[0],
+                kind: Kind::Sol,
+                price_usd: 0.0,
+            },
+            Token {
+                name: quotes[2],
+                kind: Kind::Stable,
+                price_usd: 1.0,
+            },
+        ];
         for i in 0..ESTABLISHED {
             // Prices from $0.0001 to $300.
             let price_usd = 10f64.powf(-4.0 + rng.f64() * 6.5);
@@ -321,10 +345,13 @@ impl Generator {
     fn pick_token(&mut self) -> usize {
         let u = self.rng.f64();
         if u < SOL_SHARE {
-            return 0;
+            return SOL_TOKEN;
         }
-        if u < SOL_SHARE + ESTABLISHED_SHARE {
-            return 1 + self.established_zipf.sample(&mut self.rng);
+        if u < SOL_SHARE + STABLE_SHARE {
+            return USDT_TOKEN;
+        }
+        if u < SOL_SHARE + STABLE_SHARE + ESTABLISHED_SHARE {
+            return FIRST_ESTABLISHED + self.established_zipf.sample(&mut self.rng);
         }
         let p = 1.0 / MEME_RECENCY;
         let back = ((1.0 - self.rng.f64()).ln() / (1.0 - p).ln()) as usize;
@@ -335,8 +362,14 @@ impl Generator {
     /// The price of `token` after one more swap, with a small push in the
     /// direction of the trade.
     fn step_price(&mut self, token: usize, buy: bool) -> f64 {
-        if self.tokens[token].kind == Kind::Sol {
-            return self.sol_usd;
+        match self.tokens[token].kind {
+            Kind::Sol => return self.sol_usd,
+            Kind::Stable => {
+                let price = (0.0005 * self.rng.normal()).exp();
+                self.tokens[token].price_usd = price;
+                return price;
+            }
+            Kind::Established | Kind::Meme => {}
         }
         let sigma = if self.tokens[token].kind == Kind::Meme {
             0.015
@@ -356,15 +389,38 @@ impl Generator {
         (median * (sigma * self.rng.normal()).exp()).clamp(0.05, 250_000.0)
     }
 
-    fn pool(&mut self, token: usize) -> (u32, u32, usize) {
+    fn price_usd(&self, token: usize) -> f64 {
+        match self.tokens[token].kind {
+            Kind::Sol => self.sol_usd,
+            _ => self.tokens[token].price_usd,
+        }
+    }
+
+    /// The DEX, pool and quote of a swap of `token`, and the USD price of
+    /// the quote.
+    fn pool(&mut self, token: usize) -> (u32, u32, u32, f64) {
         let (dexes, quotes) = match self.tokens[token].kind {
             Kind::Sol => (SOL_DEXES, SOL_QUOTES),
+            Kind::Stable => (SOL_DEXES, STABLE_QUOTES),
             Kind::Established => (ESTABLISHED_DEXES, ESTABLISHED_QUOTES),
             Kind::Meme => (MEME_DEXES, MEME_QUOTES),
         };
         let dex = self.rng.pick(dexes);
-        let quote = self.rng.pick(quotes);
-        let key = (token, quote, dex);
+        let quote_token = match self.rng.pick(quotes) {
+            0 => Some(SOL_TOKEN),
+            1 => None,
+            2 => Some(USDT_TOKEN),
+            _ => {
+                let hub = FIRST_ESTABLISHED + self.rng.below(HUBS);
+                Some(if hub == token { hub + 1 } else { hub })
+            }
+        };
+        let (quote, quote_usd) = match quote_token {
+            Some(t) => (self.tokens[t].name, self.price_usd(t)),
+            None => (self.quotes[1], 1.0),
+        };
+
+        let key = (token, quote as usize, dex);
         let pool = match self.pools.get(&key) {
             Some(&pool) => pool,
             None => {
@@ -374,7 +430,7 @@ impl Generator {
                 pool
             }
         };
-        (self.dexes[dex], pool, quote)
+        (self.dexes[dex], pool, quote, quote_usd)
     }
 
     fn swap(&mut self) -> Swap {
@@ -425,8 +481,7 @@ impl Generator {
         };
 
         self.positions.insert((rank, token));
-        let (dex, pool, quote) = self.pool(token);
-        let quote_usd = if quote == 0 { self.sol_usd } else { 1.0 };
+        let (dex, pool, quote, quote_usd) = self.pool(token);
         let quote_amount = base_amount * price / quote_usd;
 
         Swap {
@@ -434,7 +489,7 @@ impl Generator {
             pool,
             trader,
             token: self.tokens[token].name,
-            quote: self.quotes[quote],
+            quote,
             buy,
             base_amount,
             quote_amount,
@@ -465,7 +520,6 @@ pub fn generate(slots: usize, seed: u64) -> Dataset {
         blocks.push(Block {
             slot: FIRST_SLOT + offset,
             timestamp_ms: FIRST_TIMESTAMP_MS + offset * SLOT_MS,
-            sol_usd: g.sol_usd,
             swaps: start..swaps.len(),
         });
     }
@@ -483,15 +537,15 @@ pub fn generate(slots: usize, seed: u64) -> Dataset {
 
 impl Dataset {
     /// Little-endian, each section padded to 8 bytes:
-    /// `SDEX0001`, string count, string bytes, the strings joined by '\n';
-    /// block count, swap count; per block slot, timestamp, SOL/USD (f64) and
-    /// swap count (u32); per swap base amount, quote amount (f64), then dex,
-    /// pool, trader, token, quote (u32), then side (u8, 1 = buy).
+    /// `SDEX0002`, string count, string bytes, the strings joined by '\n';
+    /// block count, swap count; per block slot, timestamp (f64) and swap
+    /// count (u32); per swap base amount, quote amount (f64), then dex, pool,
+    /// trader, token, quote (u32), then side (u8, 1 = buy).
     pub fn write(&self, path: &str) -> std::io::Result<()> {
         let mut out: Vec<u8> = Vec::new();
         let pad = |out: &mut Vec<u8>| out.resize(out.len().next_multiple_of(8), 0);
 
-        out.extend_from_slice(b"SDEX0001");
+        out.extend_from_slice(b"SDEX0002");
         let joined = self.strings.join("\n");
         out.extend_from_slice(&(self.strings.len() as u32).to_le_bytes());
         out.extend_from_slice(&(joined.len() as u32).to_le_bytes());
@@ -505,9 +559,6 @@ impl Dataset {
         }
         for b in &self.blocks {
             out.extend_from_slice(&(b.timestamp_ms as f64).to_le_bytes());
-        }
-        for b in &self.blocks {
-            out.extend_from_slice(&b.sol_usd.to_le_bytes());
         }
         for b in &self.blocks {
             out.extend_from_slice(&(b.swaps.len() as u32).to_le_bytes());

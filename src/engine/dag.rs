@@ -271,6 +271,7 @@ impl SettleEngine {
                 let mut cols: HashMap<String, ColumnType> = r
                     .state
                     .iter()
+                    .filter(|s| !s.map)
                     .map(|s| (s.name.clone(), s.column_type.clone()))
                     .collect();
                 if let Some(table_cols) = table_column_types.get(&r.source) {
@@ -1591,11 +1592,13 @@ mod tests {
                         name: "quantity".to_string(),
                         column_type: ColumnType::Float64,
                         default: "0".to_string(),
+                        map: false,
                     },
                     StateField {
                         name: "cost_basis".to_string(),
                         column_type: ColumnType::Float64,
                         default: "0".to_string(),
+                        map: false,
                     },
                 ],
                 requires: vec![],
@@ -2025,6 +2028,7 @@ mod tests {
                         name: "total".to_string(),
                         column_type: ColumnType::Float64,
                         default: "0".to_string(),
+                        map: false,
                     }],
                     requires: vec![],
                     body: ReducerBody::Lua {
@@ -2343,6 +2347,7 @@ mod tests {
                 name: "count".to_string(),
                 column_type: ColumnType::Float64,
                 default: "0".to_string(),
+                map: false,
             }],
             requires: vec![],
             body: ReducerBody::Lua {
@@ -2411,6 +2416,7 @@ mod tests {
                         name: "total".to_string(),
                         column_type: ColumnType::Float64,
                         default: "0".to_string(),
+                        map: false,
                     }],
                     requires: vec![],
                     body: ReducerBody::Lua {
@@ -2429,6 +2435,7 @@ mod tests {
                         name: "total".to_string(),
                         column_type: ColumnType::Float64,
                         default: "0".to_string(),
+                        map: false,
                     }],
                     requires: vec![],
                     body: ReducerBody::Lua {

@@ -703,13 +703,16 @@ fn parse_reducer_block(input: &str) -> Result<(ReducerDef, usize), Error> {
     let (source, new_pos) = read_identifier(input, pos)?;
     pos = skip_ws(input, new_pos);
 
-    // GROUP BY
-    pos = skip_keyword(input, pos, "GROUP")?;
-    pos = skip_ws(input, pos);
-    pos = skip_keyword(input, pos, "BY")?;
-    pos = skip_ws(input, pos);
-    let (group_by, new_pos) = read_identifier_list(input, pos)?;
-    pos = skip_ws(input, new_pos);
+    // GROUP BY; without it the reducer has one group.
+    let mut group_by = Vec::new();
+    if let Ok(after) = skip_keyword(input, pos, "GROUP") {
+        pos = skip_ws(input, after);
+        pos = skip_keyword(input, pos, "BY")?;
+        pos = skip_ws(input, pos);
+        let (columns, new_pos) = read_identifier_list(input, pos)?;
+        group_by = columns;
+        pos = skip_ws(input, new_pos);
+    }
 
     // STATE (...)
     pos = skip_keyword(input, pos, "STATE")?;
@@ -783,6 +786,24 @@ fn parse_state_block(input: &str, start: usize) -> Result<(Vec<StateField>, usiz
 
         let (type_name, new_pos) = read_identifier(input, pos)?;
         pos = skip_ws(input, new_pos);
+
+        if type_name.eq_ignore_ascii_case("map") {
+            let (column_type, new_pos) = parse_map_type(input, pos, &field_name)?;
+            pos = skip_ws(input, new_pos);
+            if skip_keyword(input, pos, "DEFAULT").is_ok() {
+                return Err(Error::Schema(format!(
+                    "state field '{field_name}': a Map field starts with no entries and \
+                     takes no DEFAULT"
+                )));
+            }
+            fields.push(StateField {
+                name: field_name,
+                column_type,
+                default: String::new(),
+                map: true,
+            });
+            continue;
+        }
         let column_type = str_to_column_type(&type_name)?;
 
         pos = skip_keyword(input, pos, "DEFAULT")?;
@@ -795,10 +816,38 @@ fn parse_state_block(input: &str, start: usize) -> Result<(Vec<StateField>, usiz
             name: field_name,
             column_type,
             default,
+            map: false,
         });
     }
 
     Ok((fields, pos))
+}
+
+/// `(String, ValueType)` after `Map`: the type of the values.
+fn parse_map_type(input: &str, start: usize, field: &str) -> Result<(ColumnType, usize), Error> {
+    let bytes = input.as_bytes();
+    let expect = |pos: usize, c: u8| -> Result<usize, Error> {
+        if bytes.get(pos) == Some(&c) {
+            return Ok(skip_ws(input, pos + 1));
+        }
+        Err(Error::Schema(format!(
+            "state field '{field}': expected Map(String, Type), got: '{}'",
+            &input[start..std::cmp::min(start + 30, input.len())]
+        )))
+    };
+
+    let pos = expect(start, b'(')?;
+    let (key, pos) = read_identifier(input, pos)?;
+    let pos = expect(skip_ws(input, pos), b',')?;
+    let (value, pos) = read_identifier(input, pos)?;
+    let pos = expect(skip_ws(input, pos), b')')?;
+
+    if str_to_column_type(&key)? != ColumnType::String {
+        return Err(Error::Schema(format!(
+            "state field '{field}': the keys of a Map are String, not {key}"
+        )));
+    }
+    Ok((str_to_column_type(&value)?, pos))
 }
 
 fn parse_reducer_body(
@@ -1579,6 +1628,61 @@ mod tests {
     }
 
     /// Issue #24: read_token must handle SQL doubled-quote escaping.
+    /// A Map field has a value type and no DEFAULT, and a reducer without
+    /// GROUP BY has no group-by columns.
+    #[test]
+    fn parse_map_state_field() {
+        let sql = r#"
+            CREATE TABLE swaps (block_number UInt64, token String, price Float64);
+            CREATE REDUCER prices
+            SOURCE swaps
+            STATE (
+                swaps UInt64 DEFAULT 0,
+                usdc  Map(String, Float64),
+                book  map( string , JSON )
+            )
+            LANGUAGE lua
+            PROCESS $$ state.swaps = state.swaps + 1 $$;
+        "#;
+        let schema = parse_schema(sql).unwrap();
+        let reducer = &schema.reducers[0];
+        assert!(reducer.group_by.is_empty());
+
+        let fields: Vec<_> = reducer
+            .state
+            .iter()
+            .map(|f| (f.name.as_str(), f.type_name(), f.default.as_str()))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                ("swaps", "UInt64".to_string(), "0"),
+                ("usdc", "Map(String, Float64)".to_string(), ""),
+                ("book", "Map(String, JSON)".to_string(), ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn map_state_field_errors() {
+        let reducer = |state: &str| {
+            format!(
+                "CREATE TABLE t (block_number UInt64, k String);
+                 CREATE REDUCER r SOURCE t STATE ({state}) LANGUAGE lua PROCESS $$ $$;"
+            )
+        };
+        let cases = [
+            ("m Map(UInt64, Float64)", "the keys of a Map are String, not UInt64"),
+            ("m Map(String, Float64) DEFAULT '{}'", "takes no DEFAULT"),
+            ("m Map(String)", "expected Map(String, Type)"),
+            ("m Map(String, Money)", "unknown type: 'Money'"),
+        ];
+        for (state, error) in cases {
+            let err = parse_schema(&reducer(state)).unwrap_err();
+            assert!(err.to_string().contains(error), "{state}: {err}");
+        }
+    }
+
     #[test]
     fn read_token_handles_doubled_quotes() {
         let (token, end) = read_token("'it''s fine' rest", 0).unwrap();

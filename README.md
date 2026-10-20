@@ -57,6 +57,14 @@ FROM market_stats
 GROUP BY asset_id;
 ```
 
+### Map state
+
+A state field can be a map from String keys to values, for example `book Map(String, JSON)`. A body changes one
+entry at a time, so undo, finality and checkpoints cost as much as the changed entries, not the whole map. In Lua:
+`state.book:get(key)` (a copy, or nil), `state.book:set(key, value)` (nil deletes) and `state.book:delete(key)`. In a
+Rust closure: `state.map("book")`. JS reducers do not support Map fields yet. A reducer without `GROUP BY` has one
+group, for example a price map with an entry for each token.
+
 ## Usage (Rust)
 
 ```rust

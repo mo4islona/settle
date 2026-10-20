@@ -123,6 +123,7 @@ impl Settle {
                 name: f.name,
                 column_type: parse_column_type(&f.column_type),
                 default: f.default_value,
+                map: false,
             })
             .collect();
 

@@ -6,6 +6,7 @@ use rustc_hash::FxHashMap;
 use crate::error::{Error, Result};
 #[cfg(feature = "lua")]
 use crate::reducer_runtime::lua::LuaRuntime;
+use crate::reducer_runtime::map::StateMaps;
 use crate::reducer_runtime::{Emits, GroupBatch, GroupState, GroupedRows, ReducerRuntime};
 use crate::schema::ast::{ReducerBody, ReducerDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
@@ -21,9 +22,11 @@ pub struct ReducerEngine {
     def: ReducerDef,
     runtime: Box<dyn ReducerRuntime>,
     storage: Arc<dyn StorageBackend>,
-    /// The STATE fields in schema order: the layout of a group's state in
-    /// memory and in storage.
+    /// The STATE fields but the MAP fields, in schema order: the layout of
+    /// a group's state in memory and in storage.
     state_fields: ColumnRegistry,
+    /// The MAP fields in schema order; empty for most reducers.
+    map_fields: Arc<ColumnRegistry>,
     /// Cached default state (computed once from def.state).
     default_state: Vec<Value>,
     /// Every group since open or `reload`.
@@ -71,6 +74,9 @@ struct Group {
     undo: VecDeque<(BlockNumber, Vec<Value>)>,
     /// Whether `pending_durable` holds the group.
     pending_durable: bool,
+    /// The MAP fields, with their own undo; None for a reducer without
+    /// them.
+    maps: Option<Box<StateMaps>>,
 }
 
 /// The groups of a reducer by id, their index in `all`. Never evicted: a
@@ -84,17 +90,19 @@ struct Groups {
 
 impl Groups {
     /// The id of the group `key`. On its first row, `load` gives its state.
-    fn id(&mut self, key: &[u8], load: impl FnOnce() -> Result<Vec<Value>>) -> Result<usize> {
+    fn id(&mut self, key: &[u8], load: impl FnOnce() -> Result<LoadedState>) -> Result<usize> {
         if let Some(&id) = self.ids.get(key) {
             return Ok(id);
         }
 
+        let (state, maps) = load()?;
         let id = self.all.len();
         self.all.push(Group {
             key: key.into(),
-            state: load()?,
+            state,
             undo: VecDeque::new(),
             pending_durable: false,
+            maps,
         });
         self.ids.insert(key.into(), id);
         Ok(id)
@@ -108,6 +116,9 @@ impl Groups {
         if first {
             group.undo.push_back((block, group.state.clone()));
             changed.push(id);
+            if let Some(maps) = &mut group.maps {
+                maps.begin(block);
+            }
         }
         group
     }
@@ -157,10 +168,16 @@ impl ReducerEngine {
         source_registry: &ColumnRegistry,
         runtime: Box<dyn ReducerRuntime>,
     ) -> Self {
-        let state_fields = ColumnRegistry::new(def.state.iter().map(|f| f.name.clone()).collect());
+        let field_names = |map: bool| {
+            let names = def.state.iter().filter(|f| f.map == map);
+            ColumnRegistry::new(names.map(|f| f.name.clone()).collect())
+        };
+        let state_fields = field_names(false);
+        let map_fields = Arc::new(field_names(true));
         let default_state = def
             .state
             .iter()
+            .filter(|f| !f.map)
             .map(|f| parse_default(&f.default, &f.column_type))
             .collect();
         let group_by_ids = def
@@ -176,6 +193,7 @@ impl ReducerEngine {
             runtime,
             storage,
             state_fields,
+            map_fields,
             default_state,
             groups: Groups::default(),
             reads_storage,
@@ -204,16 +222,20 @@ impl ReducerEngine {
                     .iter()
                     .filter_map(|name| modules.iter().find(|(n, _)| n == name).cloned())
                     .collect();
-                let state_fields: Vec<String> = def.state.iter().map(|f| f.name.clone()).collect();
-                let state_types: Vec<(String, crate::types::ColumnType)> = def
-                    .state
-                    .iter()
-                    .map(|f| (f.name.clone(), f.column_type.clone()))
-                    .collect();
-                Box::new(LuaRuntime::with_state_fields(
+                let typed = |map: bool| -> Vec<(String, crate::types::ColumnType)> {
+                    let fields = def.state.iter().filter(|f| f.map == map);
+                    fields
+                        .map(|f| (f.name.clone(), f.column_type.clone()))
+                        .collect()
+                };
+                let state_types = typed(false);
+                let state_fields: Vec<String> =
+                    state_types.iter().map(|(name, _)| name.clone()).collect();
+                Box::new(LuaRuntime::with_fields(
                     script,
                     &state_fields,
                     &state_types,
+                    &typed(true),
                     source_registry.names(),
                     &requiredmodules,
                 ))
@@ -268,6 +290,13 @@ impl ReducerEngine {
     /// - **Batched**: groups rows by key, calls `process_grouped()` once per block.
     ///   Used by external (host-language) reducers to minimize FFI overhead.
     pub fn process_block(&mut self, block: BlockNumber, rows: &[Row]) -> Result<Vec<Row>> {
+        if !self.map_fields.is_empty() && !self.runtime.supports_maps() {
+            return Err(Error::Reducer(format!(
+                "reducer '{}' has Map state fields, which JS and WASM reducers do not \
+                 support yet: write its body in Lua or as a Rust closure",
+                self.def.name
+            )));
+        }
         if let Some(first) = rows.first() {
             self.resolve_source(first.registry());
         }
@@ -341,7 +370,13 @@ impl ReducerEngine {
         for (index, row) in rows.iter().enumerate() {
             write_group_key(&mut self.key, &self.group_by_ids, row);
             let id = self.groups.id(&self.key, || {
-                load_state_from(storage, &self.def.name, &self.key, &self.default_state)
+                load_state_from(
+                    storage,
+                    &self.def.name,
+                    &self.key,
+                    &self.default_state,
+                    &self.map_fields,
+                )
             })?;
             let group = self.groups.change(id, block, changed);
 
@@ -349,6 +384,7 @@ impl ReducerEngine {
             let state = GroupState {
                 values: &mut group.state,
                 fields: &self.state_fields,
+                maps: group.maps.as_deref_mut(),
             };
             self.runtime
                 .process(state, row, &mut self.emits)
@@ -371,7 +407,13 @@ impl ReducerEngine {
         for row in rows {
             write_group_key(&mut self.key, &self.group_by_ids, row);
             let id = self.groups.id(&self.key, || {
-                load_state_from(storage, &self.def.name, &self.key, &self.default_state)
+                load_state_from(
+                    storage,
+                    &self.def.name,
+                    &self.key,
+                    &self.default_state,
+                    &self.map_fields,
+                )
             })?;
             let slot = *slots.entry(id).or_insert_with(|| {
                 ids.push(id);
@@ -389,6 +431,7 @@ impl ReducerEngine {
             let group = self.groups.change(id, block, changed);
             groups.push(GroupBatch {
                 state: std::mem::take(&mut group.state),
+                maps: group.maps.take(),
                 rows: start..start + size,
             });
             start += size;
@@ -413,7 +456,9 @@ impl ReducerEngine {
         // Also on failure, as on the per-row path: the undo of the failed
         // ingest restores the states from before the block.
         for (&id, group) in ids.iter().zip(grouped.groups) {
-            self.groups.all[id].state = group.state;
+            let stored = &mut self.groups.all[id];
+            stored.state = group.state;
+            stored.maps = group.maps;
         }
         processed?;
         self.emits.check()
@@ -444,6 +489,9 @@ impl ReducerEngine {
                 group.state = state;
                 affected += 1;
             }
+            if let Some(maps) = &mut group.maps {
+                maps.rollback(fork_point);
+            }
         }
         affected
     }
@@ -470,6 +518,9 @@ impl ReducerEngine {
             let group = &mut self.groups.all[id];
             let final_entries = group.undo.partition_point(|(b, _)| *b <= block);
             group.undo.drain(..final_entries);
+            if let Some(maps) = &mut group.maps {
+                maps.finalize(block);
+            }
 
             if !group.pending_durable {
                 group.pending_durable = true;
@@ -487,6 +538,9 @@ impl ReducerEngine {
             let above = group.undo.partition_point(|(b, _)| *b <= finalized);
             let state = group.undo.get(above).map_or(&group.state, |(_, state)| state);
             batch.set_reducer_finalized(&self.def.name, group.key.to_vec(), storage::encode_values(state));
+            if let Some(maps) = &mut group.maps {
+                maps.write_checkpoint(finalized, &self.def.name, &group.key, batch);
+            }
         }
     }
 }
@@ -520,20 +574,56 @@ fn stores_state(storage: &dyn StorageBackend, reducer: &str) -> bool {
     storage.has_reducer_finalized(reducer).unwrap_or(true)
 }
 
+/// The state of a group as it loads: its values, and its MAP fields if the
+/// reducer has any.
+type LoadedState = (Vec<Value>, Option<Box<StateMaps>>);
+
 /// The state of a new group: its finalized state in `storage`, else the
-/// default. No `storage` when it holds no state of the reducer.
+/// default. No `storage` when it holds no state of the reducer. A group has
+/// stored MAP entries only if it has a stored state.
 fn load_state_from(
     storage: Option<&dyn StorageBackend>,
     reducer_name: &str,
     group_key_bytes: &[u8],
     default_state: &[Value],
-) -> Result<Vec<Value>> {
+    map_fields: &Arc<ColumnRegistry>,
+) -> Result<LoadedState> {
+    let mut maps = (!map_fields.is_empty()).then(|| Box::new(StateMaps::new(map_fields.clone())));
+
     if let Some(storage) = storage
         && let Some(bytes) = storage.get_reducer_finalized(reducer_name, group_key_bytes)?
     {
-        return decode_state(&bytes, reducer_name, default_state.len());
+        let state = decode_state(&bytes, reducer_name, default_state.len())?;
+        if let Some(maps) = &mut maps {
+            load_map_entries(storage, reducer_name, group_key_bytes, maps)?;
+        }
+        return Ok((state, maps));
     }
-    Ok(default_state.to_vec())
+    Ok((default_state.to_vec(), maps))
+}
+
+/// Read the stored MAP entries of a group into `maps`.
+fn load_map_entries(
+    storage: &dyn StorageBackend,
+    reducer_name: &str,
+    group_key_bytes: &[u8],
+    maps: &mut StateMaps,
+) -> Result<()> {
+    let unreadable = |reason: String| {
+        Error::Storage(format!(
+            "unreadable Map entry of reducer '{reducer_name}': {reason}"
+        ))
+    };
+
+    for (map, key, bytes) in storage.get_reducer_map_entries(reducer_name, group_key_bytes)? {
+        let map = map as usize;
+        if map >= maps.names().len() {
+            return Err(unreadable(format!("Map field {map} of {}", maps.names().len())));
+        }
+        let value = storage::decode_value_bytes(&bytes).map_err(|e| unreadable(e.to_string()))?;
+        maps.insert_stored(map, &key, value);
+    }
+    Ok(())
 }
 
 /// Decode a finalized state that `write_checkpoint` encoded.
@@ -612,11 +702,13 @@ mod tests {
                     name: "quantity".to_string(),
                     column_type: crate::types::ColumnType::Float64,
                     default: "0".to_string(),
+                    map: false,
                 },
                 StateField {
                     name: "cost_basis".to_string(),
                     column_type: crate::types::ColumnType::Float64,
                     default: "0".to_string(),
+                    map: false,
                 },
             ],
             requires: vec![],
@@ -875,6 +967,7 @@ mod tests {
                 name: "count".to_string(),
                 column_type: crate::types::ColumnType::Float64,
                 default: "0".to_string(),
+                map: false,
             }],
             requires: vec![],
             body: ReducerBody::Lua {
@@ -1005,6 +1098,7 @@ mod tests {
                 name: "book".to_string(),
                 column_type: ColumnType::JSON,
                 default: "'{}'".to_string(),
+                map: false,
             }],
             requires: vec![],
             body: ReducerBody::Lua {
@@ -1060,6 +1154,7 @@ mod tests {
                 name: "last".to_string(),
                 column_type: ColumnType::JSON,
                 default: "'{}'".to_string(),
+                map: false,
             }],
             body: ReducerBody::Lua {
                 script: r#"
@@ -1137,11 +1232,13 @@ mod tests {
                     name: "quantity".to_string(),
                     column_type: crate::types::ColumnType::Float64,
                     default: "0".to_string(),
+                    map: false,
                 },
                 StateField {
                     name: "cost_basis".to_string(),
                     column_type: crate::types::ColumnType::Float64,
                     default: "0".to_string(),
+                    map: false,
                 },
             ],
             requires: vec![],
@@ -1330,6 +1427,7 @@ mod tests {
                 name: "count".to_string(),
                 column_type: ColumnType::Float64,
                 default: "0".to_string(),
+                map: false,
             }],
             requires: vec![],
             body: ReducerBody::External {
@@ -1493,5 +1591,180 @@ mod tests {
 
         let rows = vec![event("alice", 1.0)];
         assert!(engine.process_block(1000, &rows).is_err());
+    }
+
+    /// `book Map(String, value_type)` for each user, with the Lua `script`.
+    #[cfg(feature = "lua")]
+    fn lua_book(script: &str, value_type: ColumnType, storage: Arc<dyn StorageBackend>) -> ReducerEngine {
+        let def = ReducerDef {
+            state: vec![StateField {
+                name: "book".to_string(),
+                column_type: value_type,
+                default: String::new(),
+                map: true,
+            }],
+            body: ReducerBody::Lua {
+                script: script.to_string(),
+            },
+            ..external_counter_def()
+        };
+        let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
+        ReducerEngine::new(def, storage, &reg, &[])
+    }
+
+    /// The `before` emits of `output`, in order; None for a Null.
+    fn befores(output: &[Row]) -> Vec<Option<f64>> {
+        output
+            .iter()
+            .map(|row| row.get("before").and_then(Value::as_f64))
+            .collect()
+    }
+
+    /// Emits the entry `x` as it was, then sets it to the amount; 0 deletes
+    /// it, 13 fails. The amount keeps an emit of a nil `before` from being
+    /// empty, which Lua drops.
+    #[cfg(feature = "lua")]
+    const SET_X: &str = r#"
+        if row.amount == 13 then error("unlucky amount") end
+        local before = state.book:get("x")
+        if row.amount == 0 then state.book:delete("x") else state.book:set("x", row.amount) end
+        emit({ before = before, amount = row.amount })
+    "#;
+
+    /// Map entries roll back, and a checkpoint stores them as of finality: a
+    /// reload reads the entry that a final block deleted as absent, and not
+    /// the value that a later block set.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_map_entries_roll_back_and_reload_as_of_finality() {
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine = lua_book(SET_X, ColumnType::Float64, storage.clone());
+
+        let output = engine.process_block(1, &[event("alice", 1.0), event("bob", 5.0)]).unwrap();
+        assert_eq!(befores(&output), [None, None]);
+        let output = engine.process_block(2, &[event("alice", 2.0)]).unwrap();
+        assert_eq!(befores(&output), [Some(1.0)]);
+
+        engine.rollback(1);
+        let output = engine.process_block(2, &[event("alice", 0.0)]).unwrap();
+        assert_eq!(befores(&output), [Some(1.0)]);
+        let output = engine.process_block(3, &[event("alice", 7.0), event("bob", 6.0)]).unwrap();
+        assert_eq!(befores(&output), [None, Some(5.0)]);
+
+        let mut batch = StorageWriteBatch::new();
+        engine.advance_finality(2);
+        engine.write_checkpoint(2, &mut batch);
+        storage.commit(&batch).unwrap();
+
+        engine.reload();
+        let output = engine.process_block(3, &[event("alice", 4.0), event("bob", 8.0)]).unwrap();
+        assert_eq!(befores(&output), [None, Some(5.0)]);
+    }
+
+    /// A block that fails in its second group undoes the map changes of
+    /// both groups.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_failed_block_rolls_back_map_entries() {
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let mut engine = lua_book(SET_X, ColumnType::Float64, storage);
+        engine.process_block(1, &[event("alice", 1.0), event("bob", 5.0)]).unwrap();
+
+        let rows = [event("bob", 6.0), event("alice", 2.0), event("alice", 13.0)];
+        assert!(engine.process_block(2, &rows).is_err());
+        engine.rollback(1);
+
+        let output = engine.process_block(2, &[event("alice", 3.0), event("bob", 7.0)]).unwrap();
+        assert_eq!(befores(&output), [Some(1.0), Some(5.0)]);
+    }
+
+    /// A Map field takes no index, and a Map of numbers takes no table.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_map_misuse_fails_the_block() {
+        let cases = [
+            ("local p = state.book[row.user]", "takes no index"),
+            ("state.book[row.user] = 1", "takes no index"),
+            ("state.book:set(row.user, {})", "holds Float64 values, not tables"),
+        ];
+        for (script, error) in cases {
+            let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+            let mut engine = lua_book(script, ColumnType::Float64, storage);
+            let err = engine.process_block(1, &[event("alice", 1.0)]).unwrap_err();
+            assert!(err.to_string().contains(error), "{script}: {err}");
+        }
+    }
+
+    /// `get` on a Json map returns a copy: a change of the table stays only
+    /// after a `set`.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_json_map_get_returns_a_copy() {
+        let script = r#"
+            local p = state.book:get("p") or { n = 0 }
+            p.n = p.n + 1
+            if row.amount == 1 then state.book:set("p", p) end
+            emit({ before = p.n })
+        "#;
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let mut engine = lua_book(script, ColumnType::JSON, storage);
+
+        let rows = [event("alice", 1.0), event("alice", 2.0), event("alice", 1.0)];
+        let output = engine.process_block(1, &rows).unwrap();
+        assert_eq!(befores(&output), [Some(1.0), Some(2.0), Some(2.0)]);
+    }
+
+    /// A Rust closure reads and writes a Map field through `StateCtx::map`.
+    #[test]
+    fn fn_reducer_uses_a_map_field() {
+        use crate::reducer_runtime::fn_reducer::FnReducerRuntime;
+
+        let runtime = FnReducerRuntime::new(|ctx, row| {
+            assert!(ctx.map("missing").is_none());
+            let amount = row.get("amount").cloned().unwrap_or(Value::Null);
+            let mut book = ctx.map("book").expect("a Map field");
+            let before = book.get("x").cloned().unwrap_or(Value::Null);
+            book.set("x", amount);
+            ctx.emit(HashMap::from([("before".to_string(), before)]));
+        });
+        let def = ReducerDef {
+            state: vec![StateField {
+                name: "book".to_string(),
+                column_type: ColumnType::Float64,
+                default: String::new(),
+                map: true,
+            }],
+            ..external_counter_def()
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
+        let mut engine = ReducerEngine::with_runtime(def, storage, &reg, Box::new(runtime));
+
+        engine.process_block(1, &[event("alice", 1.0)]).unwrap();
+        engine.process_block(2, &[event("alice", 2.0)]).unwrap();
+        engine.rollback(1);
+        let output = engine.process_block(2, &[event("alice", 3.0)]).unwrap();
+        assert_eq!(befores(&output), [Some(1.0)]);
+    }
+
+    /// The JS and WASM bridges carry no Map fields: a reducer with one fails
+    /// its blocks on them, with a message that says what to do.
+    #[test]
+    fn js_reducer_refuses_map_state() {
+        let def = ReducerDef {
+            state: vec![StateField {
+                name: "book".to_string(),
+                column_type: ColumnType::Float64,
+                default: String::new(),
+                map: true,
+            }],
+            ..external_counter_def()
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
+        let mut engine = ReducerEngine::new(def, storage, &reg, &[]);
+
+        let err = engine.process_block(1, &[event("alice", 1.0)]).unwrap_err();
+        assert!(err.to_string().contains("Map state fields"), "{err}");
     }
 }

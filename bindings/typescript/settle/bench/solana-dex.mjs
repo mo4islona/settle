@@ -11,7 +11,10 @@
 // Settle: what the JS work alone costs); modes `backfill` and `tip` as in the
 // Rust bench. Each case runs in a process of its own. Env: SDEX_BATCH_SLOTS
 // (100), SDEX_STORAGE (rocks | memory), SDEX_POSITIONS (pair | json: the
-// positions of a wallet in one JSON map).
+// positions of a wallet in one JSON map | map: in a Map field, lua only).
+//
+// The `prices` reducer keeps a Map field, which JS reducers do not support
+// yet: it runs in Lua for the `js` runtime too.
 
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -24,13 +27,15 @@ const require = createRequire(import.meta.url)
 const REPO = fileURLToPath(new URL('../../../../', import.meta.url))
 const SQL = (name) => readFileSync(join(REPO, 'benches/solana_dex', name), 'utf8')
 
-const SOL = 'So11111111111111111111111111111111111111112'
+const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 const SLOT_SECONDS = 0.4
 const CONFIRMATION_DEPTH = 32
 const TIP_SHARE = 0.2
 const BATCH_SLOTS = Number(process.env.SDEX_BATCH_SLOTS ?? 100)
 const STORAGE = process.env.SDEX_STORAGE ?? 'rocks'
-const JSON_POSITIONS = process.env.SDEX_POSITIONS === 'json'
+const LAYOUT = process.env.SDEX_POSITIONS ?? 'pair'
+const POSITIONS_SQL = { pair: 'positions.sql', json: 'positions_json.sql', map: 'positions_map.sql' }[LAYOUT]
+if (!POSITIONS_SQL) throw new Error(`unknown SDEX_POSITIONS ${LAYOUT}`)
 const ALL_CASES = [
   'js,backfill', 'lua,backfill', 'floor,backfill',
   'js,tip', 'lua,tip',
@@ -44,7 +49,7 @@ function load(path) {
   const buffer = file.buffer.slice(file.byteOffset, file.byteOffset + file.byteLength)
   const view = new DataView(buffer)
   const magic = new TextDecoder().decode(new Uint8Array(buffer, 0, 8))
-  if (magic !== 'SDEX0001') throw new Error(`${path}: not a swaps file`)
+  if (magic !== 'SDEX0002') throw new Error(`${path}: not a swaps file`)
 
   const align = (n) => Math.ceil(n / 8) * 8
   const stringBytes = view.getUint32(12, true)
@@ -61,7 +66,6 @@ function load(path) {
   }
   const slot = take(Float64Array, blockCount)
   const timestamp = take(Float64Array, blockCount)
-  const solUsd = take(Float64Array, blockCount)
   const lengths = take(Uint32Array, blockCount)
   at = align(at)
   const base = take(Float64Array, swapCount)
@@ -90,7 +94,6 @@ function load(path) {
         side: buy[i] ? 'buy' : 'sell',
         base_amount: base[i],
         quote_amount: quoteAmount[i],
-        sol_usd: solUsd[b],
       }
     }
     blocks.push({ slot: slot[b], rows })
@@ -100,10 +103,27 @@ function load(path) {
 
 // ─── JS reducers: the logic of the Lua reducers ──────────────────────
 
+/**
+ * lua/prices.sql: the USDC price of a swap from the last prices in `usdc`,
+ * or null for a swap of two tokens without a price. Sets the price that the
+ * swap gives.
+ */
+function priceOf(usdc, row) {
+  const quoteUsd = row.quote === USDC ? 1 : usdc.get(row.quote)
+  if (quoteUsd !== undefined) {
+    const price = (row.quote_amount * quoteUsd) / row.base_amount
+    usdc.set(row.token, price)
+    return price
+  }
+  const price = usdc.get(row.token)
+  if (price === undefined) return null
+  usdc.set(row.quote, (row.base_amount * price) / row.quote_amount)
+  return price
+}
+
 function poolPrices(state, row) {
-  let usd = row.quote_amount
-  if (row.quote === SOL) usd *= row.sol_usd
-  const price = usd / row.base_amount
+  const usd = row.usd
+  const price = row.price_usd
   const change = state.price_usd > 0 ? price / state.price_usd - 1 : 0
 
   state.update({
@@ -122,10 +142,7 @@ function poolPrices(state, row) {
 }
 
 function positions(state, row) {
-  let usd = row.quote_amount
-  if (row.quote === SOL) usd *= row.sol_usd
-  const base = row.base_amount
-  const price = usd / base
+  const { usd, price_usd: price, base_amount: base } = row
   let qty = state.qty
   let cost = state.cost_usd
 
@@ -168,10 +185,7 @@ function positions(state, row) {
 
 /** lua/positions_json.sql: the positions of a wallet in one JSON map. */
 function positionsJson(state, row) {
-  let usd = row.quote_amount
-  if (row.quote === SOL) usd *= row.sol_usd
-  const base = row.base_amount
-  const price = usd / base
+  const { usd, price_usd: price, base_amount: base } = row
 
   const book = state.book
   let p = book[row.token]
@@ -209,10 +223,11 @@ function positionsJson(state, row) {
 }
 
 /**
- * The two reducers and the five views in Maps, without rollback, change
+ * The three reducers and the five views in Maps, without rollback, change
  * records or storage: the least that the JS work of this pipeline costs.
  */
 class Floor {
+  usdc = new Map()
   pools = new Map()
   positions = new Map()
   candles = new Map()
@@ -223,10 +238,10 @@ class Floor {
 
   ingest(rows) {
     for (const row of rows) {
-      let usd = row.quote_amount
-      if (row.quote === SOL) usd *= row.sol_usd
+      const price = priceOf(this.usdc, row)
+      if (price === null) continue
       const base = row.base_amount
-      const price = usd / base
+      const usd = base * price
 
       let pool = this.pools.get(row.pool)
       if (!pool) this.pools.set(row.pool, (pool = { price_usd: 0, volume_usd: 0, swaps: 0 }))
@@ -390,12 +405,13 @@ class Split {
 const cursor = (slot) => ({ number: slot, hash: `0x${slot.toString(16).padStart(16, '0')}` })
 
 function open(runtime) {
+  if (runtime === 'js' && LAYOUT === 'map') throw new Error('JS reducers do not support Map fields yet')
   const dir = { js: 'external', lua: 'lua' }[runtime]
-  const positionsFile = JSON_POSITIONS ? 'positions_json.sql' : 'positions.sql'
   const schema = [
     SQL('tables.sql'),
+    SQL('lua/prices.sql'),
     SQL(`${dir}/pool_prices.sql`),
-    SQL(`${dir}/${positionsFile}`),
+    SQL(`${dir}/${POSITIONS_SQL}`),
     SQL('views.sql'),
   ].join('\n')
 
@@ -407,7 +423,7 @@ function open(runtime) {
   const db = Settle.open({ schema, dataDir })
   if (runtime === 'js') {
     db.registerReducerCallback('pool_prices', poolPrices)
-    db.registerReducerCallback('positions', JSON_POSITIONS ? positionsJson : positions)
+    db.registerReducerCallback('positions', LAYOUT === 'json' ? positionsJson : positions)
   }
   return { db, dataDir }
 }
@@ -511,7 +527,7 @@ async function runCase(data, runtime, mode) {
   if (dataDir) rmSync(dataDir, { recursive: true, force: true })
 
   return {
-    label: `${runtime},${mode}${JSON_POSITIONS && runtime !== 'floor' ? ',json' : ''}`,
+    label: `${runtime},${mode}${runtime === 'floor' ? '' : `,${LAYOUT}`}`,
     swaps,
     slots: last - first + 1,
     wallMs,
@@ -577,12 +593,13 @@ if (rest[0] === '--case') {
   const result = await runCase(data, runtime, mode)
   process.stdout.write(`\n${JSON.stringify(result)}\n`)
 } else {
-  // The floor does not change.
-  const defaults = JSON_POSITIONS ? ALL_CASES.filter((c) => /^(js|lua),/.test(c)) : ALL_CASES
+  // The floor does not change; JS has no Map fields.
+  const runtimes = { pair: /^/, json: /^(js|lua),/, map: /^lua,/ }[LAYOUT]
+  const defaults = ALL_CASES.filter((c) => runtimes.test(c))
   const cases = rest.length ? rest : defaults
   console.log(
     `node ${process.version}, storage ${STORAGE}, ${BATCH_SLOTS} slots in each backfill ingest, ` +
-      `positions ${JSON_POSITIONS ? 'json' : 'pair'}\n`,
+      `positions ${LAYOUT}\n`,
   )
   for (const c of cases) {
     const child = spawnSync(

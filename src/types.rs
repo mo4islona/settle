@@ -46,6 +46,10 @@ impl ColumnRegistry {
         self.names.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
     pub fn names(&self) -> &[String] {
         &self.names
     }

@@ -10,11 +10,12 @@ use crate::error::{Error, Result};
 use crate::types::BlockNumber;
 
 use super::journal::JournalPart;
-use super::{BatchOp, StorageBackend, StorageWriteBatch};
+use super::{BatchOp, MapEntry, StorageBackend, StorageWriteBatch};
 
 const CF_RAW: &str = "raw";
 const CF_REDUCER_SNAP: &str = "reducer_snap";
 const CF_REDUCER_FIN: &str = "reducer_fin";
+const CF_REDUCER_MAP: &str = "reducer_map";
 const CF_MV: &str = "mv";
 const CF_META: &str = "meta";
 const CF_BLOCK_HASH: &str = "block_hash";
@@ -32,6 +33,7 @@ fn to_err(e: rocksdb::Error) -> Error {
 // CF_RAW:           {table}\0{block_be8}
 // CF_REDUCER_SNAP:  {reducer}\0{gk_len_be2}{group_key}{block_be8}
 // CF_REDUCER_FIN:   {reducer}\0{group_key}
+// CF_REDUCER_MAP:   {reducer}\0{gk_len_be4}{group_key}{map_be2}{entry_key}
 // CF_MV:            {view}\0{group_key}
 // CF_META:          {key}, and journal\0{sequence_be8}{part_be8}
 // CF_BLOCK_HASH:    {block_be8}
@@ -93,6 +95,24 @@ fn fin_key(reducer: &str, gk: &[u8]) -> Vec<u8> {
     k.extend_from_slice(reducer.as_bytes());
     k.push(0);
     k.extend_from_slice(gk);
+    k
+}
+
+/// The prefix of the MAP entries of one group. The length of the group key
+/// keeps a group key that is a prefix of another from reading its entries.
+fn map_group_prefix(reducer: &str, gk: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(reducer.len() + 1 + 4 + gk.len());
+    k.extend_from_slice(reducer.as_bytes());
+    k.push(0);
+    k.extend_from_slice(&(gk.len() as u32).to_be_bytes());
+    k.extend_from_slice(gk);
+    k
+}
+
+fn map_entry_key(reducer: &str, gk: &[u8], map: u16, key: &str) -> Vec<u8> {
+    let mut k = map_group_prefix(reducer, gk);
+    k.extend_from_slice(&map.to_be_bytes());
+    k.extend_from_slice(key.as_bytes());
     k
 }
 
@@ -196,8 +216,16 @@ impl RocksDbBackend {
         db_opts.create_missing_column_families(true);
         db_opts.set_max_total_wal_size(MAX_TOTAL_WAL_SIZE);
 
-        let cfs = [CF_RAW, CF_REDUCER_SNAP, CF_REDUCER_FIN, CF_MV, CF_META, CF_BLOCK_HASH]
-            .into_iter()
+        let cfs = [
+            CF_RAW,
+            CF_REDUCER_SNAP,
+            CF_REDUCER_FIN,
+            CF_REDUCER_MAP,
+            CF_MV,
+            CF_META,
+            CF_BLOCK_HASH,
+        ]
+        .into_iter()
             .map(|name| ColumnFamilyDescriptor::new(name, make_opts()))
             .collect::<Vec<_>>();
 
@@ -463,6 +491,27 @@ impl StorageBackend for RocksDbBackend {
         }
     }
 
+    fn get_reducer_map_entries(&self, reducer: &str, group_key: &[u8]) -> Result<Vec<MapEntry>> {
+        let cf = self.db.cf_handle(CF_REDUCER_MAP).expect("reducer_map CF");
+        let prefix = map_group_prefix(reducer, group_key);
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_upper_bound(upper_bound(&prefix));
+
+        let mut entries = Vec::new();
+        let iter =
+            self.db
+                .iterator_cf_opt(cf, opts, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (key, value) = item.map_err(to_err)?;
+            let corrupt = || Error::Storage("corrupt key of a MAP entry".into());
+            let rest = key.strip_prefix(prefix.as_slice()).ok_or_else(corrupt)?;
+            let (map, entry_key) = rest.split_first_chunk::<2>().ok_or_else(corrupt)?;
+            let entry_key = String::from_utf8(entry_key.to_vec()).map_err(|_| corrupt())?;
+            entries.push((u16::from_be_bytes(*map), entry_key, value.into_vec()));
+        }
+        Ok(entries)
+    }
+
     fn delete_reducer_states_up_to(
         &self,
         reducer: &str,
@@ -586,6 +635,25 @@ impl StorageBackend for RocksDbBackend {
                 } => {
                     let cf = self.db.cf_handle(CF_REDUCER_FIN).expect("reducer_fin CF");
                     wb.put_cf(cf, fin_key(reducer, group_key), state);
+                }
+                BatchOp::PutReducerMapEntry {
+                    reducer,
+                    group_key,
+                    map,
+                    key,
+                    value,
+                } => {
+                    let cf = self.db.cf_handle(CF_REDUCER_MAP).expect("reducer_map CF");
+                    wb.put_cf(cf, map_entry_key(reducer, group_key, *map, key), value);
+                }
+                BatchOp::DeleteReducerMapEntry {
+                    reducer,
+                    group_key,
+                    map,
+                    key,
+                } => {
+                    let cf = self.db.cf_handle(CF_REDUCER_MAP).expect("reducer_map CF");
+                    wb.delete_cf(cf, map_entry_key(reducer, group_key, *map, key));
                 }
                 BatchOp::PutMvState {
                     view,

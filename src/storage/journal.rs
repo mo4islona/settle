@@ -28,6 +28,8 @@ const DELETE_BLOCK_HASH: u8 = 7;
 const PUT_JOURNAL: u8 = 8;
 const DELETE_JOURNAL: u8 = 9;
 const DELETE_RAW_ROWS: u8 = 10;
+const PUT_REDUCER_MAP_ENTRY: u8 = 11;
+const DELETE_REDUCER_MAP_ENTRY: u8 = 12;
 
 pub fn encode(batch: &StorageWriteBatch) -> Vec<u8> {
     let len = batch.ops.iter().map(encoded_len).sum();
@@ -50,6 +52,32 @@ pub fn encode(batch: &StorageWriteBatch) -> Vec<u8> {
                 put_bytes(&mut out, reducer.as_bytes());
                 put_bytes(&mut out, group_key);
                 put_bytes(&mut out, state);
+            }
+            BatchOp::PutReducerMapEntry {
+                reducer,
+                group_key,
+                map,
+                key,
+                value,
+            } => {
+                out.push(PUT_REDUCER_MAP_ENTRY);
+                put_bytes(&mut out, reducer.as_bytes());
+                put_bytes(&mut out, group_key);
+                put_u64(&mut out, u64::from(*map));
+                put_bytes(&mut out, key.as_bytes());
+                put_bytes(&mut out, value);
+            }
+            BatchOp::DeleteReducerMapEntry {
+                reducer,
+                group_key,
+                map,
+                key,
+            } => {
+                out.push(DELETE_REDUCER_MAP_ENTRY);
+                put_bytes(&mut out, reducer.as_bytes());
+                put_bytes(&mut out, group_key);
+                put_u64(&mut out, u64::from(*map));
+                put_bytes(&mut out, key.as_bytes());
             }
             BatchOp::PutMvState {
                 view,
@@ -132,6 +160,19 @@ pub fn decode(bytes: &[u8]) -> Result<StorageWriteBatch> {
                 group_key: reader.bytes()?,
                 state: reader.bytes()?,
             },
+            PUT_REDUCER_MAP_ENTRY => BatchOp::PutReducerMapEntry {
+                reducer: reader.string()?,
+                group_key: reader.bytes()?,
+                map: reader.u16()?,
+                key: reader.string()?,
+                value: reader.bytes()?,
+            },
+            DELETE_REDUCER_MAP_ENTRY => BatchOp::DeleteReducerMapEntry {
+                reducer: reader.string()?,
+                group_key: reader.bytes()?,
+                map: reader.u16()?,
+                key: reader.string()?,
+            },
             PUT_MV_STATE => BatchOp::PutMvState {
                 view: reader.string()?,
                 group_key: reader.bytes()?,
@@ -187,6 +228,19 @@ fn encoded_len(op: &BatchOp) -> usize {
             group_key,
             state,
         } => 3 * N + reducer.len() + group_key.len() + state.len(),
+        BatchOp::PutReducerMapEntry {
+            reducer,
+            group_key,
+            key,
+            value,
+            ..
+        } => 5 * N + reducer.len() + group_key.len() + key.len() + value.len(),
+        BatchOp::DeleteReducerMapEntry {
+            reducer,
+            group_key,
+            key,
+            ..
+        } => 4 * N + reducer.len() + group_key.len() + key.len(),
         BatchOp::PutMvState {
             view,
             group_key,
@@ -238,6 +292,10 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
     }
 
+    fn u16(&mut self) -> Result<u16> {
+        u16::try_from(self.u64()?).map_err(|_| corrupt("Map field index"))
+    }
+
     fn bytes(&mut self) -> Result<Vec<u8>> {
         let len = usize::try_from(self.u64()?).map_err(|_| corrupt("length"))?;
         Ok(self.take(len)?.to_vec())
@@ -258,6 +316,8 @@ mod tests {
         batch.put_raw_rows("swaps", 10, vec![1, 2, 3]);
         batch.delete_raw_rows("swaps", 0, 4);
         batch.set_reducer_finalized("running", b"ETH".to_vec(), vec![4]);
+        batch.put_reducer_map_entry("prices", b"", 1, "BONK", vec![5]);
+        batch.delete_reducer_map_entry("prices", b"", 0, "WIF");
         batch.put_mv_state("volume", vec![5, 6], vec![]);
         batch.delete_mv_state("volume", &[7]);
         batch.put_meta("latest_block", &10u64.to_be_bytes());

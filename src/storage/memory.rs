@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::types::BlockNumber;
 
 use super::journal::JournalPart;
-use super::{BatchOp, StorageBackend, StorageWriteBatch};
+use super::{BatchOp, MapEntry, StorageBackend, StorageWriteBatch};
 
 /// In-memory storage backend using BTreeMap. Suitable for testing and small datasets.
 pub struct MemoryBackend {
@@ -19,6 +19,8 @@ struct MemoryInner {
     reducer_states: BTreeMap<(String, Vec<u8>, BlockNumber), Vec<u8>>,
     /// reducer_finalized:{name}:{group_key_hex} -> state bytes
     reducer_finalized: BTreeMap<(String, Vec<u8>), Vec<u8>>,
+    /// (reducer, group key) -> (MAP field index, key) -> value bytes
+    reducer_maps: BTreeMap<(String, Vec<u8>), BTreeMap<(u16, String), Vec<u8>>>,
     /// mv:{view}:{group_key_hex} -> state bytes
     mv_states: BTreeMap<(String, Vec<u8>), Vec<u8>>,
     /// meta:{key} -> value bytes
@@ -35,6 +37,7 @@ impl MemoryBackend {
                 raw: BTreeMap::new(),
                 reducer_states: BTreeMap::new(),
                 reducer_finalized: BTreeMap::new(),
+                reducer_maps: BTreeMap::new(),
                 mv_states: BTreeMap::new(),
                 meta: BTreeMap::new(),
                 block_hashes: BTreeMap::new(),
@@ -244,6 +247,19 @@ impl StorageBackend for MemoryBackend {
         Ok(())
     }
 
+    fn get_reducer_map_entries(&self, reducer: &str, group_key: &[u8]) -> Result<Vec<MapEntry>> {
+        let inner = self.inner.lock().unwrap();
+        let key = (reducer.to_string(), group_key.to_vec());
+        let Some(entries) = inner.reducer_maps.get(&key) else {
+            return Ok(Vec::new());
+        };
+        let entries = entries
+            .iter()
+            .map(|((map, key), value)| (*map, key.clone(), value.clone()))
+            .collect();
+        Ok(entries)
+    }
+
     // --- MV state ---
 
     fn put_mv_state(&self, view: &str, group_key: &[u8], state: &[u8]) -> Result<()> {
@@ -315,6 +331,28 @@ impl StorageBackend for MemoryBackend {
                 } => {
                     let key = (reducer.clone(), group_key.clone());
                     inner.reducer_finalized.insert(key, state.clone());
+                }
+                BatchOp::PutReducerMapEntry {
+                    reducer,
+                    group_key,
+                    map,
+                    key,
+                    value,
+                } => {
+                    let group = (reducer.clone(), group_key.clone());
+                    let entries = inner.reducer_maps.entry(group).or_default();
+                    entries.insert((*map, key.clone()), value.clone());
+                }
+                BatchOp::DeleteReducerMapEntry {
+                    reducer,
+                    group_key,
+                    map,
+                    key,
+                } => {
+                    let group = (reducer.clone(), group_key.clone());
+                    if let Some(entries) = inner.reducer_maps.get_mut(&group) {
+                        entries.remove(&(*map, key.clone()));
+                    }
                 }
                 BatchOp::PutMvState {
                     view,

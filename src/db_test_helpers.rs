@@ -160,6 +160,7 @@ impl StorageBackend for FailingStorage {
     fn get_reducer_finalized(&self, r: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_reducer_finalized(r, k) }
     fn set_reducer_finalized(&self, r: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.set_reducer_finalized(r, k, s) }
     fn delete_reducer_states_up_to(&self, r: &str, k: &[u8], u: BlockNumber) -> Result<()> { self.inner.delete_reducer_states_up_to(r, k, u) }
+    fn get_reducer_map_entries(&self, r: &str, k: &[u8]) -> Result<Vec<crate::storage::MapEntry>> { self.inner.get_reducer_map_entries(r, k) }
     fn put_mv_state(&self, v: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.put_mv_state(v, k, s) }
     fn get_mv_state(&self, v: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_mv_state(v, k) }
     fn delete_mv_state(&self, v: &str, k: &[u8]) -> Result<()> { self.inner.delete_mv_state(v, k) }
