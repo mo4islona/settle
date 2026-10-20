@@ -226,6 +226,7 @@ Tests MUST NOT pin these behaviors:
 | OQ-3 | When an object comes back to the schema after a removal, does it start empty, load its old state, or does open refuse? | GAP-18 | Maintainer |
 | OQ-4 | Does a Base58 value leave Settle as base58 text or as hex text? | GAP-28 | Maintainer |
 | OQ-5 | Is the deferral gate for sliding windows permanent, or only a test gap? | ADR-2 | Maintainer |
+| OQ-6 | Is an emit whose values are all Null an emit row (DEF-27)? Today it is no row, so a view that counts the rows of a reducer does not count that input row. | DEF-27 | Maintainer |
 
 ### Closed
 

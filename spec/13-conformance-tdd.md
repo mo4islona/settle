@@ -1,6 +1,6 @@
 # 13 — Conformance and TDD
 
-**As of 2026-10-20.** This is a mutable status document. The statuses come from the test inventory of the repository at that date: about 580 Rust tests and 76 binding tests. The reference model of this document is normative. The matrices, the registers and the build order are status.
+**As of 2026-10-20.** This is a mutable status document. The statuses come from the test inventory of the repository at that date: about 590 Rust tests and 76 binding tests. The reference model of this document is normative. The matrices, the registers and the build order are status.
 
 ## Harness architecture
 
@@ -177,8 +177,8 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 |---|---|---|
 | REQ-1 | P | Parser tests cover cycles, absent sources and unknown types. No test opens the examples of IB-60. |
 | REQ-2 | C | Validation tests compare the state after a failed ingest with the state before it. |
-| REQ-3 | P | The differential compares the final targets. No test checks each record against a model target. |
-| REQ-4 | P | The differential uses both fork paths, but its reference is Settle itself. |
+| REQ-3 | P | CT-1 checks each record against the model and the target. known-violated for raw deletes (GAP-10). |
+| REQ-4 | C | CT-1 sends forks by both paths, also as hash conflicts, against the model. |
 | REQ-5 | P | known-violated: an open restores `F` as `D`, below the `F` of the last durable commit (GAP-3). |
 | REQ-6 | C | Gappy chains are in the differential and in the ack tests. |
 | REQ-7 | P | Many tests use virtual tables. No test checks the absence of their records after a fork. |
@@ -215,37 +215,37 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 
 | Property | Classes | Status | Note |
 |---|---|---|---|
-| INV-1 | CT-1, CT-2 | P | Backfill tests read `D`. The differential does not read it after each step. |
+| INV-1 | CT-1, CT-2 | C | CT-1 compares `D`, `F` and `L` with the model after every call. |
 | INV-2 | CT-1, CT-4 | C | Tests of the full queue. |
-| INV-3 | CT-1, CT-2 | P | Pipelined tests check the sequences. No check after each reopen. |
-| INV-4 | CT-1 | P | Unit tests of the merge. No validator runs on each batch. |
+| INV-3 | CT-1, CT-2 | C | CT-1 compares each sequence with the model, also after each open, and a validator checks that they follow each other. |
+| INV-4 | CT-1 | C | A validator on every batch. |
 | INV-5 | CT-1, CT-2 | C | The differential compares stored and memory hashes at each reopen. |
-| INV-6 | CT-1 | P | Unit tests of empty groups. |
+| INV-6 | CT-1 | P | known-violated for a group whose values are all NaN (GAP-48), so CT-1 sends no NaN. CT-1 compares the presence of each group with the model, also for groups that a rollback or a window empties. |
 | INV-7 | CT-2, CT-7 | P | Tests of the purge margin. |
 | INV-8 | CT-1, CT-4 | C | Tests of the emit limit and of columns that shrink. |
-| INV-9 | CT-1 | P | The fold and window oracles are independent. The pipeline oracle is Settle itself. |
-| INV-10 | CT-1, CT-2 | P | known-violated (GAP-3). |
+| INV-9 | CT-1 | P | CT-1 compares the derived state with the model for raw and virtual tables, Lua reducers with Map state, and the Int and Float modes. Chained and external reducers and the BigInt mode are not in CT-1. |
+| INV-10 | CT-1, CT-2 | P | known-violated (GAP-3). CT-1 checks `F` after every call. |
 | INV-11 | CT-1, CT-2 | P | In a running process: C. known-violated after a reopen (GAP-3). |
 | INV-12 | CT-4, CT-8 | P | known-violated for attach (GAP-31). |
-| INV-13 | CT-1 | U | No test reads a status twice. |
+| INV-13 | CT-1 | C | CT-1 reads each status twice after every call. |
 | INV-14 | CT-4 | P | Dedup tests, also for block 0. No test for a second table of an accepted block. |
 | INV-15 | CT-8, CT-3 | P | CT-8 is C, with a store that records each commit. CT-3 is U: no kill points (HC-7). |
 | INV-16 | CT-8 | C | Tests of each poison trigger and of a failed sync. |
 | INV-17 | CT-4 | C | A test sends a conflict with a bad row. |
 | INV-18 | CT-1, CT-7 | U | No test classifies deletes. |
-| INV-20 | CT-1, CT-2, CT-10 | P | The differential and the golden scenarios. No independent model (GAP-32). |
-| INV-21 | CT-1 | U | known-suspect (GAP-41). |
-| INV-22 | CT-1 | U | known-violated (GAP-10). |
-| INV-23 | CT-1 | P | No validator on compensation batches. |
-| INV-24 | CT-1 | P | The fold oracle (300 seeds of 300 operations) compares the running fold with a fresh fold of the same block contributions. It does not fold `A` from scratch. The window oracle compares Settle with its own replay (GAP-32). |
+| INV-20 | CT-1, CT-2, CT-10 | C | CT-1 compares the target with `out(A)` outside `K` after every call, on the memory backend. |
+| INV-21 | CT-1 | P | known-violated (GAP-41). A validator checks the operation of every record against the target. |
+| INV-22 | CT-1 | P | known-violated (GAP-10). A validator checks the previous values of every record against the target. |
+| INV-23 | CT-1 | C | A validator on every batch, also on compensation batches. |
+| INV-24 | CT-1 | P | CT-1 folds `A` from scratch after every call, with Float64 values that make the two folds of DEF-42 differ. The BigInt mode is not in CT-1. known-violated for NaN (GAP-48). |
 | INV-25 | CT-1, CT-12 | P | No parallel against sequential comparison. |
 | INV-26 | CT-4, CT-5 | P | Error tests in Rust. JS tests only for two classes. |
-| INV-27 | CT-1, CT-4 | U | known-violated (GAP-1). |
+| INV-27 | CT-1, CT-4 | P | known-violated (GAP-1). A validator checks the type of every value for input of the right types. |
 | INV-28 | CT-1 | U | known-violated (GAP-1, GAP-26). |
-| INV-29 | CT-1 | U | No ledger. |
-| INV-30 | CT-1, CT-5 | P | The cursors are checked in tests, not after each step. |
-| INV-31 | CT-1 | P | Some tests check the heads. |
-| INV-32 | CT-1 | P | Pipelined tests. |
+| INV-29 | CT-1 | C | The input ledger checks raw records and the key items of views. |
+| INV-30 | CT-1, CT-5 | P | CT-1 compares every status read with the model after every call. known-violated for the finalized cursor after an open (GAP-3). |
+| INV-31 | CT-1 | P | CT-1 compares the heads of every batch with the model. known-violated for the finalized head after an open (GAP-3). |
+| INV-32 | CT-1 | C | CT-1 compares every sequence with the model. |
 | INV-33 | CT-5 | U | known-violated (GAP-11). |
 | INV-35 | CT-12 | U | No test. |
 | INV-36 | CT-1 | U | known-violated (GAP-7). |
@@ -279,7 +279,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | FM-4 | CT-1 | U | known-violated (GAP-1). |
 | FM-10..FM-17 | CT-4 | C | Validation and fork tests. |
 | FM-18, FM-19 | CT-4 | U | OQ-1 and GAP-1. |
-| FM-20..FM-25 | CT-4, CT-1 | P | Fork tests. FM-22 is known-violated on the in-line path (GAP-8). |
+| FM-20..FM-25 | CT-4, CT-1 | P | Fork tests and CT-1. FM-22 is known-violated on the in-line path (GAP-8). |
 | FM-26..FM-28 | CT-4, CT-9 | U | GAP-9 and GAP-17. |
 | FM-29 | CT-2 | C | Replay gives the same batch. |
 | FM-30..FM-35 | CT-8 | C | The failing store and the corruption tests. |
@@ -304,7 +304,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 
 **As of 2026-10-20.** Priorities: P0 is an active production risk, P1 a correctness hole with a plausible trigger, P2 bounded or rare, P3 polish. No entry is P0. A closed gap is deleted (see the IDs in the README).
 
-**Next gap number:** 47
+**Next gap number:** 49
 
 | ID | Statement | Violated | Priority | First test |
 |---|---|---|---|---|
@@ -338,7 +338,6 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | GAP-29 | The browser output differs from Node: NaN and infinities become null, and bytes become arrays of numbers. | REQ-32, IB-48 | P2 | The same calls in Node and in the browser. Expect equal batches. |
 | GAP-30 | A String group key whose bytes equal the encoding of a Null key shares one reducer group with it. | DEF-25 | P3 | Rows with the key Null and the key `"\x01\x00\x00\x00\x00"`. Expect two groups. |
 | GAP-31 | A failed attach, registration or replay leaves the chain rolled back and in part replayed. The instance is not poisoned. | WP-64, INV-12 | P2 | An attach whose replay fails. Expect the state before the attach. |
-| GAP-32 | No independent reference model exists. The differential tests compare Settle with itself, on the memory backend, with one table. | INV-9, INV-20 | P1 | Build HC-4, and run CT-1 on the schemas of the current tests. |
 | GAP-33 | No kill-point or power-loss harness exists, and the differential never runs on the persistent backend. | INV-40, INV-42, INV-49 | P1 | Build HC-7 and HC-8. Kill after the journal write and before the return. |
 | GAP-34 | No fuzzer exists. | REQ-42, FM-1 | P2 | A fuzzer for the schema parser with case-mapping text. |
 | GAP-35 | No line coverage is measured. | MG-4 | P3 | Build HC-12 and record the first value. |
@@ -346,8 +345,9 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | GAP-37 | No performance gate runs in CI or before a release. | REQ-40, MG-7, MG-8 | P3 | A release checklist step that runs CT-6 on the reference host. |
 | GAP-38 | The configuration differs across bindings. The Node binding has no deferral, retention, timing or warning setting, and the Rust builder has no queue or journal setting. | REQ-31, IB-22 | P3 | Set each configuration field in each binding. |
 | GAP-39 | The engine module is public in Rust, so a host can commit, roll back or finalize outside an atomic call. | REQ-30 | P3 | A compile test that the engine module is not public. |
-| GAP-40 | A `count(c)` group with only Null values has data before finality and none after it, so its presence changes at finality. | DEF-42, INV-6 | P3 | A group with only Null values of `c`, then a finality advance and a reopen. Expect no change in presence. |
-| GAP-41 | After an in-line fork, a view update can have values equal to its previous values. | RP-6, INV-21 | P3 | An in-line fork that restores the same aggregate. Expect no record. |
+| GAP-41 | After an in-line fork, an update of a view row or of a raw row can have values equal to its previous values. | RP-6, INV-21 | P3 | An in-line fork that restores the same aggregate. Expect no record. |
+| GAP-47 | An in-line fork can update a view group in its rollback and empty the group with its new rows. The delete record then has the values of the update, not the deleted row. | RP-4 | P3 | A rollback brings back an expired block of a sliding-view group, and the new rows of the same call expire the group. Expect a delete whose values are its previous values. |
+| GAP-48 | `min` and `max` take a NaN as a value. A group whose values are all NaN gets NaN, and a view group that has no other data is present. | DEF-42, INV-6, INV-24 | P3 | A view with only `min` and `max` of a Float64 column, and one row whose value is NaN. Expect no group. |
 | GAP-42 | The layout check lets the virtual flag and the runtime kind change. | CN-32 | P3 | Make a stored table virtual and reopen. Expect INCOMPATIBLE_STORAGE. |
 | GAP-43 | No memory gauge, no open-phase report and no store gauge exists. | OB-10, OB-11, OB-12 | P3 | Read each gauge after a run and compare it with a probe. |
 | GAP-44 | The type names `Bytes`, `JSON` and `JSONB` probably fail in a CREATE TABLE statement, so raw tables cannot have these types. This is known-suspect. | REQ-1, IB-62 | P2 | Open `CREATE TABLE t (block_number UInt64, doc JSON)`. Expect success. |
@@ -356,11 +356,11 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 
 | ID | Phase | Content | Done when |
 |---|---|---|---|
-| BO-1 | Harness skeleton | HC-4, HC-9, HC-10 and HC-17. Run CT-1 on the schemas of the current tests. | CT-1 runs in CI, and the matrix shows its first results. |
+| BO-1 | Harness skeleton | HC-4, HC-9 and HC-10. Run CT-1 on the schemas of the current tests. | CT-1 runs in CI, and the matrix shows its first results. |
 | BO-2 | P1 correctness | GAP-1, GAP-2, GAP-3 and GAP-4. Measure for GAP-6. | Each closure has its failing test first, and the matrix rows move to C. |
 | BO-3 | Crash harness | HC-7 and HC-8 (GAP-33). CT-3 at each kill point. | INV-40, INV-41, INV-42 and INV-49 are C. |
 | BO-4 | Robustness | GAP-5, GAP-7, GAP-8, GAP-16, GAP-17 and GAP-31. HC-11 (GAP-34). | FM-1 is C, and CT-9 runs nightly. |
-| BO-5 | Binding parity | GAP-9, GAP-12, GAP-13, GAP-14, GAP-15, GAP-23, GAP-24, GAP-28, GAP-29 and GAP-38. | CT-5 compares all bindings in CI. |
+| BO-5 | Binding parity | HC-17. GAP-9, GAP-12, GAP-13, GAP-14, GAP-15, GAP-23, GAP-24, GAP-28, GAP-29 and GAP-38. | CT-5 compares all bindings in CI. |
 | BO-6 | Performance regime | GAP-6, GAP-21 and GAP-22. HC-15 and the gates of GAP-37. Ratify ADR-9. | Each SLO row has a gate. |
 
 Each phase ends with an update of the matrices and the gap register in the same change.
@@ -379,7 +379,7 @@ Each phase ends with an update of the matrices and the gap register in the same 
 | MG-8 | Each SLO row of 11 holds, and a soak run (CT-7) shows no growth of memory, disk or open time. | P-GATE-WALL-NOISE | pre-release | HC-14, HC-15 | Advisory (GAP-37) |
 | MG-9 | The checker of this suite reports no error. | P-GATE-SPEC-ERRORS | per-PR | HC-18 | Yes |
 | MG-10 | The formatter reports no change, and the linter reports no warning at its configured level. | P-GATE-LINT-WARNINGS | per-PR | HC-23 | Advisory (GAP-36) |
-| MG-11 | The nightly runs pass at their budgets: the oracle (CT-1), the crash points (CT-3), fuzz (CT-9) and concurrency (CT-12). | P-ORACLE-SEEDS, P-FUZZ-BUDGET | nightly | HC-4, HC-7, HC-11, HC-22 | Advisory (GAP-32, GAP-33, GAP-34) |
+| MG-11 | The nightly runs pass at their budgets: the oracle (CT-1), the crash points (CT-3), fuzz (CT-9) and concurrency (CT-12). | P-ORACLE-SEEDS, P-FUZZ-BUDGET | nightly | HC-4, HC-7, HC-11, HC-22 | Advisory (GAP-33, GAP-34) |
 | MG-12 | Flake policy: no automatic retry. A test that fails twice with no code change goes to quarantine, with an owner and an expiry of P-QUARANTINE-DAYS. A silent skip is not allowed. | P-QUARANTINE-DAYS | per-PR | HC-1, HC-20 | Yes |
 | MG-13 | The release build packs and installs each binding package. | P-GATE-TEST-FAILURES | pre-release | HC-16 | Advisory (GAP-23, GAP-24) |
 
@@ -390,15 +390,15 @@ A per-PR gate stays within P-GATE-PR-BUDGET of CI time. CT-6, CT-7 and the long 
 | ID | Capability | Needed by | Status | Note |
 |---|---|---|---|---|
 | HC-1 | A Rust test runner for library, integration and end-to-end tests. | CT-4, CT-10, CT-11, MG-1, MG-5, MG-12 | C | Runs in CI in debug mode. |
-| HC-2 | A random history generator with a model client and a target map: the reopen differential. | CT-1, CT-2, MG-1, MG-6 | C | Memory backend, one table, forks only above finality. |
+| HC-2 | A random history generator with a model client and a target map: the reopen differential. | CT-1, CT-2, MG-1, MG-6 | C | Memory backend. The CT-1 generator adds hash conflicts, two tables, late and wrong acks, and crashes after the target applied a batch. |
 | HC-3 | Pipelined and journal client models for the differential. | CT-2, MG-1 | C | Depths 1, 2 and 4. |
-| HC-4 | An independent reference model as an executable oracle. | CT-1, MG-11 | U | GAP-32. |
+| HC-4 | An independent reference model as an executable oracle. | CT-1, MG-11 | C | Raw and virtual tables, Lua reducers with Map state, the Int and Float modes, both windows. Not chained or external reducers, nor the BigInt mode. |
 | HC-5 | A store that fails reads, syncs and commits on request. | CT-8, MG-1 | C | |
 | HC-6 | A tool that corrupts stored values of each kind. | CT-8 | P | View and reducer state only. |
 | HC-7 | A kill-point injector, and a store that drops the writes after the last sync. | CT-3, MG-11 | U | GAP-33. |
 | HC-8 | A run of the differential on the persistent backend. | CT-2, CT-3 | U | GAP-33. |
-| HC-9 | Structural validators on every batch. | CT-1 | U | Today only the final target is compared. |
-| HC-10 | An input ledger for provenance checks. | CT-1 | U | |
+| HC-9 | Structural validators on every batch. | CT-1 | C | Against the target before the batch, so CT-2 can run them too. |
+| HC-10 | An input ledger for provenance checks. | CT-1 | C | Raw records and the key items of views. |
 | HC-11 | Fuzzers for the schema text, the row codecs, the decoders and call sequences. | CT-9, MG-11 | U | GAP-34. |
 | HC-12 | Line coverage instrumentation. | MG-4 | U | GAP-35. |
 | HC-13 | An instruction-count runner with saved baselines and a limit. | CT-6, MG-7 | C | Manual, on the reference host only. |

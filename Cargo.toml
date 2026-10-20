@@ -69,6 +69,10 @@ name = "integration"
 path = "tests/integration/main.rs"
 
 [[test]]
+name = "conformance"
+path = "tests/conformance/main.rs"
+
+[[test]]
 name = "dex"
 path = "tests/dex/tests.rs"
 

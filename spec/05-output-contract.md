@@ -37,7 +37,7 @@ Bands: 1–9 batch content · 10–19 sequence and order · 20–29 target dutie
 - An update record names a key that is present in both, with values that differ.
 - A delete record names a key that is present in `T` and absent in `T′`.
 
-**RP-4 — Previous values.** An update record and a delete record carry the values of their key in `T`. An insert record carries no previous values. A view delete record also carries the previous values as its values. The current code gives no previous values to a raw delete record (GAP-10). It also gives none to an update record that merges a raw delete and a raw insert.
+**RP-4 — Previous values.** An update record and a delete record carry the values of their key in `T`. An insert record carries no previous values. A view delete record also carries the previous values as its values. After an in-line fork, the current code gives a view delete record that merges the compensation update the values of that update (GAP-47). It gives no previous values to a raw delete record (GAP-10). It also gives none to an update record that merges a raw delete and a raw insert.
 
 **RP-5 — One record per key.** A batch holds at most one record for each pair of table and key.
 
