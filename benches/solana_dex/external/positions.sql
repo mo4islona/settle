@@ -1,7 +1,7 @@
 -- The host gives the body: a Rust closure or a JS callback with the logic
 -- of lua/positions.sql.
 CREATE REDUCER positions
-SOURCE swaps
+SOURCE prices
 GROUP BY trader, token
 STATE (
     qty          Float64 DEFAULT 0,

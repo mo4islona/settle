@@ -88,6 +88,64 @@ const REDUCER_SCHEMA: &str = r#"
     GROUP BY pool;
 "#;
 
+/// Map state: one group with an entry per pool (the shape of a price map),
+/// and a group per pool with an entry per amount class. A multiple of 3
+/// deletes the entry, so entries come, go and come back.
+const MAP_SCHEMA: &str = r#"
+    CREATE TABLE swaps (
+        block_number UInt64,
+        pool String,
+        amount UInt64,
+        ts DateTime
+    );
+
+    CREATE REDUCER tallies
+    SOURCE swaps
+    STATE (
+        rows UInt64 DEFAULT 0,
+        by_pool Map(String, UInt64)
+    )
+    LANGUAGE lua
+    PROCESS $$
+        state.rows = state.rows + 1
+        local before = state.by_pool:get(row.pool)
+        if row.amount % 3 == 0 then
+            state.by_pool:delete(row.pool)
+        else
+            state.by_pool:set(row.pool, (before or 0) + row.amount)
+        end
+        emit { pool = row.pool, before = before, rows = state.rows }
+    $$;
+
+    CREATE REDUCER classes
+    SOURCE swaps
+    GROUP BY pool
+    STATE (
+        by_class Map(String, UInt64)
+    )
+    LANGUAGE lua
+    PROCESS $$
+        local class = tostring(row.amount % 4)
+        local before = state.by_class:get(class)
+        if row.amount % 3 == 0 then
+            state.by_class:delete(class)
+        else
+            state.by_class:set(class, (before or 0) + 1)
+        end
+        emit { before = before }
+    $$;
+
+    CREATE MATERIALIZED VIEW pool_tallies AS
+    SELECT pool, sum(before) AS before, max(rows) AS rows, count() AS events
+    FROM tallies
+    GROUP BY pool;
+
+    CREATE MATERIALIZED VIEW pool_classes AS
+    SELECT pool, sum(before) AS before, count() AS events
+    FROM classes
+    GROUP BY pool;
+"#;
+
 /// No count(): a row with a NULL amount feeds no aggregate.
 const SLIDING_SUM_SCHEMA: &str = r#"
     CREATE TABLE swaps (
@@ -1161,6 +1219,20 @@ fn random_histories_survive_reopen_reducer() {
 fn random_histories_survive_reopen_reducer_deferred() {
     for seed in 0..300 {
         check_history(REDUCER_SCHEMA, 3, true, seed, 40);
+    }
+}
+
+#[test]
+fn random_histories_survive_reopen_map() {
+    for seed in 0..300 {
+        check_history(MAP_SCHEMA, 1, true, seed, 40);
+    }
+}
+
+#[test]
+fn random_histories_survive_reopen_map_deferred() {
+    for seed in 0..300 {
+        check_history(MAP_SCHEMA, 3, true, seed, 40);
     }
 }
 

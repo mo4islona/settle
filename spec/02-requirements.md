@@ -116,9 +116,9 @@ A view can aggregate the blocks whose timestamps lie within a width of the newes
 *Trace:* ADR-4; DEF-33, DEF-45, RS-13.
 
 **REQ-23 — Reducers.** [MUST]
-A reducer keeps a typed state for each group, with defaults, and emits rows for the next stage. Settle runs reducer bodies in Lua, in host code and as Rust closures. It has no other body language (ADR-10).
-*Acceptance:* One reducer logic in each runtime gives the same view output (CT-1, differential). A reducer with a WHEN clause fails to open with INVALID_SCHEMA.
-*Trace:* ADR-5, ADR-10; DEF-24, DEF-26, DEF-27, DEF-28.
+A reducer keeps a typed state for each group, with defaults, and emits rows for the next stage. A state field can be a Map, whose entries change one at a time (ADR-12). Settle runs reducer bodies in Lua, in host code and as Rust closures. It has no other body language (ADR-10).
+*Acceptance:* One reducer logic in each runtime gives the same view output (CT-1, differential). A reducer with a Map field gives the same target after random forks and reopens as an instance that never stops. A reducer with a WHEN clause fails to open with INVALID_SCHEMA.
+*Trace:* ADR-5, ADR-10, ADR-12; DEF-24, DEF-26, DEF-27, DEF-28.
 
 **REQ-24 — Chained stages.** [MUST]
 A reducer can read another reducer. Settle refuses a cycle and an absent source.

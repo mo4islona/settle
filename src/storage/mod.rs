@@ -22,6 +22,20 @@ pub enum BatchOp {
         group_key: Vec<u8>,
         state: Vec<u8>,
     },
+    /// An entry of a MAP state field of one group.
+    PutReducerMapEntry {
+        reducer: String,
+        group_key: Vec<u8>,
+        map: u16,
+        key: String,
+        value: Vec<u8>,
+    },
+    DeleteReducerMapEntry {
+        reducer: String,
+        group_key: Vec<u8>,
+        map: u16,
+        key: String,
+    },
     PutMvState {
         view: String,
         group_key: Vec<u8>,
@@ -89,6 +103,32 @@ impl StorageWriteBatch {
             reducer: reducer.to_string(),
             group_key,
             state,
+        });
+    }
+
+    pub fn put_reducer_map_entry(
+        &mut self,
+        reducer: &str,
+        group_key: &[u8],
+        map: u16,
+        key: &str,
+        value: Vec<u8>,
+    ) {
+        self.ops.push(BatchOp::PutReducerMapEntry {
+            reducer: reducer.to_string(),
+            group_key: group_key.to_vec(),
+            map,
+            key: key.to_string(),
+            value,
+        });
+    }
+
+    pub fn delete_reducer_map_entry(&mut self, reducer: &str, group_key: &[u8], map: u16, key: &str) {
+        self.ops.push(BatchOp::DeleteReducerMapEntry {
+            reducer: reducer.to_string(),
+            group_key: group_key.to_vec(),
+            map,
+            key: key.to_string(),
         });
     }
 
@@ -216,6 +256,10 @@ impl<'a> PendingWrites<'a> {
 /// Serialized state blob (MessagePack-encoded).
 pub type StateBytes = Vec<u8>;
 
+/// A stored entry of a MAP state field: (MAP field index, key, the encoded
+/// value).
+pub type MapEntry = (u16, String, Vec<u8>);
+
 /// A composite key for reducer/MV group lookups, serialized for storage.
 pub type GroupKeyBytes = Vec<u8>;
 
@@ -264,6 +308,26 @@ pub fn write_values(buf: &mut Vec<u8>, values: &[Value]) {
     for v in values {
         encode_value(buf, v);
     }
+}
+
+/// One value, as a MAP entry stores it.
+pub fn encode_value_bytes(value: &Value) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(encoded_len_hint(value));
+    encode_value(&mut buf, value);
+    buf
+}
+
+/// Decode a value that [`encode_value_bytes`] encoded.
+pub fn decode_value_bytes(bytes: &[u8]) -> Result<Value> {
+    let mut pos = 0;
+    let value = decode_value(bytes, &mut pos)?;
+    if pos != bytes.len() {
+        return Err(Error::Storage(format!(
+            "{} trailing bytes after an encoded value",
+            bytes.len() - pos
+        )));
+    }
+    Ok(value)
 }
 
 /// Decode a positional list of `Value`s encoded by [`encode_values`].
@@ -619,6 +683,9 @@ pub trait StorageBackend: Send + Sync {
         up_to_block: BlockNumber,
     ) -> Result<()>;
 
+    /// The stored entries of the MAP fields of one group of `reducer`.
+    fn get_reducer_map_entries(&self, reducer: &str, group_key: &[u8]) -> Result<Vec<MapEntry>>;
+
     // --- MV state ---
 
     fn put_mv_state(&self, view: &str, group_key: &[u8], state: &[u8]) -> Result<()>;
@@ -749,6 +816,50 @@ mod tests {
     fn has_reducer_finalized_in_rocksdb() {
         let dir = tempfile::tempdir().unwrap();
         check_has_reducer_finalized(&rocks::RocksDbBackend::open(dir.path()).unwrap());
+    }
+
+    /// A group reads only its own Map entries: not those of a group whose
+    /// key starts with its key, nor of a reducer whose name starts with its
+    /// name. A delete removes one entry.
+    fn check_map_entries(backend: &dyn StorageBackend) {
+        let mut batch = StorageWriteBatch::new();
+        batch.put_reducer_map_entry("r", b"a", 0, "x", vec![1]);
+        batch.put_reducer_map_entry("r", b"a", 1, "x", vec![2]);
+        batch.put_reducer_map_entry("r", b"a", 0, "y", vec![3]);
+        batch.put_reducer_map_entry("r", b"ab", 0, "x", vec![4]);
+        batch.put_reducer_map_entry("rr", b"a", 0, "x", vec![5]);
+        batch.put_reducer_map_entry("r", b"", 0, "x", vec![6]);
+        backend.commit(&batch).unwrap();
+
+        let mut batch = StorageWriteBatch::new();
+        batch.delete_reducer_map_entry("r", b"a", 0, "y");
+        batch.delete_reducer_map_entry("r", b"a", 0, "absent");
+        backend.commit(&batch).unwrap();
+
+        let entries = |reducer: &str, group: &[u8]| {
+            let mut entries = backend.get_reducer_map_entries(reducer, group).unwrap();
+            entries.sort();
+            entries
+        };
+        assert_eq!(
+            entries("r", b"a"),
+            [(0, "x".to_string(), vec![1]), (1, "x".to_string(), vec![2])]
+        );
+        assert_eq!(entries("r", b"ab"), [(0, "x".to_string(), vec![4])]);
+        assert_eq!(entries("r", b""), [(0, "x".to_string(), vec![6])]);
+        assert!(entries("r", b"b").is_empty());
+    }
+
+    #[test]
+    fn map_entries_in_memory() {
+        check_map_entries(&memory::MemoryBackend::new());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn map_entries_in_rocksdb() {
+        let dir = tempfile::tempdir().unwrap();
+        check_map_entries(&rocks::RocksDbBackend::open(dir.path()).unwrap());
     }
 
     #[test]

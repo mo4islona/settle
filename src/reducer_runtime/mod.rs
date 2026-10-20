@@ -2,12 +2,14 @@ pub mod external;
 pub mod fn_reducer;
 #[cfg(feature = "lua")]
 pub mod lua;
+pub mod map;
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::types::{ColumnId, ColumnRegistry, Row, Value};
+use map::StateMaps;
 #[cfg(all(test, feature = "lua"))]
 use crate::types::RowMap;
 
@@ -16,11 +18,13 @@ use crate::types::RowMap;
 /// data would make every row as wide as the data has distinct keys.
 pub const MAX_EMIT_COLUMNS: usize = 1024;
 
-/// The state of one group: a value per STATE field of the reducer, in the
-/// order of `fields`.
+/// The state of one group: a value per STATE field of the reducer but the
+/// MAP fields, in the order of `fields`, and the MAP fields.
 pub struct GroupState<'a> {
     pub values: &'a mut [Value],
     pub fields: &'a ColumnRegistry,
+    /// None for a reducer without MAP fields.
+    pub maps: Option<&'a mut StateMaps>,
 }
 
 impl GroupState<'_> {
@@ -178,6 +182,7 @@ pub(crate) fn run_by_name(
     let group = GroupState {
         values: &mut values,
         fields: &fields,
+        maps: None,
     };
     runtime.process(group, row, &mut emits)?;
 
@@ -215,8 +220,11 @@ impl GroupedRows<'_> {
 
 /// One group of a block, used by `process_grouped`.
 pub struct GroupBatch {
-    /// The group's state, in the order of the reducer's STATE fields.
+    /// The group's state, in the order of the reducer's STATE fields but
+    /// the MAP fields.
     pub state: Vec<Value>,
+    /// The group's MAP fields; None for a reducer without them.
+    pub maps: Option<Box<StateMaps>>,
     /// The group's range in `GroupedRows::order`.
     pub rows: Range<usize>,
 }
@@ -240,6 +248,12 @@ pub trait ReducerRuntime: Send {
     /// cloning rows into GroupBatch.
     fn use_batched_processing(&self) -> bool {
         false
+    }
+
+    /// Whether a body on this runtime can use MAP state fields. A reducer
+    /// with MAP fields fails each block on a runtime without them.
+    fn supports_maps(&self) -> bool {
+        true
     }
 
     /// Whether `process_grouped` needs a host (JS) callback that the
@@ -272,6 +286,7 @@ pub trait ReducerRuntime: Send {
                 let state = GroupState {
                     values: &mut group.state,
                     fields,
+                    maps: group.maps.as_deref_mut(),
                 };
                 self.process(state, &rows[index], emits)?;
                 emits.check()?;

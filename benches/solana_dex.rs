@@ -1,14 +1,19 @@
-//! Solana DEX PnL: the swaps of ten DEX programs through two reducers and
+//! Solana DEX PnL: the swaps of ten DEX programs through three reducers and
 //! five views, once with each reducer runtime that a Rust host has. The
 //! target is a store that applies every change batch at once, so the
 //! numbers are the cost of Settle alone.
 //!
-//! - `pool_prices` (GROUP BY pool): USD price of each swap, feeds 1-minute
-//!   OHLC candles of each token, hourly volume of each DEX, pool stats.
+//! - `prices` (one group): the USD price of each swap, where USD means
+//!   USDC, through a chain of pools from the swaps themselves (X/BONK,
+//!   BONK/SOL, SOL/USDC). The last price of each token is an entry of a Map
+//!   field. The other reducers take their rows from it.
+//! - `pool_prices` (GROUP BY pool): feeds 1-minute OHLC candles of each
+//!   token, hourly volume of each DEX, pool stats.
 //! - `positions` (GROUP BY trader, token): average-cost PnL, feeds the PnL
-//!   of each wallet and its open positions, about a million groups. With
-//!   `SDEX_POSITIONS=json`, GROUP BY trader with the positions of the wallet
-//!   in a JSON map, as tests/uniswap/schema.sql keeps them.
+//!   of each wallet and its open positions, about a million groups.
+//!   `SDEX_POSITIONS=json`: GROUP BY trader, the positions of the wallet in
+//!   a JSON map, as tests/uniswap/schema.sql kept them. `map`: the same in a
+//!   Map field.
 //!
 //! Runtimes: `fn` (Rust closures, LANGUAGE EXTERNAL), `lua`. Modes:
 //! - `backfill`: 100 slots in each ingest, finality at the batch tip.
@@ -18,7 +23,7 @@
 //! Run: `cargo bench --bench solana_dex`
 //! Env: `SDEX_SLOTS` (12000, ~3M swaps), `SDEX_RUNTIMES` (fn,lua),
 //! `SDEX_MODES` (backfill,tip), `SDEX_STORAGE` (rocks | memory),
-//! `SDEX_BATCH_SLOTS` (100), `SDEX_POSITIONS` (pair | json),
+//! `SDEX_BATCH_SLOTS` (100), `SDEX_POSITIONS` (pair | json | map),
 //! `RAYON_NUM_THREADS`.
 //! `SDEX_WRITE=<path>` writes the swaps for the Node bench and exits.
 
@@ -29,7 +34,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dataset::{Dataset, SOL};
+use dataset::{Dataset, USDC};
 use settle::db::{Config, IngestRows, Settle};
 use settle::reducer_runtime::fn_reducer::{FnReducerRuntime, StateCtx};
 use settle::test_helpers::cursor;
@@ -37,15 +42,20 @@ use settle::types::{ChangeBatch, ChangeOp, ColumnRegistry, PerfNode, PerfNodeKin
 
 const TABLES: &str = include_str!("solana_dex/tables.sql");
 const VIEWS: &str = include_str!("solana_dex/views.sql");
-const LUA: [&str; 3] = [
+/// `prices`, `pool_prices`, then `positions` in the order of `Layout`.
+const LUA: [&str; 5] = [
+    include_str!("solana_dex/lua/prices.sql"),
     include_str!("solana_dex/lua/pool_prices.sql"),
     include_str!("solana_dex/lua/positions.sql"),
     include_str!("solana_dex/lua/positions_json.sql"),
+    include_str!("solana_dex/lua/positions_map.sql"),
 ];
-const EXTERNAL: [&str; 3] = [
+const EXTERNAL: [&str; 5] = [
+    include_str!("solana_dex/external/prices.sql"),
     include_str!("solana_dex/external/pool_prices.sql"),
     include_str!("solana_dex/external/positions.sql"),
     include_str!("solana_dex/external/positions_json.sql"),
+    include_str!("solana_dex/external/positions_map.sql"),
 ];
 
 const SEED: u64 = 0x50_1A4A;
@@ -75,13 +85,8 @@ fn f64_of(row: &Row, column: &str) -> f64 {
     row.get(column).and_then(Value::as_f64).unwrap_or(0.0)
 }
 
-fn usd_of(row: &Row) -> f64 {
-    let amount = f64_of(row, "quote_amount");
-    if row.get("quote").and_then(Value::as_str) == Some(SOL) {
-        amount * f64_of(row, "sol_usd")
-    } else {
-        amount
-    }
+fn str_of<'a>(row: &'a Row, column: &str) -> &'a str {
+    row.get(column).and_then(Value::as_str).unwrap_or("")
 }
 
 /// Emit `fields` by output position, as a Rust reducer that cares about
@@ -98,10 +103,56 @@ fn emit<const N: usize>(state: &mut StateCtx<'_>, fields: [(&str, Value); N]) {
     state.emit_values(values);
 }
 
+/// `lua/prices.sql`.
+fn prices_fn() -> FnReducerRuntime {
+    FnReducerRuntime::new(|state, row| {
+        let quote = str_of(row, "quote");
+        let token = str_of(row, "token");
+        let base = f64_of(row, "base_amount");
+        let quote_amount = f64_of(row, "quote_amount");
+
+        let mut usdc = state.map("usdc").expect("the usdc Map field");
+        let quote_usd = match quote {
+            USDC => Some(1.0),
+            _ => usdc.get(quote).and_then(Value::as_f64),
+        };
+        let price = match quote_usd {
+            Some(quote_usd) => {
+                let price = quote_amount * quote_usd / base;
+                usdc.set(token, Value::Float64(price));
+                price
+            }
+            None => {
+                let Some(price) = usdc.get(token).and_then(Value::as_f64) else {
+                    return;
+                };
+                usdc.set(quote, Value::Float64(base * price / quote_amount));
+                price
+            }
+        };
+
+        let column = |name: &str| row.get(name).cloned().unwrap_or(Value::Null);
+        emit(
+            state,
+            [
+                ("dex", column("dex")),
+                ("pool", column("pool")),
+                ("trader", column("trader")),
+                ("token", column("token")),
+                ("side", column("side")),
+                ("base_amount", column("base_amount")),
+                ("timestamp", column("timestamp")),
+                ("price_usd", Value::Float64(price)),
+                ("usd", Value::Float64(base * price)),
+            ],
+        );
+    })
+}
+
 fn pool_prices_fn() -> FnReducerRuntime {
     FnReducerRuntime::new(|state, row| {
-        let usd = usd_of(row);
-        let price = usd / f64_of(row, "base_amount");
+        let price = f64_of(row, "price_usd");
+        let usd = f64_of(row, "usd");
 
         let last = state.get_f64("price_usd");
         let change = if last > 0.0 { price / last - 1.0 } else { 0.0 };
@@ -128,48 +179,95 @@ fn pool_prices_fn() -> FnReducerRuntime {
     })
 }
 
+/// The position of a wallet in a token: the state of `positions`, or an
+/// entry of its book.
+#[derive(Default)]
+struct Position {
+    qty: f64,
+    cost_usd: f64,
+    realized_usd: f64,
+    buys: u64,
+    sells: u64,
+}
+
+impl Position {
+    fn from_json(entry: Option<&serde_json::Value>) -> Self {
+        let Some(entry) = entry else {
+            return Self::default();
+        };
+        let field = |name: &str| entry[name].as_f64().unwrap_or(0.0);
+        Self {
+            qty: field("qty"),
+            cost_usd: field("cost_usd"),
+            realized_usd: field("realized_usd"),
+            buys: field("buys") as u64,
+            sells: field("sells") as u64,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "qty": self.qty,
+            "cost_usd": self.cost_usd,
+            "realized_usd": self.realized_usd,
+            "buys": self.buys,
+            "sells": self.sells,
+        })
+    }
+
+    /// Apply the swap `row`; returns the PnL that it realized.
+    fn trade(&mut self, row: &Row) -> f64 {
+        let base = f64_of(row, "base_amount");
+        if str_of(row, "side") == "buy" {
+            self.qty += base;
+            self.cost_usd += f64_of(row, "usd");
+            self.buys += 1;
+            return 0.0;
+        }
+
+        let avg = if self.qty > 0.0 { self.cost_usd / self.qty } else { 0.0 };
+        let matched = base.min(self.qty);
+        let realized = matched * f64_of(row, "price_usd") - matched * avg;
+        self.qty -= matched;
+        self.cost_usd -= matched * avg;
+        self.realized_usd += realized;
+        self.sells += 1;
+        realized
+    }
+
+    /// The emit of `positions` for the swap `row`.
+    fn emit(&self, state: &mut StateCtx<'_>, row: &Row, realized: f64) {
+        let fields = [
+            ("token", Value::String(str_of(row, "token").to_string())),
+            ("realized", Value::Float64(realized)),
+            ("usd", Value::Float64(f64_of(row, "usd"))),
+            ("price_usd", Value::Float64(f64_of(row, "price_usd"))),
+            ("position", Value::Float64(self.qty)),
+            ("cost_usd", Value::Float64(self.cost_usd)),
+            ("win", Value::Int64((realized > 0.0) as i64)),
+            ("loss", Value::Int64((realized < 0.0) as i64)),
+        ];
+        emit(state, fields);
+    }
+}
+
 fn positions_fn() -> FnReducerRuntime {
     FnReducerRuntime::new(|state, row| {
-        let usd = usd_of(row);
-        let base = f64_of(row, "base_amount");
-        let price = usd / base;
-        let mut qty = state.get_f64("qty");
-        let mut cost = state.get_f64("cost_usd");
+        let mut position = Position {
+            qty: state.get_f64("qty"),
+            cost_usd: state.get_f64("cost_usd"),
+            realized_usd: state.get_f64("realized_usd"),
+            buys: state.get_u64("buys"),
+            sells: state.get_u64("sells"),
+        };
+        let realized = position.trade(row);
 
-        let mut realized = 0.0;
-        if row.get("side").and_then(Value::as_str) == Some("buy") {
-            qty += base;
-            cost += usd;
-            state.set("buys", Value::UInt64(state.get_u64("buys") + 1));
-        } else {
-            let avg = if qty > 0.0 { cost / qty } else { 0.0 };
-            let matched = base.min(qty);
-            realized = matched * price - matched * avg;
-            qty -= matched;
-            cost -= matched * avg;
-            state.set(
-                "realized_usd",
-                Value::Float64(state.get_f64("realized_usd") + realized),
-            );
-            state.set("sells", Value::UInt64(state.get_u64("sells") + 1));
-        }
-        state.set("qty", Value::Float64(qty));
-        state.set("cost_usd", Value::Float64(cost));
-
-        let win = (realized > 0.0) as i64;
-        let loss = (realized < 0.0) as i64;
-        emit(
-            state,
-            [
-                ("realized", Value::Float64(realized)),
-                ("usd", Value::Float64(usd)),
-                ("price_usd", Value::Float64(price)),
-                ("position", Value::Float64(qty)),
-                ("cost_usd", Value::Float64(cost)),
-                ("win", Value::Int64(win)),
-                ("loss", Value::Int64(loss)),
-            ],
-        );
+        state.set("qty", Value::Float64(position.qty));
+        state.set("cost_usd", Value::Float64(position.cost_usd));
+        state.set("realized_usd", Value::Float64(position.realized_usd));
+        state.set("buys", Value::UInt64(position.buys));
+        state.set("sells", Value::UInt64(position.sells));
+        position.emit(state, row, realized);
     })
 }
 
@@ -177,15 +275,7 @@ fn positions_fn() -> FnReducerRuntime {
 /// changed in place.
 fn positions_json_fn() -> FnReducerRuntime {
     FnReducerRuntime::new(|state, row| {
-        let usd = usd_of(row);
-        let base = f64_of(row, "base_amount");
-        let price = usd / base;
-        let token = row
-            .get("token")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let buy = row.get("side").and_then(Value::as_str) == Some("buy");
+        let token = str_of(row, "token");
 
         let book = &mut state.values()[0];
         if !matches!(book, Value::JSON(serde_json::Value::Object(_))) {
@@ -194,57 +284,74 @@ fn positions_json_fn() -> FnReducerRuntime {
         let Value::JSON(serde_json::Value::Object(book)) = book else {
             unreachable!()
         };
-        let position = book.entry(token.clone()).or_insert_with(|| {
-            serde_json::json!({"qty": 0.0, "cost_usd": 0.0, "realized_usd": 0.0, "buys": 0, "sells": 0})
-        });
-        let field = |p: &serde_json::Value, name: &str| p[name].as_f64().unwrap_or(0.0);
-        let mut qty = field(position, "qty");
-        let mut cost = field(position, "cost_usd");
+        let mut position = Position::from_json(book.get(token));
+        let realized = position.trade(row);
+        book.insert(token.to_string(), position.to_json());
 
-        let mut realized = 0.0;
-        if buy {
-            qty += base;
-            cost += usd;
-            position["buys"] = (field(position, "buys") as u64 + 1).into();
-        } else {
-            let avg = if qty > 0.0 { cost / qty } else { 0.0 };
-            let matched = base.min(qty);
-            realized = matched * price - matched * avg;
-            qty -= matched;
-            cost -= matched * avg;
-            position["realized_usd"] = (field(position, "realized_usd") + realized).into();
-            position["sells"] = (field(position, "sells") as u64 + 1).into();
-        }
-        position["qty"] = qty.into();
-        position["cost_usd"] = cost.into();
-
-        let win = (realized > 0.0) as i64;
-        let loss = (realized < 0.0) as i64;
-        emit(
-            state,
-            [
-                ("token", Value::String(token)),
-                ("realized", Value::Float64(realized)),
-                ("usd", Value::Float64(usd)),
-                ("price_usd", Value::Float64(price)),
-                ("position", Value::Float64(qty)),
-                ("cost_usd", Value::Float64(cost)),
-                ("win", Value::Int64(win)),
-                ("loss", Value::Int64(loss)),
-            ],
-        );
+        position.emit(state, row, realized);
     })
 }
 
-fn schema(runtime: &str, json: bool) -> String {
-    let (pool_prices, positions) = match (runtime, json) {
-        ("fn", false) => (EXTERNAL[0], EXTERNAL[1]),
-        ("fn", true) => (EXTERNAL[0], EXTERNAL[2]),
-        ("lua", false) => (LUA[0], LUA[1]),
-        ("lua", true) => (LUA[0], LUA[2]),
-        (other, _) => panic!("no {other} reducers"),
+/// `lua/positions_map.sql`: the positions of a wallet in a Map field.
+fn positions_map_fn() -> FnReducerRuntime {
+    FnReducerRuntime::new(|state, row| {
+        let token = str_of(row, "token");
+
+        let mut book = state.map("book").expect("the book Map field");
+        let entry = match book.get(token) {
+            Some(Value::JSON(entry)) => Some(entry),
+            _ => None,
+        };
+        let mut position = Position::from_json(entry);
+        let realized = position.trade(row);
+        book.set(token, Value::JSON(position.to_json()));
+
+        position.emit(state, row, realized);
+    })
+}
+
+/// How `positions` keeps the positions of a wallet.
+#[derive(Clone, Copy, PartialEq)]
+enum Layout {
+    /// A group for each wallet and token.
+    Pair,
+    /// A group for each wallet, its positions in a JSON map.
+    Json,
+    /// A group for each wallet, its positions in a Map field.
+    Map,
+}
+
+impl Layout {
+    fn parse(name: &str) -> Self {
+        match name {
+            "pair" => Self::Pair,
+            "json" => Self::Json,
+            "map" => Self::Map,
+            other => panic!("unknown positions layout {other}"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pair => "pair",
+            Self::Json => "json",
+            Self::Map => "map",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+fn schema(runtime: &str, layout: Layout) -> String {
+    let sql = match runtime {
+        "fn" => &EXTERNAL,
+        "lua" => &LUA,
+        other => panic!("no {other} reducers"),
     };
-    [TABLES, pool_prices, positions, VIEWS].join("\n")
+    let [prices, pool_prices, positions @ ..] = sql;
+    [TABLES, prices, pool_prices, positions[layout.index()], VIEWS].join("\n")
 }
 
 // ─── Input rows ────────────────────────────────────────────────────────────
@@ -273,7 +380,6 @@ fn build_rows(data: &Dataset, registry: &Arc<ColumnRegistry>) -> Vec<(u64, Vec<R
                             "side" => Value::String(if swap.buy { "buy" } else { "sell" }.into()),
                             "base_amount" => Value::Float64(swap.base_amount),
                             "quote_amount" => Value::Float64(swap.quote_amount),
-                            "sol_usd" => Value::Float64(block.sol_usd),
                             other => panic!("unexpected column {other}"),
                         })
                         .collect();
@@ -416,8 +522,8 @@ struct Outcome {
     quarters: Vec<f64>,
 }
 
-fn open(runtime: &str, json: bool, storage: &str) -> (Settle, Option<tempfile::TempDir>) {
-    let schema = schema(runtime, json);
+fn open(runtime: &str, layout: Layout, storage: &str) -> (Settle, Option<tempfile::TempDir>) {
+    let schema = schema(runtime, layout);
     let (config, dir) = match storage {
         "memory" => (Config::new(schema), None),
         "rocks" => {
@@ -429,15 +535,19 @@ fn open(runtime: &str, json: bool, storage: &str) -> (Settle, Option<tempfile::T
     };
     let mut db = Settle::open(config).unwrap();
     if runtime == "fn" {
-        db.register_reducer_callback("pool_prices", Box::new(pool_prices_fn()))
-            .unwrap();
-        let positions = if json {
-            positions_json_fn()
-        } else {
-            positions_fn()
+        let positions = match layout {
+            Layout::Pair => positions_fn(),
+            Layout::Json => positions_json_fn(),
+            Layout::Map => positions_map_fn(),
         };
-        db.register_reducer_callback("positions", Box::new(positions))
-            .unwrap();
+        let runtimes = [
+            ("prices", prices_fn()),
+            ("pool_prices", pool_prices_fn()),
+            ("positions", positions),
+        ];
+        for (name, runtime) in runtimes {
+            db.register_reducer_callback(name, Box::new(runtime)).unwrap();
+        }
     }
     (db, dir)
 }
@@ -482,11 +592,11 @@ fn run(
     data: &Dataset,
     runtime: &str,
     mode: &str,
-    json: bool,
+    layout: Layout,
     storage: &str,
     batch_slots: usize,
 ) -> Outcome {
-    let (mut db, _dir) = open(runtime, json, storage);
+    let (mut db, _dir) = open(runtime, layout, storage);
     let registry = db.table_registry("swaps").unwrap().clone();
     let mut blocks = build_rows(data, &registry);
 
@@ -567,7 +677,7 @@ fn run(
     let slots = (timed_blocks.last().unwrap().slot - timed_blocks[0].slot + 1) as f64;
 
     Outcome {
-        label: format!("{runtime},{mode}{}", if json { ",json" } else { "" }),
+        label: format!("{runtime},{mode},{}", layout.name()),
         swaps: timed_swaps,
         slots,
         wall,
@@ -672,7 +782,7 @@ fn main() {
         return;
     }
 
-    let json = std::env::var("SDEX_POSITIONS").is_ok_and(|v| v == "json");
+    let layout = Layout::parse(&std::env::var("SDEX_POSITIONS").unwrap_or_else(|_| "pair".into()));
     let runtimes = env_list("SDEX_RUNTIMES", "fn,lua");
     let modes = env_list("SDEX_MODES", "backfill,tip");
     let storage = std::env::var("SDEX_STORAGE").unwrap_or_else(|_| "rocks".into());
@@ -686,7 +796,7 @@ fn main() {
     for mode in &modes {
         eprintln!();
         for runtime in &runtimes {
-            let outcome = run(&data, runtime, mode, json, &storage, batch_slots);
+            let outcome = run(&data, runtime, mode, layout, &storage, batch_slots);
             report(&outcome);
         }
     }

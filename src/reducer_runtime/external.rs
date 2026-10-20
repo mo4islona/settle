@@ -578,6 +578,11 @@ impl ReducerRuntime for ExternalRuntime {
         true
     }
 
+    /// The JS and WASM bridges carry no MAP fields yet.
+    fn supports_maps(&self) -> bool {
+        false
+    }
+
     fn missing_host_callback(&self) -> bool {
         !callback_installed(&self.reducer_id)
     }

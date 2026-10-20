@@ -84,8 +84,24 @@ pub const MAX_MV_AGGREGATES: usize = u8::MAX as usize;
 #[derive(Debug, Clone)]
 pub struct StateField {
     pub name: String,
+    /// The type of the field; of the value of each entry for a MAP field.
     pub column_type: ColumnType,
+    /// Empty for a MAP field, which starts with no entries.
     pub default: String,
+    /// A MAP field, `Map(String, column_type)`: entries by String key, each
+    /// changed on its own.
+    pub map: bool,
+}
+
+impl StateField {
+    /// The type as the schema writes it.
+    pub fn type_name(&self) -> String {
+        if self.map {
+            format!("Map(String, {})", self.column_type)
+        } else {
+            self.column_type.to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

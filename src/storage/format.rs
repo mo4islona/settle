@@ -200,7 +200,7 @@ fn reducer_layout(def: &ReducerDef) -> Layout {
             .iter()
             .map(|f| TypedName {
                 name: &f.name,
-                column_type: f.column_type.to_string(),
+                column_type: f.type_name(),
             })
             .collect(),
     };

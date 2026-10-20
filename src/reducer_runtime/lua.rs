@@ -1,11 +1,13 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use mlua::{Lua, MultiValue, RegistryKey, Result as LuaResult, Value as LuaValue};
+use mlua::{Lua, MetaMethod, MultiValue, RegistryKey, Result as LuaResult, Value as LuaValue};
 
 use crate::types::{ColumnRegistry, ColumnType, Row, Value};
 
+use super::map::StateMaps;
 use super::{Emits, GroupState, GroupedRows, ReducerRuntime, set_at};
 
 /// Lua runtime for reducer process functions.
@@ -27,8 +29,15 @@ pub struct LuaRuntime {
     state_key: RegistryKey,
     /// Registry handle to the persistent `row` global table
     row_key: RegistryKey,
-    /// Ordered state field names for positional arg passing (empty = use generic path)
+    /// The state fields but the MAP fields, for `run` in tests.
+    #[cfg(test)]
     state_fields: Vec<String>,
+    /// Whether the state passes as arguments: the runtime knows the fields
+    /// of the reducer, and it has some.
+    hoisted: bool,
+    /// The MAP fields of the group that runs, swapped in from the group for
+    /// its rows. Each MAP field is a `LuaMap` that reads them.
+    maps: Rc<RefCell<StateMaps>>,
     /// The type of each state field, by position — JSON fields are read back
     /// as JSON
     state_types: Vec<Option<ColumnType>>,
@@ -54,6 +63,24 @@ impl LuaRuntime {
         Self::with_state_fields(script, &[], &[], &[], &[])
     }
 
+    /// `with_fields` for a reducer without MAP fields.
+    pub fn with_state_fields(
+        script: &str,
+        state_fields: &[String],
+        state_types: &[(String, ColumnType)],
+        source_columns: &[String],
+        modules: &[(String, String)],
+    ) -> Self {
+        Self::with_fields(
+            script,
+            state_fields,
+            state_types,
+            &[],
+            source_columns,
+            modules,
+        )
+    }
+
     /// Create a LuaRuntime with known state field names, types, source columns, and modules.
     /// State values are passed as function arguments and returned as return values,
     /// eliminating per-field C API calls.
@@ -61,10 +88,14 @@ impl LuaRuntime {
     /// in the Lua script are set on the row table, skipping unused columns.
     /// Modules are loaded before the user script, each executed once with its return
     /// value stored as a global with the module name.
-    pub fn with_state_fields(
+    ///
+    /// `map_fields` are the MAP fields with the type of their values: each is
+    /// `state.<name>` in Lua (`LuaMap`).
+    pub fn with_fields(
         script: &str,
         state_fields: &[String],
         state_types: &[(String, ColumnType)],
+        map_fields: &[(String, ColumnType)],
         source_columns: &[String],
         modules: &[(String, String)],
     ) -> Self {
@@ -122,9 +153,28 @@ impl LuaRuntime {
             .set("emit", emit_fn)
             .expect("failed to set emit global");
 
+        // Spare maps for the time between groups.
+        let names = ColumnRegistry::new(map_fields.iter().map(|(name, _)| name.clone()).collect());
+        let maps = Rc::new(RefCell::new(StateMaps::new(Arc::new(names))));
+        let map_args: MultiValue = map_fields
+            .iter()
+            .enumerate()
+            .map(|(map, (name, value_type))| {
+                let field = LuaMap {
+                    map,
+                    name: name.clone(),
+                    value_type: value_type.clone(),
+                    maps: maps.clone(),
+                };
+                lua.create_userdata(field).map(LuaValue::UserData)
+            })
+            .collect::<LuaResult<_>>()
+            .expect("failed to create the Map fields");
+
         // Pre-compile wrapper: calls user function and returns state fields.
         // Using string concat (not format!) to avoid issues with {} in Lua scripts.
-        let call_src = if state_fields.is_empty() {
+        let hoisted = !state_fields.is_empty() || !map_fields.is_empty();
+        let call_src = if !hoisted {
             // Generic path: no state field optimization.
             [
                 "local _user = function()\n",
@@ -145,6 +195,10 @@ impl LuaRuntime {
             for (i, field) in state_fields.iter().enumerate() {
                 set_lines.push_str(&format!("    state[\"{field}\"] = _s{i}\n"));
             }
+            // Again on each call: the script may have replaced one.
+            for (i, (field, _)) in map_fields.iter().enumerate() {
+                set_lines.push_str(&format!("    state[\"{field}\"] = _m{i}\n"));
+            }
 
             let return_fields: Vec<String> = state_fields
                 .iter()
@@ -153,6 +207,11 @@ impl LuaRuntime {
             let return_list = return_fields.join(", ");
 
             let mut parts = Vec::new();
+            if !map_fields.is_empty() {
+                let upvalues: Vec<String> =
+                    (0..map_fields.len()).map(|i| format!("_m{i}")).collect();
+                parts.push(format!("local {} = ...\n", upvalues.join(", ")));
+            }
             parts.push("local _user = function()\n".to_string());
             parts.push(script.to_string());
             parts.push("\nend\n".to_string());
@@ -166,7 +225,7 @@ impl LuaRuntime {
 
         let call_func: mlua::Function = lua
             .load(&call_src)
-            .eval()
+            .call(map_args)
             .expect("failed to compile Lua wrapper");
         let call_key = lua
             .create_registry_value(call_func)
@@ -181,7 +240,10 @@ impl LuaRuntime {
             call_key,
             state_key,
             row_key,
+            #[cfg(test)]
             state_fields: state_fields.to_vec(),
+            hoisted,
+            maps,
             state_types: state_fields
                 .iter()
                 .map(|f| {
@@ -211,7 +273,7 @@ impl ReducerRuntime for LuaRuntime {
     }
 
     fn use_batched_processing(&self) -> bool {
-        !self.state_fields.is_empty()
+        self.hoisted
     }
 
     /// A group's state stays in Lua for all its rows of the block, as the
@@ -273,19 +335,35 @@ impl LuaRuntime {
             let mut state =
                 serialize_state_hoisted(&self.lua, &group.state).map_err(reducer_error)?;
 
-            for &index in &order[group.rows.clone()] {
-                self.emits.borrow_mut().set_source(index);
-                // A new table for each row: the state, which stays in Lua
-                // until the block ends, can keep the row.
-                let row_table = self.row_table(&rows[index]).map_err(reducer_error)?;
-                globals.raw_set("row", row_table).map_err(reducer_error)?;
-                state = lua_call_hoisted(&call, state).map_err(reducer_error)?;
-                self.emits.borrow_mut().check()?;
-            }
+            let rows_of_group = &order[group.rows.clone()];
+            let state = self.with_maps(group.maps.as_deref_mut(), || {
+                for &index in rows_of_group {
+                    self.emits.borrow_mut().set_source(index);
+                    // A new table for each row: the state, which stays in Lua
+                    // until the block ends, can keep the row.
+                    let row_table = self.row_table(&rows[index]).map_err(reducer_error)?;
+                    globals.raw_set("row", row_table).map_err(reducer_error)?;
+                    state = lua_call_hoisted(&call, state).map_err(reducer_error)?;
+                    self.emits.borrow_mut().check()?;
+                }
+                Ok::<_, crate::error::Error>(state)
+            })?;
 
             deserialize_state_hoisted(state, &mut group.state, &self.state_types);
         }
         Ok(())
+    }
+
+    /// Run `f` with `maps` as the MAP fields of `state`. They stay in the
+    /// group, journal and all, also when `f` fails.
+    fn with_maps<T>(&self, maps: Option<&mut StateMaps>, f: impl FnOnce() -> T) -> T {
+        let Some(maps) = maps else {
+            return f();
+        };
+        std::mem::swap(maps, &mut *self.maps.borrow_mut());
+        let result = f();
+        std::mem::swap(maps, &mut *self.maps.borrow_mut());
+        result
     }
 
     /// A new Lua table that holds `row`.
@@ -307,17 +385,78 @@ impl LuaRuntime {
 
         let call: mlua::Function = self.lua.registry_value(&self.call_key)?;
 
-        if self.state_fields.is_empty() {
+        if !self.hoisted {
             let state_table: mlua::Table = self.lua.registry_value(&self.state_key)?;
             serialize_state_generic(&self.lua, &state_table, &state)?;
             lua_call_generic(&call)?;
             return deserialize_state_generic(&state_table, state);
         }
 
-        let args = serialize_state_hoisted(&self.lua, state.values)?;
-        let result = lua_call_hoisted(&call, args)?;
-        deserialize_state_hoisted(result, state.values, &self.state_types);
+        let GroupState { values, maps, .. } = state;
+        let args = serialize_state_hoisted(&self.lua, values)?;
+        let result = self.with_maps(maps, || lua_call_hoisted(&call, args))?;
+        deserialize_state_hoisted(result, values, &self.state_types);
         Ok(())
+    }
+}
+
+/// A MAP state field in Lua, `state.<name>`: `get`, `set` and `delete` by
+/// key, on the MAP fields of the group that runs. A value from `get` is a
+/// copy: a change of a table that it returned needs a `set` to stay.
+struct LuaMap {
+    map: usize,
+    name: String,
+    value_type: ColumnType,
+    maps: Rc<RefCell<StateMaps>>,
+}
+
+impl LuaMap {
+    /// The error of `state.<name>[key]`, which a MAP field does not have.
+    fn misuse(&self) -> mlua::Error {
+        let name = &self.name;
+        mlua::Error::runtime(format!(
+            "Map field '{name}' takes no index: use {name}:get(key), {name}:set(key, value) \
+             and {name}:delete(key)"
+        ))
+    }
+
+    /// The value of an entry from Lua: a table only for a Json map.
+    fn value(&self, value: &LuaValue) -> LuaResult<Value> {
+        if matches!(value, LuaValue::Table(_)) && self.value_type != ColumnType::JSON {
+            return Err(mlua::Error::runtime(format!(
+                "Map field '{}' holds {} values, not tables",
+                self.name, self.value_type
+            )));
+        }
+        Ok(lua_to_value_typed(value, Some(&self.value_type)))
+    }
+}
+
+impl mlua::UserData for LuaMap {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, key: mlua::LuaString| {
+            match this.maps.borrow().get(this.map, &key.to_str()?) {
+                Some(value) => value_to_lua(lua, value),
+                None => Ok(LuaValue::Nil),
+            }
+        });
+        methods.add_method(
+            "set",
+            |_, this, (key, value): (mlua::LuaString, LuaValue)| {
+                let value = this.value(&value)?;
+                this.maps.borrow_mut().set(this.map, &key.to_str()?, value);
+                Ok(())
+            },
+        );
+        methods.add_method("delete", |_, this, key: mlua::LuaString| {
+            Ok(this.maps.borrow_mut().remove(this.map, &key.to_str()?))
+        });
+        methods.add_meta_method(MetaMethod::Index, |_, this, _: LuaValue| {
+            Err::<(), _>(this.misuse())
+        });
+        methods.add_meta_method(MetaMethod::NewIndex, |_, this, _: MultiValue| {
+            Err::<(), _>(this.misuse())
+        });
     }
 }
 
@@ -836,6 +975,7 @@ mod tests {
             order: vec![0],
             groups: vec![crate::reducer_runtime::GroupBatch {
                 state: vec![Value::Int64(0)],
+                maps: None,
                 rows: 0..1,
             }],
         };

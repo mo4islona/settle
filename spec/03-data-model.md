@@ -60,11 +60,11 @@ Bands: 1–19 chain and input · 20–39 pipeline · 40–59 derived values · 6
 
 **DEF-23 — Virtual table.** A raw table whose rows feed the pipeline but which is not an output table.
 
-**DEF-24 — Reducer.** A name, a source, a list of group-by columns, a sequence of state fields, a body, a runtime kind and a list of required modules. Each state field has a name, a type and a default. A reducer that the host registers at run time can have no group-by column, and then it has one group.
+**DEF-24 — Reducer.** A name, a source, a list of group-by columns, a sequence of state fields, a body, a runtime kind and a list of required modules. Each state field has a name, a type and a default, or is a Map field (DEF-26). A reducer can have no group-by column, and then it has one group.
 
 **DEF-25 — Group and group key.** The group key of a source row is the tuple of its group-by values. Null is a valid element of a group key. A group is the set of rows of a source that share a group key. Today a String key can share a reducer group with a Null key (GAP-30).
 
-**DEF-26 — Reducer state.** One value for each state field of each group. A new group starts with the defaults of the state fields.
+**DEF-26 — Reducer state.** One value for each state field of each group. A new group starts with the defaults of the state fields. A Map field holds entries instead of one value: a value of its type for each String key. A new group has no entries, and no entry holds Null (ADR-12).
 
 **DEF-27 — Emit row.** A row that a reducer body outputs for an input row. A body can emit zero or more rows for one input row. The emit columns of a reducer are the group-by columns, then the other names that the body emits, in the order of first use. Their number is at most P-MAX-EMIT-COLUMNS. When an emit row leaves a group-by column Null, the column takes the value of the input row.
 

@@ -17,3 +17,4 @@ The files only gain new records. An accepted record changes only when a later re
 | [ADR-9](ADR-9-ratify-targets.md) | Ratify the service level targets and the gate thresholds | Proposed | — |
 | [ADR-10](ADR-10-remove-event-rules.md) | Remove the event-rules runtime | Accepted (2026-10-19) | 2026-10-19 |
 | [ADR-11](ADR-11-body-change-keeps-results.md) | A body change keeps the results of accepted rows | Proposed | — |
+| [ADR-12](ADR-12-map-state-fields.md) | Map state fields | Accepted (2026-10-20) | 2026-10-20 |

@@ -233,16 +233,23 @@ The names are not case-sensitive. An unknown name fails with INVALID_SCHEMA. A s
 ```
 CREATE REDUCER name
 SOURCE source
-GROUP BY column [, column ...]
-STATE ( field Type DEFAULT literal [, ...] )
+[GROUP BY column [, column ...]]
+STATE ( field_def [, ...] )
 [REQUIRE module [, module ...]]
 ( LANGUAGE lua PROCESS $$ lua code $$
 | LANGUAGE EXTERNAL ) ;
+
+field_def := field Type DEFAULT literal
+           | field Map(String, Type)
 ```
+
+A reducer without GROUP BY has one group. A Map field has no DEFAULT (ADR-12).
 
 IB-64 gives the semantics of a Lua body. Any other body, for example a WHEN clause, fails with INVALID_SCHEMA (ADR-10).
 
 **IB-64 — Lua bodies.** A Lua body reads `state.<field>` and `row.<column>`, and assigns `state.<field>`. It calls `emit({...})` for each emit row. It can use `json.encode` and `json.decode`. The sandbox removes `os`, `io`, `debug`, `loadfile`, `dofile`, `load`, `rawget`, `rawset`, `require` and `package`. A module (DEF-29) that `REQUIRE` names is loaded before the body.
+
+A Map field is `state.<field>` with the methods `get(key)`, `set(key, value)` and `delete(key)`. `get` returns a copy or nil, and a `set` of nil deletes the entry. A Map field takes no index, and a Map of a type other than JSON takes no table. A JS or WASM body cannot use a Map field yet (GAP-46).
 
 **IB-66 — Views.**
 

@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::types::{ColumnId, Row, RowMap, Value};
 
+use super::map::MapMut;
 use super::{Emits, GroupState, ReducerRuntime};
 
 /// Mutable context handed to `reduce(state, row)` closures.
@@ -73,9 +74,15 @@ impl<'a> StateCtx<'a> {
         self.get(name).and_then(Value::as_str).unwrap_or("")
     }
 
-    /// The state values, in the order of the STATE fields.
+    /// The state values, in the order of the STATE fields but the MAP
+    /// fields.
     pub fn values(&mut self) -> &mut [Value] {
         self.state.values
+    }
+
+    /// The MAP field `name`; None if STATE has no such MAP field.
+    pub fn map(&mut self, name: &str) -> Option<MapMut<'_>> {
+        self.state.maps.as_deref_mut()?.map(name)
     }
 }
 

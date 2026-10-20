@@ -349,6 +349,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | GAP-42 | The layout check lets the virtual flag and the runtime kind change. | CN-32 | P3 | Make a stored table virtual and reopen. Expect INCOMPATIBLE_STORAGE. |
 | GAP-43 | No memory gauge, no open-phase report and no store gauge exists. | OB-10, OB-11, OB-12 | P3 | Read each gauge after a run and compare it with a probe. |
 | GAP-44 | The type names `Bytes`, `JSON` and `JSONB` probably fail in a CREATE TABLE statement, so raw tables cannot have these types. This is known-suspect. | REQ-1, IB-62 | P2 | Open `CREATE TABLE t (block_number UInt64, doc JSON)`. Expect success. |
+| GAP-46 | The JS and WASM bridges carry no Map fields (ADR-12). A reducer with a Map field fails each block in a JS or WASM body. | REQ-23, REQ-31 | P2 | A JS body that sets and reads a Map entry across a fork. Expect the batches of the same body in Lua. |
 
 ## Build order
 

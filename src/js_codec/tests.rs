@@ -127,10 +127,12 @@ fn groups_carry_states_rows_and_names() {
         groups: vec![
             GroupBatch {
                 state: vec![Value::Int64(-3), s("alice")],
+                maps: None,
                 rows: 0..2,
             },
             GroupBatch {
                 state: vec![Value::JSON(serde_json::json!({"a": 1})), Value::Boolean(true)],
+                maps: None,
                 rows: 2..3,
             },
         ],
@@ -176,6 +178,7 @@ fn groups_of_rows_with_different_registries() {
         order: vec![0, 1],
         groups: vec![GroupBatch {
             state: vec![],
+            maps: None,
             rows: 0..2,
         }],
     };
@@ -273,10 +276,12 @@ fn two_groups(rows: &[Row]) -> GroupedRows<'_> {
         groups: vec![
             GroupBatch {
                 state: vec![Value::Float64(1.0)],
+                maps: None,
                 rows: 0..2,
             },
             GroupBatch {
                 state: vec![Value::Float64(9.0)],
+                maps: None,
                 rows: 2..3,
             },
         ],
