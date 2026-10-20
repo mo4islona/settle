@@ -190,7 +190,8 @@ impl Schema {
         self.table(table).is_some_and(|t| !t.is_virtual) || self.view(table).is_some()
     }
 
-    /// DEF-84: deferral-safe means no sliding view and no external reducer.
+    /// DEF-84: deferral-safe means no sliding view and no reducer registered
+    /// at run time; the harness registers none.
     pub fn deferral_safe(&self) -> bool {
         self.views.iter().all(|v| v.sliding.is_none())
     }

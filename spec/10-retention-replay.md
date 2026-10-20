@@ -30,7 +30,7 @@ Bands: 1–9 raw rows · 10–19 derived state · 20–29 space and memory.
 
 **RS-15 — Journal size.** The journal holds the entries of at most P-MAX-UNACKED places. The commit of a batch deletes its entries, and an open deletes all entries (LIV-9).
 
-**RS-16 — External chains.** An open does not replay an external reducer that has no code. The attach of its code replays its chain from `F + 1` (WP-60).
+**RS-16 — External chains.** An open does not replay an external reducer that has no code. If `D < min(F, L)` after the replay, the open waits for code: the reducers and views stay final at `D`, and `F` keeps its stored value. Each attach then replays its chain from `D + 1` (WP-60). The first ingest call after the last attach makes the replayed blocks final, and this ends the wait. With no such gap, an attach replays its chain from `F + 1` (ADR-17).
 
 ## Space and memory
 

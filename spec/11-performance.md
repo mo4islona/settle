@@ -53,7 +53,7 @@ On raw rows with no aggregate, Settle cannot remove work from the target, so SLI
 
 **PF-7 — Overlap with the target.** With P-MAX-UNACKED at 2 or more, Settle processes the next call while the target applies the previous batch. The total time of a pipelined run then approaches the time of the slower side.
 
-**PF-8 — Checkpoint cost in backfill.** A checkpoint on each backfill call adds a premium of 1.2 to 1.9 times the tip time. Deferral removes it for deferral-safe pipelines (REQ-16, HZ-7). External reducers keep it.
+**PF-8 — Checkpoint cost in backfill.** A checkpoint on each backfill call adds a premium of 1.2 to 1.9 times the tip time. Deferral removes most of it for deferral-safe pipelines, also with external reducers (REQ-16, HZ-7, ADR-17). The finality work stays.
 
 ## Workload model
 

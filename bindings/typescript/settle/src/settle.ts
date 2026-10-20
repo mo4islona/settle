@@ -55,6 +55,16 @@ export interface SettleConfig {
    * web build keeps no data across restarts and ignores it.
    */
   appliedSequence?: number
+  /**
+   * In a backfill (`finalizedHead` at the tip of each `ingest()`), write the
+   * derived state to disk once in this many blocks, not at each call
+   * (default 1). A crash then replays up to this many blocks at open. After
+   * such a reopen, `ingest()` throws until each external reducer of the
+   * schema has its callback (`registerReducerCallback`). A pipeline with a
+   * sliding view or a reducer from `registerReducer` writes at each call.
+   * The web build ignores it.
+   */
+  backfillCheckpointInterval?: number
 }
 
 export interface SettleCursor {

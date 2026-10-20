@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 
 use settle::db::{Config, IngestInput, Settle};
 use settle::error::{Error, Result};
+use settle::reducer_runtime::fn_reducer::FnReducerRuntime;
 use settle::storage::memory::MemoryBackend;
 use settle::storage::{StorageBackend, StorageWriteBatch};
 use settle::test_helpers::{block_hash, cursor, ingest_with_finalized_no_ack};
@@ -259,6 +260,97 @@ impl settle::reducer_runtime::ReducerRuntime for FailingSum {
     }
 }
 
+/// Lua → External → External → Lua, the shape of the Solana DEX bench: one
+/// group in `ranked` (as `prices`), so each of its rows depends on all rows
+/// before it.
+const CHAIN_SCHEMA: &str = r#"
+    CREATE TABLE swaps (
+        block_number UInt64,
+        pool String,
+        amount UInt64,
+        ts DateTime
+    );
+
+    CREATE REDUCER running
+    SOURCE swaps
+    GROUP BY pool
+    STATE (
+        balance UInt64 DEFAULT 0
+    )
+    LANGUAGE lua
+    PROCESS $$
+        state.balance = state.balance + row.amount
+        emit { amount = row.amount, balance = state.balance }
+    $$;
+
+    CREATE REDUCER ranked
+    SOURCE running
+    STATE (
+        rows UInt64 DEFAULT 0
+    )
+    LANGUAGE EXTERNAL;
+
+    CREATE REDUCER weighted
+    SOURCE ranked
+    GROUP BY pool
+    STATE (
+        total UInt64 DEFAULT 0
+    )
+    LANGUAGE EXTERNAL;
+
+    CREATE REDUCER tail
+    SOURCE weighted
+    GROUP BY pool
+    STATE (
+        events UInt64 DEFAULT 0
+    )
+    LANGUAGE lua
+    PROCESS $$
+        state.events = state.events + 1
+        emit { total = row.total, events = state.events }
+    $$;
+
+    CREATE MATERIALIZED VIEW pool_ranks AS
+    SELECT pool, max(rank) AS rank, sum(amount) AS amount, last(balance) AS balance
+    FROM ranked
+    GROUP BY pool;
+
+    CREATE MATERIALIZED VIEW pool_tail AS
+    SELECT pool, last(total) AS total, last(events) AS events
+    FROM tail
+    GROUP BY pool;
+
+    CREATE MATERIALIZED VIEW pool_volume AS
+    SELECT pool, sum(amount) AS total, count() AS swaps
+    FROM swaps
+    GROUP BY pool;
+"#;
+
+fn u64_of(row: &settle::types::Row, name: &str) -> u64 {
+    row.get(name).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn ranked() -> FnReducerRuntime {
+    FnReducerRuntime::new(|state, row| {
+        let rank = state.get_u64("rows") + 1;
+        state.set("rows", Value::UInt64(rank));
+        state.emit(HashMap::from([
+            ("pool".to_string(), row.get("pool").cloned().unwrap_or(Value::Null)),
+            ("amount".to_string(), Value::UInt64(u64_of(row, "amount"))),
+            ("balance".to_string(), Value::UInt64(u64_of(row, "balance"))),
+            ("rank".to_string(), Value::UInt64(rank)),
+        ]));
+    })
+}
+
+fn weighted() -> FnReducerRuntime {
+    FnReducerRuntime::new(|state, row| {
+        let total = state.get_u64("total") + u64_of(row, "amount") * u64_of(row, "rank");
+        state.set("total", Value::UInt64(total));
+        state.emit(HashMap::from([("total".to_string(), Value::UInt64(total))]));
+    })
+}
+
 fn attach_runtimes(db: &mut Settle, schema: &str) {
     if schema == FAILING_SCHEMA {
         let per_row = FailingSum {
@@ -271,6 +363,11 @@ fn attach_runtimes(db: &mut Settle, schema: &str) {
         };
         db.register_reducer_callback("per_row", Box::new(per_row)).unwrap();
         db.register_reducer_callback("batched", Box::new(batched)).unwrap();
+    }
+    // Downstream first: its replay runs while its source has no callback.
+    if schema == CHAIN_SCHEMA {
+        db.register_reducer_callback("weighted", Box::new(weighted())).unwrap();
+        db.register_reducer_callback("ranked", Box::new(ranked())).unwrap();
     }
 }
 
@@ -1295,6 +1392,24 @@ fn random_short_histories_survive_reopen() {
 fn random_histories_with_reducer_errors() {
     for seed in 0..300 {
         check_history(FAILING_SCHEMA, 1, true, seed, 40);
+        check_history(FAILING_SCHEMA, 3, true, seed, 40);
+    }
+}
+
+/// External reducers under deferral: a reopen replays them only when their
+/// callbacks come, from the durable block.
+#[test]
+fn random_histories_survive_reopen_external_chain() {
+    for seed in 0..300 {
+        check_history(CHAIN_SCHEMA, 1, true, seed, 40);
+        check_history(CHAIN_SCHEMA, 3, true, seed, 40);
+    }
+}
+
+#[test]
+fn random_short_histories_survive_reopen_external_chain() {
+    for seed in 0..5000 {
+        check_history(CHAIN_SCHEMA, 3, true, seed, 8);
     }
 }
 
@@ -1579,6 +1694,8 @@ fn random_pipelined_histories_with_reducer_errors() {
     for seed in 0..300 {
         for depth in [2, 4] {
             check_pipelined_history(FAILING_SCHEMA, 1, depth, seed, 40);
+            check_pipelined_history(FAILING_SCHEMA, 3, depth, seed, 40);
+            check_pipelined_history(CHAIN_SCHEMA, 3, depth, seed, 40);
         }
     }
 }
@@ -1588,6 +1705,7 @@ fn random_short_pipelined_histories() {
     for seed in 0..3000 {
         check_pipelined_history(SUM_SCHEMA, 1, 2, seed, 10);
         check_pipelined_history(REDUCER_SCHEMA, 3, 3, seed, 10);
+        check_pipelined_history(CHAIN_SCHEMA, 3, 2, seed, 10);
     }
 }
 
@@ -1608,6 +1726,7 @@ fn random_journaled_histories() {
             check_client_history(REDUCER_SCHEMA, 1, depth, true, seed, 40);
             check_client_history(SLIDING_SCHEMA, 1, depth, true, seed, 40);
             check_client_history(FAILING_SCHEMA, 1, depth, true, seed, 40);
+            check_client_history(CHAIN_SCHEMA, 3, depth, true, seed, 40);
         }
     }
 }
@@ -1617,6 +1736,7 @@ fn random_short_journaled_histories() {
     for seed in 0..3000 {
         check_client_history(SUM_SCHEMA, 1, 2, true, seed, 10);
         check_client_history(REDUCER_SCHEMA, 3, 3, true, seed, 10);
+        check_client_history(CHAIN_SCHEMA, 3, 3, true, seed, 10);
     }
 }
 

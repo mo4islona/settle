@@ -154,8 +154,8 @@ impl Storage {
 }
 
 /// Build a config. `checkpoint_interval > 1` enables backfill persist-deferral
-/// (only effective on no-lag ingest with a deferral-safe pipeline — no external
-/// reducer, no sliding-window MV). `depth` batches may wait for their ack.
+/// (only effective on no-lag ingest with a deferral-safe pipeline — no
+/// sliding-window MV). `depth` batches may wait for their ack.
 fn make_cfg(
     schema: &str,
     storage: Storage,
@@ -553,11 +553,8 @@ fn main() -> anyhow::Result<()> {
     // Modes (tag, pre_finalized, checkpoint_interval):
     //  - ""         tip operation: finality lags, persist every finalize.
     //  - ",fin"     no-lag backfill, persist every finalize (durable == finality).
-    //  - ",backfill" no-lag backfill + checkpoint_interval=100 → derived-state
-    //               persistence DEFERRED (the historical-load fast path). Only
-    //               effective for deferral-safe pipelines (lua, mv); the fn
-    //               pipeline is LANGUAGE EXTERNAL so deferral stays off by design,
-    //               so its ",backfill" row should ≈ its ",fin" row.
+    //  - ",backfill" no-lag backfill + checkpoint_interval=1000 → derived-state
+    //               persistence DEFERRED (the historical-load fast path).
     // interval=1000 > BLOCKS_PER_BATCH (100): a checkpoint fires roughly every
     // 10 batches, so 9/10 batches defer their derived-state persist.
     let modes: [(&str, bool, u64); 3] = [

@@ -175,7 +175,7 @@ By REQ-27, every value of a column is in its mode. The current code skips a valu
 
 **DEF-83 — Checkpoint.** The write of the derived state up to `F` into the writes of a call. A checkpoint sets `D` to `min(F, L)`.
 
-**DEF-84 — Backfill deferral.** A mode where Settle skips the checkpoint of a backfill call until `F − D` reaches P-CHECKPOINT-INTERVAL. A pipeline is deferral-safe when it has no sliding view and no external reducer.
+**DEF-84 — Backfill deferral.** A mode where Settle skips the checkpoint of a backfill call until `F − D` reaches P-CHECKPOINT-INTERVAL. A pipeline is deferral-safe when it has no sliding view and no reducer that the host registered at run time (WP-61).
 
 **DEF-85 — Health.** One of healthy, poisoned and sync-failed. A poisoned instance keeps the reason of its first failure.
 

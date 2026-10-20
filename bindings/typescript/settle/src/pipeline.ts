@@ -30,6 +30,8 @@ export interface BuildOptions {
   cacheSize?: number
   /** See `SettleConfig.appliedSequence`. */
   appliedSequence?: number
+  /** See `SettleConfig.backfillCheckpointInterval`. */
+  backfillCheckpointInterval?: number
 }
 
 /**
@@ -51,6 +53,7 @@ export function openCompiled<S extends ISettle>(
     compression: opts?.compression,
     cacheSize: opts?.cacheSize,
     appliedSequence: opts?.appliedSequence,
+    backfillCheckpointInterval: opts?.backfillCheckpointInterval,
   })
   for (const r of compiled.reducers) {
     // Reducer was declared in SQL above (via `reducerToSql` → `LANGUAGE
