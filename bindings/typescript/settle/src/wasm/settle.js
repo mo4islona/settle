@@ -180,6 +180,56 @@ export class Settle {
     }
 }
 if (Symbol.dispose) Settle.prototype[Symbol.dispose] = Settle.prototype.free;
+
+/**
+ * Delete `key` from Map field `map` of group `group`. False if it was absent.
+ * @param {number} group
+ * @param {number} map
+ * @param {string} key
+ * @returns {boolean}
+ */
+export function mapDelete(group, map, key) {
+    const ptr0 = passStringToWasm0(key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.mapDelete(group, map, ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0] !== 0;
+}
+
+/**
+ * The value of `key` in Map field `map` of group `group`; undefined if absent.
+ * @param {number} group
+ * @param {number} map
+ * @param {string} key
+ * @returns {any}
+ */
+export function mapGet(group, map, key) {
+    const ptr0 = passStringToWasm0(key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.mapGet(group, map, ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * Set `key` in Map field `map` of group `group`; null or undefined deletes it.
+ * @param {number} group
+ * @param {number} map
+ * @param {string} key
+ * @param {any} value
+ */
+export function mapSet(group, map, key, value) {
+    const ptr0 = passStringToWasm0(key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.mapSet(group, map, ptr0, len0, value);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
+}
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
@@ -237,10 +287,6 @@ function __wbg_get_imports() {
             const ret = typeof(val) === 'object' && val !== null;
             return ret;
         },
-        __wbg___wbindgen_is_string_dde0fd9020db4434: function(arg0) {
-            const ret = typeof(arg0) === 'string';
-            return ret;
-        },
         __wbg___wbindgen_is_undefined_35bb9f4c7fd651d5: function(arg0) {
             const ret = arg0 === undefined;
             return ret;
@@ -274,10 +320,14 @@ function __wbg_get_imports() {
             const ret = arg0.call(arg1);
             return ret;
         }, arguments); },
-        __wbg_call_dfde26266607c996: function() { return handleError(function (arg0, arg1, arg2) {
-            const ret = arg0.call(arg1, arg2);
+        __wbg_call_faa0a261f288f846: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.call(arg1, arg2, arg3);
             return ret;
         }, arguments); },
+        __wbg_defineProperty_83586bc35b9ff065: function(arg0, arg1, arg2) {
+            const ret = Object.defineProperty(arg0, arg1, arg2);
+            return ret;
+        },
         __wbg_done_54b8da57023b7ed2: function(arg0) {
             const ret = arg0.done;
             return ret;
@@ -354,6 +404,10 @@ function __wbg_get_imports() {
             const ret = Number.isSafeInteger(arg0);
             return ret;
         },
+        __wbg_isView_22ebd3b94b5f8a6e: function(arg0) {
+            const ret = ArrayBuffer.isView(arg0);
+            return ret;
+        },
         __wbg_iterator_1441b47f341dc34f: function() {
             const ret = Symbol.iterator;
             return ret;
@@ -374,16 +428,16 @@ function __wbg_get_imports() {
             const ret = new Object();
             return ret;
         },
-        __wbg_new_070df68d66325372: function() {
-            const ret = new Map();
-            return ret;
-        },
         __wbg_new_310879b66b6e95e1: function() {
             const ret = new Array();
             return ret;
         },
         __wbg_new_7ddec6de44ff8f5d: function(arg0) {
             const ret = new Uint8Array(arg0);
+            return ret;
+        },
+        __wbg_new_with_byte_offset_and_length_a87e79143162d67f: function(arg0, arg1, arg2) {
+            const ret = new Uint8Array(arg0, arg1 >>> 0, arg2 >>> 0);
             return ret;
         },
         __wbg_next_2a4e19f4f5083b0f: function(arg0) {
@@ -412,17 +466,10 @@ function __wbg_get_imports() {
         __wbg_set_6be42768c690e380: function(arg0, arg1, arg2) {
             arg0[arg1] = arg2;
         },
-        __wbg_set_78ea6a19f4818587: function(arg0, arg1, arg2) {
-            arg0[arg1 >>> 0] = arg2;
-        },
         __wbg_set_a0e911be3da02782: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = Reflect.set(arg0, arg1, arg2);
             return ret;
         }, arguments); },
-        __wbg_set_facb7a5914e0fa39: function(arg0, arg1, arg2) {
-            const ret = arg0.set(arg1, arg2);
-            return ret;
-        },
         __wbg_static_accessor_GLOBAL_THIS_02344c9b09eb08a9: function() {
             const ret = typeof globalThis === 'undefined' ? null : globalThis;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);

@@ -290,13 +290,6 @@ impl ReducerEngine {
     /// - **Batched**: groups rows by key, calls `process_grouped()` once per block.
     ///   Used by external (host-language) reducers to minimize FFI overhead.
     pub fn process_block(&mut self, block: BlockNumber, rows: &[Row]) -> Result<Vec<Row>> {
-        if !self.map_fields.is_empty() && !self.runtime.supports_maps() {
-            return Err(Error::Reducer(format!(
-                "reducer '{}' has Map state fields, which JS and WASM reducers do not \
-                 support yet: write its body in Lua or as a Rust closure",
-                self.def.name
-            )));
-        }
         if let Some(first) = rows.first() {
             self.resolve_source(first.registry());
         }
@@ -1747,10 +1740,72 @@ mod tests {
         assert_eq!(befores(&output), [Some(1.0)]);
     }
 
-    /// The JS and WASM bridges carry no Map fields: a reducer with one fails
-    /// its blocks on them, with a message that says what to do.
+    /// SET_X as a host callback: the Map field of group `g` through
+    /// `with_host_map`. On 13 it emits for a row that the group lacks, which
+    /// fails the block after the set.
+    #[cfg(feature = "lua")]
+    fn host_set_x(groups: &mut [crate::reducer_runtime::external::HostGroup]) {
+        use crate::reducer_runtime::external::with_host_map;
+
+        for (g, group) in groups.iter_mut().enumerate() {
+            for (index, row) in group.rows.iter().enumerate() {
+                let amount = row.get("amount").cloned().unwrap();
+                let before = with_host_map(g as u32, 0, |mut book| {
+                    let before = book.get("x").cloned();
+                    if amount == Value::Float64(0.0) {
+                        book.remove("x");
+                    } else {
+                        book.set("x", amount.clone());
+                    }
+                    before
+                })
+                .unwrap();
+
+                let mut emit = HashMap::from([("amount".to_string(), amount.clone())]);
+                if let Some(before) = before {
+                    emit.insert("before".to_string(), before);
+                }
+                let row = if amount == Value::Float64(13.0) { usize::MAX } else { index };
+                group.emits.push((row, emit));
+            }
+        }
+    }
+
+    /// The `before` emits of each block of a run with a fork, a failed block
+    /// and a reload from a checkpoint.
+    #[cfg(feature = "lua")]
+    fn book_run(engine: &mut ReducerEngine, storage: &MemoryBackend) -> Vec<Vec<Option<f64>>> {
+        let mut out = Vec::new();
+        let mut block = |engine: &mut ReducerEngine, number, rows: &[Row]| {
+            out.push(befores(&engine.process_block(number, rows).unwrap()));
+        };
+
+        block(engine, 1, &[event("alice", 1.0), event("bob", 5.0)]);
+        block(engine, 2, &[event("alice", 2.0)]);
+        engine.rollback(1);
+        assert!(engine.process_block(2, &[event("bob", 6.0), event("alice", 13.0)]).is_err());
+        engine.rollback(1);
+        block(engine, 2, &[event("alice", 0.0)]);
+        block(engine, 3, &[event("alice", 7.0), event("bob", 6.0)]);
+
+        let mut batch = StorageWriteBatch::new();
+        engine.advance_finality(2);
+        engine.write_checkpoint(2, &mut batch);
+        storage.commit(&batch).unwrap();
+        engine.reload();
+        block(engine, 3, &[event("alice", 4.0), event("bob", 8.0)]);
+        out
+    }
+
+    /// A host body reads and writes the Map field of its group and gets the
+    /// batches of the same body in Lua: across a fork, a block that fails
+    /// after its sets, and a reload.
+    #[cfg(feature = "lua")]
     #[test]
-    fn js_reducer_refuses_map_state() {
+    fn external_map_entries_match_lua() {
+        use crate::reducer_runtime::external::install_test_context;
+
+        let _guard = install_test_context(host_set_x);
         let def = ReducerDef {
             state: vec![StateField {
                 name: "book".to_string(),
@@ -1760,11 +1815,32 @@ mod tests {
             }],
             ..external_counter_def()
         };
-        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
-        let mut engine = ReducerEngine::new(def, storage, &reg, &[]);
+        let storage = Arc::new(MemoryBackend::new());
+        let mut external = ReducerEngine::new(def, storage.clone(), &reg, &[]);
+        let host = book_run(&mut external, &storage);
 
-        let err = engine.process_block(1, &[event("alice", 1.0)]).unwrap_err();
-        assert!(err.to_string().contains("Map state fields"), "{err}");
+        let storage = Arc::new(MemoryBackend::new());
+        let mut lua = lua_book(SET_X, ColumnType::Float64, storage.clone());
+        let lua = book_run(&mut lua, &storage);
+
+        let expected = [
+            vec![None, None],
+            vec![Some(1.0)],
+            vec![Some(1.0)],
+            vec![None, Some(5.0)],
+            vec![None, Some(5.0)],
+        ];
+        assert_eq!(lua, expected);
+        assert_eq!(host, expected);
+    }
+
+    /// A Map call outside a host callback fails, and does not panic.
+    #[test]
+    fn host_map_needs_a_callback() {
+        use crate::reducer_runtime::external::with_host_map;
+
+        let err = with_host_map(0, 0, |book| book.get("x").cloned()).unwrap_err();
+        assert!(err.contains("outside a reducer callback"), "{err}");
     }
 }

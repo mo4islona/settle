@@ -48,6 +48,8 @@ The keywords MUST, MUST NOT, SHOULD, SHOULD NOT and MAY have the meaning of RFC 
 
 Every requirement, definition, property, decision and test class has a stable ID. The suite never reuses or renumbers an ID. A retired ID stays in a "Closed" section. Each prefix has one home document, and the other documents refer to it by ID.
 
+A gap is the exception. The change that closes a gap deletes its row and every reference to it, and git keeps its history. So no document refers to a closed gap. A new gap takes the number of the "Next gap number" line of the register, and the line goes up by one.
+
 | Prefix | Meaning | Home | Bands |
 |---|---|---|---|
 | `G-n`, `NG-n` | Design goal, non-goal | 01 | — |

@@ -1,13 +1,16 @@
 import { readBatch, TableWriter } from './codec'
 import type { ReducerCtx } from './ddl'
 // Import from src/native/ directly — not copied to dist/ to avoid stale binaries
-import { Settle as NativeSettle } from '../src/native/native.js'
+import { mapDelete, mapGet, mapSet, Settle as NativeSettle } from '../src/native/native.js'
 import {
   rethrowSettleError,
   SettlePendingAckError,
   SettleWrongAckSequenceError,
 } from './errors'
 import { nativeBatchCallback } from './reducer-callback'
+import type { MapAccess } from './state-map'
+
+const nativeMaps: MapAccess = { mapGet, mapSet, mapDelete }
 
 /** A change batch as native code returns it: `[buffer, strings, others]`. */
 type EncodedBatch = [ArrayBuffer, string, unknown[] | null]
@@ -110,7 +113,7 @@ export interface ExternalReducerOptions<TState = any, TRow = any, TEmit = any> {
   reduce: (state: ReducerCtx<TState, TEmit>, row: TRow) => void
 }
 
-export type { ReducerCtx } from './ddl'
+export type { ReducerCtx, StateMap } from './ddl'
 export { SettlePendingAckError, SettleWrongAckSequenceError } from './errors'
 
 /**
@@ -297,7 +300,7 @@ export class Settle implements ISettle {
   ): void {
     const { reduce } = options
 
-    const batchFn = nativeBatchCallback<TState, TRow, TEmit>(reduce)
+    const batchFn = nativeBatchCallback<TState, TRow, TEmit>(reduce, nativeMaps)
 
     try {
       this.#native.registerReducer(
@@ -318,7 +321,7 @@ export class Settle implements ISettle {
     name: string,
     reduce: (state: ReducerCtx<TState, TEmit>, row: TRow) => void,
   ): void {
-    const batchFn = nativeBatchCallback<TState, TRow, TEmit>(reduce)
+    const batchFn = nativeBatchCallback<TState, TRow, TEmit>(reduce, nativeMaps)
 
     try {
       this.#native.registerReducerCallback(name, batchFn)

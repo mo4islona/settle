@@ -9,6 +9,7 @@ export {
   type ReducerCtx,
   type ReducerOptions,
   type SlidingWindowOptions,
+  type StateMap,
   type ViewOptions,
 } from './ddl'
 export {

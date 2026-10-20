@@ -56,8 +56,13 @@ impl StateMaps {
 
     /// The MAP field `name`.
     pub fn map(&mut self, name: &str) -> Option<MapMut<'_>> {
-        let map = self.names.get_id(name)? as usize;
-        Some(MapMut { maps: self, map })
+        let map = self.names.get_id(name)?;
+        self.map_at(map as usize)
+    }
+
+    /// The MAP field at index `map` of `names`.
+    pub fn map_at(&mut self, map: usize) -> Option<MapMut<'_>> {
+        (map < self.entries.len()).then_some(MapMut { maps: self, map })
     }
 
     /// The value of `key` in MAP field `map`.

@@ -1,4 +1,4 @@
-import type { ColumnType, FromEngine } from './column'
+import type { ColumnType, FromEngine, WidenBigint } from './column'
 import type { StateFieldDef } from './settle'
 
 // ─── Duration parsing ────────────────────────────────────────────
@@ -97,8 +97,36 @@ export type GroupByItem = string | IntervalExpr
 
 // ─── Options types ───────────────────────────────────────────────
 
+/**
+ * A Map state field (`field Map(String, Type)` in the schema): entries by
+ * string key, read and written one at a time. `get` returns a copy, so a
+ * changed object stays only after a `set`. A `set` of null deletes the entry.
+ * A bigint entry comes back as a number while it is small (`FromEngine`).
+ */
+export interface StateMap<V> {
+  get(key: string): WidenBigint<V> | undefined
+  set(key: string, value: V | null | undefined): void
+  delete(key: string): boolean
+}
+
+/** True only for `any`: no other type makes `1 & T` take 0. */
+type IsAny<T> = 0 extends 1 & T ? true : false
+
+/** The keys of the Map fields of a state. An `any` field is a JSON field, not a Map. */
+type MapKeys<TState> = {
+  [K in keyof TState]-?: IsAny<TState[K]> extends true
+    ? never
+    : TState[K] extends StateMap<any>
+      ? K
+      : never
+}[keyof TState]
+
+/**
+ * The context of a reducer row: the state fields, `update` and `emit`. A Map
+ * field changes through its own methods, so `update` takes the other fields.
+ */
 export type ReducerCtx<TState, TEmit> = Readonly<FromEngine<TState>> & {
-  update(newState: TState): void
+  update(newState: Omit<TState, MapKeys<TState>>): void
   emit(row: TEmit): void
 }
 

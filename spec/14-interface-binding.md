@@ -87,6 +87,8 @@ No call gives the finalized cursor, the durable block or the last acked sequence
 
 **IB-26 — JS reducers.** A JS reducer is a function `reduce(ctx, row)`. `ctx` gives the state fields of the group, `ctx.update(next)`, which replaces the whole state and sets an absent field to Null, and `ctx.emit(row)`. Settle calls the binding once for each block, and the binding calls `reduce` for each row.
 
+A Map field is `ctx.<field>`, with the methods `get(key)`, `set(key, value)` and `delete(key)` of IB-64. `get` returns a copy or `undefined`, and a `set` of `null` or `undefined` deletes the entry. `update` does not change a Map field. A Map field works only while the rows of its group run, and a call at another time throws.
+
 **IB-27 — Builder.** `Pipeline().table(...).createReducer(...).createView(...).build(options)` generates the schema text, opens the instance and attaches each reducer. Its options are the fields of IB-22.
 
 ## Browser
@@ -249,7 +251,7 @@ IB-64 gives the semantics of a Lua body. Any other body, for example a WHEN clau
 
 **IB-64 — Lua bodies.** A Lua body reads `state.<field>` and `row.<column>`, and assigns `state.<field>`. It calls `emit({...})` for each emit row. It can use `json.encode` and `json.decode`. The sandbox removes `os`, `io`, `debug`, `loadfile`, `dofile`, `load`, `rawget`, `rawset`, `require` and `package`. A module (DEF-29) that `REQUIRE` names is loaded before the body.
 
-A Map field is `state.<field>` with the methods `get(key)`, `set(key, value)` and `delete(key)`. `get` returns a copy or nil, and a `set` of nil deletes the entry. A Map field takes no index, and a Map of a type other than JSON takes no table. A JS or WASM body cannot use a Map field yet (GAP-46).
+A Map field is `state.<field>` with the methods `get(key)`, `set(key, value)` and `delete(key)`. `get` returns a copy or nil, and a `set` of nil deletes the entry. A Map field takes no index, and a Map of a type other than JSON takes no table. A JS body has the same methods (IB-26).
 
 **IB-66 — Views.**
 

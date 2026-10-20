@@ -33,7 +33,7 @@ export function json<T = any>(): ColumnType<T> {
  */
 export type FromEngine<T> = { [K in keyof T]: WidenBigint<T[K]> }
 
-type WidenBigint<V> = V extends bigint ? Int64Value : V
+export type WidenBigint<V> = V extends bigint ? Int64Value : V
 
 /** Infer the row type from a column definition record. */
 export type InferRow<T extends Record<string, ColumnType>> = {

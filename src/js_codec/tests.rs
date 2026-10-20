@@ -5,6 +5,7 @@ use smallvec::smallvec;
 
 use super::*;
 use crate::reducer_runtime::GroupBatch;
+use crate::reducer_runtime::map::StateMaps;
 use crate::types::{BlockCursor, ChangeRecord, ChangeSchema, Row};
 
 /// An encoder's buffer, read back the way `codec.ts` reads it.
@@ -111,7 +112,8 @@ fn bigint_to_value_keeps_every_digit() {
 }
 
 /// Groups go as their states, then their rows in group order; each
-/// distinct string goes once; integers past 2^53 and JSON go to the host.
+/// distinct string goes once; integers past 2^53 and JSON go to the host. A
+/// MAP field goes by name only.
 #[test]
 fn groups_carry_states_rows_and_names() {
     let reg = registry(&["block_number", "user", "amount"]);
@@ -121,18 +123,21 @@ fn groups_carry_states_rows_and_names() {
         row(&reg, vec![Value::UInt64(7), s("alice"), Value::Null]),
     ];
     let fields = ColumnRegistry::new(vec!["count".into(), "user".into()]);
+    let map_fields = Arc::new(ColumnRegistry::new(vec!["book".into()]));
+    let mut maps = StateMaps::new(map_fields.clone());
+    maps.set(0, "x", Value::UInt64(1));
     let block = GroupedRows {
         rows: &rows,
         order: vec![0, 2, 1],
         groups: vec![
             GroupBatch {
                 state: vec![Value::Int64(-3), s("alice")],
-                maps: None,
+                maps: Some(Box::new(maps)),
                 rows: 0..2,
             },
             GroupBatch {
                 state: vec![Value::JSON(serde_json::json!({"a": 1})), Value::Boolean(true)],
-                maps: None,
+                maps: Some(Box::new(StateMaps::new(map_fields))),
                 rows: 2..3,
             },
         ],
@@ -141,10 +146,10 @@ fn groups_carry_states_rows_and_names() {
     let enc = encode_groups(&block, &fields);
     let parsed = Parsed::new(&enc);
     let ints = &parsed.ints;
-    assert_eq!(ints[..3], [2, 2, 3]);
-    let names: Vec<&str> = ints[3..8].iter().map(|&i| parsed.strings[i as usize].as_str()).collect();
-    assert_eq!(names, ["count", "user", "block_number", "user", "amount"]);
-    assert_eq!(ints[8..], [2, 1]);
+    assert_eq!(ints[..4], [2, 2, 3, 1]);
+    let names: Vec<&str> = ints[4..10].iter().map(|&i| parsed.strings[i as usize].as_str()).collect();
+    assert_eq!(names, ["count", "user", "book", "block_number", "user", "amount"]);
+    assert_eq!(ints[10..], [2, 1]);
 
     assert_eq!(
         parsed.slots(),
@@ -184,7 +189,7 @@ fn groups_of_rows_with_different_registries() {
     };
 
     let parsed = Parsed::new(&encode_groups(&block, &fields));
-    assert_eq!(parsed.ints[..3], [1, 0, 2]);
+    assert_eq!(parsed.ints[..4], [1, 0, 2, 0]);
     assert_eq!(parsed.slots(), ["s:a", "null", "s:b", "n:2"]);
 }
 

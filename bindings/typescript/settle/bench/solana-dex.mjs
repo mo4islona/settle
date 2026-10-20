@@ -11,10 +11,7 @@
 // Settle: what the JS work alone costs); modes `backfill` and `tip` as in the
 // Rust bench. Each case runs in a process of its own. Env: SDEX_BATCH_SLOTS
 // (100), SDEX_STORAGE (rocks | memory), SDEX_POSITIONS (pair | json: the
-// positions of a wallet in one JSON map | map: in a Map field, lua only).
-//
-// The `prices` reducer keeps a Map field, which JS reducers do not support
-// yet: it runs in Lua for the `js` runtime too.
+// positions of a wallet in one JSON map | map: in a Map field).
 
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -121,6 +118,23 @@ function priceOf(usdc, row) {
   return price
 }
 
+/** lua/prices.sql: the swap with its USDC price. */
+function prices(state, row) {
+  const price = priceOf(state.usdc, row)
+  if (price === null) return
+  state.emit({
+    dex: row.dex,
+    pool: row.pool,
+    trader: row.trader,
+    token: row.token,
+    side: row.side,
+    base_amount: row.base_amount,
+    timestamp: row.timestamp,
+    price_usd: price,
+    usd: row.base_amount * price,
+  })
+}
+
 function poolPrices(state, row) {
   const usd = row.usd
   const price = row.price_usd
@@ -183,43 +197,62 @@ function positions(state, row) {
   })
 }
 
-/** lua/positions_json.sql: the positions of a wallet in one JSON map. */
-function positionsJson(state, row) {
+const newPosition = () => ({ qty: 0, cost_usd: 0, realized_usd: 0, buys: 0, sells: 0 })
+
+/** Apply the swap `row` to the position `p` of its wallet; the realized PnL. */
+function trade(p, row) {
   const { usd, price_usd: price, base_amount: base } = row
-
-  const book = state.book
-  let p = book[row.token]
-  if (!p) {
-    p = { qty: 0, cost_usd: 0, realized_usd: 0, buys: 0, sells: 0 }
-    book[row.token] = p
-  }
-
-  let realized = 0
   if (row.side === 'buy') {
     p.qty += base
     p.cost_usd += usd
     p.buys++
-  } else {
-    const avg = p.qty > 0 ? p.cost_usd / p.qty : 0
-    const matched = Math.min(base, p.qty)
-    realized = matched * price - matched * avg
-    p.qty -= matched
-    p.cost_usd -= matched * avg
-    p.realized_usd += realized
-    p.sells++
+    return 0
   }
-  state.update({ book })
 
+  const avg = p.qty > 0 ? p.cost_usd / p.qty : 0
+  const matched = Math.min(base, p.qty)
+  const realized = matched * price - matched * avg
+  p.qty -= matched
+  p.cost_usd -= matched * avg
+  p.realized_usd += realized
+  p.sells++
+  return realized
+}
+
+/** The emit of the positions reducers that keep a book of positions. */
+function emitPosition(state, row, p, realized) {
   state.emit({
     token: row.token,
     realized,
-    usd,
-    price_usd: price,
+    usd: row.usd,
+    price_usd: row.price_usd,
     position: p.qty,
     cost_usd: p.cost_usd,
     win: realized > 0 ? 1 : 0,
     loss: realized < 0 ? 1 : 0,
   })
+}
+
+/** lua/positions_json.sql: the positions of a wallet in one JSON map. */
+function positionsJson(state, row) {
+  const book = state.book
+  let p = book[row.token]
+  if (!p) {
+    p = newPosition()
+    book[row.token] = p
+  }
+
+  const realized = trade(p, row)
+  state.update({ book })
+  emitPosition(state, row, p, realized)
+}
+
+/** lua/positions_map.sql: the positions of a wallet in a Map field. */
+function positionsMap(state, row) {
+  const p = state.book.get(row.token) ?? newPosition()
+  const realized = trade(p, row)
+  state.book.set(row.token, p)
+  emitPosition(state, row, p, realized)
 }
 
 /**
@@ -405,11 +438,10 @@ class Split {
 const cursor = (slot) => ({ number: slot, hash: `0x${slot.toString(16).padStart(16, '0')}` })
 
 function open(runtime) {
-  if (runtime === 'js' && LAYOUT === 'map') throw new Error('JS reducers do not support Map fields yet')
   const dir = { js: 'external', lua: 'lua' }[runtime]
   const schema = [
     SQL('tables.sql'),
-    SQL('lua/prices.sql'),
+    SQL(`${dir}/prices.sql`),
     SQL(`${dir}/pool_prices.sql`),
     SQL(`${dir}/${POSITIONS_SQL}`),
     SQL('views.sql'),
@@ -422,8 +454,9 @@ function open(runtime) {
   }
   const db = Settle.open({ schema, dataDir })
   if (runtime === 'js') {
+    db.registerReducerCallback('prices', prices)
     db.registerReducerCallback('pool_prices', poolPrices)
-    db.registerReducerCallback('positions', LAYOUT === 'json' ? positionsJson : positions)
+    db.registerReducerCallback('positions', { pair: positions, json: positionsJson, map: positionsMap }[LAYOUT])
   }
   return { db, dataDir }
 }
@@ -593,8 +626,8 @@ if (rest[0] === '--case') {
   const result = await runCase(data, runtime, mode)
   process.stdout.write(`\n${JSON.stringify(result)}\n`)
 } else {
-  // The floor does not change; JS has no Map fields.
-  const runtimes = { pair: /^/, json: /^(js|lua),/, map: /^lua,/ }[LAYOUT]
+  // The floor does not change.
+  const runtimes = { pair: /^/, json: /^(js|lua),/, map: /^(js|lua),/ }[LAYOUT]
   const defaults = ALL_CASES.filter((c) => runtimes.test(c))
   const cases = rest.length ? rest : defaults
   console.log(

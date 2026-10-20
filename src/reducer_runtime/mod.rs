@@ -216,6 +216,14 @@ impl GroupedRows<'_> {
     pub fn row_indices(&self, group: &GroupBatch) -> &[usize] {
         &self.order[group.rows.clone()]
     }
+
+    /// The names of the MAP fields of the reducer; empty for most.
+    pub fn map_fields(&self) -> &[String] {
+        match self.groups.first().and_then(|group| group.maps.as_deref()) {
+            Some(maps) => maps.names().names(),
+            None => &[],
+        }
+    }
 }
 
 /// One group of a block, used by `process_grouped`.
@@ -248,12 +256,6 @@ pub trait ReducerRuntime: Send {
     /// cloning rows into GroupBatch.
     fn use_batched_processing(&self) -> bool {
         false
-    }
-
-    /// Whether a body on this runtime can use MAP state fields. A reducer
-    /// with MAP fields fails each block on a runtime without them.
-    fn supports_maps(&self) -> bool {
-        true
     }
 
     /// Whether `process_grouped` needs a host (JS) callback that the
