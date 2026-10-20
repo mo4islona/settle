@@ -483,7 +483,7 @@ fn bench_reducer_fn_only() -> BenchResult {
         storage,
         &source_registry,
         Box::new(pnl_fn_runtime()),
-    );
+    ).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {

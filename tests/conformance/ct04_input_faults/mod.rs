@@ -4,4 +4,5 @@
 mod dedup;
 #[cfg(feature = "lua")]
 mod termination;
+mod strict_schema;
 mod validation;

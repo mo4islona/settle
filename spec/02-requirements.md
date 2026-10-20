@@ -130,7 +130,7 @@ Settle refuses at open a schema that changes the stored layout of an object. Red
 *Acceptance:* A swap of two column types fails with INCOMPATIBLE_STORAGE. A change of a reducer body opens and gives batches of the new logic.
 *Trace:* ADR-3; CN-30, CN-32, INV-45.
 
-**REQ-26 — Strict schema.** [MUST — intent, currently violated by GAP-2]
+**REQ-26 — Strict schema.** [MUST — intent, currently violated by GAP-49]
 Settle refuses at open each schema construct that it does not execute. It does not ignore a construct silently.
 *Acceptance:* A view with WHERE, HAVING, a join, ORDER BY, LIMIT or DISTINCT fails with INVALID_SCHEMA. Two objects with one name fail. A default that does not parse as its declared type fails.
 *Trace:* ADR-14; IB-61.

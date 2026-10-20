@@ -288,6 +288,26 @@ describe('Pipeline builder', () => {
         expect(candles[1].values.tradeCount).toBe(1)
     })
 
+    it('builds a view that selects an interval key twice', async () => {
+        const p = new Pipeline()
+        p.table('swaps', {block_number: uint64(), block_time: datetime()})
+            .createView('hourly', {
+                groupBy: [interval('block_time', '1 hour').as('hour')],
+                select: (agg) => ({h1: agg.key.hour, h2: agg.key.hour, n: agg.count()}),
+            })
+
+        const db = p.build()
+        const batch = await ingestAndAck(db, {
+            data: {swaps: [{block_number: 1, block_time: 3_600_000}]},
+            finalizedHead: {number: 1, hash: '0x1'},
+            rollbackChain: [{number: 1, hash: '0x1'}],
+        })
+
+        const [row] = batch!.tables.hourly
+        expect(row.values.h1).toBe(3_600_000)
+        expect(row.values.h2).toBe(3_600_000)
+    })
+
     it('supports virtual tables (no changes emitted for raw rows)', async () => {
         const p = new Pipeline()
         const orders = p.table(

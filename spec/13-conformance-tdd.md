@@ -1,6 +1,6 @@
 # 13 — Conformance and TDD
 
-**As of 2026-10-20.** This is a mutable status document. The statuses come from the test inventory of the repository at that date: about 590 Rust tests and 76 binding tests. The reference model of this document is normative. The matrices, the registers and the build order are status.
+**As of 2026-10-21.** This is a mutable status document. The statuses come from the test inventory of the repository at that date: about 620 Rust tests and 83 binding tests. The reference model of this document is normative. The matrices, the registers and the build order are status.
 
 ## Harness architecture
 
@@ -195,8 +195,8 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | REQ-22 | C | The sliding-window oracle with random forks. |
 | REQ-23 | P | Pairwise differentials exist (closure against Lua, JS against Lua). No test compares all runtimes. A WHEN clause fails with INVALID_SCHEMA. |
 | REQ-24 | P | A cycle test and one chained reopen test. Chained reducers are absent from the random histories. |
-| REQ-25 | C | Format tests for each refused and each allowed change. |
-| REQ-26 | U | known-violated (GAP-2). |
+| REQ-25 | C | Format tests for each refused and each allowed change. A rename of a view key, which changes its GROUP BY too, keeps the stored data. A view layout stored with a GROUP BY list opens. |
+| REQ-26 | P | CT-4 opens a schema with each construct of IB-68 and expects INVALID_SCHEMA. The constructs include the view options and the modifiers of an aggregate and of the FROM table. It opens each GROUP BY form of IB-68 that is valid. known-violated for the clauses of CREATE TABLE (GAP-49). |
 | REQ-27 | U | known-violated (GAP-1). |
 | REQ-30 | P | known-violated: the engine module is public (GAP-39). |
 | REQ-31 | P | Binding tests exist. No cross-binding comparison exists, and the release workflow is broken (GAP-24). |
@@ -302,14 +302,13 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 
 ## Gap register
 
-**As of 2026-10-20.** Priorities: P0 is an active production risk, P1 a correctness hole with a plausible trigger, P2 bounded or rare, P3 polish. No entry is P0. A closed gap is deleted (see the IDs in the README).
+**As of 2026-10-21.** Priorities: P0 is an active production risk, P1 a correctness hole with a plausible trigger, P2 bounded or rare, P3 polish. No entry is P0. A closed gap is deleted (see the IDs in the README).
 
-**Next gap number:** 49
+**Next gap number:** 50
 
 | ID | Statement | Violated | Priority | First test |
 |---|---|---|---|---|
 | GAP-1 | Settle checks no value type at ingest. An aggregate skips each value outside its numeric mode without an error. Lua floats and every number from a JS callback are Float64, so an integer view column drops them. | REQ-27, INV-27, INV-28, FM-4, FM-19, FM-48 | P1 | An external reducer emits a UInt64 state field `n`, and a view sums `n`. Expect the sum of `n`. The code shows that the sum stays empty today, but no test confirms it yet. |
-| GAP-2 | The schema accepts constructs that Settle ignores: WHERE, HAVING, joins, ORDER BY, LIMIT and DISTINCT. It does not match GROUP BY to the key items. It accepts duplicate names, a view with no aggregate, numeric aggregates over columns with no numeric mode, and defaults that do not parse. | REQ-26 | P1 | Open a view with a WHERE clause. Expect INVALID_SCHEMA. |
 | GAP-5 | A reducer body has no CPU bound and no memory bound. An endless Lua loop blocks an ingest call forever. | LIV-10, FM-42 | P2 | A Lua body `while true do end`. Expect REDUCER_FAILED within P-REDUCER-STEPS. |
 | GAP-6 | Resident memory has no bound. Reducer groups never leave memory, and an open loads every view group. | REQ-41, PF-1, RS-20 | P1 | Measure the bytes for each group at 1M groups. Then expect a run at P-W-GROUPS below P-MEMORY-CEILING. |
 | GAP-7 | The Lua state table and Lua globals keep values across groups and calls. These values are not rolled back and do not survive a reopen. | INV-36, INV-43 | P2 | Group A sets an undeclared state key. Group B reads it. Expect nil. |
@@ -347,6 +346,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | GAP-48 | `min` and `max` take a NaN as a value. A group whose values are all NaN gets NaN, and a view group that has no other data is present. | DEF-42, INV-6, INV-24 | P3 | A view with only `min` and `max` of a Float64 column, and one row whose value is NaN. Expect no group. |
 | GAP-42 | The layout check lets the virtual flag and the runtime kind change. | CN-32 | P3 | Make a stored table virtual and reopen. Expect INCOMPATIBLE_STORAGE. |
 | GAP-43 | No memory gauge, no open-phase report and no store gauge exists. | OB-10, OB-11, OB-12 | P3 | Read each gauge after a run and compare it with a probe. |
+| GAP-49 | A CREATE TABLE statement accepts column options, constraints and table options, for example NOT NULL, DEFAULT, PRIMARY KEY and ENGINE. Settle ignores them. | REQ-26 | P3 | Open `CREATE TABLE t (block_number UInt64, x UInt64 NOT NULL)`. Expect INVALID_SCHEMA. |
 | GAP-44 | The type names `Bytes`, `JSON` and `JSONB` probably fail in a CREATE TABLE statement, so raw tables cannot have these types. This is known-suspect. | REQ-1, IB-62 | P2 | Open `CREATE TABLE t (block_number UInt64, doc JSON)`. Expect success. |
 
 ## Build order
@@ -354,7 +354,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | ID | Phase | Content | Done when |
 |---|---|---|---|
 | BO-1 | Harness skeleton | HC-4, HC-9 and HC-10. Run CT-1 on the schemas of the current tests. | CT-1 runs in CI, and the matrix shows its first results. |
-| BO-2 | P1 correctness | GAP-1 and GAP-2. Measure for GAP-6. | Each closure has its failing test first, and the matrix rows move to C. |
+| BO-2 | P1 correctness | GAP-1. Measure for GAP-6. | Each closure has its failing test first, and the matrix rows move to C. |
 | BO-3 | Crash harness | HC-7 and HC-8 (GAP-33). CT-3 at each kill point. | INV-40, INV-41, INV-42 and INV-49 are C. |
 | BO-4 | Robustness | GAP-5, GAP-7, GAP-8, GAP-16, GAP-17 and GAP-31. HC-11 (GAP-34). | FM-1 is C, and CT-9 runs nightly. |
 | BO-5 | Binding parity | HC-17. GAP-9, GAP-12, GAP-13, GAP-14, GAP-15, GAP-23, GAP-24, GAP-28, GAP-29 and GAP-38. | CT-5 compares all bindings in CI. |

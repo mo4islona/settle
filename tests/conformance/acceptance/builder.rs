@@ -482,6 +482,30 @@ fn interval_as_alias_appears_in_ddl() {
 }
 
 #[test]
+fn an_interval_key_selected_twice_builds() {
+    let mut p = Pipeline::new();
+    let raw = p.table("events", [("block_number", uint64()), ("ts", datetime())]);
+    raw.create_view(
+        "hourly",
+        ViewOptions {
+            group_by: vec![interval("ts", "1 hour").r#as("hour").into()],
+            sliding_window: None,
+            select: Box::new(|agg| {
+                vec![
+                    ("h1".into(), agg.key("hour").into()),
+                    ("h2".into(), agg.key("hour").into()),
+                    ("n".into(), agg.count().into()),
+                ]
+            }),
+        },
+    );
+
+    let ddl = p.to_ddl().unwrap();
+    assert!(ddl.contains("GROUP BY h1, h2"), "{ddl}");
+    assert!(p.build(BuildOptions::new()).is_ok(), "{ddl}");
+}
+
+#[test]
 fn state_ctx_typed_accessors_and_set() {
     use std::sync::{Arc, Mutex};
     let captured: Arc<Mutex<Vec<(i64, bool, String, f64)>>> = Arc::new(Mutex::new(vec![]));

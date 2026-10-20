@@ -211,7 +211,7 @@ GROUP BY asset_id;
 - The time column of a sliding view over a raw table is not DateTime, UInt64 or Int64.
 - A limit of IB-67 is exceeded.
 
-By ADR-14, an open also fails for each construct of IB-68. Today it does not (GAP-2).
+By ADR-14, an open also fails for each construct of IB-68. A CREATE TABLE statement still accepts column options and constraints that Settle ignores (GAP-49).
 
 **IB-62 — Column types.**
 
@@ -275,12 +275,18 @@ unit := SECOND | MINUTE | HOUR | DAY        (a plural form is valid in WINDOW SL
 
 **IB-68 — Refused constructs.** By ADR-14, an open refuses these constructs with INVALID_SCHEMA:
 
-- WHERE, HAVING, joins, ORDER BY, LIMIT and DISTINCT in a view.
-- A view GROUP BY that differs from the key items of its select list.
+- WHERE, HAVING, joins, ORDER BY, LIMIT, OFFSET, DISTINCT, WITH, a GROUP BY modifier and each other SELECT clause in a view.
+- Each option of CREATE MATERIALIZED VIEW, for example a column list, a TO table, OR REPLACE, TEMPORARY, OPTIONS or CLUSTER BY.
+- A modifier of a function call in a view: DISTINCT, OVER, WITHIN GROUP, an ORDER BY in the arguments and each other. A modifier of the FROM table: an alias, TABLESAMPLE, a hint and each other.
+- A view GROUP BY that does not name each key item of its select list once. A GROUP BY entry names each column item that reads the column with that name. If no column item reads it, the entry names the key item with that output name, as in SQL.
 - A view with no aggregate.
-- `sum`, `min`, `max` or `avg` over a column with no numeric mode.
-- Two objects with one name.
-- A default that does not parse as the type of its field.
+- `sum`, `min`, `max` or `avg` over a column with no numeric mode. The check needs a declared type. A table column, a state field and a group-by column of a reducer over a table have one.
+- Two tables, reducers or views with one name. Two columns of a table, two state fields of a reducer or two output columns of a view with one name.
+- A default that does not parse as the type of its field:
+  - A String or JSON default is a quoted literal, and a doubled quote in it is one quote.
+  - A Boolean default is `true`, `false`, `1` or `0`.
+  - A UInt256 default is a decimal or a `0x` hexadecimal number.
+  - A Bytes or Base58 default is `''`.
 
 **IB-70 — Builders.** The Rust `Pipeline` and the TS `Pipeline` generate a schema text of IB-60 from calls. A builder pipeline and its generated text give the same batches (REQ-35).
 

@@ -40,11 +40,37 @@ pub fn parse_schema(input: &str) -> Result<Schema, Error> {
                 tables.push(def);
             }
             sql::Statement::CreateView {
-                name,
-                query,
+                or_replace,
                 materialized: true,
-                ..
+                name,
+                columns,
+                query,
+                options,
+                cluster_by,
+                comment,
+                with_no_schema_binding,
+                if_not_exists,
+                temporary,
+                to,
+                params,
             } => {
+                let refused = [
+                    (!columns.is_empty(), "a column list"),
+                    (to.is_some(), "a TO table"),
+                    (or_replace, "OR REPLACE"),
+                    (temporary, "TEMPORARY"),
+                    (if_not_exists, "IF NOT EXISTS"),
+                    (options != sql::CreateTableOptions::None, "OPTIONS"),
+                    (!cluster_by.is_empty(), "CLUSTER BY"),
+                    (comment.is_some(), "COMMENT"),
+                    (with_no_schema_binding, "WITH NO SCHEMA BINDING"),
+                    (params.is_some(), "ALGORITHM, DEFINER or SQL SECURITY"),
+                ];
+                if let Some((_, option)) = refused.iter().find(|(present, _)| *present) {
+                    return Err(Error::Schema(format!(
+                        "MV '{name}': {option} is not supported in CREATE MATERIALIZED VIEW"
+                    )));
+                }
                 let mut mv = parse_create_mv(&name, &query)?;
                 if let Some(sw) = sliding_windows.get(&mv.name) {
                     mv.sliding_window = Some(sw.clone());
@@ -324,19 +350,111 @@ fn map_column_type(dt: &sql::DataType, col_name: &sql::Ident) -> Result<ColumnTy
 fn parse_create_mv(name: &sql::ObjectName, query: &sql::Query) -> Result<MVDef, Error> {
     let view_name = name.to_string();
 
-    let select = match query.body.as_ref() {
-        sql::SetExpr::Select(s) => s,
+    // Each field, so that a clause of a new sqlparser version cannot pass
+    // unread.
+    let sql::Query {
+        with,
+        body,
+        order_by,
+        limit,
+        limit_by,
+        offset,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+    } = query;
+    let select = match body.as_ref() {
+        sql::SetExpr::Select(s) => s.as_ref(),
         _ => {
             return Err(Error::Schema(format!(
                 "MV '{view_name}': only simple SELECT supported"
             )));
         }
     };
+    let sql::Select {
+        select_token: _,
+        distinct,
+        top,
+        top_before_distinct: _,
+        projection,
+        into,
+        from,
+        lateral_views,
+        prewhere,
+        selection,
+        group_by,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having,
+        named_window,
+        qualify,
+        window_before_qualify: _,
+        value_table_mode,
+        connect_by,
+        flavor: _,
+    } = select;
+
+    let joins = from.len() > 1 || from.iter().any(|f| !f.joins.is_empty());
+    let clusters = !cluster_by.is_empty() || !distribute_by.is_empty();
+    let limits = limit.is_some() || !limit_by.is_empty() || offset.is_some() || fetch.is_some();
+    let refused = [
+        (with.is_some(), "WITH"),
+        (distinct.is_some() || top.is_some(), "DISTINCT"),
+        (into.is_some(), "INTO"),
+        (joins || !lateral_views.is_empty(), "JOIN"),
+        (prewhere.is_some() || selection.is_some(), "WHERE"),
+        (having.is_some() || qualify.is_some(), "HAVING"),
+        (order_by.is_some() || !sort_by.is_empty(), "ORDER BY"),
+        (clusters, "CLUSTER BY"),
+        (limits, "LIMIT"),
+        (!named_window.is_empty(), "WINDOW"),
+        (value_table_mode.is_some(), "SELECT AS"),
+        (connect_by.is_some(), "CONNECT BY"),
+        (!locks.is_empty() || for_clause.is_some(), "FOR"),
+        (settings.is_some() || format_clause.is_some(), "SETTINGS"),
+    ];
+    if let Some((_, clause)) = refused.iter().find(|(present, _)| *present) {
+        return Err(Error::Schema(format!(
+            "MV '{view_name}': {clause} is not supported in a view"
+        )));
+    }
 
     // Source table (FROM clause)
-    let source = match select.from.first() {
+    let source = match from.first() {
         Some(sql::TableWithJoins { relation, .. }) => match relation {
-            sql::TableFactor::Table { name, .. } => name.to_string(),
+            sql::TableFactor::Table {
+                name,
+                alias,
+                args,
+                with_hints,
+                version,
+                with_ordinality,
+                partitions,
+                json_path,
+                sample,
+                index_hints,
+            } => {
+                let hints = !with_hints.is_empty() || !index_hints.is_empty();
+                let modifiers = [
+                    (alias.is_some(), "a table alias"),
+                    (args.is_some(), "a table function"),
+                    (sample.is_some(), "TABLESAMPLE"),
+                    (version.is_some(), "a table version"),
+                    (hints, "a table hint"),
+                    (*with_ordinality, "WITH ORDINALITY"),
+                    (!partitions.is_empty(), "PARTITION"),
+                    (json_path.is_some(), "a JSON path"),
+                ];
+                if let Some((_, modifier)) = modifiers.iter().find(|(present, _)| *present) {
+                    return Err(Error::Schema(format!(
+                        "MV '{view_name}': {modifier} in FROM is not supported"
+                    )));
+                }
+                name.to_string()
+            }
             _ => {
                 return Err(Error::Schema(format!(
                     "MV '{view_name}': unsupported FROM clause"
@@ -352,7 +470,7 @@ fn parse_create_mv(name: &sql::ObjectName, query: &sql::Query) -> Result<MVDef, 
 
     // SELECT items
     let mut items = Vec::new();
-    for proj in &select.projection {
+    for proj in projection {
         match proj {
             sql::SelectItem::UnnamedExpr(expr) => {
                 items.push(parse_select_expr(expr, None, &view_name)?);
@@ -373,7 +491,12 @@ fn parse_create_mv(name: &sql::ObjectName, query: &sql::Query) -> Result<MVDef, 
     }
 
     // GROUP BY
-    let group_by = match &select.group_by {
+    let group_by = match group_by {
+        sql::GroupByExpr::Expressions(_, modifiers) if !modifiers.is_empty() => {
+            return Err(Error::Schema(format!(
+                "MV '{view_name}': a GROUP BY modifier is not supported"
+            )));
+        }
         sql::GroupByExpr::Expressions(exprs, _) => exprs
             .iter()
             .map(|e| expr_to_column_name(e))
@@ -406,6 +529,11 @@ fn parse_select_expr(
         }),
         sql::Expr::Function(func) => {
             let func_name = func.name.to_string().to_lowercase();
+            if let Some(modifier) = function_modifier(func) {
+                return Err(Error::Schema(format!(
+                    "MV '{view_name}': {modifier} in {func_name}() is not supported"
+                )));
+            }
 
             // Check for toStartOfInterval(col, INTERVAL N UNIT)
             if func_name == "tostartofinterval" {
@@ -473,6 +601,45 @@ fn parse_select_expr(
             "MV '{view_name}': unsupported expression '{expr}'"
         ))),
     }
+}
+
+/// The first modifier of a function call, which no view function takes.
+fn function_modifier(func: &sql::Function) -> Option<&'static str> {
+    // Each field, as for the query.
+    let sql::Function {
+        name: _,
+        uses_odbc_syntax,
+        parameters,
+        args,
+        filter,
+        null_treatment,
+        over,
+        within_group,
+    } = func;
+    let (distinct, clause) = match args {
+        sql::FunctionArguments::List(list) => {
+            let distinct = list.duplicate_treatment == Some(sql::DuplicateTreatment::Distinct);
+            let clause = list.clauses.first().map(|clause| match clause {
+                sql::FunctionArgumentClause::OrderBy(_) => "ORDER BY",
+                _ => "a clause after the arguments",
+            });
+            (distinct, clause)
+        }
+        _ => (false, None),
+    };
+    let parametric = !matches!(parameters, sql::FunctionArguments::None);
+
+    let modifiers = [
+        (distinct, "DISTINCT"),
+        (filter.is_some(), "FILTER"),
+        (over.is_some(), "OVER"),
+        (!within_group.is_empty(), "WITHIN GROUP"),
+        (null_treatment.is_some(), "IGNORE NULLS"),
+        (parametric, "a parameter list"),
+        (*uses_odbc_syntax, "the ODBC syntax"),
+    ];
+    let modifier = modifiers.iter().find(|(present, _)| *present);
+    modifier.map(|(_, name)| *name).or(clause)
 }
 
 fn parse_window_func(
@@ -559,7 +726,10 @@ fn expr_to_column_name(expr: &sql::Expr) -> Result<String, Error> {
     match expr {
         sql::Expr::Identifier(ident) => Ok(ident.value.clone()),
         // sqlparser may parse some identifiers (like `user`) as functions with no args
-        sql::Expr::Function(func) if matches!(&func.args, sql::FunctionArguments::None) => {
+        sql::Expr::Function(func)
+            if matches!(&func.args, sql::FunctionArguments::None)
+                && function_modifier(func).is_none() =>
+        {
             Ok(func.name.to_string())
         }
         _ => Err(Error::Schema(format!(
@@ -914,7 +1084,10 @@ fn parse_lua_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Err
 /// Up to `chars` characters of `input` from byte `pos`, for an error message.
 fn snippet(input: &str, pos: usize, chars: usize) -> &str {
     let rest = input.get(pos..).unwrap_or_default();
-    let end = rest.char_indices().nth(chars).map_or(rest.len(), |(i, _)| i);
+    let end = rest
+        .char_indices()
+        .nth(chars)
+        .map_or(rest.len(), |(i, _)| i);
     &rest[..end]
 }
 
@@ -1058,6 +1231,119 @@ fn str_to_column_type(s: &str) -> Result<ColumnType, Error> {
 
 // --- Schema validation ---
 
+/// Err if two of `names` are equal.
+fn unique<'a>(
+    names: impl Iterator<Item = &'a String>,
+    owner: &str,
+    kind: &str,
+) -> Result<(), Error> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(Error::Schema(format!(
+                "{owner}two {kind}s are named '{name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A view groups by its key items, the items that are not aggregates. Its
+/// GROUP BY names each of them once, by its output name or, for a column,
+/// by the column.
+fn check_view_keys(mv: &MVDef) -> Result<(), Error> {
+    let keys: Vec<&SelectItem> = mv
+        .select
+        .iter()
+        .filter(|item| !matches!(item.expr, SelectExpr::Agg(..)))
+        .collect();
+    let reads =
+        |key: &SelectItem, column: &str| matches!(&key.expr, SelectExpr::Column(c) if c == column);
+
+    let mut named = vec![false; keys.len()];
+    for entry in &mv.group_by {
+        // As in SQL, a source column wins over an alias. It names each key
+        // item that reads it.
+        let mut items: Vec<usize> = (0..keys.len()).filter(|&i| reads(keys[i], entry)).collect();
+        if items.is_empty() {
+            items.extend(keys.iter().position(|key| key.output_name() == *entry));
+        }
+        if items.is_empty() {
+            return Err(Error::Schema(format!(
+                "MV '{}': GROUP BY '{entry}' is not a key item of the select list",
+                mv.name
+            )));
+        }
+
+        for i in items {
+            if std::mem::replace(&mut named[i], true) {
+                return Err(Error::Schema(format!(
+                    "MV '{}': GROUP BY names the key item '{}' twice",
+                    mv.name,
+                    keys[i].output_name()
+                )));
+            }
+        }
+    }
+
+    match named.iter().position(|n| !n) {
+        Some(i) => Err(Error::Schema(format!(
+            "MV '{}': the key item '{}' is not in GROUP BY",
+            mv.name,
+            keys[i].output_name()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// `sum`, `min`, `max` and `avg` read only numbers. The type of a column of
+/// a reducer is known for its state fields and the group-by columns of its
+/// source table; for its other emit columns only the rows tell.
+fn check_numeric_aggregates(schema: &Schema, mv: &MVDef) -> Result<(), Error> {
+    let table_type = |table: &str, column: &str| {
+        let table = schema.tables.iter().find(|t| t.name == table)?;
+        let column = table.columns.iter().find(|c| c.name == column)?;
+        Some(column.column_type.clone())
+    };
+    let column_type = |column: &str| {
+        if let Some(column_type) = table_type(&mv.source, column) {
+            return Some(column_type);
+        }
+        let reducer = schema.reducers.iter().find(|r| r.name == mv.source)?;
+        let field = reducer.state.iter().find(|f| f.name == column && !f.map);
+        match field {
+            Some(field) => Some(field.column_type.clone()),
+            None if reducer.group_by.iter().any(|c| c == column) => {
+                table_type(&reducer.source, column)
+            }
+            None => None,
+        }
+    };
+
+    for item in &mv.select {
+        let SelectExpr::Agg(func, Some(column)) = &item.expr else {
+            continue;
+        };
+        let numeric = matches!(
+            func,
+            AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Avg
+        );
+        let no_mode = matches!(
+            column_type(column),
+            Some(ColumnType::String | ColumnType::Boolean | ColumnType::Bytes)
+                | Some(ColumnType::Base58 | ColumnType::JSON)
+        );
+        if numeric && no_mode {
+            return Err(Error::Schema(format!(
+                "MV '{}': {}() reads numbers, and column '{column}' holds none",
+                mv.name,
+                func.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_schema(schema: &Schema) -> Result<(), Error> {
     let table_names: Vec<&str> = schema.tables.iter().map(|t| t.name.as_str()).collect();
     let reducer_names: Vec<&str> = schema.reducers.iter().map(|r| r.name.as_str()).collect();
@@ -1093,6 +1379,22 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
                 return Err(Error::Schema(format!("duplicate module name: '{name}'")));
             }
         }
+    }
+
+    // A source names a table or a reducer, and the output names a table or
+    // a view: the three share one namespace.
+    let objects = schema.tables.iter().map(|t| &t.name);
+    let objects = objects
+        .chain(schema.reducers.iter().map(|r| &r.name))
+        .chain(schema.materialized_views.iter().map(|v| &v.name));
+    unique(objects, "", "object")?;
+    for table in &schema.tables {
+        let owner = format!("table '{}': ", table.name);
+        unique(table.columns.iter().map(|c| &c.name), &owner, "column")?;
+    }
+    for reducer in &schema.reducers {
+        let owner = format!("reducer '{}': ", reducer.name);
+        unique(reducer.state.iter().map(|f| &f.name), &owner, "state field")?;
     }
 
     // Validate reducers
@@ -1238,6 +1540,18 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
                 }
             }
         }
+
+        if agg_count == 0 {
+            return Err(Error::Schema(format!(
+                "MV '{}': a view needs at least one aggregate",
+                mv.name
+            )));
+        }
+        let outputs: Vec<String> = mv.select.iter().map(SelectItem::output_name).collect();
+        let owner = format!("MV '{}': ", mv.name);
+        unique(outputs.iter(), &owner, "output column")?;
+        check_view_keys(mv)?;
+        check_numeric_aggregates(schema, mv)?;
     }
 
     Ok(())
@@ -1428,7 +1742,7 @@ mod tests {
         let mv_sql = |select: &str| {
             format!(
                 "CREATE TABLE trades (pair String, ts DateTime, price Float64);
-                 CREATE MATERIALIZED VIEW v AS SELECT {select} FROM trades GROUP BY pair;"
+                 CREATE MATERIALIZED VIEW v AS SELECT {select} FROM trades GROUP BY pair, hour;"
             )
         };
 
@@ -1951,7 +2265,7 @@ mod tests {
                 r#"
                 CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
                 CREATE MATERIALIZED VIEW mv AS
-                  SELECT SUM(x) AS total FROM t GROUP BY x
+                  SELECT SUM(x) AS total FROM t
                   WINDOW SLIDING {interval} BY ts;
                 "#
             );
@@ -2017,7 +2331,7 @@ mod tests {
         let sql = r#"
             CREATE TABLE t (block_number UInt64, x Float64);
             CREATE MATERIALIZED VIEW mv AS
-              SELECT SUM(x) AS total FROM t GROUP BY x;
+              SELECT SUM(x) AS total FROM t;
         "#;
         let schema = parse_schema(sql).unwrap();
         assert!(schema.materialized_views[0].sliding_window.is_none());
@@ -2028,7 +2342,7 @@ mod tests {
         let sql = r#"
             CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
             CREATE MATERIALIZED VIEW mv AS
-              SELECT SUM(x) AS total FROM t GROUP BY x
+              SELECT SUM(x) AS total FROM t
               WINDOW SLIDING BY ts;
         "#;
         let err = parse_schema(sql).unwrap_err();
@@ -2040,7 +2354,7 @@ mod tests {
         let sql = r#"
             CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
             CREATE MATERIALIZED VIEW mv AS
-              SELECT SUM(x) AS total FROM t GROUP BY x
+              SELECT SUM(x) AS total FROM t
               WINDOW SLIDING INTERVAL 0 HOUR BY ts;
         "#;
         let err = parse_schema(sql).unwrap_err();
@@ -2052,7 +2366,7 @@ mod tests {
         let sql = r#"
             CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
             CREATE MATERIALIZED VIEW mv AS
-              SELECT SUM(x) AS total FROM t GROUP BY x
+              SELECT SUM(x) AS total FROM t
               WINDOW SLIDING INTERVAL 1 HOUR;
         "#;
         let err = parse_schema(sql).unwrap_err();
@@ -2064,7 +2378,7 @@ mod tests {
         let sql = r#"
             CREATE TABLE t (block_number UInt64, x Float64);
             CREATE MATERIALIZED VIEW mv AS
-              SELECT SUM(x) AS total FROM t GROUP BY x
+              SELECT SUM(x) AS total FROM t
               WINDOW SLIDING INTERVAL 1 HOUR BY nonexistent;
         "#;
         let err = parse_schema(sql).unwrap_err();
@@ -2076,7 +2390,7 @@ mod tests {
         let sql = r#"
             CREATE TABLE t (block_number UInt64, name String, x Float64);
             CREATE MATERIALIZED VIEW mv AS
-              SELECT SUM(x) AS total FROM t GROUP BY x
+              SELECT SUM(x) AS total FROM t
               WINDOW SLIDING INTERVAL 1 HOUR BY name;
         "#;
         let err = parse_schema(sql).unwrap_err();
@@ -2088,7 +2402,7 @@ mod tests {
         let sql = r#"
             CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
             CREATE MATERIALIZED VIEW mv AS
-              SELECT SUM(x) AS total FROM t GROUP BY x
+              SELECT SUM(x) AS total FROM t
               WINDOW SLIDING INTERVAL 999999999999999999 DAY BY ts;
         "#;
         let err = parse_schema(sql).unwrap_err();

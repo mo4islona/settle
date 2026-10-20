@@ -177,6 +177,92 @@ fn logic_aliases_and_new_objects_may_change() {
     assert_eq!(totals.get("total_a_renamed"), Some(&Value::UInt64(11)));
 }
 
+/// GROUP BY names the key items by their output names (IB-68), so a key
+/// rename changes it too. The keys stay the same.
+#[test]
+fn renamed_keys_keep_the_stored_data() {
+    let storage = storage_with_data();
+    let renamed = SCHEMA.replace(
+        "SELECT user, sum(a) AS total_a\n    FROM transfers\n    GROUP BY user;",
+        "SELECT user AS who, sum(a) AS total_a\n    FROM transfers\n    GROUP BY who;",
+    );
+    assert_ne!(renamed, SCHEMA);
+
+    let mut db = open(&renamed, &storage).unwrap();
+    let batch = ingest(&mut db, 2, 10, 0, 0);
+    assert_eq!(total_a(&batch), Value::UInt64(11));
+
+    let hourly = |name: &str| {
+        format!(
+            "CREATE TABLE swaps (block_number UInt64, ts DateTime, amount UInt64);
+             CREATE MATERIALIZED VIEW hourly AS
+             SELECT toStartOfInterval(ts, INTERVAL 1 HOUR) AS {name}, sum(amount) AS volume
+             FROM swaps GROUP BY {name};"
+        )
+    };
+    let swap = |amount: u64| {
+        HashMap::from([
+            ("ts".to_string(), Value::DateTime(3_600_000)),
+            ("amount".to_string(), Value::UInt64(amount)),
+        ])
+    };
+    let storage = Arc::new(MemoryBackend::new());
+    let mut db = open(&hourly("bucket"), &storage).unwrap();
+    let rows = vec![("swaps".to_string(), 1, vec![swap(1)])];
+    ingest_with_finalized(&mut db, rows, 0).unwrap();
+    drop(db);
+
+    let mut db = open(&hourly("hour"), &storage).unwrap();
+    let rows = vec![("swaps".to_string(), 2, vec![swap(10)])];
+    let batch = ingest_with_finalized(&mut db, rows, 0).unwrap().unwrap();
+    let hourly = &batch.records_for("hourly")[0];
+    assert_eq!(hourly.get("hour"), Some(&Value::DateTime(3_600_000)));
+    assert_eq!(hourly.get("volume"), Some(&Value::UInt64(11)));
+}
+
+/// Before GROUP BY left the view layout, the layout held it after `select`.
+#[test]
+fn a_view_layout_stored_with_group_by_reads_back() {
+    let storage = storage_with_data();
+    let key = "layout:mv:totals";
+    let group_by = r#","group_by":["user"]"#;
+    let legacy = r#"{"source":"transfers","select":[{"column":"user"},{"agg":{"func":"sum","column":"a"}}],"group_by":["user"],"sliding_window":null}"#;
+    let stored = String::from_utf8(storage.get_meta(key).unwrap().unwrap()).unwrap();
+    assert_eq!(stored, legacy.replace(group_by, ""));
+
+    let mut batch = StorageWriteBatch::new();
+    batch.put_meta(key, legacy.as_bytes());
+    storage.commit(&batch).unwrap();
+
+    let mut db = open(SCHEMA, &storage).unwrap();
+    let batch = ingest(&mut db, 2, 10, 0, 0);
+    assert_eq!(total_a(&batch), Value::UInt64(11));
+    drop(db);
+
+    let renamed = SCHEMA.replace(
+        "SELECT user, sum(a) AS total_a\n    FROM transfers\n    GROUP BY user;",
+        "SELECT user AS who, sum(a) AS total_a\n    FROM transfers\n    GROUP BY who;",
+    );
+    assert!(open(&renamed, &storage).is_ok());
+
+    let changed = SCHEMA.replace("sum(a) AS total_a", "sum(b) AS total_a");
+    let msg = open_err(&changed, &storage);
+    assert!(msg.contains("materialized view 'totals'"), "{msg}");
+}
+
+#[test]
+fn a_changed_key_is_refused() {
+    let storage = storage_with_data();
+    let changed = SCHEMA.replace(
+        "SELECT user, sum(a) AS total_a\n    FROM transfers\n    GROUP BY user;",
+        "SELECT b, sum(a) AS total_a\n    FROM transfers\n    GROUP BY b;",
+    );
+    assert_ne!(changed, SCHEMA);
+
+    let msg = open_err(&changed, &storage);
+    assert!(msg.contains("materialized view 'totals'"), "{msg}");
+}
+
 #[test]
 fn database_without_data_may_change_its_layout() {
     let storage = Arc::new(MemoryBackend::new());

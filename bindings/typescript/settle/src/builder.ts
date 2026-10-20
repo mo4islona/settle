@@ -221,7 +221,16 @@ function viewToSql(
     }
   }
 
-  return `CREATE MATERIALIZED VIEW ${name} AS SELECT ${selectItems.join(', ')} FROM ${source} GROUP BY ${groupByCols.join(', ')};`
+  // GROUP BY names an interval key by each of its names in the select list.
+  const groupBy = groupByCols.flatMap((col) => {
+    const names = Object.entries(selectResult)
+      .filter(([, expr]) => expr._type === 'key' && expr.column === col)
+      .map(([alias]) => alias)
+    const interval = intervalDefs.some((d) => d.alias === col)
+    return interval && names.length > 0 ? names : [col]
+  })
+
+  return `CREATE MATERIALIZED VIEW ${name} AS SELECT ${selectItems.join(', ')} FROM ${source} GROUP BY ${groupBy.join(', ')};`
 }
 
 // ─── Internal types ──────────────────────────────────────────────

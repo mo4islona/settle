@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::{Error, Result};
-use crate::schema::ast::{AggFunc, MVDef, SelectExpr, SelectItem, SlidingWindowDef};
+use crate::schema::ast::{AggFunc, MVDef, SelectExpr, SlidingWindowDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
 use crate::types::{
     BlockNumber, ChangeOp, ChangeRecord, ChangeSchema, ColumnId, ColumnRegistry, ColumnType,
@@ -244,7 +244,7 @@ impl MVEngine {
         let mut agg_index = 0usize;
 
         for item in &def.select {
-            let output_name = resolve_output_name(item);
+            let output_name = item.output_name();
             match &item.expr {
                 SelectExpr::Column(col) => {
                     output_columns.push(OutputColumn::GroupBy {
@@ -1017,23 +1017,6 @@ fn take_values(values: &mut [Value]) -> Box<[Value]> {
         .iter_mut()
         .map(|v| std::mem::replace(v, Value::Null))
         .collect()
-}
-
-fn resolve_output_name(item: &SelectItem) -> String {
-    if let Some(alias) = &item.alias {
-        return alias.clone();
-    }
-    match &item.expr {
-        SelectExpr::Column(col) => col.clone(),
-        SelectExpr::Agg(func, col) => {
-            let func_name = func.name();
-            match col {
-                Some(c) => format!("{func_name}_{c}"),
-                None => func_name.to_string(),
-            }
-        }
-        SelectExpr::WindowFunc { column, .. } => column.clone(),
-    }
 }
 
 // MV group state binary layout:
