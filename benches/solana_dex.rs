@@ -12,7 +12,7 @@
 //! - `positions` (GROUP BY trader, token): average-cost PnL, feeds the PnL
 //!   of each wallet and its open positions, about a million groups.
 //!   `SDEX_POSITIONS=json`: GROUP BY trader, the positions of the wallet in
-//!   a JSON map, as tests/uniswap/schema.sql kept them. `map`: the same in a
+//!   a JSON map, as tests/conformance/ct10_golden/uniswap.sql kept them. `map`: the same in a
 //!   Map field.
 //!
 //! Runtimes: `fn` (Rust closures, LANGUAGE EXTERNAL), `lua`. Modes:

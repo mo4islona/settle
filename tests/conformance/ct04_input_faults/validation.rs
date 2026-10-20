@@ -1,9 +1,14 @@
-use super::test_helpers::*;
-use super::*;
-use crate::schema::ast::MAX_MV_AGGREGATES;
-use crate::test_helpers::cursor;
-use crate::types::{BlockCursor, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use settle::db::{Config, IngestInput, Settle};
+use settle::error::Error;
+use settle::schema::ast::MAX_MV_AGGREGATES;
+use settle::storage::memory::MemoryBackend;
+use settle::test_helpers::cursor;
+use settle::types::{BlockCursor, Value};
+
+use crate::support::*;
 
 /// ingest() must reject non-UInt64 block_number values.
 #[test]

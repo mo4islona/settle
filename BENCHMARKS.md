@@ -343,7 +343,7 @@ from a steady state. The count includes `ack` and the drop of each
 | `mv_sum_stored` | The same, on a stored table. A stored table also emits a change record for each raw row. |
 | `mv_minmax` | A `min`/`max`/`last` MV over 1,000 assets |
 | `lua` | A Lua reducer → a `last` MV |
-| `polymarket` | `tests/polymarket/schema.sql`: two Lua reducers and their MVs |
+| `polymarket` | `tests/conformance/ct10_golden/polymarket.sql`: two Lua reducers and their MVs |
 
 | Mode | Each ingest | Finality | Counted |
 |---|---|---|---|

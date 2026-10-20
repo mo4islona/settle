@@ -39,7 +39,7 @@ tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # End-to-end tests in `tests/e2e/` spin up a real Postgres container via
 # testcontainers. Requires a running Docker daemon — `cargo test --tests`
-# will run them. Filter with `cargo test --test integration` to skip the
+# will run them. Filter with `cargo test --test conformance` to skip the
 # Docker-dependent suite.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
@@ -65,28 +65,8 @@ name = "e2e"
 path = "tests/e2e/main.rs"
 
 [[test]]
-name = "integration"
-path = "tests/integration/main.rs"
-
-[[test]]
 name = "conformance"
 path = "tests/conformance/main.rs"
-
-[[test]]
-name = "dex"
-path = "tests/dex/tests.rs"
-
-[[test]]
-name = "uniswap"
-path = "tests/uniswap/tests.rs"
-
-[[test]]
-name = "polymarket"
-path = "tests/polymarket/tests.rs"
-
-[[test]]
-name = "sliding"
-path = "tests/sliding/tests.rs"
 
 [[bench]]
 name = "throughput"

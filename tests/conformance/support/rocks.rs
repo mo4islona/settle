@@ -1,12 +1,10 @@
-//! Shared helpers for e2e tests against a real RocksDB backend (and, for
-//! Postgres-target tests, the fixture in `pg`).
+//! Helpers for the tests against a real RocksDB backend.
 //!
 //! The schema is integer-only (deterministic across crash boundaries), keeps
 //! a reducer + MV so Settle's value-proposition is exercised, and is small
 //! enough for assertions to be readable.
 
 #![allow(dead_code)]
-
 
 use std::collections::HashMap;
 use std::path::Path;

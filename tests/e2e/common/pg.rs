@@ -9,7 +9,7 @@
 //! panics (via `.expect(...)`) — cargo surfaces this as a test failure
 //! with the docker-error message in the panic payload, making the cause
 //! obvious in CI logs. To skip these tests entirely, filter with
-//! `cargo test --test integration`.
+//! `cargo test --test conformance`.
 
 use settle::types::{ChangeBatch, ChangeOp, Value};
 use testcontainers::{runners::AsyncRunner, ContainerAsync};

@@ -1,8 +1,10 @@
-use super::test_helpers::*;
-use super::*;
-use crate::reducer_runtime::fn_reducer::FnReducerRuntime;
-use crate::types::{ChangeOp, RowMap};
 use std::collections::HashMap;
+
+use settle::db::{Config, Settle};
+use settle::reducer_runtime::fn_reducer::FnReducerRuntime;
+use settle::types::{ChangeBatch, ChangeOp, RowMap, Value};
+
+use crate::support::*;
 
 /// The latest values of the rows of `view`, by the value of `key`.
 #[derive(Default)]
@@ -188,7 +190,7 @@ fn wide(prefix: &str, n: usize, fail: bool) -> RowMap {
 #[cfg(feature = "lua")]
 #[test]
 fn undone_blocks_free_their_emit_columns() {
-    use crate::reducer_runtime::MAX_EMIT_COLUMNS;
+    use settle::reducer_runtime::MAX_EMIT_COLUMNS;
 
     let mut db = Settle::open(Config::new(WIDE_SCHEMA)).unwrap();
     let mut sums = View::default();

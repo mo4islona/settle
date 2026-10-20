@@ -1,6 +1,6 @@
 //! Polymarket insider detection pipeline — integration tests.
 //!
-//! Tests the full schema from tests/polymarket/schema.sql:
+//! Tests the full schema from tests/conformance/ct10_golden/polymarket.sql:
 //! - orders (raw table)
 //! - market_stats (Lua reducer, GROUP BY asset_id) → token_summary (MV)
 //! - insider_classifier (Lua reducer, GROUP BY trader) → insider_positions (MV)
@@ -11,7 +11,7 @@ use settle::db::{Config, Settle};
 use settle::test_helpers::{ingest_blocks, ingest_one, rollback_to};
 use settle::types::{ChangeOp, RowMap, Value};
 
-const SCHEMA: &str = include_str!("schema.sql");
+const SCHEMA: &str = include_str!("polymarket.sql");
 
 fn make_order(
     trader: &str,

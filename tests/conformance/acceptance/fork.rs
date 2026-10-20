@@ -11,7 +11,7 @@ use settle::types::{BlockCursor, ChangeOp, Value};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
-use super::common::{mv_record_for, open_rocks, order, prev_total_volume, total_volume, trade_count};
+use crate::support::rocks::{mv_record_for, open_rocks, order, prev_total_volume, total_volume, trade_count};
 
 const ASSET: &str = "token_a";
 

@@ -12,7 +12,7 @@ use settle::db::IngestInput;
 use settle::test_helpers::{cursor, ingest_one, ingest_with_finalized};
 use tempfile::TempDir;
 
-use super::common::{
+use crate::support::rocks::{
     ingest_orders, mv_record_for, open_rocks, order, prev_total_volume, prev_trade_count,
     total_volume, trade_count,
 };

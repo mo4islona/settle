@@ -17,7 +17,7 @@ use settle::db::{Config, IngestInput, Settle};
 use settle::test_helpers::{cursor, ingest_input};
 use settle::types::{RowMap, Value};
 
-const SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
+const SCHEMA: &str = include_str!("../tests/conformance/ct10_golden/polymarket.sql");
 
 fn make_polymarket_order(i: usize, num_traders: usize) -> RowMap {
     let top_traders = num_traders / 10;

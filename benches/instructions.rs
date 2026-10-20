@@ -104,7 +104,7 @@ impl Workload {
                 SELECT from_addr, last(balance) AS balance
                 FROM user_balance GROUP BY from_addr;"
             ),
-            Workload::Polymarket => include_str!("../tests/polymarket/schema.sql").to_string(),
+            Workload::Polymarket => include_str!("../tests/conformance/ct10_golden/polymarket.sql").to_string(),
         }
     }
 

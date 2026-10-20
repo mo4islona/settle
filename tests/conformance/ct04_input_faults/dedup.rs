@@ -12,7 +12,7 @@ use settle::test_helpers::{cursor, ingest_input, ingest_one, ingest_with_finaliz
 use settle::types::{BlockCursor, Value};
 use tempfile::TempDir;
 
-use super::common::{
+use crate::support::rocks::{
     ingest_orders, mv_record_for, open_rocks, order, prev_total_volume, prev_trade_count,
     total_volume, trade_count,
 };

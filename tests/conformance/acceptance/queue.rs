@@ -1,12 +1,18 @@
 //! Pipelined acks: several change batches wait for their ack while the
 //! caller ingests the next blocks. Random histories with crashes and forks
-//! are in `db_recovery_tests.rs`; these tests pin the contract.
+//! are in `ct02_reopen/recovery.rs`; these tests pin the contract.
 
-use super::test_helpers::*;
-use super::*;
-use crate::test_helpers::{cursor, ingest_with_finalized_no_ack};
-use crate::types::{ChangeOp, Value};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+use settle::db::{Config, Settle};
+use settle::error::{Error, Result};
+use settle::storage::StorageBackend;
+use settle::storage::memory::MemoryBackend;
+use settle::test_helpers::{cursor, ingest_with_finalized_no_ack};
+use settle::types::{BlockNumber, ChangeBatch, ChangeOp, RowMap, Value};
+
+use crate::support::*;
 
 fn open(schema: &str, storage: Arc<dyn StorageBackend>, depth: usize) -> Settle {
     let config = Config::new(schema).storage(storage).max_pending_batches(depth);
@@ -17,11 +23,6 @@ fn swap_block(db: &mut Settle, block: BlockNumber, finalized: BlockNumber) -> Re
     let rows = vec![("swaps".into(), block, vec![make_swap("ETH", block as f64)])];
     let batch = ingest_with_finalized_no_ack(db, rows, finalized)?;
     Ok(batch.expect("a data block makes a batch"))
-}
-
-fn stored_u64(storage: &MemoryBackend, key: &str) -> Option<u64> {
-    let bytes = storage.get_meta(key).unwrap()?;
-    Some(u64::from_be_bytes(bytes.try_into().unwrap()))
 }
 
 #[test]

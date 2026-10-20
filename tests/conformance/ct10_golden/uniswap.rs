@@ -32,7 +32,7 @@ const POOL_LINK_WETH: &str = "0xa6cc3c2531fdaa6ae1a3ca84c2855806728693e8";
 
 // --- Schema ---
 
-const UNISWAP_SCHEMA: &str = include_str!("schema.sql");
+const UNISWAP_SCHEMA: &str = include_str!("uniswap.sql");
 
 // --- Helpers ---
 

@@ -2,13 +2,18 @@
 //! go on exactly as one that never stopped: the derived state it persisted,
 //! plus the raw rows it replays, must rebuild the same reducers and MVs.
 
-use super::test_helpers::*;
-use super::*;
-use crate::storage::BatchOp;
-use crate::test_helpers::{cursor, ingest_with_finalized_no_ack};
-use crate::types::{ChangeOp, Value};
-use std::sync::atomic::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use settle::db::{Config, IngestInput, Settle};
+use settle::error::{Error, Result};
+use settle::storage::memory::MemoryBackend;
+use settle::storage::{StorageBackend, StorageWriteBatch};
+use settle::test_helpers::{block_hash, cursor, ingest_with_finalized_no_ack};
+use settle::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeOp, RowMap, Value};
+
+use crate::support::*;
 
 const SUM_SCHEMA: &str = r#"
     CREATE TABLE swaps (
@@ -231,12 +236,12 @@ struct FailingSum {
     poison: u64,
 }
 
-impl crate::reducer_runtime::ReducerRuntime for FailingSum {
+impl settle::reducer_runtime::ReducerRuntime for FailingSum {
     fn process(
         &self,
-        mut state: crate::reducer_runtime::GroupState<'_>,
-        row: &crate::types::Row,
-        emits: &mut crate::reducer_runtime::Emits,
+        mut state: settle::reducer_runtime::GroupState<'_>,
+        row: &settle::types::Row,
+        emits: &mut settle::reducer_runtime::Emits,
     ) -> Result<()> {
         let amount = row.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
         if amount == self.poison {
@@ -577,16 +582,16 @@ fn first_data_block_is_a_checkpoint_under_deferral() {
     let mut db = reopen(SUM_SCHEMA, &storage, 100);
 
     ingest_with_finalized(&mut db, vec![], 7).unwrap();
-    assert_eq!(db.engine.durable_block(), None, "no data, so nothing is durable");
+    assert_eq!(db.durable_block(), 0, "no data, so nothing is durable");
     assert!(storage.get_meta(META_FINALIZED_BLOCK).unwrap().is_none());
 
     ingest_with_finalized(&mut db, vec![("swaps".into(), 5, vec![swap(5, "ETH", 10)])], 7)
         .unwrap();
-    assert_eq!(db.engine.durable_block(), Some(5), "the first data block persists");
+    assert_eq!(db.durable_block(), 5, "the first data block persists");
 
     ingest_with_finalized(&mut db, vec![("swaps".into(), 8, vec![swap(8, "ETH", 10)])], 8)
         .unwrap();
-    assert_eq!(db.engine.durable_block(), Some(5), "later blocks defer");
+    assert_eq!(db.durable_block(), 5, "later blocks defer");
 }
 
 /// A heartbeat on an empty database stores no latest block. If it stored 0,
@@ -625,7 +630,7 @@ fn legacy_watermark_without_data_does_not_hide_new_blocks() {
     let (stored_finalized, first) = (100u64, 7);
     let storage = Arc::new(MemoryBackend::new());
     let mut legacy = StorageWriteBatch::new();
-    legacy.put_meta("format_version", &crate::storage::format::FORMAT_VERSION.to_be_bytes());
+    legacy.put_meta("format_version", &settle::storage::format::FORMAT_VERSION.to_be_bytes());
     legacy.put_meta(META_LATEST_BLOCK, &0u64.to_be_bytes());
     legacy.put_meta(META_FINALIZED_BLOCK, &stored_finalized.to_be_bytes());
     storage.commit(&legacy).unwrap();
@@ -678,7 +683,12 @@ fn legacy_watermark_above_latest_does_not_hide_new_blocks() {
 /// change are not written again.
 #[test]
 fn tip_ingest_writes_only_changed_block_hashes() {
-    let mut db = reopen(SUM_SCHEMA, &Arc::new(MemoryBackend::new()), 1);
+    let storage = Arc::new(FailingStorage::default());
+    let config = Config::new(SUM_SCHEMA)
+        .storage(storage.clone())
+        .backfill_checkpoint_interval(1)
+        .raw_retention_blocks(0);
+    let mut db = Settle::open(config).unwrap();
     let ingest = |db: &mut Settle, block: BlockNumber| {
         let finalized = block.saturating_sub(10);
         let mut row = swap(block, "ETH", 1);
@@ -695,23 +705,10 @@ fn tip_ingest_writes_only_changed_block_hashes() {
         let batch = ingest(&mut db, block);
         db.ack(batch.sequence).unwrap();
     }
-    ingest(&mut db, 50);
+    let batch = ingest(&mut db, 50);
+    db.ack(batch.sequence).unwrap();
 
-    let ops = &db.pending.back().unwrap().write_batch.ops;
-    let puts: Vec<BlockNumber> = ops
-        .iter()
-        .filter_map(|op| match op {
-            BatchOp::PutBlockHash { block, .. } => Some(*block),
-            _ => None,
-        })
-        .collect();
-    let deletes: Vec<BlockNumber> = ops
-        .iter()
-        .filter_map(|op| match op {
-            BatchOp::DeleteBlockHash { block } => Some(*block),
-            _ => None,
-        })
-        .collect();
+    let (puts, deletes) = storage.hash_writes.lock().unwrap().clone();
     assert_eq!(puts, [50]);
     assert_eq!(deletes, [39]);
 }
@@ -729,9 +726,9 @@ fn deferral_keeps_only_the_durable_hash_below_finality() {
             ingest_with_finalized(&mut db, vec![("swaps".into(), block, vec![swap(block, "ETH", 1)])], block)
                 .unwrap();
         }
-        assert_eq!(db.engine.durable_block(), Some(0));
-        let hashes: Vec<BlockNumber> = db.engine.block_hashes().keys().copied().collect();
-        assert_eq!(hashes, vec![0, 49]);
+        assert_eq!(db.durable_block(), 0);
+        assert_eq!(stored_u64(&storage, META_FINALIZED_BLOCK), Some(0));
+        assert_eq!(held_hashes(&db, 0..=50), vec![0, 49]);
     }
 
     let mut db = reopen(SUM_SCHEMA, &storage, 1000);
@@ -956,6 +953,19 @@ enum Op {
 }
 
 impl Op {
+    /// The highest block that the op names, so the highest block of a hash it can give.
+    fn max_block(&self) -> BlockNumber {
+        match self {
+            Op::Ingest {
+                blocks,
+                tip,
+                finalized,
+            } => blocks.iter().map(|(b, _)| *b).chain(*tip).fold(*finalized, BlockNumber::max),
+            Op::Fork { at, finalized, .. } => (*at).max(*finalized),
+            Op::Reopen => 0,
+        }
+    }
+
     /// An ingest that `FailingSum` rejects.
     fn poisoned(&self) -> bool {
         let Op::Ingest { blocks, .. } = self else {
@@ -1145,18 +1155,24 @@ fn check_history(schema: &str, interval: u64, forks: bool, seed: u64, steps: usi
         data_blocks: Vec::new(),
     };
     let mut log = Vec::new();
+    let mut sent = 0;
 
     for _ in 0..steps {
         let op = history.next_op();
         log.push(format!("{op:?}"));
+        sent = sent.max(op.max_block());
 
         if let Op::Reopen = op {
             // Every batch is acked: storage holds the hashes in memory.
             if !reopened.is_poisoned() {
                 let stored: BTreeMap<_, _> = storage.get_block_hashes().unwrap().into_iter().collect();
+                let held: BTreeMap<_, _> = held_hashes(&reopened, 0..=sent)
+                    .into_iter()
+                    .map(|b| (b, block_hash(b)))
+                    .collect();
                 assert_eq!(
-                    &stored,
-                    reopened.engine.block_hashes(),
+                    stored,
+                    held,
                     "seed {seed}, interval {interval}: stored hashes after\n{}",
                     log.join("\n")
                 );
@@ -1741,7 +1757,7 @@ fn assert_open_fails(schema: &str, storage: &Arc<MemoryBackend>, case: &str) {
 /// above them, so it cannot rebuild them.
 #[test]
 fn unreadable_mv_state_fails_open() {
-    let eth = crate::storage::encode_group_key(&[Value::String("ETH".into())]);
+    let eth = settle::storage::encode_group_key(&[Value::String("ETH".into())]);
     let block_one = 1u64.to_be_bytes().to_vec();
     let views = [
         (SUM_SCHEMA, "pool_volume", eth),

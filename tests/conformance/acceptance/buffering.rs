@@ -6,7 +6,7 @@
 
 use tempfile::TempDir;
 
-use super::common::{ingest_orders, mv_record_for, open_rocks, order, total_volume, trade_count};
+use crate::support::rocks::{ingest_orders, mv_record_for, open_rocks, order, total_volume, trade_count};
 
 const ASSET: &str = "token_a";
 

@@ -1423,45 +1423,6 @@ impl Settle {
 }
 
 #[cfg(test)]
-#[path = "db_test_helpers.rs"]
-mod test_helpers;
-
-#[cfg(test)]
-#[path = "db_core_tests.rs"]
-mod core_tests;
-
-#[cfg(test)]
-#[path = "db_rollback_tests.rs"]
-mod rollback_tests;
-
-#[cfg(test)]
 #[path = "db_external_tests.rs"]
 mod external_tests;
 
-#[cfg(test)]
-#[path = "db_validation_tests.rs"]
-mod validation_tests;
-
-#[cfg(test)]
-#[path = "db_recovery_tests.rs"]
-mod recovery_tests;
-
-#[cfg(test)]
-#[path = "db_pipeline_tests.rs"]
-mod pipeline_tests;
-
-#[cfg(test)]
-#[path = "db_format_tests.rs"]
-mod format_tests;
-
-#[cfg(all(test, feature = "rocksdb"))]
-#[path = "backfill_tests.rs"]
-mod backfill_tests;
-
-#[cfg(all(test, feature = "rocksdb", feature = "lua"))]
-#[path = "db_rows_tests.rs"]
-mod rows_tests;
-
-#[cfg(test)]
-#[path = "db_reducer_output_tests.rs"]
-mod reducer_output_tests;

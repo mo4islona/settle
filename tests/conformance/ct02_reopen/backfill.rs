@@ -7,11 +7,12 @@
 //!
 //! Gated on `feature = "rocksdb"` (drop+reopen needs real persistence).
 
-use super::*;
-use crate::reducer_runtime::fn_reducer::FnReducerRuntime;
-use crate::test_helpers::cursor;
-use crate::types::{ChangeBatch, RowMap, Value};
 use std::collections::HashMap;
+
+use settle::db::{Config, IngestInput, Settle};
+use settle::reducer_runtime::fn_reducer::FnReducerRuntime;
+use settle::test_helpers::cursor;
+use settle::types::{ChangeBatch, RowMap, Value};
 
 const MV_SCHEMA: &str = r#"
 CREATE TABLE orders (
