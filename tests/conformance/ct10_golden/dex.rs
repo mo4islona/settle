@@ -14,7 +14,7 @@ use settle::db::{Config, Settle};
 use settle::test_helpers::{ingest_blocks, ingest_one, ingest_with_finalized, rollback_to};
 use settle::types::{ChangeBatch, ChangeOp, ChangeRecord, RowMap, Value};
 
-const DEX_SCHEMA: &str = include_str!("schema.sql");
+const DEX_SCHEMA: &str = include_str!("dex.sql");
 
 fn make_trade(user: &str, side: &str, amount: f64, price: f64) -> RowMap {
     HashMap::from([

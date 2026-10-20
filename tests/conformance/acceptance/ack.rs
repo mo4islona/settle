@@ -19,7 +19,7 @@ use settle::storage::{StorageBackend, StorageWriteBatch};
 use settle::types::{BlockCursor, BlockNumber, RowMap, Value};
 use tempfile::TempDir;
 
-use super::common::{open_rocks, order, SCHEMA};
+use crate::support::rocks::{open_rocks, order, SCHEMA};
 
 const ASSET: &str = "token_a";
 

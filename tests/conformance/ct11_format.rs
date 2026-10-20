@@ -1,12 +1,20 @@
 //! The format version and the stored layouts: open must refuse stored data
 //! that the schema would read wrong.
 
-use super::*;
-use crate::schema::ast::ReducerDef;
-use crate::storage::format::FORMAT_VERSION;
-use crate::test_helpers::ingest_with_finalized;
-use crate::types::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use settle::db::{Config, Settle};
+use settle::error::{Error, Result};
+use settle::schema::ast::ReducerDef;
+use settle::schema::parser::parse_schema;
+use settle::storage::format::FORMAT_VERSION;
+use settle::storage::memory::MemoryBackend;
+use settle::storage::{StorageBackend, StorageWriteBatch};
+use settle::test_helpers::ingest_with_finalized;
+use settle::types::{BlockNumber, ChangeBatch, RowMap, Value};
+
+use crate::support::META_LATEST_BLOCK;
 
 const SCHEMA: &str = r#"
     CREATE TABLE transfers (
@@ -192,7 +200,7 @@ fn stamp_is_written_with_the_first_commit() {
     {
         let mut db = open(SCHEMA, &storage).unwrap();
         let rows = vec![("transfers".to_string(), 1, vec![transfer(1, 100)])];
-        crate::test_helpers::ingest_with_finalized_no_ack(&mut db, rows, 0).unwrap().unwrap();
+        settle::test_helpers::ingest_with_finalized_no_ack(&mut db, rows, 0).unwrap().unwrap();
     }
     assert_eq!(storage.get_meta("format_version").unwrap(), None);
 
@@ -215,7 +223,7 @@ fn layouts_restored_from_the_journal_are_checked() {
     let sequence = {
         let mut db = open_at(SCHEMA, 0).unwrap();
         let rows = vec![("transfers".to_string(), 1, vec![transfer(1, 100)])];
-        let batch = crate::test_helpers::ingest_with_finalized_no_ack(&mut db, rows, 0).unwrap();
+        let batch = settle::test_helpers::ingest_with_finalized_no_ack(&mut db, rows, 0).unwrap();
         batch.unwrap().sequence
     };
     assert_eq!(storage.get_meta("format_version").unwrap(), None);

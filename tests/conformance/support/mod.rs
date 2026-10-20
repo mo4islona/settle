@@ -1,17 +1,40 @@
-// The ingest/rollback helpers live in `crate::test_helpers` so they're also
-// reachable from integration tests under `tests/` and benches under `benches/`.
-// Re-export them here so the unit tests under `db::` keep their existing
-// `use super::test_helpers::*;` import without further plumbing.
-pub use crate::test_helpers::{
+//! Helpers and schemas shared by the example tests.
+
+#[cfg(feature = "rocksdb")]
+pub mod rocks;
+
+pub use settle::test_helpers::{
     handle_fork, ingest_blocks, ingest_input, ingest_one, ingest_with_finalized, rollback_to,
 };
 
-use crate::error::{Error, Result};
-use crate::storage::memory::MemoryBackend;
-use crate::storage::{StorageBackend, StorageWriteBatch};
-use crate::types::{BlockNumber, RowMap, Value};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use settle::db::Settle;
+use settle::error::{Error, Result};
+use settle::storage::memory::MemoryBackend;
+use settle::storage::{BatchOp, StorageBackend, StorageWriteBatch};
+use settle::test_helpers::block_hash;
+use settle::types::{BlockNumber, RowMap, Value};
+
+/// Stored meta keys, for tests that read the watermarks or write a legacy store.
+pub const META_LATEST_BLOCK: &str = "latest_block";
+pub const META_FINALIZED_BLOCK: &str = "finalized_block";
+
+pub fn stored_u64(storage: &MemoryBackend, key: &str) -> Option<u64> {
+    let bytes = storage.get_meta(key).unwrap()?;
+    Some(u64::from_be_bytes(bytes.try_into().unwrap()))
+}
+
+/// The blocks of `blocks` whose hash in memory is `block_hash(b)`. A fork
+/// cursor probe reads the hash record of the running instance.
+pub fn held_hashes(db: &Settle, blocks: impl IntoIterator<Item = BlockNumber>) -> Vec<BlockNumber> {
+    blocks
+        .into_iter()
+        .filter(|&b| db.resolve_fork_cursor(&[(b, &block_hash(b))]).is_some())
+        .collect()
+}
 
 pub const DEX_SCHEMA: &str = r#"
     CREATE TABLE trades (
@@ -118,7 +141,8 @@ pub fn make_swap(pool: &str, amount: f64) -> RowMap {
 /// `fail_reads` is set, syncs while `fail_syncs` is set, and commits fail once
 /// `commits_before_failure` commits have passed. It keeps the default bounded
 /// raw-row read; `blocks_read` counts the blocks of raw rows that it returned,
-/// and `syncs` the syncs that succeeded.
+/// and `syncs` the syncs that succeeded. `hash_writes` holds the blocks whose
+/// hash the last commit put and deleted.
 pub struct FailingStorage {
     inner: MemoryBackend,
     pub fail_reads: AtomicBool,
@@ -126,6 +150,7 @@ pub struct FailingStorage {
     pub commits_before_failure: AtomicU64,
     pub blocks_read: AtomicU64,
     pub syncs: AtomicU64,
+    pub hash_writes: Mutex<(Vec<BlockNumber>, Vec<BlockNumber>)>,
 }
 
 impl Default for FailingStorage {
@@ -137,6 +162,7 @@ impl Default for FailingStorage {
             commits_before_failure: AtomicU64::new(u64::MAX),
             blocks_read: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
+            hash_writes: Mutex::default(),
         }
     }
 }
@@ -160,7 +186,7 @@ impl StorageBackend for FailingStorage {
     fn get_reducer_finalized(&self, r: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_reducer_finalized(r, k) }
     fn set_reducer_finalized(&self, r: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.set_reducer_finalized(r, k, s) }
     fn delete_reducer_states_up_to(&self, r: &str, k: &[u8], u: BlockNumber) -> Result<()> { self.inner.delete_reducer_states_up_to(r, k, u) }
-    fn get_reducer_map_entries(&self, r: &str, k: &[u8]) -> Result<Vec<crate::storage::MapEntry>> { self.inner.get_reducer_map_entries(r, k) }
+    fn get_reducer_map_entries(&self, r: &str, k: &[u8]) -> Result<Vec<settle::storage::MapEntry>> { self.inner.get_reducer_map_entries(r, k) }
     fn put_mv_state(&self, v: &str, k: &[u8], s: &[u8]) -> Result<()> { self.inner.put_mv_state(v, k, s) }
     fn get_mv_state(&self, v: &str, k: &[u8]) -> Result<Option<Vec<u8>>> { self.inner.get_mv_state(v, k) }
     fn delete_mv_state(&self, v: &str, k: &[u8]) -> Result<()> { self.inner.delete_mv_state(v, k) }
@@ -168,7 +194,7 @@ impl StorageBackend for FailingStorage {
     fn put_meta(&self, k: &str, v: &[u8]) -> Result<()> { self.inner.put_meta(k, v) }
     fn get_meta(&self, k: &str) -> Result<Option<Vec<u8>>> { self.inner.get_meta(k) }
     fn get_block_hashes(&self) -> Result<Vec<(BlockNumber, String)>> { self.inner.get_block_hashes() }
-    fn journal(&self) -> Result<Vec<crate::storage::journal::JournalPart>> { self.inner.journal() }
+    fn journal(&self) -> Result<Vec<settle::storage::journal::JournalPart>> { self.inner.journal() }
     fn list_reducer_group_keys(&self, r: &str) -> Result<Vec<Vec<u8>>> { self.inner.list_reducer_group_keys(r) }
     fn commit(&self, batch: &StorageWriteBatch) -> Result<()> {
         let left = self.commits_before_failure.load(Ordering::SeqCst);
@@ -178,6 +204,17 @@ impl StorageBackend for FailingStorage {
         if left != u64::MAX {
             self.commits_before_failure.store(left - 1, Ordering::SeqCst);
         }
+
+        let mut writes = (Vec::new(), Vec::new());
+        for op in &batch.ops {
+            match op {
+                BatchOp::PutBlockHash { block, .. } => writes.0.push(*block),
+                BatchOp::DeleteBlockHash { block } => writes.1.push(*block),
+                _ => {}
+            }
+        }
+        *self.hash_writes.lock().unwrap() = writes;
+
         self.inner.commit(batch)
     }
     fn sync(&self) -> Result<()> {

@@ -1,7 +1,9 @@
-use super::test_helpers::*;
-use super::*;
-use crate::types::{BlockCursor, ChangeOp, Value};
 use std::collections::HashMap;
+
+use settle::db::{Config, IngestInput, Settle};
+use settle::types::{BlockCursor, ChangeOp, Value};
+
+use crate::support::*;
 
 #[test]
 fn open_with_valid_schema() {
@@ -132,7 +134,7 @@ fn unknown_table_returns_error() {
 
 #[test]
 fn empty_db_has_no_pending() {
-    let mut db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
+    let db = Settle::open(Config::new(SIMPLE_SCHEMA)).unwrap();
     assert!(!db.is_awaiting_ack());
     assert_eq!(db.pending_count(), 0);
 }
@@ -249,6 +251,7 @@ fn ingest_errors_on_missing_block_number() {
 }
 
 #[test]
+#[cfg(feature = "rocksdb")]
 fn ingest_persists_and_restores_state() {
     let dir = tempfile::tempdir().unwrap();
     let schema = SIMPLE_SCHEMA;

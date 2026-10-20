@@ -1,8 +1,14 @@
-use super::test_helpers::*;
-use super::*;
-use crate::test_helpers::cursor;
-use crate::types::{BlockCursor, ChangeOp, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use settle::db::{Config, IngestInput, Settle};
+use settle::error::Error;
+use settle::storage::StorageBackend;
+use settle::storage::memory::MemoryBackend;
+use settle::test_helpers::cursor;
+use settle::types::{BlockCursor, BlockNumber, ChangeBatch, ChangeOp, ChangeRecord, Value};
+
+use crate::support::*;
 
 #[test]
 fn rollback_produces_compensating_changes() {
@@ -247,7 +253,7 @@ fn partial_rollback_emits_update_not_delete() {
 
 #[test]
 fn rollback_persists_metadata_atomically() {
-    use crate::storage::memory::MemoryBackend;
+    use settle::storage::memory::MemoryBackend;
 
     let storage = Arc::new(MemoryBackend::new());
     let mut db = Settle::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
@@ -289,7 +295,7 @@ fn rollback_persists_metadata_atomically() {
 
 #[test]
 fn rollback_survives_simulated_restart() {
-    use crate::storage::memory::MemoryBackend;
+    use settle::storage::memory::MemoryBackend;
 
     let storage = Arc::new(MemoryBackend::new());
 
@@ -330,6 +336,7 @@ fn rollback_survives_simulated_restart() {
 }
 
 #[test]
+#[cfg(feature = "rocksdb")]
 fn crash_recovery_replays_unfinalized_blocks() {
     // Full pipeline with reducer: ingest blocks, finalize some,
     // reopen (simulating crash), verify reducer/MV state is rebuilt
@@ -371,20 +378,20 @@ fn crash_recovery_replays_unfinalized_blocks() {
             rollback_chain: vec![
                 BlockCursor {
                     number: 1000,
-                    hash: crate::test_helpers::block_hash(1000),
+                    hash: settle::test_helpers::block_hash(1000),
                 },
                 BlockCursor {
                     number: 1001,
-                    hash: crate::test_helpers::block_hash(1001),
+                    hash: settle::test_helpers::block_hash(1001),
                 },
                 BlockCursor {
                     number: 1002,
-                    hash: crate::test_helpers::block_hash(1002),
+                    hash: settle::test_helpers::block_hash(1002),
                 },
             ],
             finalized_head: BlockCursor {
                 number: 1000,
-                hash: crate::test_helpers::block_hash(1000),
+                hash: settle::test_helpers::block_hash(1000),
             },
         })
         .unwrap();
@@ -601,11 +608,11 @@ fn deferral_fork_below_finality_rejected_cleanly() {
             )]),
             rollback_chain: vec![BlockCursor {
                 number: b,
-                hash: crate::test_helpers::block_hash(b),
+                hash: settle::test_helpers::block_hash(b),
             }],
             finalized_head: BlockCursor {
                 number: b,
-                hash: crate::test_helpers::block_hash(b),
+                hash: settle::test_helpers::block_hash(b),
             },
         };
         ingest_input(&mut db, input).unwrap();
@@ -619,7 +626,7 @@ fn deferral_fork_below_finality_rejected_cleanly() {
     // resolve_fork_cursor_bounded iterates DESC; 31 hash differs, 30 matches.
     let fork_chain = vec![
         BlockCursor { number: 31, hash: "0xforked31".into() },
-        BlockCursor { number: 30, hash: crate::test_helpers::block_hash(30) },
+        BlockCursor { number: 30, hash: settle::test_helpers::block_hash(30) },
     ];
     assert!(
         handle_fork(&mut db, fork_chain).is_err(),
@@ -644,11 +651,11 @@ fn deferral_fork_below_finality_rejected_cleanly() {
         )]),
         rollback_chain: vec![BlockCursor {
             number: 51,
-            hash: crate::test_helpers::block_hash(51),
+            hash: settle::test_helpers::block_hash(51),
         }],
         finalized_head: BlockCursor {
             number: 51,
-            hash: crate::test_helpers::block_hash(51),
+            hash: settle::test_helpers::block_hash(51),
         },
     };
     ingest_input(&mut db, next).expect("instance must remain usable after a rejected fork");

@@ -1,8 +1,11 @@
-use super::*;
-use crate::js_codec::{self, Decoder, Strings};
-use crate::msgpack_conv::decode_data_from_msgpack;
-use crate::test_helpers::cursor;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use settle::db::{BlockRows, Config, IngestInput, IngestRows, Settle};
+use settle::js_codec::{self, Decoder, Strings};
+use settle::msgpack_conv::decode_data_from_msgpack;
+use settle::test_helpers::cursor;
+use settle::types::{BlockCursor, BlockNumber, ChangeBatch, ColumnRegistry, Row, Value};
 
 /// A raw table without a `block_number` column, one with it, and a VIRTUAL
 /// one, each read by a view directly and through a reducer.

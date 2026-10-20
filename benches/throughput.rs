@@ -646,7 +646,7 @@ fn bench_many_group_keys(backend: Backend) -> BenchResult {
 
 // ─── Polymarket schemas ───────────────────────────────────────────
 
-const POLYMARKET_FULL_SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
+const POLYMARKET_FULL_SCHEMA: &str = include_str!("../tests/conformance/ct10_golden/polymarket.sql");
 
 const POLYMARKET_MARKET_STATS_ONLY: &str = r#"
 CREATE VIRTUAL TABLE orders (

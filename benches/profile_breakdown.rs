@@ -12,7 +12,7 @@ use settle::storage::memory::MemoryBackend;
 use settle::test_helpers::ingest_one;
 use settle::types::{ColumnRegistry, Row, RowMap, Value};
 
-const FULL_SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
+const FULL_SCHEMA: &str = include_str!("../tests/conformance/ct10_golden/polymarket.sql");
 
 const MARKET_STATS_ONLY: &str = r#"
 CREATE VIRTUAL TABLE orders (

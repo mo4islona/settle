@@ -1,5 +1,5 @@
 -- lua/positions.sql with one group for each wallet: its positions in a JSON
--- map by token, as tests/uniswap/schema.sql kept them. A bot that trades
+-- map by token, as tests/conformance/ct10_golden/uniswap.sql kept them. A bot that trades
 -- thousands of tokens has thousands of entries in its map, and each block
 -- copies all of them. lua/positions_map.sql is the same with a Map field.
 CREATE REDUCER positions

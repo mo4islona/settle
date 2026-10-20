@@ -9,7 +9,7 @@ use settle::db::{Config, Settle};
 use settle::test_helpers::{ingest_blocks, ingest_one, ingest_with_finalized, rollback_to};
 use settle::types::{ChangeBatch, ChangeOp, ChangeRecord, RowMap, Value};
 
-const SCHEMA: &str = include_str!("schema.sql");
+const SCHEMA: &str = include_str!("sliding.sql");
 
 fn make_trade(pair: &str, volume: f64, price: f64, block_time_ms: i64) -> RowMap {
     HashMap::from([
