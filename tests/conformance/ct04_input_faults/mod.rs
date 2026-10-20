@@ -2,4 +2,6 @@
 
 #[cfg(feature = "rocksdb")]
 mod dedup;
+#[cfg(feature = "lua")]
+mod termination;
 mod validation;

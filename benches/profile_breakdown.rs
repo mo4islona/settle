@@ -115,7 +115,7 @@ fn main() {
                 .map(|c| c.name.clone())
                 .collect(),
         );
-        let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]);
+        let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]).unwrap();
 
         // Convert RowMaps to Rows for reducer input
         let registry = Arc::new(source_registry);

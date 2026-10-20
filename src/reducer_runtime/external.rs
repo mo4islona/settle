@@ -370,7 +370,8 @@ mod wasm_bridge {
                 .dyn_into()
                 .map_err(|_| "result item must be an object")?;
 
-            let js_state = js_sys::Reflect::get(&item_obj, &JsValue::from_str("state")).unwrap();
+            let js_state = js_sys::Reflect::get(&item_obj, &JsValue::from_str("state"))
+                .map_err(|_| "the 'state' getter of a result item threw")?;
             for (value, name) in group.state.iter_mut().zip(fields.names()) {
                 let js_value = js_sys::Reflect::get(&js_state, &JsValue::from_str(name))
                     .unwrap_or(JsValue::NULL);
@@ -378,12 +379,13 @@ mod wasm_bridge {
             }
 
             let rows = &order[group.rows.clone()];
-            let js_emits = js_sys::Reflect::get(&item_obj, &JsValue::from_str("emits")).unwrap();
+            let js_emits = js_sys::Reflect::get(&item_obj, &JsValue::from_str("emits"))
+                .map_err(|_| "the 'emits' getter of a result item threw")?;
             let emits_arr: js_sys::Array = js_emits
                 .dyn_into()
                 .map_err(|_| "emits must be an array")?;
-            let js_emit_rows =
-                js_sys::Reflect::get(&item_obj, &JsValue::from_str("emitRows")).unwrap();
+            let js_emit_rows = js_sys::Reflect::get(&item_obj, &JsValue::from_str("emitRows"))
+                .map_err(|_| "the 'emitRows' getter of a result item threw")?;
             let emit_rows: Option<js_sys::Array> = js_emit_rows.dyn_into().ok();
             for j in 0..emits_arr.length() {
                 let row = match &emit_rows {

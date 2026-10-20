@@ -26,7 +26,8 @@ pub fn parse_duration(s: &str) -> Result<u64> {
         "d" | "day" | "days" => 86400,
         _ => return Err(Error::Schema(format!("unknown duration unit: '{unit}'"))),
     };
-    Ok(n * mult)
+    n.checked_mul(mult)
+        .ok_or_else(|| Error::Schema(format!("duration overflows: '{s}'")))
 }
 
 // ─── Interval helper ────────────────────────────────────────────
@@ -36,6 +37,8 @@ pub struct IntervalExpr {
     pub column: String,
     pub seconds: u64,
     pub alias: Option<String>,
+    /// Why the duration does not parse: `build()` fails with it.
+    pub(crate) error: Option<String>,
 }
 
 impl IntervalExpr {
@@ -47,11 +50,15 @@ impl IntervalExpr {
 
 /// `interval("block_time", "5 minutes")` — bucket a DateTime column by duration.
 pub fn interval(column: impl Into<String>, duration: &str) -> IntervalExpr {
-    let seconds = parse_duration(duration).unwrap_or_else(|e| panic!("interval(): {e}"));
+    let (seconds, error) = match parse_duration(duration) {
+        Ok(seconds) => (seconds, None),
+        Err(e) => (0, Some(e.to_string())),
+    };
     IntervalExpr {
         column: column.into(),
         seconds,
         alias: None,
+        error,
     }
 }
 

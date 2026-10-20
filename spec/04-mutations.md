@@ -43,7 +43,7 @@ A fork call checks gates 1 and 2, then requires a non-empty chain (INVALID_INPUT
 - Each row carries a block number (DEF-1) of type UInt64, and it equals the block of the row.
 - Each table with at least one row is a declared raw table.
 - Each positional row has the column layout of its table.
-- Each value has the declared type of its column, or converts to it exactly (ADR-6).
+- Each value has the declared type of its column, or converts to it exactly (ADR-15).
 
 Otherwise the call fails with INVALID_INPUT. The current code checks no value type other than the block number (GAP-1). An entry for an undeclared table with no rows has no effect. The treatment of an undeclared column name in a row map is open (OQ-1).
 
@@ -200,7 +200,7 @@ A layout mismatch fails with INCOMPATIBLE_STORAGE, and a queue that is not empty
 
 **WP-72 — Poison effect.** A poisoned instance fails each call with POISONED, except ack and the status reads. An ack still commits, so the host can ack the batches that the target applied, then drop the instance and reopen (ADR-1).
 
-**WP-73 — No termination.** No input, schema text, reducer result or call sequence terminates the host process (FM-1). The current code can panic on some schema texts and Lua code (GAP-4).
+**WP-73 — No termination.** No input, schema text, reducer result or call sequence terminates the host process (FM-1).
 
 ## Transition catalog
 

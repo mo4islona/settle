@@ -44,3 +44,14 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The message of a caught panic.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = panic.downcast_ref::<String>() {
+        message
+    } else if let Some(message) = panic.downcast_ref::<&str>() {
+        message
+    } else {
+        "no message"
+    }
+}

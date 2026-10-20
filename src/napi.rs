@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use napi::{JsObject, JsUnknown, NapiRaw, NapiValue};
 use napi::bindgen_prelude::*;
@@ -6,7 +7,7 @@ use napi::sys;
 use napi_derive::napi;
 
 use crate::db::{BlockRows, Config, IngestRows, Settle as Inner};
-use crate::error::Error as SettleError;
+use crate::error::{Error as SettleError, panic_message};
 use crate::js_codec::napi::{
     Arrays, element, js_to_value, other_value, read_strings, to_js, value_to_js,
 };
@@ -30,6 +31,17 @@ fn settle_err_to_napi(e: SettleError) -> napi::Error {
         )),
         other => napi::Error::new(Status::GenericFailure, format!("{other}")),
     }
+}
+
+/// Run `call`, so that a panic in it cannot unwind into Node, which aborts
+/// the process.
+fn catch_panic<T>(call: impl FnOnce() -> Result<T>) -> Result<T> {
+    catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|panic| Err(panic_error(&*panic)))
+}
+
+fn panic_error(panic: &(dyn std::any::Any + Send)) -> Error {
+    let message = format!("internal error: {}", panic_message(panic));
+    Error::new(Status::GenericFailure, message)
 }
 
 /// Configuration for opening a Settle instance.
@@ -146,6 +158,10 @@ impl Settle {
     /// Open a new Settle instance.
     #[napi(factory)]
     pub fn open(env: Env, config: SettleConfig) -> Result<Self> {
+        catch_panic(|| Self::open_unguarded(env, config))
+    }
+
+    fn open_unguarded(env: Env, config: SettleConfig) -> Result<Self> {
         let mut cfg = if let Some(dir) = config.data_dir {
             Config::with_data_dir(config.schema, dir)
         } else {
@@ -207,6 +223,15 @@ impl Settle {
     /// return an array of `{ state, emits }` results (same length, same order).
     #[napi]
     pub fn register_reducer(
+        &mut self,
+        env: Env,
+        config: ExternalReducerConfig,
+        callback: JsFunction,
+    ) -> Result<()> {
+        self.guarded(|this| this.register_reducer_unguarded(env, config, callback))
+    }
+
+    fn register_reducer_unguarded(
         &mut self,
         env: Env,
         config: ExternalReducerConfig,
@@ -302,6 +327,15 @@ impl Settle {
         name: String,
         callback: JsFunction,
     ) -> Result<()> {
+        self.guarded(|this| this.register_reducer_callback_unguarded(env, name, callback))
+    }
+
+    fn register_reducer_callback_unguarded(
+        &mut self,
+        env: Env,
+        name: String,
+        callback: JsFunction,
+    ) -> Result<()> {
         if !self.inner.has_reducer(&name) {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -378,6 +412,15 @@ impl Settle {
         rows: JsObject,
         input: IngestInput,
     ) -> Result<Option<JsObject>> {
+        self.guarded(|this| this.ingest_unguarded(env, rows, input))
+    }
+
+    fn ingest_unguarded(
+        &mut self,
+        env: Env,
+        rows: JsObject,
+        input: IngestInput,
+    ) -> Result<Option<JsObject>> {
         let data = decode_rows(&env, &rows, |table| self.inner.table_registry(table))
             .map_err(|e| Error::new(Status::InvalidArg, e))?;
 
@@ -421,6 +464,13 @@ impl Settle {
     pub fn resolve_fork_cursor(
         &self,
         previous_blocks: Vec<SettleCursor>,
+    ) -> Result<Option<SettleCursor>> {
+        catch_panic(|| Ok(self.resolve_fork_cursor_unguarded(previous_blocks)))
+    }
+
+    fn resolve_fork_cursor_unguarded(
+        &self,
+        previous_blocks: Vec<SettleCursor>,
     ) -> Option<SettleCursor> {
         // Sort DESC so resolve_fork_cursor returns the HIGHEST common ancestor
         // regardless of the order the portal sends previousBlocks (typically ASC).
@@ -443,6 +493,14 @@ impl Settle {
     /// Throws if no common ancestor is found (fork too deep / unrecoverable).
     #[napi]
     pub fn handle_fork(
+        &mut self,
+        env: Env,
+        previous_blocks: Vec<SettleCursor>,
+    ) -> napi::Result<ForkResultJs> {
+        self.guarded(|this| this.handle_fork_unguarded(env, previous_blocks))
+    }
+
+    fn handle_fork_unguarded(
         &mut self,
         env: Env,
         previous_blocks: Vec<SettleCursor>,
@@ -482,9 +540,7 @@ impl Settle {
                 "ack sequence must be non-negative",
             ));
         }
-        self.inner
-            .ack(sequence as u64)
-            .map_err(settle_err_to_napi)
+        self.guarded(|this| this.inner.ack(sequence as u64).map_err(settle_err_to_napi))
     }
 
     /// Number of pending (unflushed) change records in the buffer. Does NOT
@@ -529,6 +585,19 @@ impl Settle {
     pub fn cursor(&self) -> Option<SettleCursor> {
         self.inner.latest_cursor().map(|c| c.into())
     }
+
+    /// `catch_panic` for a call on the instance. The state after a panic is
+    /// not known, so the panic poisons the instance.
+    fn guarded<T>(&mut self, call: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        match catch_unwind(AssertUnwindSafe(|| call(&mut *self))) {
+            Ok(result) => result,
+            Err(panic) => {
+                let error = panic_error(&*panic);
+                self.inner.poison(error.reason.clone());
+                Err(error)
+            }
+        }
+    }
 }
 
 // ─── Map fields in a reducer callback ─────────────────────────────
@@ -539,6 +608,10 @@ impl Settle {
 /// The value of `key` in Map field `map` of group `group`; undefined if absent.
 #[napi]
 pub fn map_get(env: Env, group: u32, map: u32, key: String) -> Result<JsUnknown> {
+    catch_panic(|| map_get_unguarded(env, group, map, key))
+}
+
+fn map_get_unguarded(env: Env, group: u32, map: u32, key: String) -> Result<JsUnknown> {
     let value = with_host_map(group, map, |field| {
         field.get(&key).map(|value| value_to_js(&env, value)).transpose()
     })
@@ -555,6 +628,10 @@ pub fn map_get(env: Env, group: u32, map: u32, key: String) -> Result<JsUnknown>
 /// Set `key` in Map field `map` of group `group`; null or undefined deletes it.
 #[napi]
 pub fn map_set(env: Env, group: u32, map: u32, key: String, value: JsUnknown) -> Result<()> {
+    catch_panic(|| map_set_unguarded(env, group, map, key, value))
+}
+
+fn map_set_unguarded(env: Env, group: u32, map: u32, key: String, value: JsUnknown) -> Result<()> {
     // Read before the map is borrowed: a getter of `value` runs JS.
     let value = js_to_value(&env, unsafe { value.raw() })
         .map_err(|e| Error::new(Status::InvalidArg, e))?;
@@ -565,8 +642,10 @@ pub fn map_set(env: Env, group: u32, map: u32, key: String, value: JsUnknown) ->
 /// Delete `key` from Map field `map` of group `group`. False if it was absent.
 #[napi]
 pub fn map_delete(group: u32, map: u32, key: String) -> Result<bool> {
-    with_host_map(group, map, |mut field| field.remove(&key))
-        .map_err(|e| Error::new(Status::GenericFailure, e))
+    catch_panic(|| {
+        with_host_map(group, map, |mut field| field.remove(&key))
+            .map_err(|e| Error::new(Status::GenericFailure, e))
+    })
 }
 
 /// The rows of `ingest`, `[ints, tags, nums, strings, others]`: ints

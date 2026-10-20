@@ -55,7 +55,7 @@ The hot path is this loop: ingest a range of blocks, apply the returned batch, a
 | Host | The shape of each argument, the block order, the finality order, the ack sequence and the hash conflicts against stored hashes. | That the hashes and the finality come from the source. That it applies batches in sequence order. | A termination of the process, corrupt stored state, or a rollback below finality. |
 | Source | Nothing directly. The host passes its claims. | Its finality claims. | A rollback below finality. A conflict below finality is an error (WP-13). |
 | Target | In journal mode, the applied sequence against the journal at open (WP-52). | That it applies each batch atomically and in order. | A reopen that silently disagrees with the target. |
-| Schema author | The grammar, the references between objects and the stored layouts. | The logic of the reducer bodies. | A termination of the process, unbounded CPU time or unbounded memory. These are open deviations (GAP-4, GAP-5). |
+| Schema author | The grammar, the references between objects and the stored layouts. | The logic of the reducer bodies. | A termination of the process, unbounded CPU time or unbounded memory. The bounds on CPU time and memory are open deviations (GAP-5). |
 | External runtime | The shape of its output and the row index of each emit row. | The values that it returns. | A termination of the process. |
 | Operator | The format version and the layouts of the stored data. | Exclusive use of the data directory. | A read of stored data with another layout (INV-45). |
 | Storage medium | That each stored value decodes. | That a value that decodes is the value that Settle wrote. Settle keeps no checksums of its own. | A silent default in place of unreadable state (INV-46). |

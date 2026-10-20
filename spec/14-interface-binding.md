@@ -135,7 +135,7 @@ By REQ-27, Settle then converts each value to the declared type of its column, o
 | JSON | The JS value, with an integer above P-JS-SAFE-INT as `bigint` |
 | Null | `null` |
 
-**IB-43 — Reducer callback values, Node.** A JS reducer gets Bytes as hex text, an absent row field as `undefined` and a Null state field as `null`. Settle reads each number that the reducer returns as Float64, and each object as JSON. By ADR-6, Settle converts each returned value to the declared type, or fails with REDUCER_FAILED (GAP-1).
+**IB-43 — Reducer callback values, Node.** A JS reducer gets Bytes as hex text, an absent row field as `undefined` and a Null state field as `null`. Settle reads each number that the reducer returns as Float64, and each object as JSON. By ADR-15, Settle converts each returned value to the declared type, or fails with REDUCER_FAILED (GAP-1).
 
 **IB-44 — Wide values.** Uint256 and Base58 values leave the JS bindings as text. The TS types MUST describe the runtime form. Today the TS type of a Uint256 column says `bigint` (GAP-28).
 
@@ -211,7 +211,7 @@ GROUP BY asset_id;
 - The time column of a sliding view over a raw table is not DateTime, UInt64 or Int64.
 - A limit of IB-67 is exceeded.
 
-By ADR-6, an open also fails for each construct of IB-68. Today it does not (GAP-2).
+By ADR-14, an open also fails for each construct of IB-68. Today it does not (GAP-2).
 
 **IB-62 — Column types.**
 
@@ -273,7 +273,7 @@ unit := SECOND | MINUTE | HOUR | DAY        (a plural form is valid in WINDOW SL
 
 **IB-67 — Limits.** A table has at most P-MAX-COLUMNS columns, and a reducer at most P-MAX-COLUMNS state fields. A view has at most P-MAX-AGGREGATES aggregates. A reducer has at most P-MAX-EMIT-COLUMNS emit columns.
 
-**IB-68 — Refused constructs.** By ADR-6, an open refuses these constructs with INVALID_SCHEMA:
+**IB-68 — Refused constructs.** By ADR-14, an open refuses these constructs with INVALID_SCHEMA:
 
 - WHERE, HAVING, joins, ORDER BY, LIMIT and DISTINCT in a view.
 - A view GROUP BY that differs from the key items of its select list.

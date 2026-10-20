@@ -254,6 +254,8 @@ pub struct PipelineInner {
     views: Vec<ViewSpec>,
     /// Reducer name → reduce callback (drained into runtimes by `build()`).
     reduce_fns: HashMap<String, ReduceFn>,
+    /// The first call that failed: `to_ddl` and `build()` return it.
+    error: Option<String>,
 }
 
 impl PipelineInner {
@@ -271,7 +273,11 @@ impl PipelineInner {
     ) {
         let state_fields = match codegen::infer_state_fields(&opts.initial_state) {
             Ok(f) => f,
-            Err(e) => panic!("Pipeline::create_reducer('{name}'): {e}"),
+            Err(e) => {
+                self.error
+                    .get_or_insert(format!("create_reducer('{name}'): {e}"));
+                return;
+            }
         };
         self.reducers.push(ReducerSpec {
             name: name.clone(),
@@ -297,6 +303,9 @@ impl PipelineInner {
     }
 
     pub(crate) fn to_ddl(&self) -> Result<String> {
+        if let Some(e) = &self.error {
+            return Err(Error::Schema(e.clone()));
+        }
         let mut parts: Vec<String> = Vec::with_capacity(
             self.tables.len() + self.reducers.len() + self.views.len(),
         );

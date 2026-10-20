@@ -13,7 +13,7 @@ Bands: 1–9 global · 10–29 input · 30–39 storage · 40–49 reducer runti
 
 ## Global requirements
 
-**FM-1 — No termination.** No input, schema text, reducer result, call order or stored data terminates the host process. Settle returns an error class. The current code can panic on some schema texts, on a Lua compile error and on some numeric limits (GAP-4, GAP-17).
+**FM-1 — No termination.** No input, schema text, reducer result, call order or stored data terminates the host process. Settle returns an error class. Some additions wrap at the integer limits (GAP-17).
 
 **FM-2 — Fault classes.** Settle classifies each fault as transient or integrity:
 
@@ -37,7 +37,7 @@ Bands: 1–9 global · 10–29 input · 30–39 storage · 40–49 reducer runti
 | FM-16 | A positional row whose block number differs from its block, or whose width differs from its table. | Fail-safe: INVALID_INPUT. |
 | FM-17 | Rows for an undeclared table. | Fail-safe: INVALID_INPUT. |
 | FM-18 | An undeclared column name in a row map. | Open (OQ-1). Today Settle ignores the name. |
-| FM-19 | A value whose type differs from its column. | Fail-safe: INVALID_INPUT, unless the value converts exactly (ADR-6). Today Settle stores it, and aggregates skip it (GAP-1). |
+| FM-19 | A value whose type differs from its column. | Fail-safe: INVALID_INPUT, unless the value converts exactly (ADR-15). Today Settle stores it, and aggregates skip it (GAP-1). |
 | FM-20 | A hash conflict above `F` with a common ancestor. | Mask: Settle rolls back (WP-14). |
 | FM-21 | A hash conflict at or below `F` (a source that contradicts its finality). | Fail-safe: FORK_BELOW_FINALITY. |
 | FM-22 | A conflict or a fork chain with no common ancestor in `[F, L]`. | Fail-safe: NO_COMMON_ANCESTOR (WP-12). The in-line path rolls back to block 0 today (GAP-8). |
@@ -68,14 +68,14 @@ Bands: 1–9 global · 10–29 input · 30–39 storage · 40–49 reducer runti
 | ID | Fault | Required response |
 |---|---|---|
 | FM-40 | A body fails at run time, or a JS function throws. | Fail-safe: REDUCER_FAILED with the cause of the body, and Settle undoes the call. After a rollback in the same call: alarm, poison (WP-71). |
-| FM-41 | A body or a module has a syntax error, or a module does not load. | Fail-safe: INVALID_SCHEMA at open. Today the open panics (GAP-4). |
+| FM-41 | A body or a module has a syntax error, or a module does not load. | Fail-safe: INVALID_SCHEMA at open. |
 | FM-42 | A body loops without an end, or allocates without a bound. | Fail-safe: REDUCER_FAILED within P-REDUCER-STEPS and P-REDUCER-MEMORY (LIV-10). Today no bound exists (GAP-5). |
 | FM-43 | A reducer emits more than P-MAX-EMIT-COLUMNS columns. | Fail-safe: REDUCER_FAILED. |
 | FM-44 | Rows reach an external reducer with no attached code. | Fail-safe: INVALID_OPERATION (WP-62). |
 | FM-45 | External code returns a bad shape or an emit row index that no row has. | Fail-safe: REDUCER_FAILED. |
 | FM-46 | External code calls into the instance that runs it. | Fail-safe: INVALID_OPERATION (WP-1). Today the call is not refused (GAP-16). |
-| FM-47 | A Rust closure panics. | Fail-safe: REDUCER_FAILED, and Settle undoes the call. Today the panic passes to the host and the instance state is not defined (GAP-4). |
-| FM-48 | A body writes a value of the wrong type into a typed state field or emit column. | Fail-safe: exact conversion or REDUCER_FAILED (ADR-6). Today Settle keeps the value (GAP-1). |
+| FM-47 | A Rust closure panics. | Fail-safe: REDUCER_FAILED, and Settle undoes the call. |
+| FM-48 | A body writes a value of the wrong type into a typed state field or emit column. | Fail-safe: exact conversion or REDUCER_FAILED (ADR-15). Today Settle keeps the value (GAP-1). |
 
 ## Process faults
 

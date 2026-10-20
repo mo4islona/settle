@@ -89,7 +89,7 @@ fn parse_create_table(ct: &sql::CreateTable) -> Result<TableDef, Error> {
 fn extract_virtual_tables(input: &str) -> (String, Vec<String>) {
     let mut result = String::with_capacity(input.len());
     let mut virtual_names = Vec::new();
-    let upper = input.to_uppercase();
+    let upper = input.to_ascii_uppercase();
     let mut pos = 0;
 
     while pos < input.len() {
@@ -137,7 +137,7 @@ fn extract_sliding_windows(
 ) -> Result<(String, HashMap<String, SlidingWindowDef>), Error> {
     let mut result = String::with_capacity(input.len());
     let mut windows = HashMap::new();
-    let upper = input.to_uppercase();
+    let upper = input.to_ascii_uppercase();
     let mut pos = 0;
 
     while pos < input.len() {
@@ -539,11 +539,11 @@ fn parse_interval(iv: &sql::Interval, view_name: &str) -> Result<u64, Error> {
         .as_ref()
         .ok_or_else(|| Error::Schema(format!("MV '{view_name}': interval missing unit")))?;
 
-    let seconds = match unit {
-        sql::DateTimeField::Second => n,
-        sql::DateTimeField::Minute => n * 60,
-        sql::DateTimeField::Hour => n * 3600,
-        sql::DateTimeField::Day => n * 86400,
+    let multiplier: u64 = match unit {
+        sql::DateTimeField::Second => 1,
+        sql::DateTimeField::Minute => 60,
+        sql::DateTimeField::Hour => 3600,
+        sql::DateTimeField::Day => 86400,
         _ => {
             return Err(Error::Schema(format!(
                 "MV '{view_name}': unsupported interval unit '{unit}'"
@@ -551,7 +551,8 @@ fn parse_interval(iv: &sql::Interval, view_name: &str) -> Result<u64, Error> {
         }
     };
 
-    Ok(seconds)
+    n.checked_mul(multiplier)
+        .ok_or_else(|| Error::Schema(format!("MV '{view_name}': interval {n} {unit} overflows")))
 }
 
 fn expr_to_column_name(expr: &sql::Expr) -> Result<String, Error> {
@@ -587,7 +588,7 @@ fn extract_modules(input: &str) -> Result<(String, Vec<ModuleDef>), Error> {
 }
 
 fn find_create_module(input: &str) -> Option<usize> {
-    let upper = input.to_uppercase();
+    let upper = input.to_ascii_uppercase();
     let mut search_from = 0;
     while let Some(pos) = upper[search_from..].find("CREATE MODULE") {
         let abs_pos = search_from + pos;
@@ -618,7 +619,7 @@ fn parse_module_block(input: &str) -> Result<(ModuleDef, usize), Error> {
     pos = skip_ws(input, new_pos);
 
     // Optional "LANGUAGE LUA" (only Lua is supported)
-    let upper_here = input[pos..].to_uppercase();
+    let upper_here = input[pos..].to_ascii_uppercase();
     if upper_here.starts_with("LANGUAGE") {
         pos = skip_keyword(input, pos, "LANGUAGE")?;
         pos = skip_ws(input, pos);
@@ -627,7 +628,7 @@ fn parse_module_block(input: &str) -> Result<(ModuleDef, usize), Error> {
     }
 
     // Optional "AS"
-    let upper_here = input[pos..].to_uppercase();
+    let upper_here = input[pos..].to_ascii_uppercase();
     if upper_here.starts_with("AS") {
         pos = skip_keyword(input, pos, "AS")?;
         pos = skip_ws(input, pos);
@@ -666,7 +667,7 @@ fn extract_reducers(input: &str) -> Result<(String, Vec<ReducerDef>), Error> {
 }
 
 fn find_create_reducer(input: &str) -> Option<usize> {
-    let upper = input.to_uppercase();
+    let upper = input.to_ascii_uppercase();
     let mut search_from = 0;
     while let Some(pos) = upper[search_from..].find("CREATE REDUCER") {
         let abs_pos = search_from + pos;
@@ -722,7 +723,7 @@ fn parse_reducer_block(input: &str) -> Result<(ReducerDef, usize), Error> {
 
     // Optional REQUIRE clause (before body)
     let mut requires = Vec::new();
-    let upper_here = input[pos..].to_uppercase();
+    let upper_here = input[pos..].to_ascii_uppercase();
     if upper_here.starts_with("REQUIRE") {
         pos = skip_keyword(input, pos, "REQUIRE")?;
         pos = skip_ws(input, pos);
@@ -832,7 +833,7 @@ fn parse_map_type(input: &str, start: usize, field: &str) -> Result<(ColumnType,
         }
         Err(Error::Schema(format!(
             "state field '{field}': expected Map(String, Type), got: '{}'",
-            &input[start..std::cmp::min(start + 30, input.len())]
+            snippet(input, start, 30)
         )))
     };
 
@@ -855,7 +856,7 @@ fn parse_reducer_body(
     start: usize,
     reducer: &str,
 ) -> Result<(ReducerBody, usize), Error> {
-    let upper = input[start..].to_uppercase();
+    let upper = input[start..].to_ascii_uppercase();
     if upper.starts_with("LANGUAGE") {
         // Check for LANGUAGE EXTERNAL vs LANGUAGE LUA
         let after_lang = upper["LANGUAGE".len()..].trim_start();
@@ -872,7 +873,7 @@ fn parse_reducer_body(
     } else {
         Err(Error::Schema(format!(
             "expected LANGUAGE lua or LANGUAGE EXTERNAL after STATE, got: '{}'",
-            &input[start..std::cmp::min(start + 30, input.len())]
+            snippet(input, start, 30)
         )))
     }
 }
@@ -910,6 +911,13 @@ fn parse_lua_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Err
 
 // --- Utility functions ---
 
+/// Up to `chars` characters of `input` from byte `pos`, for an error message.
+fn snippet(input: &str, pos: usize, chars: usize) -> &str {
+    let rest = input.get(pos..).unwrap_or_default();
+    let end = rest.char_indices().nth(chars).map_or(rest.len(), |(i, _)| i);
+    &rest[..end]
+}
+
 fn skip_ws(input: &str, pos: usize) -> usize {
     let bytes = input.as_bytes();
     let mut p = pos;
@@ -930,7 +938,7 @@ fn skip_ws(input: &str, pos: usize) -> usize {
 
 fn skip_keyword(input: &str, pos: usize, keyword: &str) -> Result<usize, Error> {
     let remaining = &input[pos..];
-    let upper = remaining.to_uppercase();
+    let upper = remaining.to_ascii_uppercase();
     if upper.starts_with(keyword) {
         let after = pos + keyword.len();
         if after >= input.len() || !input.as_bytes()[after].is_ascii_alphanumeric() {
@@ -939,7 +947,7 @@ fn skip_keyword(input: &str, pos: usize, keyword: &str) -> Result<usize, Error> 
     }
     Err(Error::Schema(format!(
         "expected '{keyword}' at position {pos}, got: '{}'",
-        &input[pos..std::cmp::min(pos + 20, input.len())]
+        snippet(input, pos, 20)
     )))
 }
 
@@ -953,7 +961,7 @@ fn read_identifier(input: &str, pos: usize) -> Result<(String, usize), Error> {
     if p == start {
         return Err(Error::Schema(format!(
             "expected identifier at position {pos}, got: '{}'",
-            &input[pos..std::cmp::min(pos + 10, input.len())]
+            snippet(input, pos, 10)
         )));
     }
     Ok((input[start..p].to_string(), p))
