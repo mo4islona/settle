@@ -45,7 +45,7 @@ Bands: 1–9 commit model · 10–19 durability · 20–29 recovery · 30–39 f
 
 **CN-24 — Replay equivalence.** The replay of a tail gives the same derived state as the live run of the same blocks.
 
-**CN-25 — External chains at recovery.** Until code attaches to an external reducer, the derived state of its chain covers only the blocks at or below `D`. An ingest call that reaches the chain fails (WP-62). The attach replays the chain (WP-60).
+**CN-25 — External chains at recovery.** Until code attaches to an external reducer, the derived state of its chain covers only the blocks at or below `D`. An ingest call that reaches the chain fails (WP-62). While the open waits for code (RS-16), every ingest call fails. The attach replays the chain (WP-60).
 
 ## Format
 

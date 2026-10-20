@@ -85,5 +85,5 @@ The journal is off by default.
 
 - No write leaves a poisoned instance except the acks of batches that it already returned.
 - The host needs a recovery procedure (RP-25).
-- A failed attach is not covered yet, and leaves the chain in part replayed (GAP-31).
+- A failed attach is not covered yet, and leaves the chain in part replayed. ADR-17 poisons the instance then.
 - Shapes: WP-70, WP-71, WP-72, INV-16, LIV-11.

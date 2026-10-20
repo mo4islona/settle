@@ -70,7 +70,7 @@ Let `m = min(F, L)` before a transition. After the transition, `A↾m` and the c
 *Why:* the target relies on final data to stay.
 *Check:* CT-1 sends forks below finality and expects FORK_BELOW_FINALITY with no change. It also sends blocks between `L` and `F` and checks that `A↾m` stays. CT-2 repeats it after a reopen.
 
-**INV-12 — No effect on error.** [transition] — known-violated (GAP-31)
+**INV-12 — No effect on error.** [transition]
 A call that fails, other than a poison trigger of WP-71, leaves every element of `S` as before the call. There is one exception. An ack that fails at the commit of a batch keeps the commits of the batches before it, and these batches leave the queue (WP-36).
 *Why:* a host retries after an error and expects the instance to be intact. A retry of the ack commits the rest.
 *Check:* CT-4 sends each error class and compares the state with a copy. CT-8 makes the store fail at each step. For a cumulative ack, it checks that exactly the batches before the failed commit are committed.

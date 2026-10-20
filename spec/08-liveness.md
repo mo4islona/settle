@@ -92,7 +92,7 @@ A liveness claim has meaning only in a defined environment:
 
 **LIV-13 — Attach ends.**
 *Pre:* a healthy store and reducers that end.
-*Bound:* the replay of an attach (WP-60) is linear in the tail above `F` of its chain.
+*Bound:* the replay of an attach (WP-60) is linear in the tail of its chain above `N`. `N` is `D` while an open waits for code (RS-16), and `F` otherwise.
 *Witness:* the attach returns.
 *Check:* CT-6 times an attach after a reopen with a long tail.
 

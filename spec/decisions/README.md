@@ -22,3 +22,4 @@ The files only gain new records. An accepted record changes only when a later re
 | [ADR-14](ADR-14-refuse-unexecuted-constructs.md) | Refuse schema constructs that Settle does not execute | Accepted (2026-10-20) | 2026-10-20 |
 | [ADR-15](ADR-15-exact-value-conversion.md) | Check and convert value types at each boundary | Proposed | — |
 | [ADR-16](ADR-16-remove-inert-buffer.md) | Remove the inert buffer setting and gauges | Proposed | — |
+| [ADR-17](ADR-17-external-reducers-defer.md) | External reducers defer their checkpoints | Proposed | — |

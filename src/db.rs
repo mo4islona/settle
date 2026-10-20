@@ -52,13 +52,15 @@ pub struct Config {
     /// fork: a fork's compensating batch undoes all the batches before it.
     pub max_pending_batches: usize,
     /// Backfill durability checkpoint interval, in blocks. Default `1` =
-    /// persist derived reducer/MV state on every finalize. When `> 1` AND the ingest is no-lag (finalized head at the
-    /// batch tip, i.e. historical backfill) AND the pipeline is deferral-safe
-    /// (no sliding-window MV, no external reducer), derived-state persistence
-    /// is deferred and only flushed every `interval` blocks. Recovery replays
-    /// raw rows from the last durable checkpoint, so a crash mid-interval costs
-    /// extra replay but never loses data. See
-    /// spec/decisions/ADR-2-finality-and-durable-watermark.md.
+    /// persist derived reducer/MV state on every finalize. When `> 1` AND the
+    /// ingest is no-lag (finalized head at the batch tip, i.e. historical
+    /// backfill) AND the pipeline is deferral-safe (no sliding-window MV, no
+    /// reducer from `Settle::register_reducer`), derived-state persistence is
+    /// deferred and only flushed every `interval` blocks. Recovery replays raw
+    /// rows from the last durable checkpoint, so a crash mid-interval costs
+    /// extra replay but never loses data. After a reopen with deferred
+    /// blocks, ingest fails until every external reducer has its callback.
+    /// See spec/decisions/ADR-2-finality-and-durable-watermark.md.
     pub backfill_checkpoint_interval: u64,
     /// Build the `ChangeBatch::perf` timing tree on ingest. Default `true`.
     pub collect_perf: bool,
@@ -167,8 +169,8 @@ impl Config {
     /// every finalize). Set `> 1` to defer derived-state persistence on no-lag
     /// historical backfill, flushing every `n` blocks. Safe: recovery replays
     /// raw rows from the last checkpoint. Has no effect at chain tip (where
-    /// finality lags), nor for pipelines with sliding-window MVs or external
-    /// reducers (those always persist every finalize).
+    /// finality lags), nor for pipelines with sliding-window MVs or a reducer
+    /// from `Settle::register_reducer` (those always persist every finalize).
     pub fn backfill_checkpoint_interval(mut self, n: u64) -> Self {
         self.backfill_checkpoint_interval = n.max(1);
         self
@@ -446,10 +448,12 @@ impl Settle {
             engine.replay_unfinalized(replay_from, latest)?;
         }
         // Under deferral, and on a gappy chain, finality is above the durable
-        // block: the replayed blocks up to it become final again. A store
-        // without the key restarts finality at the durable block.
+        // block: the replayed blocks up to it become final again, or, with
+        // external reducers, at the first ingest after their callbacks replay
+        // their chains. A store without the key restarts finality at the
+        // durable block.
         if let Some(block) = meta_u64(storage.as_ref(), META_FINALITY_BLOCK)? {
-            engine.advance_finality(block);
+            engine.restore_finality(block);
         }
 
         let mut buffer = ChangeBuffer::new(config.max_buffer_size);
@@ -575,10 +579,26 @@ impl Settle {
 
     /// Rebuild the unfinalized state of `name` and of what feeds it or
     /// depends on it, from the raw rows. See `SettleEngine::replay_reducer_chain`.
+    ///
+    /// A failed replay leaves the chain rolled back and in part replayed, and
+    /// its reducer counts as attached, so the instance is poisoned. A replay
+    /// writes nothing to storage: a reopen starts from the state before it.
     fn replay_reducer_chain(&mut self, name: &str) -> Result<()> {
-        let finalized = self.engine.finalized_block();
+        if !self.engine.has_reducer(name) {
+            return Err(Error::InvalidOperation(format!(
+                "replay: unknown reducer '{name}'"
+            )));
+        }
+
+        let finalized = self.engine.nodes_final_block();
         let latest = self.engine.latest_block();
-        self.engine.replay_reducer_chain(name, finalized, latest)
+        self.engine
+            .replay_reducer_chain(name, finalized, latest)
+            .inspect_err(|e| {
+                self.poisoned = Some(format!(
+                    "the replay of reducer '{name}' failed ({e}) — drop and reopen"
+                ));
+            })
     }
 
     /// Register a *new* external reducer definition. The reducer is added
@@ -928,6 +948,7 @@ impl Settle {
         //    state diverge from disk; reject all further work so the caller
         //    drops and reopens rather than silently producing stale writes.
         self.guard_not_poisoned()?;
+        self.guard_callbacks_replayed()?;
 
         // 1. Queue guard — before validation, so a caller that retries the
         //    input of an unacked batch gets a clean "ack first" signal, not a
@@ -1381,6 +1402,17 @@ impl Settle {
         })?;
         self.stamp.clear();
         Ok(())
+    }
+
+    /// After an open under deferral, finality would make final the blocks
+    /// that the replay of a missing callback must still rebuild.
+    fn guard_callbacks_replayed(&self) -> Result<()> {
+        match self.engine.awaited_callback() {
+            None => Ok(()),
+            Some(name) => Err(Error::InvalidOperation(format!(
+                "external reducer '{name}' has no callback: register it before the first ingest"
+            ))),
+        }
     }
 
     /// Returns `Err(PendingAck)` when an unacked batch is in flight, with the

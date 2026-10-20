@@ -11,7 +11,8 @@
 // Settle: what the JS work alone costs); modes `backfill` and `tip` as in the
 // Rust bench. Each case runs in a process of its own. Env: SDEX_BATCH_SLOTS
 // (100), SDEX_STORAGE (rocks | memory), SDEX_POSITIONS (pair | json: the
-// positions of a wallet in one JSON map | map: in a Map field).
+// positions of a wallet in one JSON map | map: in a Map field),
+// SDEX_CHECKPOINT (1: the backfill checkpoint interval, in blocks).
 
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -31,6 +32,7 @@ const TIP_SHARE = 0.2
 const BATCH_SLOTS = Number(process.env.SDEX_BATCH_SLOTS ?? 100)
 const STORAGE = process.env.SDEX_STORAGE ?? 'rocks'
 const LAYOUT = process.env.SDEX_POSITIONS ?? 'pair'
+const CHECKPOINT = Number(process.env.SDEX_CHECKPOINT ?? 1)
 const POSITIONS_SQL = { pair: 'positions.sql', json: 'positions_json.sql', map: 'positions_map.sql' }[LAYOUT]
 if (!POSITIONS_SQL) throw new Error(`unknown SDEX_POSITIONS ${LAYOUT}`)
 const ALL_CASES = [
@@ -452,7 +454,7 @@ function open(runtime) {
     mkdirSync(join(REPO, 'target/tmp'), { recursive: true })
     dataDir = mkdtempSync(join(REPO, 'target/tmp/sdex-node-'))
   }
-  const db = Settle.open({ schema, dataDir })
+  const db = Settle.open({ schema, dataDir, backfillCheckpointInterval: CHECKPOINT })
   if (runtime === 'js') {
     db.registerReducerCallback('prices', prices)
     db.registerReducerCallback('pool_prices', poolPrices)
@@ -560,7 +562,9 @@ async function runCase(data, runtime, mode) {
   if (dataDir) rmSync(dataDir, { recursive: true, force: true })
 
   return {
-    label: `${runtime},${mode}${runtime === 'floor' ? '' : `,${LAYOUT}`}`,
+    label:
+      `${runtime},${mode}${runtime === 'floor' ? '' : `,${LAYOUT}`}` +
+      (runtime !== 'floor' && CHECKPOINT > 1 ? `,ckpt${CHECKPOINT}` : ''),
     swaps,
     slots: last - first + 1,
     wallMs,
@@ -588,7 +592,7 @@ function report(r) {
   const rest = r.totalIngestMs - r.split.encode - r.split.dag - r.split.decode - r.ackMs
 
   console.log(
-    `${r.label.padEnd(20)} ${(r.swaps / secs).toFixed(0).padStart(9)} swaps/s  ` +
+    `${r.label.padEnd(27)} ${(r.swaps / secs).toFixed(0).padStart(9)} swaps/s  ` +
       `${((r.slots * SLOT_SECONDS) / secs).toFixed(1).padStart(5)}x real time  ${secs.toFixed(2).padStart(7)} s  ` +
       `cores ${(r.cpuMs / r.wallMs).toFixed(2).padStart(5)}  ` +
       `ingest p50 ${percentile(sorted, 0.5).toFixed(2).padStart(7)} p99 ${percentile(sorted, 0.99).toFixed(2).padStart(7)} ` +

@@ -226,7 +226,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | INV-9 | CT-1 | P | CT-1 compares the derived state with the model for raw and virtual tables, Lua reducers with Map state, and the Int and Float modes. Chained and external reducers and the BigInt mode are not in CT-1. |
 | INV-10 | CT-1, CT-2 | C | CT-1 checks `F` after every call, also after a reopen. |
 | INV-11 | CT-1, CT-2 | C | CT-1 sends forks below finality, also after a reopen. |
-| INV-12 | CT-4, CT-8 | P | known-violated for attach (GAP-31). |
+| INV-12 | CT-4, CT-8 | P | A failed attach replay poisons the instance (WP-71); a CT-2 test checks it after a reopen, with and without deferral. |
 | INV-13 | CT-1 | C | CT-1 reads each status twice after every call. |
 | INV-14 | CT-4 | P | Dedup tests, also for block 0. No test for a second table of an accepted block. |
 | INV-15 | CT-8, CT-3 | P | CT-8 is C, with a store that records each commit. CT-3 is U: no kill points (HC-7). |
@@ -253,7 +253,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | INV-41 | CT-2, CT-3 | P | The journal differential on the memory backend. |
 | INV-42 | CT-3 | U | No kill during an open. |
 | INV-43 | CT-2 | C | The reopen differential, 300 seeds of 40 steps and 5,000 seeds of 8 steps. |
-| INV-44 | CT-2 | C | Deferred schemas in the differential and in the backfill tests. |
+| INV-44 | CT-2 | C | Deferred schemas in the differential, also with external reducers in a chain, and in the backfill tests. |
 | INV-45 | CT-11 | C | Format tests. |
 | INV-46 | CT-8 | P | Corrupt view and reducer state. Raw rows only in unit tests. |
 | INV-47 | CT-1, CT-2 | C | CT-1 compares the finalized cursor after each reopen with the model, with deferral and with gappy chains. |
@@ -333,13 +333,12 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | GAP-28 | A Base58 value leaves the JS bindings as hex. The TS types say BigInt for Uint256, but the value is hex text. | IB-44 | P3 | Ingest a Base58 value and read it back in Node. Expect the form that OQ-4 decides. |
 | GAP-29 | The browser output differs from Node: NaN and infinities become null, and bytes become arrays of numbers. | REQ-32, IB-48 | P2 | The same calls in Node and in the browser. Expect equal batches. |
 | GAP-30 | A String group key whose bytes equal the encoding of a Null key shares one reducer group with it. | DEF-25 | P3 | Rows with the key Null and the key `"\x01\x00\x00\x00\x00"`. Expect two groups. |
-| GAP-31 | A failed attach, registration or replay leaves the chain rolled back and in part replayed. The instance is not poisoned. | WP-64, INV-12 | P2 | An attach whose replay fails. Expect the state before the attach. |
 | GAP-33 | No kill-point or power-loss harness exists, and the differential never runs on the persistent backend. | INV-40, INV-42, INV-49 | P1 | Build HC-7 and HC-8. Kill after the journal write and before the return. |
 | GAP-34 | No fuzzer exists. | REQ-42, FM-1 | P2 | A fuzzer for the schema parser with case-mapping text. |
 | GAP-35 | No line coverage is measured. | MG-4 | P3 | Build HC-12 and record the first value. |
 | GAP-36 | CI runs no formatter check and no linter. | MG-10 | P3 | Add both to CI. |
 | GAP-37 | No performance gate runs in CI or before a release. | REQ-40, MG-7, MG-8 | P3 | A release checklist step that runs CT-6 on the reference host. |
-| GAP-38 | The configuration differs across bindings. The Node binding has no deferral, retention, timing or warning setting, and the Rust builder has no queue or journal setting. | REQ-31, IB-22 | P3 | Set each configuration field in each binding. |
+| GAP-38 | The configuration differs across bindings. The Node binding has no retention, timing or warning setting, and the Rust builder has no queue or journal setting. | REQ-31, IB-22 | P3 | Set each configuration field in each binding. |
 | GAP-39 | The engine module is public in Rust, so a host can commit, roll back or finalize outside an atomic call. | REQ-30 | P3 | A compile test that the engine module is not public. |
 | GAP-41 | After an in-line fork, an update of a view row or of a raw row can have values equal to its previous values. | RP-6, INV-21 | P3 | An in-line fork that restores the same aggregate. Expect no record. |
 | GAP-47 | An in-line fork can update a view group in its rollback and empty the group with its new rows. The delete record then has the values of the update, not the deleted row. | RP-4 | P3 | A rollback brings back an expired block of a sliding-view group, and the new rows of the same call expire the group. Expect a delete whose values are its previous values. |
@@ -356,7 +355,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | BO-1 | Harness skeleton | HC-4, HC-9 and HC-10. Run CT-1 on the schemas of the current tests. | CT-1 runs in CI, and the matrix shows its first results. |
 | BO-2 | P1 correctness | GAP-1. Measure for GAP-6. | Each closure has its failing test first, and the matrix rows move to C. |
 | BO-3 | Crash harness | HC-7 and HC-8 (GAP-33). CT-3 at each kill point. | INV-40, INV-41, INV-42 and INV-49 are C. |
-| BO-4 | Robustness | GAP-5, GAP-7, GAP-8, GAP-16, GAP-17 and GAP-31. HC-11 (GAP-34). | FM-1 is C, and CT-9 runs nightly. |
+| BO-4 | Robustness | GAP-5, GAP-7, GAP-8, GAP-16 and GAP-17. HC-11 (GAP-34). | FM-1 is C, and CT-9 runs nightly. |
 | BO-5 | Binding parity | HC-17. GAP-9, GAP-12, GAP-13, GAP-14, GAP-15, GAP-23, GAP-24, GAP-28, GAP-29 and GAP-38. | CT-5 compares all bindings in CI. |
 | BO-6 | Performance regime | GAP-6 and GAP-21. HC-15 and the gates of GAP-37. Ratify ADR-9. | Each SLO row has a gate. |
 

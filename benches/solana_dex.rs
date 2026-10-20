@@ -24,6 +24,7 @@
 //! Env: `SDEX_SLOTS` (12000, ~3M swaps), `SDEX_RUNTIMES` (fn,lua),
 //! `SDEX_MODES` (backfill,tip), `SDEX_STORAGE` (rocks | memory),
 //! `SDEX_BATCH_SLOTS` (100), `SDEX_POSITIONS` (pair | json | map),
+//! `SDEX_CHECKPOINT` (1: a list of backfill checkpoint intervals, in blocks),
 //! `RAYON_NUM_THREADS`.
 //! `SDEX_WRITE=<path>` writes the swaps for the Node bench and exits.
 
@@ -522,7 +523,12 @@ struct Outcome {
     quarters: Vec<f64>,
 }
 
-fn open(runtime: &str, layout: Layout, storage: &str) -> (Settle, Option<tempfile::TempDir>) {
+fn open(
+    runtime: &str,
+    layout: Layout,
+    storage: &str,
+    checkpoint: u64,
+) -> (Settle, Option<tempfile::TempDir>) {
     let schema = schema(runtime, layout);
     let (config, dir) = match storage {
         "memory" => (Config::new(schema), None),
@@ -533,6 +539,7 @@ fn open(runtime: &str, layout: Layout, storage: &str) -> (Settle, Option<tempfil
         }
         other => panic!("unknown storage {other}"),
     };
+    let config = config.backfill_checkpoint_interval(checkpoint);
     let mut db = Settle::open(config).unwrap();
     if runtime == "fn" {
         let positions = match layout {
@@ -595,8 +602,9 @@ fn run(
     layout: Layout,
     storage: &str,
     batch_slots: usize,
+    checkpoint: u64,
 ) -> Outcome {
-    let (mut db, _dir) = open(runtime, layout, storage);
+    let (mut db, _dir) = open(runtime, layout, storage, checkpoint);
     let registry = db.table_registry("swaps").unwrap().clone();
     let mut blocks = build_rows(data, &registry);
 
@@ -677,7 +685,10 @@ fn run(
     let slots = (timed_blocks.last().unwrap().slot - timed_blocks[0].slot + 1) as f64;
 
     Outcome {
-        label: format!("{runtime},{mode},{}", layout.name()),
+        label: match checkpoint {
+            1 => format!("{runtime},{mode},{}", layout.name()),
+            n => format!("{runtime},{mode},{},ckpt{n}", layout.name()),
+        },
         swaps: timed_swaps,
         slots,
         wall,
@@ -709,7 +720,7 @@ fn report(o: &Outcome) {
     };
 
     eprintln!(
-        "{:<19} {:>9.0} swaps/s  {:>5.1}x real time  {:>7.2} s  cores {:>5}  \
+        "{:<26} {:>9.0} swaps/s  {:>5.1}x real time  {:>7.2} s  cores {:>5}  \
          ingest p50 {:>7.2} p99 {:>7.2} max {:>7.2} ms  peak RSS {}",
         o.label,
         o.swaps as f64 / secs,
@@ -787,6 +798,10 @@ fn main() {
     let modes = env_list("SDEX_MODES", "backfill,tip");
     let storage = std::env::var("SDEX_STORAGE").unwrap_or_else(|_| "rocks".into());
     let batch_slots = env_usize("SDEX_BATCH_SLOTS", 100);
+    let checkpoints: Vec<u64> = env_list("SDEX_CHECKPOINT", "1")
+        .iter()
+        .map(|n| n.parse().expect("SDEX_CHECKPOINT: a list of block counts"))
+        .collect();
     eprintln!(
         "storage {storage}, {batch_slots} slots in each backfill ingest, \
          rayon threads {}",
@@ -796,8 +811,10 @@ fn main() {
     for mode in &modes {
         eprintln!();
         for runtime in &runtimes {
-            let outcome = run(&data, runtime, mode, layout, &storage, batch_slots);
-            report(&outcome);
+            for &checkpoint in &checkpoints {
+                let outcome = run(&data, runtime, mode, layout, &storage, batch_slots, checkpoint);
+                report(&outcome);
+            }
         }
     }
 }

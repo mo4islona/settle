@@ -48,7 +48,7 @@ The conditions:
 | serial (no `,pipe`) | Settle waits until Postgres writes a batch. Then it ingests the next batch. The total time is the Settle time plus the Postgres time. |
 | tip (no mode tag) | Finality does not move. Settle keeps all blocks, because a rollback can occur. |
 | `,fin` | Backfill. Each batch is final, and Settle writes a checkpoint of its state after each batch. |
-| `,backfill` | The same as `,fin`, but Settle writes the checkpoint only one time in 1,000 blocks. Settle cannot delay the checkpoint of an External reducer, so with `fn` this mode is the same as `,fin`. |
+| `,backfill` | The same as `,fin`, but Settle writes the checkpoint only one time in 1,000 blocks. |
 | `fn` | A reducer in user code (`LANGUAGE EXTERNAL`). In this bench it is a Rust closure. In the TS binding it is a JS callback. |
 | `lua` | A Lua reducer in the schema, with no host code. |
 | `mv` | No reducer. A materialized view calculates `sum()` from the raw rows. |
@@ -115,13 +115,14 @@ column shows how long Postgres works in pipelined mode. The Settle rows ran on
 | `,fin` | `fn` | 1.026s (+21%) | 0.790s (−7%) | 0.763s |
 | | `lua` | 1.081s (+27%) | 0.800s (−6%) | 0.766s |
 | | `mv` | 0.921s (+8%) | 0.801s (−6%) | 0.774s |
-| `,backfill` | `fn` | 1.040s (+22%) | 0.802s (−6%) | 0.774s |
+| `,backfill` | `fn` | 0.942s (+11%) | 0.793s (−7%) | 0.769s |
 | | `lua` | 0.969s (+14%) | 0.794s (−7%) | 0.770s |
 | | `mv` | 0.878s (+3%) | 0.773s (−9%) | 0.755s |
 
 - The checkpoint after each batch (`,fin`) adds the most time to `fn` and
-  `lua`. With `,backfill`, `lua` and `mv` write fewer checkpoints. `fn` is
-  External, so it cannot.
+  `lua`. With `,backfill`, all three write fewer checkpoints. The `fn` row
+  of `,backfill` ran on 2026-10-21. Before that day, an External reducer
+  could not delay its checkpoint, and the row was 1.040s (+22%).
 - In each batch, no user occurs more than one time (5,000 rows, 5,000 keys).
   Thus Settle cannot merge rows, and Postgres receives the same number of rows
   from the two sides.
@@ -442,3 +443,4 @@ only in the same row.
 | 2026-10-18 | Reducer state and emits by position | `backfill event_rules` −11.7%, `backfill polymarket` −14.3% instructions |
 | 2026-10-18 | Binary bridge for the TS binding | External JS reducer through napi: 3.31 → 0.89 µs for each row at 100 groups, 9.22 → 4.20 at 100K groups. This is now approximately the time of EventRules. |
 | 2026-10-18 | Reducer groups in a slab. Finality on the thread that processed the node. | At 100K groups, µs for each row: EventRules 3.27 → 2.10, Rust closure 3.67 → 2.08, External JS through napi 4.15 → 2.45 |
+| 2026-10-21 | External reducers delay their checkpoint in a backfill too (ADR-17) | Solana DEX bench, 4,000 slots: Rust closures +13% and JS +14% at 1,000 blocks; +23% and +17% with 10 slots in each call at 100 blocks. `simple_agg` serial `fn,backfill` 1.040s → 0.942s |

@@ -72,6 +72,12 @@ pub struct SettleConfig {
     /// Set, it turns on the journal: open brings the database to the state
     /// after this batch, acked or not. Negative values are rejected.
     pub applied_sequence: Option<i64>,
+    /// In a backfill (finalized head at the tip of each ingest), write the
+    /// derived state to disk once in this many blocks, not at each ingest
+    /// (default 1). A crash replays the blocks since the last write. After
+    /// such a reopen, `ingest()` throws until every external reducer has
+    /// its callback.
+    pub backfill_checkpoint_interval: Option<u32>,
 }
 
 /// Block cursor: number + hash.
@@ -172,6 +178,9 @@ impl Settle {
         }
         if let Some(max) = config.max_pending_batches {
             cfg = cfg.max_pending_batches(max as usize);
+        }
+        if let Some(blocks) = config.backfill_checkpoint_interval {
+            cfg = cfg.backfill_checkpoint_interval(u64::from(blocks));
         }
         cfg.compression = config.compression;
         cfg.cache_size = match config.cache_size {

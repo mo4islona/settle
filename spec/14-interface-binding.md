@@ -77,7 +77,7 @@ The drop of a `Settle` value closes the instance. The unacked batches of a dropp
 
 No call gives the finalized cursor, the durable block or the last acked sequence (GAP-15), and no call closes the instance (GAP-13).
 
-**IB-22 — Configuration.** `SettleConfig { schema, dataDir?, maxBufferSize?, maxPendingBatches?, compression?, cacheSize?, appliedSequence? }`. A negative `cacheSize` or `appliedSequence` fails with INVALID_CONFIG. The deferral interval, the retention margin, the warning age and the performance switch are absent (GAP-38).
+**IB-22 — Configuration.** `SettleConfig { schema, dataDir?, maxBufferSize?, maxPendingBatches?, compression?, cacheSize?, appliedSequence?, backfillCheckpointInterval? }`. A negative `cacheSize` or `appliedSequence` fails with INVALID_CONFIG. `backfillCheckpointInterval` is P-CHECKPOINT-INTERVAL. The retention margin, the warning age and the performance switch are absent (GAP-38).
 
 **IB-23 — Memory mode.** With no `dataDir`, the instance is in memory. A `dataDir` of `":memory:"` also selects memory. Today `Settle.open` creates a directory with that name, and only the pipeline builder maps it (GAP-12).
 
@@ -93,7 +93,7 @@ A Map field is `ctx.<field>`, with the methods `get(key)`, `set(key, value)` and
 
 ## Browser
 
-**IB-30 — Entry.** `@settle/stream/web`. The host MUST await `init(wasmUrl?)` before the first call. `Settle.open(config)` opens a memory instance (NG-9). It throws when the config sets `dataDir`, `compression`, `cacheSize` or `maxBufferSize`. It ignores `appliedSequence` (GAP-38). The packed package does not ship the module of this entry today (GAP-23).
+**IB-30 — Entry.** `@settle/stream/web`. The host MUST await `init(wasmUrl?)` before the first call. `Settle.open(config)` opens a memory instance (NG-9). It throws when the config sets `dataDir`, `compression`, `cacheSize` or `maxBufferSize`. It ignores `appliedSequence` and `backfillCheckpointInterval` (GAP-38). The packed package does not ship the module of this entry today (GAP-23).
 
 **IB-31 — Operations.** The operations of IB-21, with the same names. The ack throws for a value that is not finite, negative, fractional or above P-JS-SAFE-INT.
 

@@ -189,11 +189,15 @@ pub struct SettleEngine {
     /// The highest block whose raw rows a write batch deletes; None until the
     /// first purge after open.
     raw_purged_through: Option<BlockNumber>,
-    /// True when the pipeline contains no sliding-window MV and no external
-    /// reducer, so backfill persist-deferral is safe. Computed at construction
-    /// (and after `add_reducer`). When false, every ingest writes a
-    /// checkpoint (durable == finalized).
+    /// True when the pipeline contains no sliding-window MV and no reducer
+    /// registered at run time, so backfill persist-deferral is safe. When
+    /// false, every ingest writes a checkpoint (durable == finalized).
     defer_allowed: bool,
+    /// The durable block, while the reducers and MVs stay final at it below
+    /// `finalized_block`: an open under deferral replayed no external
+    /// reducer, and each callback replays its chain from here. The next
+    /// `advance_finality` ends it. See `restore_finality`.
+    nodes_final_at: Option<BlockNumber>,
     /// True once finality advanced at least once (or state was restored from
     /// disk). Lets `advance_finality(N)` skip work when N has not moved:
     /// heartbeat ingests with a stale `finalized_head` are common at the tip.
@@ -342,7 +346,7 @@ impl SettleEngine {
             }
         }
 
-        let defer_allowed = compute_defer_allowed(&branches, &reducers, &mvs);
+        let defer_allowed = compute_defer_allowed(&branches, &mvs);
 
         Ok(Self {
             raw_tables,
@@ -361,6 +365,7 @@ impl SettleEngine {
             raw_retention_blocks: DEFAULT_RAW_RETENTION_BLOCKS,
             raw_purged_through: None,
             defer_allowed,
+            nodes_final_at: None,
             has_finalized: false,
             collect_perf: true,
             block_hashes: BTreeMap::new(),
@@ -421,8 +426,9 @@ impl SettleEngine {
         // Add to pipeline
         self.pipeline.push(PipelineNode::Reducer(name));
 
-        // Recompute: an added external reducer disables backfill deferral.
-        self.defer_allowed = compute_defer_allowed(&self.branches, &self.reducers, &self.mvs);
+        // The schema lacks this reducer, so an open cannot wait for it to
+        // replay the deferred blocks (`restore_finality`).
+        self.defer_allowed = false;
 
         Ok(())
     }
@@ -1076,10 +1082,59 @@ impl SettleEngine {
         // Finality writes nothing to storage.
         let mut unused = StorageWriteBatch::new();
         self.finalize_nodes(&mut unused, |node, _| node.advance_finality(block));
+        self.nodes_final_at = None;
 
         self.finalized_block = block;
         self.has_finalized = true;
         self.prune_block_hashes();
+    }
+
+    /// Restore the finality of a reopened store, after the replay of the
+    /// blocks above the durable block. That replay skipped each external
+    /// reducer with no callback, and what depends on it. While one has none,
+    /// the reducers and MVs stay final at the durable block, so that the
+    /// replay of each callback can start there. Ingest refuses to run until
+    /// each has one (`awaited_callback`).
+    pub fn restore_finality(&mut self, block: BlockNumber) {
+        let replayed_final = self.latest_block.map(|latest| latest.min(block));
+        let skipped = self
+            .durable_block
+            .zip(replayed_final)
+            .is_some_and(|(durable, last)| durable < last);
+        if !skipped || self.reducer_without_callback().is_none() {
+            self.advance_finality(block);
+            return;
+        }
+
+        self.nodes_final_at = self.durable_block;
+        self.finalized_block = block;
+        self.prune_block_hashes();
+    }
+
+    /// The block that the reducers and MVs are final at: below finality only
+    /// while `restore_finality` waits for a callback.
+    pub fn nodes_final_block(&self) -> BlockNumber {
+        self.nodes_final_at.unwrap_or(self.finalized_block)
+    }
+
+    /// While `restore_finality` waits: the first external reducer, in
+    /// pipeline order, that has no callback.
+    pub fn awaited_callback(&self) -> Option<&str> {
+        self.nodes_final_at?;
+        self.reducer_without_callback()
+    }
+
+    fn reducer_without_callback(&self) -> Option<&str> {
+        self.pipeline.iter().find_map(|node| {
+            let PipelineNode::Reducer(name) = node else {
+                return None;
+            };
+            let reducer = match self.branch_index.get(name) {
+                Some(&i) => &self.branches[i].reducer,
+                None => &self.reducers[name],
+            };
+            reducer.needs_host_callback().then_some(name.as_str())
+        })
     }
 
     /// Write the derived state of every block up to finality into `batch`,
@@ -1275,7 +1330,7 @@ impl SettleEngine {
     }
 
     /// Whether backfill persist-deferral is structurally safe for this pipeline
-    /// (no sliding-window MV, no external reducer).
+    /// (no sliding-window MV, no reducer registered at run time).
     pub fn defer_allowed(&self) -> bool {
         self.defer_allowed
     }
@@ -1433,21 +1488,13 @@ impl SettleEngine {
 }
 
 /// Backfill persist-deferral is only allowed when the pipeline has no
-/// sliding-window MV (not tested with deferral) and no external reducer
-/// (replay skips them, so deferred state can't be rebuilt).
+/// sliding-window MV (not tested with deferral).
 /// See spec/decisions/ADR-2-finality-and-durable-watermark.md.
-fn compute_defer_allowed(
-    branches: &[PipelineBranch],
-    reducers: &HashMap<String, ReducerEngine>,
-    mvs: &HashMap<String, MVEngine>,
-) -> bool {
-    let no_external = branches.iter().all(|b| !b.reducer.is_external())
-        && reducers.values().all(|r| !r.is_external());
-    let no_sliding = branches
+fn compute_defer_allowed(branches: &[PipelineBranch], mvs: &HashMap<String, MVEngine>) -> bool {
+    branches
         .iter()
         .all(|b| b.mv_entries.iter().all(|(_, mv)| !mv.is_sliding()))
-        && mvs.values().all(|mv| !mv.is_sliding());
-    no_external && no_sliding
+        && mvs.values().all(|mv| !mv.is_sliding())
 }
 
 /// Identify independent branches and direct MVs from the pipeline.

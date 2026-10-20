@@ -121,7 +121,7 @@ Otherwise the call fails with INVALID_INPUT. The current code checks no value ty
 - `D` is not ⊥.
 - `F − D` is below P-CHECKPOINT-INTERVAL.
 
-**WP-41 — Deferral gate.** Settle computes the deferral-safe property at open and again after each reducer registration (ADR-2).
+**WP-41 — Deferral gate.** Settle computes the deferral-safe property at open and again after each reducer registration (ADR-2, ADR-17).
 
 **WP-42 — Durable clamp.** A checkpoint sets `D` to `min(F, L)`. Before the first block with rows, no checkpoint occurs and `D` stays ⊥.
 
@@ -169,7 +169,7 @@ Otherwise Settle commits the journal entries with a sequence in `(c, a]` in orde
 - The reducer exists and has the external runtime kind.
 - No code is attached to it yet.
 
-Otherwise the call fails with INVALID_OPERATION. On success, Settle rolls the chain of the reducer back to `F` and replays it from `F + 1`. The chain is the upstream reducers, the reducer, and the downstream reducers and views.
+Otherwise the call fails with INVALID_OPERATION. On success, Settle rolls the chain of the reducer back to `N` and replays it from `N + 1`. `N` is `D` while an open waits for code (RS-16), and `F` otherwise. The chain is the upstream reducers, the reducer, and the downstream reducers and views.
 
 **WP-61 — Register a reducer.** A call that registers a new reducer at run time succeeds only when all these conditions are true:
 
@@ -180,11 +180,11 @@ Otherwise the call fails with INVALID_OPERATION. On success, Settle rolls the ch
 
 A layout mismatch fails with INCOMPATIBLE_STORAGE, and a queue that is not empty with PENDING_ACK. Each other failure fails with INVALID_OPERATION. Today the output of such a reducer is not visible (GAP-20).
 
-**WP-62 — External reducer without code.** An ingest call whose rows reach an external reducer with no attached code fails with INVALID_OPERATION. Settle undoes the call.
+**WP-62 — External reducer without code.** An ingest call whose rows reach an external reducer with no attached code fails with INVALID_OPERATION. Settle undoes the call. While an open waits for code (RS-16), each ingest call fails with INVALID_OPERATION before it changes state. This includes a call whose rows reach no external reducer.
 
 **WP-63 — Replay a reducer.** A call that replays a reducer needs a healthy instance and an empty queue. It replays the chain of WP-60.
 
-**WP-64 — Attach atomicity.** A failed attach, registration or replay leaves the state as it was before the call. The current code leaves the chain rolled back and in part replayed (GAP-31).
+**WP-64 — Attach atomicity.** An attach, registration or replay that fails before its replay leaves the state as it was before the call. A failure in the replay poisons the instance (WP-71), because the chain is then rolled back and in part replayed. A replay writes nothing to the store, so a reopen starts from the state before the call.
 
 ## Errors
 
@@ -197,6 +197,7 @@ A layout mismatch fails with INCOMPATIBLE_STORAGE, and a queue that is not empty
 - A rollback fails part way.
 - Processing fails after a rollback in the same call.
 - The undo of WP-70 fails.
+- The replay of an attach, a registration or a replay call fails (WP-64).
 
 **WP-72 — Poison effect.** A poisoned instance fails each call with POISONED, except ack and the status reads. An ack still commits, so the host can ack the batches that the target applied, then drop the instance and reopen (ADR-1).
 

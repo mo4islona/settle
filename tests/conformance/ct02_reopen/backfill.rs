@@ -2,17 +2,20 @@
 //!
 //! These exercise the deferral path of `Config::backfill_checkpoint_interval`
 //! and the invariants of spec/decisions/ADR-2-finality-and-durable-watermark.md:
-//! recovery anchored on the durable watermark, gappy-chain clamping, and the
-//! sliding/external deferral exclusions.
+//! recovery anchored on the durable watermark, gappy-chain clamping, the
+//! sliding deferral exclusion, and external reducers after a reopen.
 //!
 //! Gated on `feature = "rocksdb"` (drop+reopen needs real persistence).
 
 use std::collections::HashMap;
 
 use settle::db::{Config, IngestInput, Settle};
+use settle::schema::parser::parse_schema;
+use settle::error::{Error, Result};
 use settle::reducer_runtime::fn_reducer::FnReducerRuntime;
+use settle::reducer_runtime::{Emits, GroupState, ReducerRuntime};
 use settle::test_helpers::cursor;
-use settle::types::{ChangeBatch, RowMap, Value};
+use settle::types::{ChangeBatch, Row, RowMap, Value};
 
 const MV_SCHEMA: &str = r#"
 CREATE TABLE orders (
@@ -229,25 +232,157 @@ fn ext_runtime() -> FnReducerRuntime {
     })
 }
 
-/// Gating (review hole #5): a pipeline with an external reducer must NOT defer —
-/// replay skips external reducers, so their deferred state couldn't be rebuilt.
+/// An external reducer defers too. After a reopen, the open replay skipped
+/// it, so an ingest waits for its callback, whose replay rebuilds the
+/// deferred blocks from the durable one.
 #[test]
-fn defer_disabled_for_external_reducer() {
+fn external_reducer_defers_and_replays_from_the_durable_block() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
-    let cfg = Config::with_data_dir(EXTERNAL_SCHEMA, &path).backfill_checkpoint_interval(100);
-    let mut db = Settle::open(cfg).unwrap();
+    let open = || {
+        let cfg = Config::with_data_dir(EXTERNAL_SCHEMA, &path).backfill_checkpoint_interval(100);
+        Settle::open(cfg).unwrap()
+    };
+    let event = || {
+        vec![HashMap::from([
+            ("user".to_string(), Value::String("u1".to_string())),
+            ("amount".to_string(), Value::Float64(1.0)),
+        ])]
+    };
+
+    {
+        let mut db = open();
+        db.register_reducer_callback("agg", Box::new(ext_runtime())).unwrap();
+        for b in 1..=50u64 {
+            ingest_block(&mut db, "events", b, b, event());
+        }
+        assert_eq!(db.durable_block(), 1, "the first data block is the only checkpoint");
+        assert_eq!(db.finalized_block(), 50);
+    }
+
+    let mut db = open();
+    assert_eq!(db.finalized_block(), 50);
+    // No row reaches the reducer, but the finality of this call would make
+    // blocks 2..50 final without it.
+    let heartbeat = db.ingest(IngestInput {
+        data: HashMap::new(),
+        rollback_chain: vec![cursor(50)],
+        finalized_head: cursor(50),
+    });
+    let error = heartbeat.unwrap_err().to_string();
+    assert!(error.contains("'agg' has no callback"), "{error}");
+
     db.register_reducer_callback("agg", Box::new(ext_runtime())).unwrap();
-    let ev = HashMap::from([
-        ("user".to_string(), Value::String("u1".to_string())),
-        ("amount".to_string(), Value::Float64(5.0)),
-    ]);
-    ingest_block(&mut db, "events", 5, 5, vec![ev]);
-    assert_eq!(
-        db.durable_block(),
-        5,
-        "external-reducer pipeline must persist every finalize (no deferral)"
+    let batch = ingest_block(&mut db, "events", 51, 51, event()).unwrap();
+    let total = mv_value(&batch, "user_totals", "user", "u1", "total").unwrap();
+    assert_eq!(total, 51.0, "blocks 2..50 come back through the callback replay");
+
+    // Once final, the blocks stay out of a later replay.
+    db.replay_reducer("agg").unwrap();
+    let batch = ingest_block(&mut db, "events", 52, 52, event()).unwrap();
+    let total = mv_value(&batch, "user_totals", "user", "u1", "total").unwrap();
+    assert_eq!(total, 52.0);
+}
+
+/// `ext_runtime`, but it fails on an amount of 3.
+struct FailsOnThree;
+
+impl ReducerRuntime for FailsOnThree {
+    fn process(&self, mut state: GroupState<'_>, row: &Row, emits: &mut Emits) -> Result<()> {
+        let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if amount == 3.0 {
+            return Err(Error::Reducer("unlucky amount".into()));
+        }
+
+        let total = state.get("total").and_then(|v| v.as_f64()).unwrap_or(0.0) + amount;
+        state.set("total", Value::Float64(total));
+        emits.push_named([("total", Value::Float64(total))]);
+        Ok(())
+    }
+}
+
+/// A callback whose replay fails leaves its chain rolled back and in part
+/// replayed, so the instance is poisoned until a reopen. Under deferral the
+/// replay covers final blocks too: an ingest would make the gap final.
+#[test]
+fn failed_callback_replay_poisons_the_instance() {
+    // (interval, finality of block b): deferral with finality at each block,
+    // and the tip with finality at block 1.
+    for (interval, finality) in [(100, None), (1, Some(1))] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let open = || {
+            let cfg = Config::with_data_dir(EXTERNAL_SCHEMA, &path)
+                .backfill_checkpoint_interval(interval);
+            Settle::open(cfg).unwrap()
+        };
+        let event = |amount: f64| {
+            vec![HashMap::from([
+                ("user".to_string(), Value::String("u1".to_string())),
+                ("amount".to_string(), Value::Float64(amount)),
+            ])]
+        };
+
+        {
+            let mut db = open();
+            db.register_reducer_callback("agg", Box::new(ext_runtime())).unwrap();
+            for b in 1..=4u64 {
+                ingest_block(&mut db, "events", b, finality.unwrap_or(b), event(b as f64));
+            }
+            assert_eq!(db.durable_block(), 1, "interval {interval}");
+        }
+
+        let mut db = open();
+        // A replay that never starts changes nothing.
+        assert!(db.replay_reducer("missing").is_err());
+        assert!(!db.is_poisoned(), "interval {interval}");
+        let failed = db.register_reducer_callback("agg", Box::new(FailsOnThree));
+        assert!(failed.is_err(), "interval {interval}: the replay reaches block 3");
+        assert!(db.is_poisoned(), "interval {interval}");
+        let mut rows = event(5.0);
+        rows[0].insert("block_number".to_string(), Value::UInt64(5));
+        let next = db.ingest(IngestInput {
+            data: HashMap::from([("events".to_string(), rows)]),
+            rollback_chain: vec![cursor(5)],
+            finalized_head: cursor(5),
+        });
+        assert!(next.is_err(), "interval {interval}: ingest after a failed replay");
+        drop(db);
+
+        let mut db = open();
+        db.register_reducer_callback("agg", Box::new(ext_runtime())).unwrap();
+        let batch = ingest_block(&mut db, "events", 5, 5, event(5.0)).unwrap();
+        let total = mv_value(&batch, "user_totals", "user", "u1", "total").unwrap();
+        assert_eq!(total, 15.0, "interval {interval}: blocks 1..5");
+    }
+}
+
+/// A reducer registered at run time is not in the schema, so an open cannot
+/// wait for it: its pipeline writes a checkpoint at each finality.
+#[test]
+fn run_time_reducer_keeps_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let cfg = Config::with_data_dir(MV_SCHEMA, &path).backfill_checkpoint_interval(100);
+    let mut db = Settle::open(cfg).unwrap();
+
+    let sql = format!(
+        "{MV_SCHEMA}
+        CREATE REDUCER late SOURCE orders GROUP BY asset_id
+        STATE (total UInt64 DEFAULT 0) LANGUAGE EXTERNAL;"
     );
+    let def = parse_schema(&sql).unwrap().reducers.remove(0);
+    db.register_reducer(def).unwrap();
+    let count = FnReducerRuntime::new(|state, _row| {
+        let total = state.get_u64("total") + 1;
+        state.set("total", Value::UInt64(total));
+    });
+    db.register_reducer_callback("late", Box::new(count)).unwrap();
+
+    for b in 1..=5u64 {
+        ingest_block(&mut db, "orders", b, b, vec![order("A", 1000)]);
+    }
+    assert_eq!(db.durable_block(), 5);
 }
 
 /// Reducer deferral path (review hole #1, reducer side): a Lua-reducer pipeline
