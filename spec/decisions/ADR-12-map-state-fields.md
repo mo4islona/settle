@@ -30,7 +30,7 @@ The alternatives:
 ## Consequences
 
 - A change of one entry costs O(1) in memory, at rollback and at a checkpoint, whatever the size of the map.
-- The JS and WASM bridges carry no Map fields yet: a reducer with one fails its blocks there (GAP-46).
+- A JS or WASM body makes one host call for each get, set or delete. The entries stay in Settle, so the journal and the checkpoint are the same for each runtime.
 - A body cannot list the entries of a Map field yet. A pipeline that needs that keeps a JSON field or a group per entry.
 - A group with many entries loads all of them on its first row after an open.
 - Shapes: DEF-24, DEF-26, REQ-23, IB-63, IB-64.

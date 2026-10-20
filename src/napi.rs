@@ -7,9 +7,11 @@ use napi_derive::napi;
 
 use crate::db::{BlockRows, Config, IngestRows, Settle as Inner};
 use crate::error::Error as SettleError;
-use crate::js_codec::napi::{Arrays, element, other_value, read_strings, to_js};
+use crate::js_codec::napi::{
+    Arrays, element, js_to_value, other_value, read_strings, to_js, value_to_js,
+};
 use crate::js_codec::{self, Decoder};
-use crate::reducer_runtime::external::install_context;
+use crate::reducer_runtime::external::{install_context, with_host_map};
 use crate::schema::ast::{ReducerBody, ReducerDef, StateField};
 use crate::types::{BlockCursor, ChangeBatch, ColumnRegistry, ColumnType};
 
@@ -527,6 +529,44 @@ impl Settle {
     pub fn cursor(&self) -> Option<SettleCursor> {
         self.inner.latest_cursor().map(|c| c.into())
     }
+}
+
+// ─── Map fields in a reducer callback ─────────────────────────────
+// `StateMapHandle` in `state-map.ts` calls these while the callback of a
+// block runs; `group` and `map` index the groups and the Map fields that the
+// callback got.
+
+/// The value of `key` in Map field `map` of group `group`; undefined if absent.
+#[napi]
+pub fn map_get(env: Env, group: u32, map: u32, key: String) -> Result<JsUnknown> {
+    let value = with_host_map(group, map, |field| {
+        field.get(&key).map(|value| value_to_js(&env, value)).transpose()
+    })
+    .and_then(|value| value)
+    .map_err(|e| Error::new(Status::GenericFailure, e))?;
+
+    let raw = match value {
+        Some(value) => value,
+        None => unsafe { env.get_undefined()?.raw() },
+    };
+    Ok(unsafe { JsUnknown::from_raw_unchecked(env.raw(), raw) })
+}
+
+/// Set `key` in Map field `map` of group `group`; null or undefined deletes it.
+#[napi]
+pub fn map_set(env: Env, group: u32, map: u32, key: String, value: JsUnknown) -> Result<()> {
+    // Read before the map is borrowed: a getter of `value` runs JS.
+    let value = js_to_value(&env, unsafe { value.raw() })
+        .map_err(|e| Error::new(Status::InvalidArg, e))?;
+    with_host_map(group, map, |mut field| field.set(&key, value))
+        .map_err(|e| Error::new(Status::GenericFailure, e))
+}
+
+/// Delete `key` from Map field `map` of group `group`. False if it was absent.
+#[napi]
+pub fn map_delete(group: u32, map: u32, key: String) -> Result<bool> {
+    with_host_map(group, map, |mut field| field.remove(&key))
+        .map_err(|e| Error::new(Status::GenericFailure, e))
 }
 
 /// The rows of `ingest`, `[ints, tags, nums, strings, others]`: ints

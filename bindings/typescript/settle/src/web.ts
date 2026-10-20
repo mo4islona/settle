@@ -43,6 +43,7 @@ export {
   type ReducerCtx,
   type ReducerOptions,
   type SlidingWindowOptions,
+  type StateMap,
   type ViewOptions,
 } from './ddl'
 export {
@@ -68,10 +69,12 @@ import type {
 } from './settle'
 import { rethrowSettleError } from './errors'
 import { groupBatchCallback } from './reducer-callback'
+import type { MapAccess } from './state-map'
 
 // The wasm module is loaded lazily via init()
 let wasmReady = false
 let WasmSettle: typeof import('./wasm/settle.js').Settle
+let wasmMaps: MapAccess
 
 /**
  * Initialize the wasm module. Must be called once before creating Settle instances.
@@ -88,6 +91,7 @@ export async function init(wasmUrl?: URL | string): Promise<void> {
   const mod: any = await import('./wasm/settle.js')
   await mod.default(wasmUrl)
   WasmSettle = mod.Settle
+  wasmMaps = { mapGet: mod.mapGet, mapSet: mod.mapSet, mapDelete: mod.mapDelete }
   wasmReady = true
 }
 
@@ -129,7 +133,7 @@ export class Settle implements ISettle {
   ): void {
     const { reduce } = options
 
-    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce)
+    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce, wasmMaps)
 
     try {
       this.#native.registerReducer(
@@ -148,7 +152,7 @@ export class Settle implements ISettle {
     name: string,
     reduce: (state: any, row: TRow) => void,
   ): void {
-    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce)
+    const batchFn = groupBatchCallback<TState, TRow, TEmit>(reduce, wasmMaps)
 
     try {
       this.#native.registerReducerCallback(name, batchFn)

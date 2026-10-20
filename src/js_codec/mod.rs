@@ -41,6 +41,10 @@ pub const OTHER: u8 = 5;
 /// integers cross as BigInt.
 pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
+/// The depth at which the msgpack encoder stopped: a deeper JS object is an
+/// error, also for a cycle.
+pub const MAX_JSON_DEPTH: usize = 100;
+
 /// u32 words before the sections of an encoded buffer: the slot, int and
 /// string counts, and room for more.
 const HEADER_WORDS: usize = 8;
@@ -102,7 +106,7 @@ pub fn js_number(n: &serde_json::Number) -> JsNumber {
     JsNumber::Number(n.as_f64().unwrap_or(f64::NAN))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -272,10 +276,11 @@ impl<'a> Encoder<'a> {
 /// The groups of a block for a reducer callback (`nativeBatchCallback` in
 /// `reducer-callback.ts`).
 ///
-/// ints: group count, state field count, column count, the string id of
-/// each state field and each column, the row count of each group. Slots:
-/// the state of each group, then the rows group by group, a value per
-/// column.
+/// ints: group count, state field count, column count, MAP field count,
+/// the string id of each state field, each MAP field and each column, the
+/// row count of each group. Slots: the state of each group, then the rows
+/// group by group, a value per column. A MAP field is not in the slots: the
+/// callback reaches it through `with_host_map`.
 pub fn encode_groups<'a>(block: &'a GroupedRows<'_>, fields: &'a ColumnRegistry) -> Encoder<'a> {
     let mut enc = Encoder::new(true);
     let uniform = match block.rows.first() {
@@ -301,10 +306,12 @@ pub fn encode_groups<'a>(block: &'a GroupedRows<'_>, fields: &'a ColumnRegistry)
         (None, None) => &[],
     };
 
+    let map_fields = block.map_fields();
     enc.count(block.groups.len());
     enc.count(fields.len());
     enc.count(names.len());
-    for name in fields.names() {
+    enc.count(map_fields.len());
+    for name in fields.names().iter().chain(map_fields) {
         let id = enc.string_id(name);
         enc.int(id);
     }

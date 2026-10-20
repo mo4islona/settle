@@ -302,7 +302,9 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 
 ## Gap register
 
-**As of 2026-10-20.** Priorities: P0 is an active production risk, P1 a correctness hole with a plausible trigger, P2 bounded or rare, P3 polish. No entry is P0.
+**As of 2026-10-20.** Priorities: P0 is an active production risk, P1 a correctness hole with a plausible trigger, P2 bounded or rare, P3 polish. No entry is P0. A closed gap is deleted (see the IDs in the README).
+
+**Next gap number:** 47
 
 | ID | Statement | Violated | Priority | First test |
 |---|---|---|---|---|
@@ -349,7 +351,6 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | GAP-42 | The layout check lets the virtual flag and the runtime kind change. | CN-32 | P3 | Make a stored table virtual and reopen. Expect INCOMPATIBLE_STORAGE. |
 | GAP-43 | No memory gauge, no open-phase report and no store gauge exists. | OB-10, OB-11, OB-12 | P3 | Read each gauge after a run and compare it with a probe. |
 | GAP-44 | The type names `Bytes`, `JSON` and `JSONB` probably fail in a CREATE TABLE statement, so raw tables cannot have these types. This is known-suspect. | REQ-1, IB-62 | P2 | Open `CREATE TABLE t (block_number UInt64, doc JSON)`. Expect success. |
-| GAP-46 | The JS and WASM bridges carry no Map fields (ADR-12). A reducer with a Map field fails each block in a JS or WASM body. | REQ-23, REQ-31 | P2 | A JS body that sets and reads a Map entry across a fork. Expect the batches of the same body in Lua. |
 
 ## Build order
 
@@ -411,10 +412,3 @@ A per-PR gate stays within P-GATE-PR-BUDGET of CI time. CT-6, CT-7 and the long 
 | HC-21 | A Postgres container for end-to-end tests. | CT-10, MG-1 | C | The image has no pinned version. |
 | HC-22 | A switch between parallel and sequential stages. | CT-12, MG-11 | U | |
 | HC-23 | A formatter check and a linter in CI. | MG-10 | U | GAP-36. |
-
-## Closed
-
-| ID | Closed on | Resolution |
-|---|---|---|
-| GAP-27 | 2026-10-19 | Event-rules arithmetic was Float64 only. ADR-10 removes the runtime, and GAP-45 holds the rest of the deviation. |
-| GAP-45 | 2026-10-20 | The event-rules runtime and its grammar are removed. A reducer with a WHEN clause fails with INVALID_SCHEMA, and the message names Lua. The tests and benches that used event rules use Lua. |

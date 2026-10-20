@@ -7,7 +7,9 @@ use wasm_bindgen::prelude::*;
 use crate::db::{Config, Settle as Inner, IngestInput as IngestInputInner};
 use crate::json_conv::json_object_to_row;
 use crate::msgpack_conv::encode_batch_to_json_value;
-use crate::reducer_runtime::external::{WasmContextGuard, install_wasm_context};
+use crate::reducer_runtime::external::{
+    WasmContextGuard, install_wasm_context, wasm_to_value, wasm_value, with_host_map,
+};
 use crate::schema::ast::{ReducerBody, ReducerDef, StateField};
 use crate::types::{BlockCursor, ColumnType, RowMap};
 
@@ -19,7 +21,7 @@ fn to_js<T: Serialize>(v: &T) -> Result<JsValue, serde_wasm_bindgen::Error> {
 
 /// A JSON value as a plain JS value. An integer beyond 2^53 becomes a BigInt:
 /// a JS number would round it, and `serde_wasm_bindgen` refuses it.
-fn json_to_js(value: &serde_json::Value) -> JsValue {
+pub(crate) fn json_to_js(value: &serde_json::Value) -> JsValue {
     const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
     match value {
@@ -47,11 +49,28 @@ fn json_to_js(value: &serde_json::Value) -> JsValue {
         serde_json::Value::Object(fields) => {
             let object = js_sys::Object::new();
             for (key, field) in fields {
-                js_sys::Reflect::set(&object, &JsValue::from_str(key), &json_to_js(field)).unwrap();
+                set_own(&object, key, &json_to_js(field));
             }
             object.into()
         }
     }
+}
+
+/// Set an own field. A plain set of `__proto__` sets the prototype; the
+/// other keys take the cheaper set.
+fn set_own(object: &js_sys::Object, key: &str, value: &JsValue) {
+    let key_js = JsValue::from_str(key);
+    if key != "__proto__" {
+        js_sys::Reflect::set(object, &key_js, value).unwrap();
+        return;
+    }
+
+    let field = js_sys::Object::new();
+    for flag in ["writable", "enumerable", "configurable"] {
+        js_sys::Reflect::set(&field, &JsValue::from_str(flag), &JsValue::TRUE).unwrap();
+    }
+    js_sys::Reflect::set(&field, &JsValue::from_str("value"), value).unwrap();
+    js_sys::Object::define_property(object, &key_js, &field);
 }
 
 /// WASM binding for Settle.
@@ -385,6 +404,32 @@ impl Settle {
         }
         Some(install_wasm_context(self.external_callbacks.clone()))
     }
+}
+
+// ─── Map fields in a reducer callback ─────────────────────────────
+// `StateMapHandle` in `state-map.ts` calls these while the callback of a
+// block runs; `group` and `map` index the groups and the Map fields that the
+// callback got.
+
+/// The value of `key` in Map field `map` of group `group`; undefined if absent.
+#[wasm_bindgen(js_name = mapGet)]
+pub fn map_get(group: u32, map: u32, key: &str) -> Result<JsValue, JsError> {
+    with_host_map(group, map, |field| field.get(key).map_or(JsValue::UNDEFINED, wasm_value))
+        .map_err(to_js_err)
+}
+
+/// Set `key` in Map field `map` of group `group`; null or undefined deletes it.
+#[wasm_bindgen(js_name = mapSet)]
+pub fn map_set(group: u32, map: u32, key: &str, value: JsValue) -> Result<(), JsError> {
+    // Read before the map is borrowed: a getter of `value` runs JS.
+    let value = wasm_to_value(value).map_err(to_js_err)?;
+    with_host_map(group, map, |mut field| field.set(key, value)).map_err(to_js_err)
+}
+
+/// Delete `key` from Map field `map` of group `group`. False if it was absent.
+#[wasm_bindgen(js_name = mapDelete)]
+pub fn map_delete(group: u32, map: u32, key: &str) -> Result<bool, JsError> {
+    with_host_map(group, map, |mut field| field.remove(key)).map_err(to_js_err)
 }
 
 // ─── Internal serde types ────────────────────────────────────────

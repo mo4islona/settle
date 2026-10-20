@@ -84,11 +84,29 @@ export class Settle {
     readonly unackedBatches: number;
 }
 
+/**
+ * Delete `key` from Map field `map` of group `group`. False if it was absent.
+ */
+export function mapDelete(group: number, map: number, key: string): boolean;
+
+/**
+ * The value of `key` in Map field `map` of group `group`; undefined if absent.
+ */
+export function mapGet(group: number, map: number, key: string): any;
+
+/**
+ * Set `key` in Map field `map` of group `group`; null or undefined deletes it.
+ */
+export function mapSet(group: number, map: number, key: string, value: any): void;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_settle_free: (a: number, b: number) => void;
+    readonly mapDelete: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly mapGet: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly mapSet: (a: number, b: number, c: number, d: number, e: any) => [number, number];
     readonly settle_ack: (a: number, b: number) => [number, number];
     readonly settle_cursor: (a: number) => any;
     readonly settle_handleFork: (a: number, b: any) => [number, number, number];

@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { float64, int64, Pipeline, string, uint64 } from '../src'
+import { float64, int64, Pipeline, type ReducerCtx, type StateMap, string, uint64 } from '../src'
 
 describe('Type safety', () => {
   it('rejects raw strings as column types', () => {
@@ -114,6 +114,25 @@ describe('Type safety', () => {
         state.update({ total: BigInt(state.total) + BigInt(row.amount) })
       },
     })
+  })
+
+  it('lets update() take an any field and refuses a Map field', () => {
+    const _reduce = (
+      state: ReducerCtx<{ meta: any; count: number; seen: StateMap<number> }, unknown>,
+    ) => {
+      state.update({ meta: { token: 'X' }, count: state.count + 1 })
+      // @ts-expect-error — a Map field changes through its own methods
+      state.update({ meta: null, count: 0, seen: state.seen })
+    }
+  })
+
+  it('types bigint entries of a Map field as number | bigint', () => {
+    const _reduce = (state: ReducerCtx<{ counts: StateMap<bigint> }, unknown>) => {
+      const _c: number | bigint | undefined = state.counts.get('x')
+      // @ts-expect-error — an entry is a number while it is small
+      const _next = (state.counts.get('x') ?? 0n) + 1n
+      state.counts.set('x', BigInt(state.counts.get('x') ?? 0) + 1n)
+    }
   })
 
   it('types bigint fields of a parent emit as number | bigint', () => {

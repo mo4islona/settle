@@ -15,6 +15,7 @@ import type {
   PerfNodeKind,
   SettleCursor,
 } from './settle'
+import { type MapAccess, StateMapHandle } from './state-map'
 
 export const NULL = 0
 export const NUMBER = 1
@@ -393,65 +394,89 @@ export class GroupWriter extends Writer {
 
 // ─── Reducer layout ──────────────────────────────────────────────
 
-/** A reducer context class: the state fields, `update` and `emit`. */
+/**
+ * The ints before the names in the input of a reducer callback: the group,
+ * state field, column and Map field counts.
+ */
+export const GROUP_HEADER = 4
+
+/**
+ * A reducer context class: the state fields, `update` and `emit`, for the
+ * group at index `group` of the block.
+ */
 export type CtxClass = new (
   t: Uint8Array,
   n: Float64Array,
   s: string[],
   o: Others,
   base: number,
+  group: number,
 ) => any
 
-/** The state fields and row columns of the groups of a reducer, with code for them. */
+/** The state fields, Map fields and row columns of the groups of a reducer, with code for them. */
 export class ReducerLayout {
   readonly stateNames: string[]
+  readonly mapNames: string[]
   readonly columnNames: string[]
   readonly Ctx: CtxClass
   readonly row: Build
   readonly writeState: (w: Writer, state: any) => void
 
-  constructor(input: Input, out: GroupWriter) {
+  constructor(input: Input, out: GroupWriter, access: MapAccess) {
     const { ints, strings } = input
-    const stateCount = ints[1]
-    const columnCount = ints[2]
-    this.stateNames = []
-    for (let i = 0; i < stateCount; i++) this.stateNames.push(strings[ints[3 + i]])
-    this.columnNames = []
-    for (let i = 0; i < columnCount; i++) this.columnNames.push(strings[ints[3 + stateCount + i]])
+    let at = GROUP_HEADER
+    const names = (count: number) => {
+      const list: string[] = []
+      for (let i = 0; i < count; i++) list.push(strings[ints[at++]])
+      return list
+    }
+    this.stateNames = names(ints[1])
+    this.mapNames = names(ints[3])
+    this.columnNames = names(ints[2])
 
     this.row = objectBuilder(this.columnNames, field)
-    this.Ctx = ctxClass(this.stateNames, out)
+    this.Ctx = ctxClass(this.stateNames, this.mapNames, out, access)
     this.writeState = stateWriter(this.stateNames)
   }
 
   matches(input: Input): boolean {
     const { ints, strings } = input
-    const stateCount = ints[1]
-    const columnCount = ints[2]
-    if (stateCount !== this.stateNames.length || columnCount !== this.columnNames.length)
-      return false
-    for (let i = 0; i < stateCount; i++) {
-      if (strings[ints[3 + i]] !== this.stateNames[i]) return false
-    }
-    for (let i = 0; i < columnCount; i++) {
-      if (strings[ints[3 + stateCount + i]] !== this.columnNames[i]) return false
+    const sameCounts =
+      ints[1] === this.stateNames.length &&
+      ints[3] === this.mapNames.length &&
+      ints[2] === this.columnNames.length
+    if (!sameCounts) return false
+
+    let at = GROUP_HEADER
+    for (const names of [this.stateNames, this.mapNames, this.columnNames]) {
+      for (const name of names) {
+        if (strings[ints[at++]] !== name) return false
+      }
     }
     return true
   }
 }
 
 /**
- * A class whose objects hold the state fields of a group, read from slots.
- * `update(next)` makes `next` the state that goes back to the engine and
- * shows its fields on the context of the current group; `emit(row)` writes
- * an emit of the current row.
+ * A class whose objects hold the state fields of a group, read from slots,
+ * and a `StateMapHandle` for each Map field. `update(next)` makes `next` the
+ * state that goes back to the engine and shows its fields on the context of
+ * the current group; `emit(row)` writes an emit of the current row.
  */
-function ctxClass(names: readonly string[], out: GroupWriter): CtxClass {
+function ctxClass(
+  names: readonly string[],
+  mapNames: readonly string[],
+  out: GroupWriter,
+  access: MapAccess,
+): CtxClass {
   const init = names.map((name, i) => assignCode('this', name, `value(t, n, s, o, b + ${i})`))
+  const maps = mapNames.map((name, i) =>
+    assignCode('this', name, `new StateMap(access, g, ${i}, ${JSON.stringify(name)})`),
+  )
   const update = names.map((name) => assignCode('ctx', name, readCode('next', name)))
   const source = `
     "use strict"
-    function Ctx(t, n, s, o, b) { ${init.join('; ')} }
+    function Ctx(t, n, s, o, b, g) { ${[...init, ...maps].join('; ')} }
     Ctx.prototype.update = function update(next) {
       const ctx = out.ctx
       out.changed = true
@@ -462,7 +487,12 @@ function ctxClass(names: readonly string[], out: GroupWriter): CtxClass {
       if (row != null) out.emit(row)
     }
     return Ctx`
-  return new Function('value', 'out', source)(value, out) as CtxClass
+  return new Function('value', 'out', 'StateMap', 'access', source)(
+    value,
+    out,
+    StateMapHandle,
+    access,
+  ) as CtxClass
 }
 
 function stateWriter(names: readonly string[]): (w: Writer, state: any) => void {

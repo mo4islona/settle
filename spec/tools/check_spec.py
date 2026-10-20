@@ -64,7 +64,9 @@ PROPERTIES_MATRIX = "Properties matrix"
 TEST_CLASSES = "Test classes"
 MERGE_GATES = "Merge gates"
 HARNESS_REGISTER = "Harness capability register"
+GAP_REGISTER = "Gap register"
 CLOSED_HEADING = re.compile(r"^#{2,6}\s+Closed\b")
+NEXT_GAP_RE = re.compile(r"^\*\*Next gap number:\*\*\s*(\d+)\s*$")
 ACCEPTANCE_PREFIXES = {"REQ"}
 PROPERTY_PREFIXES = {"INV", "LIV", "FM", "SLI"}
 COVERAGE_PREFIXES = {"INV", "LIV", "REQ"}
@@ -149,6 +151,8 @@ CHECKS = {
     "heading-duplicate": (W, "No two headings of a file share a slug."),
     "warn-unratified": (W, "Every ⚠ routes to an ADR, OQ, GAP or a routed parameter."),
     "id-number-gap": (I, "No unused number inside a declared band."),
+    "gap-kept": (E, "A gap row is only in the gap register: a closed gap is deleted, not kept."),
+    "gap-next": (E, "The gap register has a next gap number above every gap number in it."),
     "stale-matrix": (W, "No normative doc is newer than the as-of date of the status doc."),
     "date-inconsistent": (W, "A mutable doc states one as-of date."),
     "commit-unknown": (W, "Every cited commit hash exists in the repository."),
@@ -799,6 +803,9 @@ class Checker:
             pfx, n = ident.split("-")
             nums.setdefault(pfx, set()).add(int(n))
         for pfx, ns in sorted(nums.items()):
+            # The numbers of deleted gaps stay unused.
+            if pfx == "GAP":
+                continue
             bands = BANDS.get(pfx, [(min(ns), max(ns))])
             for lo, hi in bands:
                 inside = sorted(n for n in ns if lo <= n <= hi)
@@ -807,6 +814,27 @@ class Checker:
                         rel, line = self.defs[f"{pfx}-{b}"]
                         unused = f"{pfx}-{a + 1}" if b == a + 2 else f"{pfx}-{a + 1}..{pfx}-{b - 1}"
                         self.add("id-number-gap", rel, line, f"{unused} unused inside the band {lo}–{hi}")
+
+    def check_gaps(self):
+        gaps = {ident: where for ident, where in self.defs.items() if ident.startswith("GAP-")}
+        for ident, (rel, line) in sorted(gaps.items()):
+            section = section_of(self.docs[rel], line - 1)
+            if section != GAP_REGISTER:
+                self.add("gap-kept", rel, line, f"{ident} is in '{section}', not in the {GAP_REGISTER.lower()}: "
+                         "delete a closed gap and every reference to it")
+
+        lines = self.docs[CONFORMANCE].lines
+        found = [(i, NEXT_GAP_RE.match(line)) for i, line in enumerate(lines)]
+        found = [(i, int(m.group(1))) for i, m in found if m]
+        if not found:
+            self.add("gap-next", CONFORMANCE, 1, "the gap register has no **Next gap number:** line")
+            return
+
+        line, next_number = found[0]
+        top = max((int(ident.split("-")[1]) for ident in gaps), default=0)
+        if top >= next_number:
+            self.add("gap-next", CONFORMANCE, line + 1,
+                     f"GAP-{top} is not below the next gap number {next_number}; raise the number")
 
     # ── freshness ──
 
@@ -893,6 +921,7 @@ class Checker:
         self.check_constants_and_leakage()
         self.check_warn_markers()
         self.check_number_gaps()
+        self.check_gaps()
         self.check_freshness()
         self.check_ste()
         return self.findings

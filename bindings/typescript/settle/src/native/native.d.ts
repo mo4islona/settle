@@ -76,6 +76,12 @@ export interface ExternalReducerConfig {
   groupBy: Array<string>
   state: Array<ExternalStateField>
 }
+/** The value of `key` in Map field `map` of group `group`; undefined if absent. */
+export declare function mapGet(group: number, map: number, key: string): unknown
+/** Set `key` in Map field `map` of group `group`; null or undefined deletes it. */
+export declare function mapSet(group: number, map: number, key: string, value: unknown): void
+/** Delete `key` from Map field `map` of group `group`. False if it was absent. */
+export declare function mapDelete(group: number, map: number, key: string): boolean
 /** Settle N-API wrapper. */
 export declare class Settle {
   /** Open a new Settle instance. */
@@ -112,7 +118,7 @@ export declare class Settle {
   /**
    * Process a batch of rows for a raw table.
    * Atomic ingest: process all tables, store rollback chain, finalize, flush.
-   * `rows` is `[ints, tags, nums, strings, others]` from `encodeTables` in
+   * `rows` is `[ints, tags, nums, strings, others]` from `TableWriter` in
    * `codec.ts`. Returns the ChangeBatch as `[buffer, strings, others]`
    * (`readBatch` in `codec.ts`), or null if no records produced.
    */

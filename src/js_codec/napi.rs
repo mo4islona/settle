@@ -6,12 +6,11 @@ use std::ptr;
 
 use napi::{Env, JsUnknown, NapiValue, sys};
 
-use super::{Encoder, JsNumber, Strings, bigint_to_value, js_number, json_number};
+use super::{
+    Encoder, JsNumber, MAX_JSON_DEPTH, MAX_SAFE_INTEGER, Strings, bigint_to_value, hex, js_number,
+    json_number,
+};
 use crate::types::Value;
-
-/// The depth at which the msgpack encoder stopped: deeper objects are an
-/// error, also for a cycle.
-const MAX_JSON_DEPTH: usize = 100;
 
 fn check(status: sys::napi_status, what: &str) -> Result<(), String> {
     if status == sys::Status::napi_ok {
@@ -64,6 +63,58 @@ pub fn to_js(env: &Env, enc: &Encoder<'_>) -> Result<[sys::napi_value; 3], Strin
     }
 
     Ok([buffer, strings, others])
+}
+
+/// A value as a reducer callback gets it: as `Encoder::value` sends it,
+/// bytes as hex.
+pub fn value_to_js(env: &Env, value: &Value) -> Result<sys::napi_value, String> {
+    let raw = env.raw();
+    let mut out = ptr::null_mut();
+    let number = |n: f64, out: &mut sys::napi_value| {
+        check(unsafe { sys::napi_create_double(raw, n, out) }, "create number")
+    };
+
+    match value {
+        Value::Null => check(unsafe { sys::napi_get_null(raw, &mut out) }, "get null")?,
+        Value::Boolean(b) => check(
+            unsafe { sys::napi_get_boolean(raw, *b, &mut out) },
+            "get boolean",
+        )?,
+        Value::Float64(f) => number(*f, &mut out)?,
+        Value::UInt64(n) if *n <= MAX_SAFE_INTEGER => number(*n as f64, &mut out)?,
+        Value::Int64(n) | Value::DateTime(n) if n.unsigned_abs() <= MAX_SAFE_INTEGER => {
+            number(*n as f64, &mut out)?
+        }
+        Value::String(text) => out = js_string(env, text)?,
+        Value::Uint256(b) => out = js_string(env, &format!("0x{}", hex(b)))?,
+        Value::Base58(b) | Value::Bytes(b) => out = js_string(env, &hex(b))?,
+        _ => out = host_value(env, value)?,
+    }
+    Ok(out)
+}
+
+/// A JS value as a reducer callback returns it: as `Writer.put` in
+/// `codec.ts` sends it and `Decoder::value` reads it, a number as Float64.
+pub fn js_to_value(env: &Env, value: sys::napi_value) -> Result<Value, String> {
+    let raw = env.raw();
+    let unknown = unsafe { JsUnknown::from_raw_unchecked(raw, value) };
+
+    match unknown.get_type().map_err(|e| e.to_string())? {
+        napi::ValueType::Number => {
+            let mut n = 0.0;
+            check(unsafe { sys::napi_get_value_double(raw, value, &mut n) }, "read number")?;
+            Ok(Value::Float64(n))
+        }
+        napi::ValueType::String => Ok(Value::String(string_value(env, value)?)),
+        napi::ValueType::Boolean => {
+            let mut b = false;
+            check(unsafe { sys::napi_get_value_bool(raw, value, &mut b) }, "read boolean")?;
+            Ok(Value::Boolean(b))
+        }
+        napi::ValueType::BigInt => bigint(env, value),
+        napi::ValueType::Object => Ok(Value::JSON(js_to_json(env, value, 0)?)),
+        _ => Ok(Value::Null),
+    }
 }
 
 /// A value that the encoder left to the host.
