@@ -1,4 +1,6 @@
-use crate::error::Result;
+use std::panic::AssertUnwindSafe;
+
+use crate::error::{Error, Result, panic_message};
 use crate::types::{ColumnId, Row, RowMap, Value};
 
 use super::map::MapMut;
@@ -105,9 +107,13 @@ impl FnReducerRuntime {
 }
 
 impl ReducerRuntime for FnReducerRuntime {
+    /// A panic of the closure fails the call (FM-47), which then undoes the
+    /// call: it cannot reach the host.
     fn process(&self, state: GroupState<'_>, row: &Row, emits: &mut Emits) -> Result<()> {
         let mut ctx = StateCtx::new(state, emits);
-        (self.process_fn)(&mut ctx, row);
-        Ok(())
+        let call = AssertUnwindSafe(|| (self.process_fn)(&mut ctx, row));
+        std::panic::catch_unwind(call).map_err(|panic| {
+            Error::Reducer(format!("the reducer panicked: {}", panic_message(&*panic)))
+        })
     }
 }

@@ -24,7 +24,7 @@ Each design goal of [01-overview.md](01-overview.md) leads to these requirements
 **REQ-1 — Pipeline from one schema text.** [MUST]
 Settle builds its whole pipeline from one schema text: raw tables, virtual tables, modules, reducers and materialized views. Settle refuses at open a schema that fails the grammar or the validation rules, and the error names the object at fault.
 *Acceptance:* An open with each example schema of IB-60 succeeds. An open with an absent source, a reducer cycle or an unknown type fails with INVALID_SCHEMA.
-*Trace:* ADR-6; DEF-20, DEF-21, IB-60, IB-61.
+*Trace:* ADR-14; DEF-20, DEF-21, IB-60, IB-61.
 
 **REQ-2 — Atomic ingest.** [MUST]
 The host gives Settle the rows of one or more blocks, a rollback chain and a finalized head in one ingest call. The call has its full effect or no effect, and it returns at most one change batch.
@@ -133,12 +133,12 @@ Settle refuses at open a schema that changes the stored layout of an object. Red
 **REQ-26 — Strict schema.** [MUST — intent, currently violated by GAP-2]
 Settle refuses at open each schema construct that it does not execute. It does not ignore a construct silently.
 *Acceptance:* A view with WHERE, HAVING, a join, ORDER BY, LIMIT or DISTINCT fails with INVALID_SCHEMA. Two objects with one name fail. A default that does not parse as its declared type fails.
-*Trace:* ADR-6; IB-61.
+*Trace:* ADR-14; IB-61.
 
 **REQ-27 — Type fidelity.** [MUST — intent, currently violated by GAP-1]
 Every value in an output table has the declared type of its column. Every input value reaches the aggregates that read it, or the call fails. Settle refuses a value that it cannot convert exactly.
 *Acceptance:* A Float64 value with a fraction in a UInt64 column fails the ingest with INVALID_INPUT. A JS reducer that emits a UInt64 state field feeds the sum of a view.
-*Trace:* ADR-6; INV-27, INV-28.
+*Trace:* ADR-15; INV-27, INV-28.
 
 ## Bindings
 
@@ -184,7 +184,7 @@ The resident memory of an instance stays below a ceiling that the host can compu
 *Acceptance:* A run with P-W-GROUPS at its largest value stays below P-MEMORY-CEILING.
 *Trace:* ADR-8; PF-1, RS-20.
 
-**REQ-42 — No termination by input.** [MUST — intent, currently violated by GAP-4]
+**REQ-42 — No termination by input.** [MUST]
 No schema text, row, chain, reducer result or call sequence terminates the host process. Settle returns an error.
 *Acceptance:* The fuzzers for the schema text, the row codec and the call sequence find no termination within P-FUZZ-BUDGET (CT-9).
 *Trace:* ADR-6; FM-1.

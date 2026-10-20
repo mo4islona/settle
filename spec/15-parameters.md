@@ -14,7 +14,7 @@
 | P-WAL-BOUND | The largest size of the log of the persistent backend (RS-21). | 256 MiB | 256 MiB (ADR-3) |
 | P-ACK-WARN | The age of the oldest unacked batch for the event of OB-8. | 10 s | 10 s |
 | P-FORMAT-VERSION | The format version of the database (DEF-35, WP-51). | 1 | 1 until a release stores data (ADR-3) |
-| P-BUFFER-SIZE | The inert buffer setting (IB-2). | 10,000, with no effect | Removed ⚠ (ADR-6) |
+| P-BUFFER-SIZE | The inert buffer setting (IB-2). | 10,000, with no effect | Removed ⚠ (ADR-16) |
 
 ## Schema limits
 

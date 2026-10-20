@@ -496,6 +496,12 @@ impl Settle {
     /// applied, then drop and reopen: the reopened instance can undo only
     /// what is on disk. After a failed sync every call, `ack()` too, returns
     /// `SyncFailed`.
+    /// Poison the instance after a call that left its state unknown.
+    #[cfg(feature = "napi")]
+    pub(crate) fn poison(&mut self, reason: String) {
+        self.poisoned = Some(reason);
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.is_some()
     }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use mlua::{Lua, MetaMethod, MultiValue, RegistryKey, Result as LuaResult, Value as LuaValue};
 
+use crate::error::{Error, Result};
 use crate::types::{ColumnRegistry, ColumnType, Row, Value};
 
 use super::map::StateMaps;
@@ -59,7 +60,7 @@ unsafe impl Send for LuaRuntime {}
 impl LuaRuntime {
     /// Create a new LuaRuntime without state field or source column optimization.
     /// State is synced via per-field table.get/set calls. All row fields are marshalled.
-    pub fn new(script: &str) -> Self {
+    pub fn new(script: &str) -> Result<Self> {
         Self::with_state_fields(script, &[], &[], &[], &[])
     }
 
@@ -70,7 +71,7 @@ impl LuaRuntime {
         state_types: &[(String, ColumnType)],
         source_columns: &[String],
         modules: &[(String, String)],
-    ) -> Self {
+    ) -> Result<Self> {
         Self::with_fields(
             script,
             state_fields,
@@ -91,6 +92,8 @@ impl LuaRuntime {
     ///
     /// `map_fields` are the MAP fields with the type of their values: each is
     /// `state.<name>` in Lua (`LuaMap`).
+    ///
+    /// Err(Schema) if a module does not load or the script does not compile.
     pub fn with_fields(
         script: &str,
         state_fields: &[String],
@@ -98,42 +101,39 @@ impl LuaRuntime {
         map_fields: &[(String, ColumnType)],
         source_columns: &[String],
         modules: &[(String, String)],
-    ) -> Self {
+    ) -> Result<Self> {
         let lua = Lua::new();
+        let not_set_up = |e| Error::Schema(format!("the Lua runtime does not set up: {e}"));
 
         // Sandbox: remove dangerous globals
-        sandbox(&lua).expect("failed to sandbox Lua");
+        sandbox(&lua).map_err(not_set_up)?;
 
         // Provide json module
-        register_json_module(&lua).expect("failed to register json module");
+        register_json_module(&lua).map_err(not_set_up)?;
 
-        // Load required modules: execute each script once, store return value as global
+        // Load required modules: execute each script once, store return value as global.
+        // A module can set a metatable on the globals: from here on, the setup
+        // writes them raw.
         for (name, code) in modules {
-            let result: LuaValue = lua
-                .load(code.as_str())
-                .eval()
-                .unwrap_or_else(|e| panic!("failed to load module '{name}': {e}"));
+            let not_loaded = |e| Error::Schema(format!("module '{name}' does not load: {e}"));
+            let result: LuaValue = lua.load(code.as_str()).eval().map_err(not_loaded)?;
             lua.globals()
-                .set(name.as_str(), result)
-                .unwrap_or_else(|e| panic!("failed to set module global '{name}': {e}"));
+                .raw_set(name.as_str(), result)
+                .map_err(not_loaded)?;
         }
 
         // Create persistent state and row tables as globals
-        let state_table = lua.create_table().expect("failed to create state table");
+        let state_table = lua.create_table().map_err(not_set_up)?;
         lua.globals()
-            .set("state", state_table.clone())
-            .expect("failed to set state global");
-        let state_key = lua
-            .create_registry_value(state_table)
-            .expect("failed to store state in registry");
+            .raw_set("state", state_table.clone())
+            .map_err(not_set_up)?;
+        let state_key = lua.create_registry_value(state_table).map_err(not_set_up)?;
 
-        let row_table = lua.create_table().expect("failed to create row table");
+        let row_table = lua.create_table().map_err(not_set_up)?;
         lua.globals()
-            .set("row", row_table.clone())
-            .expect("failed to set row global");
-        let row_key = lua
-            .create_registry_value(row_table)
-            .expect("failed to store row in registry");
+            .raw_set("row", row_table.clone())
+            .map_err(not_set_up)?;
+        let row_key = lua.create_registry_value(row_table).map_err(not_set_up)?;
 
         // Register `emit` as a Rust callback. Each emit({...}) call goes into
         // the emit buffer at once — no Lua table accumulation.
@@ -148,10 +148,8 @@ impl LuaRuntime {
                 }
                 Ok(())
             })
-            .expect("failed to create emit function");
-        lua.globals()
-            .set("emit", emit_fn)
-            .expect("failed to set emit global");
+            .map_err(not_set_up)?;
+        lua.globals().raw_set("emit", emit_fn).map_err(not_set_up)?;
 
         // Spare maps for the time between groups.
         let names = ColumnRegistry::new(map_fields.iter().map(|(name, _)| name.clone()).collect());
@@ -169,7 +167,7 @@ impl LuaRuntime {
                 lua.create_userdata(field).map(LuaValue::UserData)
             })
             .collect::<LuaResult<_>>()
-            .expect("failed to create the Map fields");
+            .map_err(not_set_up)?;
 
         // Pre-compile wrapper: calls user function and returns state fields.
         // Using string concat (not format!) to avoid issues with {} in Lua scripts.
@@ -226,16 +224,14 @@ impl LuaRuntime {
         let call_func: mlua::Function = lua
             .load(&call_src)
             .call(map_args)
-            .expect("failed to compile Lua wrapper");
-        let call_key = lua
-            .create_registry_value(call_func)
-            .expect("failed to store call function in registry");
+            .map_err(|e| Error::Schema(format!("the body does not compile: {e}")))?;
+        let call_key = lua.create_registry_value(call_func).map_err(not_set_up)?;
 
         // Determine which row fields the script actually accesses.
         // Only those fields will be marshalled to Lua per row.
         let accessed_fields = compute_accessed_fields(script, source_columns);
 
-        Self {
+        Ok(Self {
             lua,
             call_key,
             state_key,
@@ -255,7 +251,7 @@ impl LuaRuntime {
                 .collect(),
             accessed_fields,
             emits,
-        }
+        })
     }
 }
 
@@ -845,7 +841,8 @@ mod tests {
             state.count = state.count + 1
             emit({total = state.count})
             "#,
-        );
+        )
+        .unwrap();
 
         let mut state = HashMap::from([("count".to_string(), Value::Float64(0.0))]);
         let row = Row::from(RowMap::new());
@@ -873,7 +870,8 @@ mod tests {
             r#"
             emit({doubled = row.amount * 2})
             "#,
-        );
+        )
+        .unwrap();
 
         let mut state = HashMap::new();
         let row = Row::from(HashMap::from([("amount".to_string(), Value::Float64(5.0))]));
@@ -896,7 +894,8 @@ mod tests {
             if row.a == 1 then row.extra = "x" end
             emit({has_b = row.b ~= nil, extra = row.extra or "nil"})
             "#,
-        );
+        )
+        .unwrap();
         let columns = Arc::new(ColumnRegistry::new(vec!["a".into(), "b".into()]));
         let first = Row::from_values(columns.clone(), vec![Value::Int64(1), Value::Int64(2)]);
         let second = Row::from_values(columns, vec![Value::Int64(3), Value::Null]);
@@ -921,7 +920,8 @@ mod tests {
             end
             emit({b = row.b or "nil", extra = row.extra or "nil"})
             "#,
-        );
+        )
+        .unwrap();
         let columns = Arc::new(ColumnRegistry::new(vec!["a".into(), "b".into()]));
         let failing = Row::from_values(columns.clone(), vec![Value::Int64(1), Value::Int64(2)]);
         let next = Row::from_values(columns, vec![Value::Int64(3), Value::Null]);
@@ -943,7 +943,8 @@ mod tests {
             &[("n".to_string(), ColumnType::Int64)],
             &["a".to_string()],
             &[],
-        );
+        )
+        .unwrap();
         let columns = Arc::new(ColumnRegistry::new(vec!["a".into()]));
         let row = Row::from_values(columns, vec![Value::Int64(1)]);
         let mut state = HashMap::from([("n".to_string(), Value::Int64(0))]);
@@ -965,7 +966,8 @@ mod tests {
             &[("n".to_string(), ColumnType::Int64)],
             &["a".to_string()],
             &[],
-        );
+        )
+        .unwrap();
         let columns = Arc::new(ColumnRegistry::new(vec!["a".into()]));
         let row = |a| Row::from_values(columns.clone(), vec![Value::Int64(a)]);
 
@@ -1006,7 +1008,8 @@ mod tests {
                 emit({trade_pnl = pnl, position_size = state.quantity})
             end
             "#,
-        );
+        )
+        .unwrap();
 
         let mut state = HashMap::from([
             ("quantity".to_string(), Value::Float64(0.0)),
@@ -1073,7 +1076,8 @@ mod tests {
             end
             emit({trade_pnl = pnl, position_size = total_qty})
             "#,
-        );
+        )
+        .unwrap();
 
         let mut state = HashMap::from([("lots".to_string(), Value::String("[]".to_string()))]);
 
@@ -1112,7 +1116,7 @@ mod tests {
 
     #[test]
     fn lua_empty_emit_returns_none() {
-        let runtime = LuaRuntime::new("-- do nothing");
+        let runtime = LuaRuntime::new("-- do nothing").unwrap();
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
         assert!(runtime.run(&mut state, &row).unwrap().is_empty());
@@ -1126,7 +1130,8 @@ mod tests {
                 emit({sandboxed = 1})
             end
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
         let out = runtime
@@ -1147,7 +1152,8 @@ mod tests {
                 emit({sandboxed = 1})
             end
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
         let out = runtime
@@ -1169,7 +1175,8 @@ mod tests {
                 emit({matched = 0})
             end
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
         let row = Row::from(HashMap::from([(
             "side".to_string(),
@@ -1193,7 +1200,8 @@ mod tests {
                 emit { name = item.name, value = item.value }
             end
             "#,
-        );
+        )
+        .unwrap();
 
         let mut state = HashMap::new();
         let row = Row::from(HashMap::from([(
@@ -1222,7 +1230,8 @@ mod tests {
             emit { x = 1 }
             emit { x = 2 }
             "#,
-        );
+        )
+        .unwrap();
 
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
@@ -1236,7 +1245,7 @@ mod tests {
     #[test]
     fn lua_multi_emit_empty() {
         // emit() called with no args or not called → empty
-        let runtime = LuaRuntime::new("-- no emit calls");
+        let runtime = LuaRuntime::new("-- no emit calls").unwrap();
 
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
@@ -1274,7 +1283,8 @@ mod tests {
             &state_types,
             &["token".to_string(), "volume".to_string()],
             &[],
-        );
+        )
+        .unwrap();
 
         // Initialize state with JSON default (empty object)
         let mut state: HashMap<String, Value> = HashMap::from([
@@ -1363,7 +1373,8 @@ mod tests {
                 "price".to_string(),
             ],
             &[],
-        );
+        )
+        .unwrap();
 
         let mut state: HashMap<String, Value> =
             HashMap::from([("lots".to_string(), Value::JSON(serde_json::json!([])))]);
@@ -1463,7 +1474,8 @@ mod tests {
             &[("total".to_string(), ColumnType::Float64)],
             &["value".to_string()],
             &modules,
-        );
+        )
+        .unwrap();
 
         let mut state = HashMap::from([("total".to_string(), Value::Float64(0.0))]);
         let row = Row::from(HashMap::from([("value".to_string(), Value::Float64(5.0))]));
@@ -1484,7 +1496,8 @@ mod tests {
             r#"
             emit({result = row.big})
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
         // 2^53 + 1 = 9007199254740993, loses precision as f64
         let big: i64 = (1i64 << 53) + 1;
@@ -1513,7 +1526,8 @@ mod tests {
                 emit({saw = "nil"})
             end
             "#,
-        );
+        )
+        .unwrap();
 
         let mut state = HashMap::new();
 
@@ -1559,7 +1573,8 @@ mod tests {
                 emit({saw = "nil"})
             end
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
 
         // Row 1: has do_set flag, script sets row[1]
@@ -1629,7 +1644,8 @@ mod tests {
             &state_types,
             &source_cols,
             &[],
-        );
+        )
+        .unwrap();
 
         let mut state: HashMap<String, Value> = HashMap::from([
             ("status".to_string(), Value::String("unknown".into())),
@@ -1665,7 +1681,8 @@ mod tests {
                 emit({ i = i })
             end
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
 
         // Row 1 emits 5
@@ -1695,7 +1712,8 @@ mod tests {
                 emit({ idx = i, double = i * 2 })
             end
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
         let n = 1000i64;
         let row = Row::from(HashMap::from([("n".to_string(), Value::Int64(n))]));
@@ -1726,7 +1744,8 @@ mod tests {
                 emit({ val = i })
             end
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
 
         // Large flush
@@ -1764,7 +1783,8 @@ mod tests {
             &state_types,
             &source_cols,
             &[],
-        );
+        )
+        .unwrap();
 
         // Pre-populate 500 keys
         let mut positions = serde_json::Map::new();
@@ -1810,7 +1830,8 @@ mod tests {
             &state_types,
             &["token".to_string(), "vol".to_string()],
             &[],
-        );
+        )
+        .unwrap();
 
         let mut state = HashMap::from([
             ("count".to_string(), Value::Float64(0.0)),
@@ -1861,7 +1882,8 @@ mod tests {
             emit({ x = 1 })
             emit({})
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
         let results = runtime.run(&mut state, &row).unwrap();
@@ -1876,7 +1898,8 @@ mod tests {
             r#"
             error("intentional failure")
             "#,
-        );
+        )
+        .unwrap();
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
         let result = runtime.run(&mut state, &row);

@@ -88,6 +88,9 @@ pub(crate) fn view_to_sql(v: &ViewSpec) -> Result<String> {
         match item {
             GroupByItem::Column(c) => group_by_cols.push(c.clone()),
             GroupByItem::Interval(i) => {
+                if let Some(e) = &i.error {
+                    return Err(Error::Schema(format!("view '{}': interval(): {e}", v.name)));
+                }
                 let alias = i
                     .alias
                     .clone()

@@ -238,13 +238,13 @@ impl SettleEngine {
                         storage.clone(),
                         raw.registry(),
                         &modules,
-                    ),
+                    )?,
                 );
             } else {
                 // Source is another reducer — build registry dynamically per batch
                 reducers.insert(
                     reducer_def.name.clone(),
-                    ReducerEngine::new_chained(reducer_def.clone(), storage.clone(), &modules),
+                    ReducerEngine::new_chained(reducer_def.clone(), storage.clone(), &modules)?,
                 );
             }
         }
@@ -380,7 +380,7 @@ impl SettleEngine {
 
         // Build engine — source must be a raw table (chained external not yet supported)
         let engine = if let Some(raw) = self.raw_tables.get(&def.source) {
-            ReducerEngine::new(def, storage, raw.registry(), &[])
+            ReducerEngine::new(def, storage, raw.registry(), &[])?
         } else {
             return Err(crate::error::Error::InvalidOperation(format!(
                 "external reducer '{}' source '{}' must be a raw table",

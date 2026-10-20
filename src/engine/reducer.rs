@@ -135,9 +135,9 @@ impl ReducerEngine {
         storage: Arc<dyn StorageBackend>,
         source_registry: &ColumnRegistry,
         modules: &[(String, String)],
-    ) -> Self {
-        let runtime = Self::make_runtime(&def, source_registry, modules);
-        Self::build(def, storage, source_registry, runtime)
+    ) -> Result<Self> {
+        let runtime = Self::make_runtime(&def, source_registry, modules)?;
+        Ok(Self::build(def, storage, source_registry, runtime))
     }
 
     /// Create a ReducerEngine that sources from another reducer's output,
@@ -146,10 +146,10 @@ impl ReducerEngine {
         def: ReducerDef,
         storage: Arc<dyn StorageBackend>,
         modules: &[(String, String)],
-    ) -> Self {
+    ) -> Result<Self> {
         let empty_registry = ColumnRegistry::default();
-        let runtime = Self::make_runtime(&def, &empty_registry, modules);
-        Self::build(def, storage, &empty_registry, runtime)
+        let runtime = Self::make_runtime(&def, &empty_registry, modules)?;
+        Ok(Self::build(def, storage, &empty_registry, runtime))
     }
 
     /// Create a ReducerEngine with a custom runtime (for FnReducerRuntime / external).
@@ -207,13 +207,14 @@ impl ReducerEngine {
         }
     }
 
-    /// Build a runtime for the given reducer definition.
+    /// Build a runtime for the given reducer definition. Err(Schema) if its
+    /// body or a module does not load.
     #[allow(unused_variables)]
     fn make_runtime(
         def: &ReducerDef,
         source_registry: &ColumnRegistry,
         modules: &[(String, String)],
-    ) -> Box<dyn ReducerRuntime> {
+    ) -> Result<Box<dyn ReducerRuntime>> {
         match &def.body {
             #[cfg(feature = "lua")]
             ReducerBody::Lua { script } => {
@@ -231,14 +232,19 @@ impl ReducerEngine {
                 let state_types = typed(false);
                 let state_fields: Vec<String> =
                     state_types.iter().map(|(name, _)| name.clone()).collect();
-                Box::new(LuaRuntime::with_fields(
+                let runtime = LuaRuntime::with_fields(
                     script,
                     &state_fields,
                     &state_types,
                     &typed(true),
                     source_registry.names(),
                     &requiredmodules,
-                ))
+                )
+                .map_err(|e| match e {
+                    Error::Schema(m) => Error::Schema(format!("reducer '{}': {m}", def.name)),
+                    other => other,
+                })?;
+                Ok(Box::new(runtime))
             }
             #[cfg(not(feature = "lua"))]
             ReducerBody::Lua { .. } => {
@@ -246,9 +252,9 @@ impl ReducerEngine {
                 // disabled, so this branch is unreachable in normal usage.
                 unreachable!("Lua reducer body reached without lua feature — schema parser should have rejected it");
             }
-            ReducerBody::External { id } => Box::new(
+            ReducerBody::External { id } => Ok(Box::new(
                 crate::reducer_runtime::external::ExternalRuntime::new(id.clone()),
-            ),
+            )),
         }
     }
 
@@ -741,7 +747,8 @@ mod tests {
     #[test]
     fn reducer_processes_rows_and_emits_output() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]);
+        let mut engine =
+            ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]).unwrap();
 
         let rows = vec![
             make_trade("alice", "buy", 10.0, 2000.0),
@@ -764,7 +771,8 @@ mod tests {
     #[test]
     fn reducer_state_persists_across_blocks() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]);
+        let mut engine =
+            ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]).unwrap();
 
         // Block 1: buy
         engine
@@ -786,7 +794,8 @@ mod tests {
     #[test]
     fn reducer_rollback_restores_state() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]);
+        let mut engine =
+            ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]).unwrap();
 
         // Block 1: buy 10 @ 2000
         engine
@@ -817,7 +826,8 @@ mod tests {
     #[test]
     fn reducer_multiple_groups() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]);
+        let mut engine =
+            ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]).unwrap();
 
         let rows = vec![
             make_trade("alice", "buy", 10.0, 2000.0),
@@ -847,7 +857,7 @@ mod tests {
     fn reducer_finalize_then_rollback() {
         let storage = Arc::new(MemoryBackend::new());
         let mut engine =
-            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]);
+            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]).unwrap();
 
         // Block 1000: buy 10
         engine
@@ -889,7 +899,7 @@ mod tests {
     fn deferred_finalize_persists_the_state_as_of_finality() {
         let storage = Arc::new(MemoryBackend::new());
         let mut engine =
-            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]);
+            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]).unwrap();
 
         for block in 1..=10 {
             engine
@@ -928,7 +938,7 @@ mod tests {
     fn new_groups_read_storage_once_it_holds_state() {
         let storage = Arc::new(MemoryBackend::new());
         let mut engine =
-            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]);
+            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]).unwrap();
         assert!(!engine.reads_storage);
 
         engine
@@ -942,7 +952,7 @@ mod tests {
 
         engine.reload();
         let mut reopened =
-            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]);
+            ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]).unwrap();
 
         // Both continue from the stored 10 bought at 100.
         for engine in [&mut engine, &mut reopened] {
@@ -979,7 +989,7 @@ mod tests {
 
         let storage = Arc::new(MemoryBackend::new());
         let events_registry = ColumnRegistry::new(vec!["value".to_string()]);
-        let mut engine = ReducerEngine::new(def, storage, &events_registry, &[]);
+        let mut engine = ReducerEngine::new(def, storage, &events_registry, &[]).unwrap();
 
         let reg = Arc::new(events_registry);
         let rows: Vec<Row> = vec![
@@ -1014,7 +1024,7 @@ mod tests {
         };
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
-        ReducerEngine::new(def, storage, &reg, &[])
+        ReducerEngine::new(def, storage, &reg, &[]).unwrap()
     }
 
     #[cfg(feature = "lua")]
@@ -1112,7 +1122,7 @@ mod tests {
         let registry = Arc::new(ColumnRegistry::new(
             ["user", "token", "amount"].map(String::from).to_vec(),
         ));
-        let mut engine = ReducerEngine::new(def, storage, &registry, &[]);
+        let mut engine = ReducerEngine::new(def, storage, &registry, &[]).unwrap();
         let trade = |user: &str, token: &str, amount: f64| {
             let values = vec![
                 Value::String(user.into()),
@@ -1165,7 +1175,7 @@ mod tests {
         };
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
-        let mut engine = ReducerEngine::new(def, storage, &reg, &[]);
+        let mut engine = ReducerEngine::new(def, storage, &reg, &[]).unwrap();
 
         let rows = [event("alice", 1.0), event("bob", 5.0), event("alice", 2.0)];
         let output = engine.process_block(1000, &rows).unwrap();
@@ -1258,7 +1268,8 @@ mod tests {
         );
 
         let storage2 = Arc::new(MemoryBackend::new());
-        let mut lua_engine = ReducerEngine::new(pnl_reducer_def(), storage2, &trade_registry(), &[]);
+        let mut lua_engine =
+            ReducerEngine::new(pnl_reducer_def(), storage2, &trade_registry(), &[]).unwrap();
 
         let rows = vec![
             make_trade("alice", "buy", 10.0, 2000.0),
@@ -1380,7 +1391,7 @@ mod tests {
         };
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let reg = ColumnRegistry::new(vec![]);
-        let mut engine = ReducerEngine::new(def, storage, &reg, &[]);
+        let mut engine = ReducerEngine::new(def, storage, &reg, &[]).unwrap();
 
         // ExternalRuntime + no JS context → needs callback (would panic)
         assert!(engine.needs_host_callback());
@@ -1413,7 +1424,7 @@ mod tests {
         let def = external_counter_def();
         let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
-        ReducerEngine::new(def, storage, &reg, &[])
+        ReducerEngine::new(def, storage, &reg, &[]).unwrap()
     }
 
     fn external_counter_def() -> ReducerDef {
@@ -1607,7 +1618,7 @@ mod tests {
             ..external_counter_def()
         };
         let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
-        ReducerEngine::new(def, storage, &reg, &[])
+        ReducerEngine::new(def, storage, &reg, &[]).unwrap()
     }
 
     /// The `before` emits of `output`, in order; None for a Null.
@@ -1822,7 +1833,7 @@ mod tests {
         };
         let reg = ColumnRegistry::new(vec!["user".to_string(), "amount".to_string()]);
         let storage = Arc::new(MemoryBackend::new());
-        let mut external = ReducerEngine::new(def, storage.clone(), &reg, &[]);
+        let mut external = ReducerEngine::new(def, storage.clone(), &reg, &[]).unwrap();
         let host = book_run(&mut external, &storage);
 
         let storage = Arc::new(MemoryBackend::new());

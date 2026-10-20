@@ -423,7 +423,7 @@ fn bench_reducer_lua_only() -> BenchResult {
         .collect();
     let source_registry = ColumnRegistry::new(source_names);
     let registry = Arc::new(source_registry.clone());
-    let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]);
+    let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]).unwrap();
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {

@@ -25,7 +25,7 @@ This record holds four related decisions about the values of a view and the reco
 **Consequences.**
 
 - Integer sums are exact in the range of the accumulator.
-- A value outside the mode of its column needs a rule. Today the aggregate skips it silently (GAP-1). ADR-6 proposes the rule.
+- A value outside the mode of its column needs a rule. Today the aggregate skips it silently (GAP-1). ADR-15 proposes the rule.
 - Shapes: REQ-20, DEF-43.
 
 ## 3. Expired window data stays until its expirer is final
