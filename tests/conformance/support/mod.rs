@@ -20,7 +20,7 @@ use settle::types::{BlockNumber, RowMap, Value};
 
 /// Stored meta keys, for tests that read the watermarks or write a legacy store.
 pub const META_LATEST_BLOCK: &str = "latest_block";
-pub const META_FINALIZED_BLOCK: &str = "finalized_block";
+pub const META_DURABLE_BLOCK: &str = "finalized_block";
 
 pub fn stored_u64(storage: &MemoryBackend, key: &str) -> Option<u64> {
     let bytes = storage.get_meta(key).unwrap()?;

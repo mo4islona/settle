@@ -60,12 +60,12 @@ The derived state of each reducer and view equals DEF-41 and DEF-42 over `A` (DE
 
 ## Transition legality
 
-**INV-10 — Monotonic finality.** [transition] — known-violated (GAP-3)
+**INV-10 — Monotonic finality.** [transition]
 Within one run, `F` never decreases. An open restores the `F` of the last durable commit (INV-47). A crash loses the finality advances of the unacked batches, as it loses their rows (CN-20).
 *Why:* a finality that goes back lets a later fork undo final blocks.
 *Check:* CT-1 checks `F` after each step. CT-2 compares the finalized cursor after each reopen with the one of the last durable commit.
 
-**INV-11 — Final blocks stay.** [transition] — known-violated (GAP-3)
+**INV-11 — Final blocks stay.** [transition]
 Let `m = min(F, L)` before a transition. After the transition, `A↾m` and the contributions of its blocks to the derived state are as before. A new block can still enter between `L` and `F` (WP-7, REQ-6), because it is above `m`. Across a crash and an open, the same holds with `m` of the last durable commit. A crash loses only the blocks of unacked batches (CN-20).
 *Why:* the target relies on final data to stay.
 *Check:* CT-1 sends forks below finality and expects FORK_BELOW_FINALITY with no change. It also sends blocks between `L` and `F` and checks that `A↾m` stays. CT-2 repeats it after a reopen.
@@ -234,10 +234,10 @@ Stored data that does not decode gives STORAGE_FAILED. It never gives a default 
 *Why:* a silent default is silent data loss.
 *Check:* CT-8 corrupts each kind of stored value and opens.
 
-**INV-47 — Finality survives a reopen.** [recovery] — known-violated (GAP-3)
+**INV-47 — Finality survives a reopen.** [recovery]
 After a crash and an open, `F` equals the finality watermark of the last durable commit.
 *Why:* see INV-10.
-*Check:* CT-2 compares the finalized cursor after each reopen with the one of the last durable commit, with deferral and with gappy chains.
+*Check:* CT-1 and CT-2 compare the finalized cursor after each reopen with the one of the last durable commit, with deferral and with gappy chains.
 
 **INV-48 — Maintenance transparency.** [recovery]
 Purge, compaction and log rotation never change the state or a batch (CN-40).

@@ -97,7 +97,7 @@ fn writes_without_batch_commit_with_the_newest_batch() {
 
     db.ack(b1.sequence).unwrap();
     assert_eq!(stored_u64(&storage, META_LATEST_BLOCK), Some(1));
-    assert_eq!(stored_u64(&storage, META_FINALIZED_BLOCK), Some(1));
+    assert_eq!(stored_u64(&storage, META_DURABLE_BLOCK), Some(1));
 }
 
 /// The writes of a call without a batch wait in memory with the newest

@@ -105,7 +105,7 @@ fn backfill_recovery_without_checkpoint_preserves_mv() {
         // interval=100 never reached → only the first block is durable.
         assert_eq!(db.durable_block(), 1, "only the first block is a checkpoint at interval=100");
         assert_eq!(db.finalized_block(), 79, "in-memory finality still advances");
-        // db dropped here: committed batches (raw rows + META_FINALIZED=1) are on
+        // db dropped here: committed batches (raw rows + the durable block 1) are on
         // disk; the deferred derived MV state lived only in memory and is lost.
     }
 

@@ -61,7 +61,7 @@ Otherwise the call fails with INVALID_INPUT. The current code checks no value ty
 
 **WP-11 — Fork point.** Settle rolls back to the fork point of DEF-13.
 
-**WP-12 — No common ancestor.** A call has no common ancestor when no fork point of DEF-13 exists. This applies to an ingest call with a hash conflict and to each fork call. Such a call fails with NO_COMMON_ANCESTOR and changes nothing (ADR-7). The current ingest path rolls back to block 0 when `F` is 0 (GAP-8).
+**WP-12 — No common ancestor.** A call has no common ancestor when no fork point of DEF-13 exists. This applies to an ingest call with a hash conflict and to each fork call. Such a call fails with NO_COMMON_ANCESTOR and changes nothing (ADR-13). The current ingest path rolls back to block 0 when `F` is 0 (GAP-8).
 
 **WP-13 — Below finality.** A call whose lowest hash conflict is at or below `F` fails with FORK_BELOW_FINALITY and changes nothing (ADR-2).
 
@@ -85,7 +85,7 @@ Otherwise the call fails with INVALID_INPUT. The current code checks no value ty
 
 **WP-23 — Fork calls keep finality.** A fork call never changes `F`.
 
-**WP-24 — Finality across a reopen.** After a reopen, `F` equals the finality watermark of the committed state. The current code sets `F` to `D` at open (GAP-3, ADR-7).
+**WP-24 — Finality across a reopen.** After a reopen, `F` equals the finality watermark of the committed state (ADR-7).
 
 ## Commit and ack
 

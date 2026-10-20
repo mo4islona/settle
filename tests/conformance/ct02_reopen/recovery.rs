@@ -583,7 +583,7 @@ fn first_data_block_is_a_checkpoint_under_deferral() {
 
     ingest_with_finalized(&mut db, vec![], 7).unwrap();
     assert_eq!(db.durable_block(), 0, "no data, so nothing is durable");
-    assert!(storage.get_meta(META_FINALIZED_BLOCK).unwrap().is_none());
+    assert!(storage.get_meta(META_DURABLE_BLOCK).unwrap().is_none());
 
     ingest_with_finalized(&mut db, vec![("swaps".into(), 5, vec![swap(5, "ETH", 10)])], 7)
         .unwrap();
@@ -632,7 +632,7 @@ fn legacy_watermark_without_data_does_not_hide_new_blocks() {
     let mut legacy = StorageWriteBatch::new();
     legacy.put_meta("format_version", &settle::storage::format::FORMAT_VERSION.to_be_bytes());
     legacy.put_meta(META_LATEST_BLOCK, &0u64.to_be_bytes());
-    legacy.put_meta(META_FINALIZED_BLOCK, &stored_finalized.to_be_bytes());
+    legacy.put_meta(META_DURABLE_BLOCK, &stored_finalized.to_be_bytes());
     storage.commit(&legacy).unwrap();
 
     {
@@ -662,7 +662,7 @@ fn legacy_watermark_above_latest_does_not_hide_new_blocks() {
             .unwrap();
     }
     let mut legacy = StorageWriteBatch::new();
-    legacy.put_meta(META_FINALIZED_BLOCK, &100u64.to_be_bytes());
+    legacy.put_meta(META_DURABLE_BLOCK, &100u64.to_be_bytes());
     storage.commit(&legacy).unwrap();
 
     {
@@ -727,15 +727,42 @@ fn deferral_keeps_only_the_durable_hash_below_finality() {
                 .unwrap();
         }
         assert_eq!(db.durable_block(), 0);
-        assert_eq!(stored_u64(&storage, META_FINALIZED_BLOCK), Some(0));
+        assert_eq!(stored_u64(&storage, META_DURABLE_BLOCK), Some(0));
         assert_eq!(held_hashes(&db, 0..=50), vec![0, 49]);
     }
 
     let mut db = reopen(SUM_SCHEMA, &storage, 1000);
-    assert_eq!(db.finalized_cursor(), Some(cursor(0)));
+    assert_eq!(db.finalized_cursor(), Some(cursor(49)));
     let batch = ingest_with_finalized(&mut db, vec![("swaps".into(), 50, vec![swap(50, "ETH", 1)])], 50)
         .unwrap()
         .unwrap();
+    assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(51));
+}
+
+/// With a checkpoint interval of 3 the durable block stays at 48 while
+/// finality reaches 49. A reopen restores finality 49 (INV-47), so a smaller
+/// finalized head and a rollback of block 49 stay refused (INV-10, INV-11).
+#[test]
+fn reopen_restores_finality_above_the_durable_block() {
+    let storage = Arc::new(MemoryBackend::new());
+    let block = |b: BlockNumber| vec![("swaps".to_string(), b, vec![swap(b, "ETH", 1)])];
+
+    {
+        let mut db = reopen(SUM_SCHEMA, &storage, 3);
+        for b in 0..50 {
+            ingest_with_finalized(&mut db, block(b), b).unwrap();
+        }
+        assert_eq!((db.durable_block(), db.finalized_block()), (48, 49));
+    }
+
+    let mut db = reopen(SUM_SCHEMA, &storage, 3);
+    assert_eq!(db.finalized_block(), 49);
+    assert_eq!(db.finalized_cursor(), Some(cursor(49)));
+
+    assert!(ingest_with_finalized(&mut db, block(50), 48).is_err());
+    assert!(rollback_to(&mut db, 48).is_err());
+
+    let batch = ingest_with_finalized(&mut db, block(50), 50).unwrap().unwrap();
     assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(51));
 }
 

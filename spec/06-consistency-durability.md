@@ -35,7 +35,7 @@ Bands: 1–9 commit model · 10–19 durability · 20–29 recovery · 30–39 f
 
 ## Recovery
 
-**CN-20 — Recovery contract.** After a crash and an open outside journal mode, each element of the state equals its value after the last durable commit. This holds for `A`, `H`, `L`, `F`, `D`, `s` and the derived state of every object, also the expired-block stash and the emit columns. The current code restores `F` as `D` (GAP-3).
+**CN-20 — Recovery contract.** After a crash and an open outside journal mode, each element of the state equals its value after the last durable commit. This holds for `A`, `H`, `L`, `F`, `D`, `s` and the derived state of every object, also the expired-block stash and the emit columns.
 
 **CN-21 — Journal recovery.** After an open in journal mode with an applied sequence `a` that WP-52 accepts, the state equals the state after batch `a`.
 

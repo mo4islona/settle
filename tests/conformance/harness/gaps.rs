@@ -9,8 +9,6 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Gap {
-    /// An open sets `F` to `D`.
-    Gap3,
     /// A raw delete has no previous values, nor does an update that merges
     /// a raw delete and a raw insert.
     Gap10,
@@ -22,7 +20,7 @@ pub enum Gap {
 }
 
 impl Gap {
-    pub const ALL: [Gap; 4] = [Gap::Gap3, Gap::Gap10, Gap::Gap41, Gap::Gap47];
+    pub const ALL: [Gap; 3] = [Gap::Gap10, Gap::Gap41, Gap::Gap47];
 }
 
 #[derive(Default, Debug)]
