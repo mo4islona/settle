@@ -66,7 +66,7 @@ Bands: 1–19 chain and input · 20–39 pipeline · 40–59 derived values · 6
 
 **DEF-26 — Reducer state.** One value for each state field of each group. A new group starts with the defaults of the state fields. A Map field holds entries instead of one value: a value of its type for each String key. A new group has no entries, and no entry holds Null (ADR-12).
 
-**DEF-27 — Emit row.** A row that a reducer body outputs for an input row. A body can emit zero or more rows for one input row. The emit columns of a reducer are the group-by columns, then the other names that the body emits, in the order of first use. Their number is at most P-MAX-EMIT-COLUMNS. When an emit row leaves a group-by column Null, the column takes the value of the input row.
+**DEF-27 — Emit row.** A row that a reducer body outputs for an input row. A body can emit zero or more rows for one input row. The emit columns of a reducer are the group-by columns, then the other names that the body emits, in the order of first use. Their number is at most P-MAX-EMIT-COLUMNS. When an emit row leaves a group-by column Null, the column takes the value of the input row. Whether an emit whose values are all Null is a row is open (OQ-6).
 
 **DEF-28 — Runtime kind.** The way that Settle runs a reducer body:
 
@@ -111,9 +111,9 @@ An aggregate folds in two levels. First, the values of each block fold in chain 
 | Function | Input values | Result | The aggregate has data when |
 |---|---|---|---|
 | `count()` | Each row. | The number of rows, as UInt64. | At least one row reached it. |
-| `count(c)` | The non-Null values of `c`. | The number of these values, as UInt64. | At least one row reached it. Today a group with only Null values loses its data at finality (GAP-40). |
+| `count(c)` | The non-Null values of `c`. | The number of these values, as UInt64. | At least one row reached it. |
 | `sum(c)` | The values of `c` in the numeric mode of `c` (DEF-43). | The sum in the arithmetic of the mode, in the two fold levels above. | At least one input value. |
-| `min(c)`, `max(c)` | The same as `sum`. | The smallest or largest value. A NaN does not count. | At least one input value. |
+| `min(c)`, `max(c)` | The same as `sum`. | The smallest or largest value. A NaN does not count. | At least one input value. Today a NaN counts as a value (GAP-48). |
 | `avg(c)` | The same as `sum`. | The sum divided by the number of values, as Float64. In the BigInt mode, an integer division that gives a Uint256. | At least one input value. |
 | `first(c)` | The non-Null values of `c`. | The first value in chain order. | At least one input value. |
 | `last(c)` | The non-Null values of `c`. | The last value in chain order. | At least one input value. |

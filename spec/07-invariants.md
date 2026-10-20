@@ -118,7 +118,7 @@ After each successful call, the target image (DEF-64) of all returned batches eq
 *Why:* this is the main promise of Settle (G-1).
 *Check:* CT-1 compares the target image with an independent recomputation after every step. CT-2 and CT-10 compare it after reopens and in domain scenarios.
 
-**INV-21 — Record soundness.** [response] — known-suspect (GAP-41)
+**INV-21 — Record soundness.** [response] — known-violated (GAP-41)
 Each record has the operation of RP-3 for `Out(A)` before its call, and no record is an empty change (RP-6).
 *Why:* a target that checks the operation, for example an insert into a present key, fails.
 *Check:* the structural validator of CT-1 applies each record to the model target and checks the operation.
