@@ -1,10 +1,11 @@
 use std::any::Any;
-use std::collections::BTreeMap;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{BlockNumber, Value};
+
+use super::blocks::Blocks;
 
 // ---------------------------------------------------------------------------
 // Numeric accumulator — mode determined by column type at construction
@@ -195,12 +196,8 @@ pub trait AggregationFunc: Send + Sync {
     fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()>;
 }
 
-fn write_entry<V: Serialize>(
-    blocks: &BTreeMap<BlockNumber, V>,
-    block: BlockNumber,
-    out: &mut Vec<u8>,
-) -> bool {
-    let Some(value) = blocks.get(&block) else {
+fn write_entry<V: Serialize>(blocks: &Blocks<V>, block: BlockNumber, out: &mut Vec<u8>) -> bool {
+    let Some(value) = blocks.get(block) else {
         return false;
     };
     rmp_serde::encode::write(out, value).expect("block data serializes");
@@ -208,7 +205,7 @@ fn write_entry<V: Serialize>(
 }
 
 fn read_entry<V: DeserializeOwned>(
-    blocks: &mut BTreeMap<BlockNumber, V>,
+    blocks: &mut Blocks<V>,
     block: BlockNumber,
     bytes: &[u8],
 ) -> Option<()> {
@@ -216,12 +213,8 @@ fn read_entry<V: DeserializeOwned>(
     Some(())
 }
 
-fn move_entry<V>(
-    from: &mut BTreeMap<BlockNumber, V>,
-    into: &mut BTreeMap<BlockNumber, V>,
-    block: BlockNumber,
-) {
-    if let Some(v) = from.remove(&block) {
+fn move_entry<V>(from: &mut Blocks<V>, into: &mut Blocks<V>, block: BlockNumber) {
+    if let Some(v) = from.remove(block) {
         into.insert(block, v);
     }
 }
@@ -230,17 +223,6 @@ fn same_kind<T: 'static>(agg: &mut dyn AggregationFunc) -> &mut T {
     agg.as_any_mut()
         .downcast_mut()
         .expect("the aggregates of one column are of one kind")
-}
-
-/// Removes the blocks at or below `block` in ascending order and hands each
-/// value to `f`, with no temporary list of keys.
-fn drain_up_to<V>(blocks: &mut BTreeMap<BlockNumber, V>, block: BlockNumber, mut f: impl FnMut(V)) {
-    while let Some(entry) = blocks.first_entry() {
-        if *entry.key() > block {
-            break;
-        }
-        f(entry.remove());
-    }
 }
 
 /// `blocks.values()` folded onto `seed` in block order, kept current while
@@ -268,14 +250,14 @@ struct RunningFold<S, V> {
 }
 
 impl<S: Copy, V: Copy> RunningFold<S, V> {
-    fn new(seed: S, blocks: &BTreeMap<BlockNumber, V>, op: impl Fn(S, V) -> S) -> Self {
+    fn new(seed: S, blocks: &Blocks<V>, op: impl Fn(S, V) -> S) -> Self {
         let mut below_newest = seed;
         let mut newest = None;
-        for (&block, &value) in blocks {
+        blocks.iter().for_each(|(&block, &value)| {
             if let Some((_, below)) = newest.replace((block, value)) {
                 below_newest = op(below_newest, below);
             }
-        }
+        });
 
         let total = newest.map_or(below_newest, |(_, value)| op(below_newest, value));
         Self {
@@ -290,7 +272,7 @@ impl<S: Copy, V: Copy> RunningFold<S, V> {
     fn refold_into(
         slot: &mut Option<Box<Self>>,
         seed: S,
-        blocks: &BTreeMap<BlockNumber, V>,
+        blocks: &Blocks<V>,
         op: impl Fn(S, V) -> S,
     ) {
         if blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
@@ -330,7 +312,7 @@ impl<S: Copy, V: Copy> RunningFold<S, V> {
 pub struct SumAgg {
     mode: NumMode,
     finalized: NumAccum,
-    blocks: BTreeMap<BlockNumber, NumAccum>,
+    blocks: Blocks<NumAccum>,
     has_finalized: bool,
     /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
     /// or more.
@@ -344,7 +326,7 @@ impl SumAgg {
         Self {
             mode,
             finalized: NumAccum::zero(mode),
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             has_finalized: false,
             running: None,
         }
@@ -385,9 +367,7 @@ impl AggregationFunc for SumAgg {
         }
 
         let entry = self
-            .blocks
-            .entry(block)
-            .or_insert(NumAccum::zero(self.mode));
+            .blocks.or_insert(block, NumAccum::zero(self.mode));
         *entry = entry.add(partial);
         let value = *entry;
 
@@ -401,12 +381,12 @@ impl AggregationFunc for SumAgg {
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
-        self.blocks.remove(&block);
+        self.blocks.remove(block);
         self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
-        let _ = self.blocks.split_off(&(fork_point + 1));
+        self.blocks.remove_above(fork_point);
         self.running = None;
     }
 
@@ -422,7 +402,7 @@ impl AggregationFunc for SumAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        drain_up_to(&mut self.blocks, block, |v| {
+        self.blocks.drain_up_to(block, |v| {
             self.finalized = self.finalized.add(v);
             self.has_finalized = true;
         });
@@ -449,7 +429,7 @@ impl AggregationFunc for SumAgg {
 
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             running: None,
             ..*self
         };
@@ -463,7 +443,7 @@ impl AggregationFunc for SumAgg {
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
-        self.blocks.keys().copied().collect()
+        self.blocks.iter().map(|(block, _)| *block).collect()
     }
 
     fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
@@ -483,7 +463,7 @@ impl AggregationFunc for SumAgg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountAgg {
     finalized: u64,
-    blocks: BTreeMap<BlockNumber, u64>,
+    blocks: Blocks<u64>,
     /// Whether a final block reached it: a count of 0 is data too. Not
     /// stored, so the stored layout stays: a view stores a group only once
     /// a block of it is final, and each row reaches each aggregate.
@@ -503,7 +483,7 @@ impl CountAgg {
     pub fn new() -> Self {
         Self {
             finalized: 0,
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             has_finalized: false,
             running: None,
         }
@@ -525,7 +505,7 @@ impl AggregationFunc for CountAgg {
     fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
         let count = values.iter().filter(|v| !v.is_null()).count() as u64;
 
-        let entry = self.blocks.entry(block).or_insert(0);
+        let entry = self.blocks.or_insert(block, 0);
         *entry += count;
         let value = *entry;
 
@@ -539,12 +519,12 @@ impl AggregationFunc for CountAgg {
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
-        self.blocks.remove(&block);
+        self.blocks.remove(block);
         self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
-        let _ = self.blocks.split_off(&(fork_point + 1));
+        self.blocks.remove_above(fork_point);
         self.running = None;
     }
 
@@ -560,7 +540,7 @@ impl AggregationFunc for CountAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        drain_up_to(&mut self.blocks, block, |v| {
+        self.blocks.drain_up_to(block, |v| {
             self.finalized += v;
             self.has_finalized = true;
         });
@@ -587,7 +567,7 @@ impl AggregationFunc for CountAgg {
 
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             running: None,
             ..*self
         };
@@ -603,7 +583,7 @@ impl AggregationFunc for CountAgg {
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
-        self.blocks.keys().copied().collect()
+        self.blocks.iter().map(|(block, _)| *block).collect()
     }
 
     fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
@@ -624,7 +604,7 @@ impl AggregationFunc for CountAgg {
 pub struct MinAgg {
     mode: NumMode,
     finalized: Option<NumAccum>,
-    blocks: BTreeMap<BlockNumber, NumAccum>,
+    blocks: Blocks<NumAccum>,
     /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
     /// or more.
     #[serde(skip)]
@@ -640,7 +620,7 @@ impl MinAgg {
         Self {
             mode: NumMode::from_column_type(column_type),
             finalized: None,
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             running: None,
         }
     }
@@ -664,7 +644,7 @@ impl AggregationFunc for MinAgg {
             return;
         };
 
-        let entry = self.blocks.entry(block).or_insert(min_val);
+        let entry = self.blocks.or_insert(block, min_val);
         *entry = (*entry).min(min_val);
         let value = *entry;
 
@@ -678,12 +658,12 @@ impl AggregationFunc for MinAgg {
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
-        self.blocks.remove(&block);
+        self.blocks.remove(block);
         self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
-        let _ = self.blocks.split_off(&(fork_point + 1));
+        self.blocks.remove_above(fork_point);
         self.running = None;
     }
 
@@ -699,7 +679,7 @@ impl AggregationFunc for MinAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        drain_up_to(&mut self.blocks, block, |v| {
+        self.blocks.drain_up_to(block, |v| {
             self.finalized = min_into(self.finalized, v);
         });
         if self.blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
@@ -728,7 +708,7 @@ impl AggregationFunc for MinAgg {
 
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             running: None,
             ..*self
         };
@@ -742,7 +722,7 @@ impl AggregationFunc for MinAgg {
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
-        self.blocks.keys().copied().collect()
+        self.blocks.iter().map(|(block, _)| *block).collect()
     }
 
     fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
@@ -763,7 +743,7 @@ impl AggregationFunc for MinAgg {
 pub struct MaxAgg {
     mode: NumMode,
     finalized: Option<NumAccum>,
-    blocks: BTreeMap<BlockNumber, NumAccum>,
+    blocks: Blocks<NumAccum>,
     /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
     /// or more.
     #[serde(skip)]
@@ -779,7 +759,7 @@ impl MaxAgg {
         Self {
             mode: NumMode::from_column_type(column_type),
             finalized: None,
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             running: None,
         }
     }
@@ -803,7 +783,7 @@ impl AggregationFunc for MaxAgg {
             return;
         };
 
-        let entry = self.blocks.entry(block).or_insert(max_val);
+        let entry = self.blocks.or_insert(block, max_val);
         *entry = (*entry).max(max_val);
         let value = *entry;
 
@@ -817,12 +797,12 @@ impl AggregationFunc for MaxAgg {
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
-        self.blocks.remove(&block);
+        self.blocks.remove(block);
         self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
-        let _ = self.blocks.split_off(&(fork_point + 1));
+        self.blocks.remove_above(fork_point);
         self.running = None;
     }
 
@@ -838,7 +818,7 @@ impl AggregationFunc for MaxAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        drain_up_to(&mut self.blocks, block, |v| {
+        self.blocks.drain_up_to(block, |v| {
             self.finalized = max_into(self.finalized, v);
         });
         if self.blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
@@ -867,7 +847,7 @@ impl AggregationFunc for MaxAgg {
 
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             running: None,
             ..*self
         };
@@ -881,7 +861,7 @@ impl AggregationFunc for MaxAgg {
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
-        self.blocks.keys().copied().collect()
+        self.blocks.iter().map(|(block, _)| *block).collect()
     }
 
     fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
@@ -903,7 +883,7 @@ pub struct AvgAgg {
     mode: NumMode,
     finalized_sum: NumAccum,
     finalized_count: u64,
-    blocks: BTreeMap<BlockNumber, (NumAccum, u64)>,
+    blocks: Blocks<(NumAccum, u64)>,
     /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
     /// or more.
     #[serde(skip)]
@@ -935,7 +915,7 @@ impl AvgAgg {
             mode,
             finalized_sum: NumAccum::zero(mode),
             finalized_count: 0,
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             running: None,
         }
     }
@@ -970,9 +950,7 @@ impl AggregationFunc for AvgAgg {
         }
 
         let entry = self
-            .blocks
-            .entry(block)
-            .or_insert((NumAccum::zero(self.mode), 0));
+            .blocks.or_insert(block, (NumAccum::zero(self.mode), 0));
         *entry = add_sum_count(*entry, (sum, count));
         let value = *entry;
 
@@ -986,12 +964,12 @@ impl AggregationFunc for AvgAgg {
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
-        self.blocks.remove(&block);
+        self.blocks.remove(block);
         self.running = None;
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
-        let _ = self.blocks.split_off(&(fork_point + 1));
+        self.blocks.remove_above(fork_point);
         self.running = None;
     }
 
@@ -1007,7 +985,7 @@ impl AggregationFunc for AvgAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        drain_up_to(&mut self.blocks, block, |(s, c)| {
+        self.blocks.drain_up_to(block, |(s, c)| {
             self.finalized_sum = self.finalized_sum.add(s);
             self.finalized_count += c;
         });
@@ -1034,7 +1012,7 @@ impl AggregationFunc for AvgAgg {
 
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
             running: None,
             ..*self
         };
@@ -1048,7 +1026,7 @@ impl AggregationFunc for AvgAgg {
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
-        self.blocks.keys().copied().collect()
+        self.blocks.iter().map(|(block, _)| *block).collect()
     }
 
     fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
@@ -1069,21 +1047,21 @@ impl AggregationFunc for AvgAgg {
 pub struct FirstAgg {
     finalized: Option<Value>,
     /// block -> first value seen in that block
-    blocks: BTreeMap<BlockNumber, Value>,
+    blocks: Blocks<Value>,
 }
 
 impl FirstAgg {
     pub fn new() -> Self {
         Self {
             finalized: None,
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
         }
     }
 }
 
 impl AggregationFunc for FirstAgg {
     fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
-        if self.blocks.contains_key(&block) {
+        if self.blocks.get(block).is_some() {
             return; // keep the first value for this block
         }
         if let Some(first) = values.iter().find(|v| !v.is_null()) {
@@ -1092,11 +1070,11 @@ impl AggregationFunc for FirstAgg {
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
-        self.blocks.remove(&block);
+        self.blocks.remove(block);
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
-        let _ = self.blocks.split_off(&(fork_point + 1));
+        self.blocks.remove_above(fork_point);
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
@@ -1109,7 +1087,7 @@ impl AggregationFunc for FirstAgg {
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
         // Finalized first = earliest block's first value
-        drain_up_to(&mut self.blocks, block, |v| {
+        self.blocks.drain_up_to(block, |v| {
             if self.finalized.is_none() {
                 self.finalized = Some(v);
             }
@@ -1136,7 +1114,7 @@ impl AggregationFunc for FirstAgg {
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
             finalized: self.finalized.clone(),
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
         };
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
@@ -1146,7 +1124,7 @@ impl AggregationFunc for FirstAgg {
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
-        self.blocks.keys().copied().collect()
+        self.blocks.iter().map(|(block, _)| *block).collect()
     }
 
     fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
@@ -1166,14 +1144,14 @@ impl AggregationFunc for FirstAgg {
 pub struct LastAgg {
     finalized: Option<Value>,
     /// block -> last value seen in that block
-    blocks: BTreeMap<BlockNumber, Value>,
+    blocks: Blocks<Value>,
 }
 
 impl LastAgg {
     pub fn new() -> Self {
         Self {
             finalized: None,
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
         }
     }
 }
@@ -1187,11 +1165,11 @@ impl AggregationFunc for LastAgg {
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
-        self.blocks.remove(&block);
+        self.blocks.remove(block);
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
-        let _ = self.blocks.split_off(&(fork_point + 1));
+        self.blocks.remove_above(fork_point);
     }
 
     fn move_block(&mut self, block: BlockNumber, into: &mut dyn AggregationFunc) {
@@ -1204,7 +1182,7 @@ impl AggregationFunc for LastAgg {
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
         // Finalized last = latest value from blocks being finalized
-        drain_up_to(&mut self.blocks, block, |v| self.finalized = Some(v));
+        self.blocks.drain_up_to(block, |v| self.finalized = Some(v));
     }
 
     fn current_value(&self) -> Value {
@@ -1226,7 +1204,7 @@ impl AggregationFunc for LastAgg {
     fn write_finalized(&self, out: &mut Vec<u8>) {
         let finalized = Self {
             finalized: self.finalized.clone(),
-            blocks: BTreeMap::new(),
+            blocks: Blocks::new(),
         };
         rmp_serde::encode::write(out, &finalized).unwrap();
     }
@@ -1236,7 +1214,7 @@ impl AggregationFunc for LastAgg {
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
-        self.blocks.keys().copied().collect()
+        self.blocks.iter().map(|(block, _)| *block).collect()
     }
 
     fn write_block(&self, block: BlockNumber, out: &mut Vec<u8>) -> bool {
@@ -1741,7 +1719,7 @@ mod tests {
             agg.finalize_up_to(101);
 
             let mut cleared = agg.clone();
-            cleared.blocks.clear();
+            cleared.blocks = Blocks::new();
             let expected = rmp_serde::to_vec(&cleared).unwrap();
 
             // `write_finalized` appends: the byte in front must stay.

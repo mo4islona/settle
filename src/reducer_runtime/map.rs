@@ -21,10 +21,9 @@ pub struct StateMaps {
     /// The block of the changes that come next.
     block: BlockNumber,
     /// The changes of the blocks not final yet, oldest first.
-    undo: VecDeque<Change>,
-    /// For each MAP field, the keys that a final block changed since the
-    /// last checkpoint.
-    unsaved: Vec<FxHashSet<Arc<str>>>,
+    undo: Journal,
+    /// The keys that a final block changed since the last checkpoint.
+    unsaved: Unsaved,
 }
 
 /// One change of an entry.
@@ -36,6 +35,159 @@ struct Change {
     old: Option<Value>,
 }
 
+/// Changes in block order. One change stays inline: most groups change one
+/// entry between two finalizations, and an idle group holds no buffer.
+#[derive(Default)]
+enum Journal {
+    #[default]
+    Empty,
+    One(Change),
+    Many(VecDeque<Change>),
+}
+
+impl Journal {
+    fn push(&mut self, change: Change) {
+        match self {
+            Self::Many(changes) => changes.push_back(change),
+            Self::Empty => *self = Self::One(change),
+            Self::One(_) => {
+                let Self::One(first) = std::mem::take(self) else {
+                    unreachable!()
+                };
+                let mut changes = VecDeque::with_capacity(4);
+                changes.extend([first, change]);
+                *self = Self::Many(changes);
+            }
+        }
+    }
+
+    /// Remove the newest change if its block is above `block`.
+    fn pop_above(&mut self, block: BlockNumber) -> Option<Change> {
+        let popped = match self {
+            Self::Empty => None,
+            Self::One(change) if change.block <= block => None,
+            Self::One(_) => match std::mem::take(self) {
+                Self::One(change) => Some(change),
+                _ => unreachable!(),
+            },
+            Self::Many(changes) => match changes.back() {
+                Some(change) if change.block > block => changes.pop_back(),
+                _ => None,
+            },
+        };
+        self.drop_empty();
+        popped
+    }
+
+    /// Remove the changes up to `block`, and hand each to `f`, oldest first.
+    fn drain_up_to(&mut self, block: BlockNumber, mut f: impl FnMut(Change)) {
+        match self {
+            Self::Empty => {}
+            Self::One(change) if change.block > block => {}
+            Self::One(_) => {
+                if let Self::One(change) = std::mem::take(self) {
+                    f(change);
+                }
+            }
+            Self::Many(changes) => {
+                let finalized = changes.partition_point(|c| c.block <= block);
+                changes.drain(..finalized).for_each(f);
+            }
+        }
+        self.drop_empty();
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Change> {
+        let (one, many) = match self {
+            Self::Empty => (None, None),
+            Self::One(change) => (Some(change), None),
+            Self::Many(changes) => (None, Some(changes.iter())),
+        };
+        one.into_iter().chain(many.into_iter().flatten())
+    }
+
+    /// For each of `keys` that a block after `finalized` changed, the value
+    /// that the first of those changes replaced: its value as of finality.
+    /// The other changes stay out, however many they are.
+    fn replaced_after(
+        &self,
+        finalized: BlockNumber,
+        keys: &Unsaved,
+    ) -> FxHashMap<(u16, &str), Option<&Value>> {
+        let mut replaced = FxHashMap::default();
+        for change in self.iter().filter(|c| c.block > finalized) {
+            if keys.contains(change.map, &change.key) {
+                replaced
+                    .entry((change.map, &*change.key))
+                    .or_insert(change.old.as_ref());
+            }
+        }
+        replaced
+    }
+
+    fn drop_empty(&mut self) {
+        if let Self::Many(changes) = self
+            && changes.is_empty()
+        {
+            *self = Self::Empty;
+        }
+    }
+}
+
+/// Keys of MAP fields, as `(map, key)`. One key stays inline, as in
+/// `Journal`.
+#[derive(Default)]
+enum Unsaved {
+    #[default]
+    Empty,
+    One(u16, Arc<str>),
+    /// The keys of each MAP field.
+    Many(Vec<FxHashSet<Arc<str>>>),
+}
+
+impl Unsaved {
+    /// Add `key` of MAP field `map`, one of `maps` fields.
+    fn insert(&mut self, map: u16, key: Arc<str>, maps: usize) {
+        match self {
+            Self::Many(keys) => {
+                keys[map as usize].insert(key);
+            }
+            Self::One(m, k) if *m == map && **k == *key => {}
+            Self::Empty => *self = Self::One(map, key),
+            Self::One(..) => {
+                let Self::One(first_map, first) = std::mem::take(self) else {
+                    unreachable!()
+                };
+                let mut keys = vec![FxHashSet::default(); maps];
+                keys[first_map as usize].insert(first);
+                keys[map as usize].insert(key);
+                *self = Self::Many(keys);
+            }
+        }
+    }
+
+    fn contains(&self, map: u16, key: &str) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(m, k) => *m == map && **k == *key,
+            Self::Many(keys) => keys[map as usize].contains(key),
+        }
+    }
+
+    /// Hand each key to `f`, with its MAP field.
+    fn for_each(self, mut f: impl FnMut(u16, Arc<str>)) {
+        match self {
+            Self::Empty => {}
+            Self::One(map, key) => f(map, key),
+            Self::Many(keys) => {
+                for (map, keys) in keys.into_iter().enumerate() {
+                    keys.into_iter().for_each(|key| f(map as u16, key));
+                }
+            }
+        }
+    }
+}
+
 impl StateMaps {
     /// Empty maps for the MAP fields `names`.
     pub fn new(names: Arc<ColumnRegistry>) -> Self {
@@ -44,8 +196,8 @@ impl StateMaps {
             names,
             entries: (0..count).map(|_| FxHashMap::default()).collect(),
             block: 0,
-            undo: VecDeque::new(),
-            unsaved: (0..count).map(|_| FxHashSet::default()).collect(),
+            undo: Journal::Empty,
+            unsaved: Unsaved::Empty,
         }
     }
 
@@ -102,7 +254,7 @@ impl StateMaps {
     }
 
     fn log(&mut self, map: usize, key: Arc<str>, old: Option<Value>) {
-        self.undo.push_back(Change {
+        self.undo.push(Change {
             block: self.block,
             map: map as u16,
             key,
@@ -112,9 +264,7 @@ impl StateMaps {
 
     /// Undo the changes of the blocks after `fork_point`, newest first.
     pub(crate) fn rollback(&mut self, fork_point: BlockNumber) {
-        let kept = self.undo.partition_point(|c| c.block <= fork_point);
-        while self.undo.len() > kept {
-            let change = self.undo.pop_back().expect("a change above the kept ones");
+        while let Some(change) = self.undo.pop_above(fork_point) {
             let entries = &mut self.entries[change.map as usize];
             match change.old {
                 Some(old) => entries.insert(change.key, old),
@@ -126,10 +276,10 @@ impl StateMaps {
     /// The blocks up to `block` are final: their changes can no longer be
     /// undone, and their keys wait for the next checkpoint.
     pub(crate) fn finalize(&mut self, block: BlockNumber) {
-        let finalized = self.undo.partition_point(|c| c.block <= block);
-        for change in self.undo.drain(..finalized) {
-            self.unsaved[change.map as usize].insert(change.key);
-        }
+        let maps = self.entries.len();
+        let unsaved = &mut self.unsaved;
+        self.undo
+            .drain_up_to(block, |change| unsaved.insert(change.map, change.key, maps));
     }
 
     /// Write each unsaved entry as of `finalized` into `batch`: its value,
@@ -141,41 +291,22 @@ impl StateMaps {
         group_key: &[u8],
         batch: &mut StorageWriteBatch,
     ) {
-        let Self {
-            entries,
-            undo,
-            unsaved,
-            ..
-        } = self;
+        let replaced = self.undo.replaced_after(finalized, &self.unsaved);
+        let entries = &self.entries;
 
-        // An entry that a block after finality changed had, as of finality,
-        // the value that the first of those changes replaced.
-        let above = undo.partition_point(|c| c.block <= finalized);
-        let mut replaced: FxHashMap<(u16, &str), Option<&Value>> = FxHashMap::default();
-        for change in undo.range(above..) {
-            if unsaved[change.map as usize].contains(&*change.key) {
-                replaced
-                    .entry((change.map, &*change.key))
-                    .or_insert(change.old.as_ref());
-            }
-        }
-
-        for (map, keys) in unsaved.iter_mut().enumerate() {
-            let map = map as u16;
-            for key in keys.drain() {
-                let value = match replaced.get(&(map, &*key)) {
-                    Some(old) => *old,
-                    None => entries[map as usize].get(&*key),
-                };
-                match value {
-                    Some(value) => {
-                        let bytes = storage::encode_value_bytes(value);
-                        batch.put_reducer_map_entry(reducer, group_key, map, &key, bytes);
-                    }
-                    None => batch.delete_reducer_map_entry(reducer, group_key, map, &key),
+        std::mem::take(&mut self.unsaved).for_each(|map, key| {
+            let value = match replaced.get(&(map, &*key)) {
+                Some(old) => *old,
+                None => entries[map as usize].get(&*key),
+            };
+            match value {
+                Some(value) => {
+                    let bytes = storage::encode_value_bytes(value);
+                    batch.put_reducer_map_entry(reducer, group_key, map, &key, bytes);
                 }
+                None => batch.delete_reducer_map_entry(reducer, group_key, map, &key),
             }
-        }
+        });
     }
 }
 
@@ -203,6 +334,8 @@ impl MapMut<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::storage::BatchOp;
 
@@ -234,6 +367,19 @@ mod tests {
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// The entries that `batch` writes, with their MAP field; None deletes.
+    fn written_to(batch: &StorageWriteBatch) -> Vec<(usize, String, Option<Value>)> {
+        let decode = |value: &[u8]| storage::decode_value_bytes(value).unwrap();
+        let entry = |op: &BatchOp| match op {
+            BatchOp::PutReducerMapEntry {
+                map, key, value, ..
+            } => (*map as usize, key.clone(), Some(decode(value))),
+            BatchOp::DeleteReducerMapEntry { map, key, .. } => (*map as usize, key.clone(), None),
+            other => panic!("unexpected {other:?}"),
+        };
+        batch.ops.iter().map(entry).collect()
     }
 
     /// A rollback restores the entries that the undone blocks set, added and
@@ -309,5 +455,124 @@ mod tests {
         let mut batch = StorageWriteBatch::new();
         maps.write_checkpoint(2, "r", b"g", &mut batch);
         assert!(batch.ops.is_empty());
+    }
+
+    /// Maps with nothing to undo or to write hold no buffer for that: most
+    /// groups are idle, and an idle group must stay small.
+    #[test]
+    fn idle_maps_hold_no_buffer() {
+        let mut maps = book();
+        maps.begin(1);
+        for key in ["a", "b", "c", "d", "e"] {
+            maps.set(0, key, Value::UInt64(1));
+        }
+        maps.finalize(1);
+        maps.write_checkpoint(1, "r", b"g", &mut StorageWriteBatch::new());
+
+        assert!(matches!(maps.undo, Journal::Empty));
+        assert!(matches!(maps.unsaved, Unsaved::Empty));
+    }
+
+    /// A checkpoint looks up only the keys that it writes, not every key
+    /// that an unfinal block changed.
+    #[test]
+    fn checkpoint_skips_unfinal_keys_it_does_not_write() {
+        let mut maps = book();
+        maps.begin(1);
+        maps.set(0, "saved", Value::UInt64(1));
+        maps.begin(2);
+        for key in 0..1000 {
+            maps.set(0, &format!("k{key}"), Value::UInt64(key));
+        }
+        maps.set(0, "saved", Value::UInt64(2));
+        maps.finalize(1);
+
+        let replaced = maps.undo.replaced_after(1, &maps.unsaved);
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[&(0, "saved")], Some(&Value::UInt64(1)));
+    }
+
+    /// Random changes, rollbacks, finalizations and checkpoints agree with
+    /// copies of the maps: the entries now, and in storage the entries as of
+    /// the finality of the last checkpoint.
+    #[test]
+    fn maps_agree_with_copies() {
+        type Copy = [BTreeMap<String, u64>; 2];
+
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+
+        for _ in 0..500 {
+            let names = ColumnRegistry::new(vec!["a".to_string(), "b".to_string()]);
+            let mut maps = StateMaps::new(Arc::new(names));
+            let mut now: Copy = Default::default();
+            // The entries before each block that is not final.
+            let mut before: BTreeMap<BlockNumber, Copy> = BTreeMap::new();
+            let mut stored: Copy = Default::default();
+            let mut finalized = 0;
+            let mut block = 1;
+
+            for _ in 0..40 {
+                match next(6) {
+                    0..=2 => {
+                        before.entry(block).or_insert_with(|| now.clone());
+                        maps.begin(block);
+                        let map = next(2) as usize;
+                        let key = format!("k{}", next(3));
+                        if next(3) == 0 {
+                            maps.remove(map, &key);
+                            now[map].remove(&key);
+                        } else {
+                            let value = 1 + next(100);
+                            maps.set(map, &key, Value::UInt64(value));
+                            now[map].insert(key, value);
+                        }
+                    }
+                    3 => block += 1,
+                    4 => {
+                        let fork = finalized + next(block - finalized + 1);
+                        maps.rollback(fork);
+                        if let Some(copy) = before.range(fork + 1..).next().map(|(_, c)| c) {
+                            now = copy.clone();
+                        }
+                        before.split_off(&(fork + 1));
+                        block = block.max(fork + 1);
+                    }
+                    _ => {
+                        finalized += next(block - finalized + 1);
+                        maps.finalize(finalized);
+                        before = before.split_off(&(finalized + 1));
+                        block = block.max(finalized + 1);
+                        if next(2) == 0 {
+                            continue;
+                        }
+
+                        let mut batch = StorageWriteBatch::new();
+                        maps.write_checkpoint(finalized, "r", b"g", &mut batch);
+                        for (map, key, value) in written_to(&batch) {
+                            match value {
+                                Some(value) => stored[map].insert(key, value.as_u64().unwrap()),
+                                None => stored[map].remove(&key),
+                            };
+                        }
+                        let at_finality = before.values().next().unwrap_or(&now);
+                        assert_eq!(&stored, at_finality);
+                    }
+                }
+
+                for (map, copy) in now.iter().enumerate() {
+                    let entries: BTreeMap<String, u64> = maps.entries[map]
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.as_u64().unwrap()))
+                        .collect();
+                    assert_eq!(&entries, copy);
+                }
+            }
+        }
     }
 }
