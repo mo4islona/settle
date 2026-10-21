@@ -12,10 +12,13 @@ use crate::schema::ast::{ReducerBody, ReducerDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
 use crate::types::{BlockNumber, ColumnId, ColumnRegistry, Row, Value};
 
+use super::evict::{Eviction, Victims};
+
 /// Orchestrates a single reducer: state management, rollback, and output.
 ///
-/// State is kept entirely in memory during normal processing. Storage is only
-/// used for persisting finalized state. Each group keeps its state from
+/// State is kept in memory during normal processing. Storage holds the
+/// finalized state, which a group loads when it is not in memory: on its
+/// first row after an open or after `evict`. Each group keeps its state from
 /// before each block that changed it and is not final yet, so that rollback
 /// can restore to any unfinalized block without serialization overhead.
 pub struct ReducerEngine {
@@ -29,13 +32,14 @@ pub struct ReducerEngine {
     map_fields: Arc<ColumnRegistry>,
     /// Cached default state (computed once from def.state).
     default_state: Vec<Value>,
-    /// Every group since open or `reload`.
+    /// The groups in memory.
     groups: Groups,
     /// Whether a new group reads its state from storage. False when storage
     /// held no state of the reducer at open or `reload`, as on a fresh
-    /// database: groups are never evicted, so storage then holds no group
+    /// database, and no group was evicted since: storage then holds no group
     /// that `groups` lacks.
     reads_storage: bool,
+    eviction: Eviction,
     /// The groups that each block not final yet changed, by id. Each of them
     /// holds an undo entry for the block.
     block_groups: BTreeMap<BlockNumber, Vec<usize>>,
@@ -74,14 +78,25 @@ struct Group {
     undo: VecDeque<(BlockNumber, Vec<Value>)>,
     /// Whether `pending_durable` holds the group.
     pending_durable: bool,
+    /// The checkpoint that last wrote the state; 0 if none did since the
+    /// group loaded.
+    written: u64,
     /// The MAP fields, with their own undo; None for a reducer without
     /// them.
     maps: Option<Box<StateMaps>>,
 }
 
-/// The groups of a reducer by id, their index in `all`. Never evicted: a
-/// group that is not here loads its stored state, which lacks the
-/// checkpoints of unacked batches.
+impl Group {
+    /// Whether storage holds the state of the group, once checkpoint
+    /// `committed` is on disk.
+    fn stored(&self, committed: u64) -> bool {
+        self.undo.is_empty() && !self.pending_durable && self.written <= committed
+    }
+}
+
+/// The groups of a reducer in memory by id, their index in `all`. A group
+/// that is not here loads its stored state, so a group leaves only when
+/// storage holds its state (`Group::stored`).
 #[derive(Default)]
 struct Groups {
     all: Vec<Group>,
@@ -102,10 +117,33 @@ impl Groups {
             state,
             undo: VecDeque::new(),
             pending_durable: false,
+            written: 0,
             maps,
         });
         self.ids.insert(key.into(), id);
         Ok(id)
+    }
+
+    /// Drop the groups that `evict` picks, and give the new id of each old
+    /// one. The dropped groups get `usize::MAX`.
+    fn evict(&mut self, mut evict: impl FnMut(&Group) -> bool) -> Vec<usize> {
+        let mut new_ids = Vec::with_capacity(self.all.len());
+        let mut kept = 0;
+        self.all.retain(|group| {
+            if evict(group) {
+                new_ids.push(usize::MAX);
+                return false;
+            }
+            new_ids.push(kept);
+            kept += 1;
+            true
+        });
+
+        self.ids.retain(|_, id| {
+            *id = new_ids[*id];
+            *id != usize::MAX
+        });
+        new_ids
     }
 
     /// The group `id`, about to change in `block`. Its first change in the
@@ -205,6 +243,7 @@ impl ReducerEngine {
             default_state,
             groups: Groups::default(),
             reads_storage,
+            eviction: Eviction::default(),
             block_groups: BTreeMap::new(),
             pending_durable: Vec::new(),
             key: Vec::new(),
@@ -508,6 +547,7 @@ impl ReducerEngine {
     pub fn reload(&mut self) {
         self.groups.clear();
         self.reads_storage = stores_state(self.storage.as_ref(), &self.def.name);
+        self.eviction = Eviction::default();
         self.block_groups.clear();
         self.pending_durable.clear();
         self.emits.truncate_columns(self.def.group_by.len());
@@ -541,11 +581,18 @@ impl ReducerEngine {
         }
     }
 
-    /// Write the state as of `finalized` of every group in `pending_durable`.
-    pub fn write_checkpoint(&mut self, finalized: BlockNumber, batch: &mut StorageWriteBatch) {
+    /// Write the state as of `finalized` of every group in `pending_durable`,
+    /// as part of checkpoint number `checkpoint`.
+    pub fn write_checkpoint(
+        &mut self,
+        finalized: BlockNumber,
+        checkpoint: u64,
+        batch: &mut StorageWriteBatch,
+    ) {
         for id in self.pending_durable.drain(..) {
             let group = &mut self.groups.all[id];
             group.pending_durable = false;
+            group.written = checkpoint;
 
             let above = group.undo.partition_point(|(b, _)| *b <= finalized);
             let state = group.undo.get(above).map_or(&group.state, |(_, state)| state);
@@ -554,6 +601,37 @@ impl ReducerEngine {
                 maps.write_checkpoint(finalized, &self.def.name, &group.key, batch);
             }
         }
+    }
+
+    /// Once more than `cap` groups are in memory, drop those that storage
+    /// holds, the least recently written first (see `Eviction`). Checkpoint
+    /// `committed` is the last one on disk.
+    pub fn evict(&mut self, cap: usize, committed: u64) {
+        let count = self.eviction.due(self.groups.all.len(), cap, committed);
+        if count == 0 {
+            return;
+        }
+
+        let stored = self.groups.all.iter().filter(|g| g.stored(committed));
+        let written = stored.map(|g| g.written).collect();
+        if let Some(mut victims) = Victims::new(written, count) {
+            let new_ids = self
+                .groups
+                .evict(|g| g.stored(committed) && victims.pick(g.written));
+            // The groups of these have unfinal blocks or wait for a
+            // checkpoint, so none of them left.
+            let pinned = self.block_groups.values_mut().flatten();
+            for id in pinned.chain(&mut self.pending_durable) {
+                *id = new_ids[*id];
+            }
+            self.reads_storage = true;
+        }
+        self.eviction.done(self.groups.all.len(), cap, committed);
+    }
+
+    #[cfg(test)]
+    pub fn resident_groups(&self) -> usize {
+        self.groups.all.len()
     }
 }
 
@@ -857,7 +935,7 @@ mod tests {
         // Finalize up to 1000
         let mut batch = StorageWriteBatch::new();
         engine.advance_finality(1000);
-        engine.write_checkpoint(1000, &mut batch);
+        engine.write_checkpoint(1000, 1, &mut batch);
         storage.commit(&batch).unwrap();
 
         // Block 1002: buy 3 (will be rolled back)
@@ -900,7 +978,7 @@ mod tests {
 
         let mut batch = StorageWriteBatch::new();
         engine.advance_finality(9);
-        engine.write_checkpoint(9, &mut batch);
+        engine.write_checkpoint(9, 1, &mut batch);
         storage.commit(&batch).unwrap();
 
         let stored = storage.get_reducer_finalized("pnl_tracker", b"alice").unwrap().unwrap();
@@ -932,7 +1010,7 @@ mod tests {
             .unwrap();
         let mut batch = StorageWriteBatch::new();
         engine.advance_finality(1);
-        engine.write_checkpoint(1, &mut batch);
+        engine.write_checkpoint(1, 1, &mut batch);
         storage.commit(&batch).unwrap();
         assert!(!engine.reads_storage);
 
@@ -1361,6 +1439,84 @@ mod tests {
         assert_eq!(bob_out[0].get("position_size"), Some(&Value::Float64(5.0)));
     }
 
+    /// Finalize `block`, then write checkpoint `checkpoint` if given.
+    fn finalize(
+        engine: &mut ReducerEngine,
+        block: BlockNumber,
+        checkpoint: Option<u64>,
+    ) -> StorageWriteBatch {
+        engine.advance_finality(block);
+        let mut batch = StorageWriteBatch::new();
+        if let Some(number) = checkpoint {
+            engine.write_checkpoint(block, number, &mut batch);
+        }
+        batch
+    }
+
+    fn stored_quantity(storage: &MemoryBackend, user: &str) -> Option<Value> {
+        let bytes = storage.get_reducer_finalized("pnl", user.as_bytes()).unwrap()?;
+        Some(storage::decode_values(&bytes).unwrap()[0].clone())
+    }
+
+    /// Eviction drops only the groups that storage holds, those written
+    /// longest ago first. A group with an unfinal block, a final block that
+    /// waits for a checkpoint, or a checkpoint not on disk stays, and keeps
+    /// its place in the bookkeeping of finality. A dropped group loads its
+    /// stored state on its next row.
+    #[test]
+    fn eviction_drops_only_stored_groups() {
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine = ReducerEngine::with_runtime(
+            pnl_external_def(),
+            storage.clone(),
+            &trade_registry(),
+            Box::new(pnl_fn_runtime()),
+        )
+        .unwrap();
+        let buy = |user: &str| [make_trade(user, "buy", 1.0, 100.0)];
+
+        // a, b, c: written by checkpoints 1, 2 and 3, on disk. d: written by
+        // checkpoint 4, not on disk yet. e: final, no checkpoint. f: unfinal.
+        for (block, user) in [(1, "a"), (2, "b"), (3, "c")] {
+            engine.process_block(block, &buy(user)).unwrap();
+            storage.commit(&finalize(&mut engine, block, Some(block))).unwrap();
+        }
+        engine.process_block(4, &buy("d")).unwrap();
+        let unacked = finalize(&mut engine, 4, Some(4));
+        engine.process_block(5, &buy("e")).unwrap();
+        finalize(&mut engine, 5, None);
+        engine.process_block(6, &buy("f")).unwrap();
+
+        let resident = |engine: &ReducerEngine| {
+            let mut keys: Vec<&[u8]> = engine.groups.ids.keys().map(|k| &k[..]).collect();
+            keys.sort();
+            keys.join(&b' ')
+        };
+
+        // 6 groups, cap 5: down to 4, so the two oldest of a, b and c go.
+        engine.evict(5, 3);
+        assert_eq!(resident(&engine), b"c d e f");
+        engine.evict(0, 3);
+        assert_eq!(resident(&engine), b"d e f");
+
+        storage.commit(&unacked).unwrap();
+        storage.commit(&finalize(&mut engine, 6, Some(5))).unwrap();
+        for user in ["d", "e", "f"] {
+            assert_eq!(stored_quantity(&storage, user), Some(Value::Float64(1.0)), "{user}");
+        }
+        engine.evict(0, 5);
+        assert_eq!(resident(&engine), b"");
+
+        // 1 bought at 100 before the eviction.
+        for user in ["a", "f"] {
+            let output = engine
+                .process_block(7, &[make_trade(user, "sell", 1.0, 300.0)])
+                .unwrap();
+            assert_eq!(output[0].get("trade_pnl"), Some(&Value::Float64(200.0)), "{user}");
+            engine.rollback(6);
+        }
+    }
+
     /// needs_host_callback() must be true for ExternalRuntime without JS context,
     /// and false after set_runtime replaces it with FnReducer.
     #[test]
@@ -1656,7 +1812,7 @@ mod tests {
 
         let mut batch = StorageWriteBatch::new();
         engine.advance_finality(2);
-        engine.write_checkpoint(2, &mut batch);
+        engine.write_checkpoint(2, 1, &mut batch);
         storage.commit(&batch).unwrap();
 
         engine.reload();
@@ -1800,7 +1956,7 @@ mod tests {
 
         let mut batch = StorageWriteBatch::new();
         engine.advance_finality(2);
-        engine.write_checkpoint(2, &mut batch);
+        engine.write_checkpoint(2, 1, &mut batch);
         storage.commit(&batch).unwrap();
         engine.reload();
         block(engine, 3, &[event("alice", 4.0), event("bob", 8.0)]);

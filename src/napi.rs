@@ -78,6 +78,10 @@ pub struct SettleConfig {
     /// such a reopen, `ingest()` throws until every external reducer has
     /// its callback.
     pub backfill_checkpoint_interval: Option<u32>,
+    /// Most groups that each reducer and each view keeps in memory, about
+    /// (default 1,000,000). Above it, groups whose state is on disk leave
+    /// memory and load again on their next row.
+    pub max_resident_groups: Option<u32>,
 }
 
 /// Block cursor: number + hash.
@@ -181,6 +185,9 @@ impl Settle {
         }
         if let Some(blocks) = config.backfill_checkpoint_interval {
             cfg = cfg.backfill_checkpoint_interval(u64::from(blocks));
+        }
+        if let Some(groups) = config.max_resident_groups {
+            cfg = cfg.max_resident_groups(groups as usize);
         }
         cfg.compression = config.compression;
         cfg.cache_size = match config.cache_size {

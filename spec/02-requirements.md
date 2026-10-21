@@ -179,10 +179,10 @@ Settle meets the throughput floors of [11-performance.md](11-performance.md) for
 *Acceptance:* Each SLO row of 11 holds in the benchmark run before a release.
 *Trace:* ADR-9; SLI-1, SLI-8.
 
-**REQ-41 — Bounded memory.** [MUST — intent, currently violated by GAP-6]
-The resident memory of an instance stays below a ceiling that the host can compute from the configuration.
+**REQ-41 — Bounded memory.** [MUST]
+The resident memory of an instance with the persistent backend stays below a ceiling that the host can compute from the configuration.
 *Acceptance:* A run with P-W-GROUPS at its largest value stays below P-MEMORY-CEILING.
-*Trace:* ADR-8; PF-1, RS-20.
+*Trace:* ADR-8; PF-1, RS-20, RS-24.
 
 **REQ-42 — No termination by input.** [MUST]
 No schema text, row, chain, reducer result or call sequence terminates the host process. Settle returns an error.

@@ -696,6 +696,12 @@ pub trait StorageBackend: Send + Sync {
 
     fn list_mv_group_keys(&self, view: &str) -> Result<Vec<Vec<u8>>>;
 
+    /// Whether `view` has any stored state. A backend that can stop at the
+    /// first key overrides this default, which lists them all.
+    fn has_mv_state(&self, view: &str) -> Result<bool> {
+        Ok(!self.list_mv_group_keys(view)?.is_empty())
+    }
+
     // --- Metadata ---
 
     fn put_meta(&self, key: &str, value: &[u8]) -> Result<()>;
@@ -816,6 +822,34 @@ mod tests {
     fn has_reducer_finalized_in_rocksdb() {
         let dir = tempfile::tempdir().unwrap();
         check_has_reducer_finalized(&rocks::RocksDbBackend::open(dir.path()).unwrap());
+    }
+
+    /// As `check_has_reducer_finalized`, for the state of a view.
+    fn check_has_mv_state(backend: &dyn StorageBackend) {
+        assert!(!backend.has_mv_state("v").unwrap());
+
+        let mut neighbours = StorageWriteBatch::new();
+        neighbours.put_mv_state("u", b"k".to_vec(), vec![1]);
+        neighbours.put_mv_state("vv", b"k".to_vec(), vec![1]);
+        backend.commit(&neighbours).unwrap();
+        assert!(!backend.has_mv_state("v").unwrap());
+
+        let mut own = StorageWriteBatch::new();
+        own.put_mv_state("v", Vec::new(), vec![1]);
+        backend.commit(&own).unwrap();
+        assert!(backend.has_mv_state("v").unwrap());
+    }
+
+    #[test]
+    fn has_mv_state_in_memory() {
+        check_has_mv_state(&memory::MemoryBackend::new());
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn has_mv_state_in_rocksdb() {
+        let dir = tempfile::tempdir().unwrap();
+        check_has_mv_state(&rocks::RocksDbBackend::open(dir.path()).unwrap());
     }
 
     /// A group reads only its own Map entries: not those of a group whose

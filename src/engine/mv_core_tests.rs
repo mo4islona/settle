@@ -247,7 +247,7 @@ fn mv_finalize_then_rollback() {
 
     let mut batch = StorageWriteBatch::new();
     mv.advance_finality(1001);
-    mv.write_checkpoint(&mut batch);
+    mv.write_checkpoint(1, &mut batch);
 
     // Rollback block 1002
     let changes = mv.rollback(1001);
@@ -460,7 +460,7 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
         );
         let mut batch = StorageWriteBatch::new();
         mv.advance_finality(1);
-        mv.write_checkpoint(&mut batch);
+        mv.write_checkpoint(1, &mut batch);
         storage.commit(&batch).unwrap();
     }
 
@@ -482,15 +482,13 @@ fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
 
         let mut batch = StorageWriteBatch::new();
         mv.advance_finality(1);
-        mv.write_checkpoint(&mut batch);
+        mv.write_checkpoint(1, &mut batch);
         storage.commit(&batch).unwrap();
     }
 
-    // Phase 3: Restore — BTC/USDC should not be resurrected
-    {
-        let mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types()).unwrap();
-        assert_eq!(mv.groups.len(), 1, "only ETH/USDC should survive");
-    }
+    // Phase 3: BTC/USDC is not on disk
+    let stored = storage.list_mv_group_keys(&simple_sum_mv_def().name).unwrap();
+    assert_eq!(stored.len(), 1, "only ETH/USDC should survive");
 }
 
 fn pool_row(pool: &str, amount: f64) -> RowMap {
@@ -525,7 +523,7 @@ fn finalize_and_commit(
     let mut batch = StorageWriteBatch::new();
     mv.advance_finality(block);
     if checkpoint {
-        mv.write_checkpoint(&mut batch);
+        mv.write_checkpoint(1, &mut batch);
     }
     storage.commit(&batch).unwrap();
     batch
@@ -609,7 +607,8 @@ fn finalize_persists_groups_of_finalized_blocks_only() {
     let restored = MVEngine::new(simple_sum_mv_def(), storage, &test_column_types()).unwrap();
     let total = |pool: &str| {
         let key: GroupKey = std::iter::once(Value::String(pool.into())).collect();
-        restored.groups[&key][0].current_value()
+        let group = restored.load_group(&key).unwrap().unwrap();
+        group.aggs[0].current_value()
     };
     assert_eq!(total("A"), Value::Float64(4.0));
     assert_eq!(total("B"), Value::Float64(2.0));
@@ -625,9 +624,56 @@ fn replay_block_drops_group_without_data() {
     let mut mv = MVEngine::new(def, test_storage(), &test_column_types()).unwrap();
 
     let pool = ("pool", Value::String("ETH/USDC".into()));
-    mv.replay_block(1000, &[make_row(&[pool.clone(), ("amount", Value::Null)])]);
+    mv.replay_block(1000, &[make_row(&[pool.clone(), ("amount", Value::Null)])])
+        .unwrap();
 
     let changes = mv.process_block(1001, &[make_row(&[pool, ("amount", Value::Float64(5.0))])]);
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].operation, ChangeOp::Insert);
+}
+
+/// Eviction drops only the groups that storage holds: not one with an
+/// unfinal block, a final block that waits for a checkpoint, or a checkpoint
+/// not on disk. A dropped group loads its stored state on its next row, so
+/// that row updates it.
+#[test]
+fn eviction_drops_only_stored_groups() {
+    let storage = test_storage();
+    let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone(), &test_column_types()).unwrap();
+    let checkpoint = |mv: &mut MVEngine, block, number| {
+        let mut batch = StorageWriteBatch::new();
+        mv.advance_finality(block);
+        mv.write_checkpoint(number, &mut batch);
+        batch
+    };
+
+    // A: checkpoint 1, on disk. B: checkpoint 2, not on disk yet. C: final,
+    // no checkpoint. D: unfinal.
+    mv.process_block(1, &[pool_row("A", 1.0)]);
+    storage.commit(&checkpoint(&mut mv, 1, 1)).unwrap();
+    mv.process_block(2, &[pool_row("B", 2.0)]);
+    let unacked = checkpoint(&mut mv, 2, 2);
+    mv.process_block(3, &[pool_row("C", 3.0)]);
+    mv.advance_finality(3);
+    mv.process_block(4, &[pool_row("D", 4.0)]);
+
+    let resident = |mv: &MVEngine| {
+        let mut pools: Vec<String> = mv.groups.keys().map(|k| format!("{:?}", k[0])).collect();
+        pools.sort();
+        pools.join(" ")
+    };
+    mv.evict(0, 1);
+    assert_eq!(resident(&mv), r#"String("B") String("C") String("D")"#);
+
+    storage.commit(&unacked).unwrap();
+    storage.commit(&checkpoint(&mut mv, 4, 3)).unwrap();
+    mv.evict(0, 3);
+    assert_eq!(resident(&mv), "");
+
+    for (pool, total) in [("A", 2.0), ("B", 3.0), ("C", 4.0), ("D", 5.0)] {
+        let changes = mv.process_block(5, &[pool_row(pool, 1.0)]);
+        assert_eq!(changes[0].operation, ChangeOp::Update, "{pool}");
+        assert_eq!(changes[0].get("total_volume"), Some(&Value::Float64(total)), "{pool}");
+        mv.rollback(4);
+    }
 }

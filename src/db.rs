@@ -6,7 +6,7 @@ use std::time::Duration;
 use web_time::Instant;
 
 use crate::change::ChangeBuffer;
-use crate::engine::dag::{DEFAULT_RAW_RETENTION_BLOCKS, SettleEngine};
+use crate::engine::dag::{DEFAULT_MAX_RESIDENT_GROUPS, DEFAULT_RAW_RETENTION_BLOCKS, SettleEngine};
 use crate::engine::perf;
 use crate::error::{Error, Result};
 use crate::schema::parser::parse_schema;
@@ -70,6 +70,15 @@ pub struct Config {
     /// deleted, in steps of a tenth of this margin. `u64::MAX` keeps every
     /// raw row.
     pub raw_retention_blocks: u64,
+    /// Most groups that each reducer and each view keeps in memory, about.
+    /// Default 1,000,000. Above it, the groups whose state is on disk leave
+    /// memory, those written longest ago first, down to three quarters of
+    /// it, and a group loads from storage on its next row. A group with an
+    /// unfinal block, a final change that waits for a checkpoint, or a
+    /// checkpoint that waits for its ack stays: those can keep a node above
+    /// the bound. A sliding-window view keeps all of its groups. `usize::MAX`
+    /// keeps every group in memory.
+    pub max_resident_groups: usize,
     /// The sequence of the newest change batch that the target applied, as
     /// the target stored it with the data of that batch; 0 before the first.
     /// Set, it turns on the journal: each batch that `ingest()` or
@@ -96,6 +105,7 @@ impl Config {
             backfill_checkpoint_interval: 1,
             collect_perf: true,
             raw_retention_blocks: DEFAULT_RAW_RETENTION_BLOCKS,
+            max_resident_groups: DEFAULT_MAX_RESIDENT_GROUPS,
             applied_sequence: None,
         }
     }
@@ -114,6 +124,7 @@ impl Config {
             backfill_checkpoint_interval: 1,
             collect_perf: true,
             raw_retention_blocks: DEFAULT_RAW_RETENTION_BLOCKS,
+            max_resident_groups: DEFAULT_MAX_RESIDENT_GROUPS,
             applied_sequence: None,
         }
     }
@@ -186,6 +197,12 @@ impl Config {
     /// See [`Config::raw_retention_blocks`].
     pub fn raw_retention_blocks(mut self, blocks: u64) -> Self {
         self.raw_retention_blocks = blocks;
+        self
+    }
+
+    /// See [`Config::max_resident_groups`].
+    pub fn max_resident_groups(mut self, groups: usize) -> Self {
+        self.max_resident_groups = groups;
         self
     }
 
@@ -341,6 +358,8 @@ struct PendingAck {
     /// Calls without a batch whose writes joined this one. Each takes a
     /// place in the queue, so their writes cannot grow without a bound.
     joined: usize,
+    /// The number of the last checkpoint in `write_batch` or before it.
+    checkpoint: u64,
     since: Instant,
 }
 
@@ -429,6 +448,7 @@ impl Settle {
         let mut engine = SettleEngine::new(&schema, storage.clone())?;
         engine.set_collect_perf(config.collect_perf);
         engine.set_raw_retention_blocks(config.raw_retention_blocks);
+        engine.set_max_resident_groups(config.max_resident_groups);
 
         // Restore persisted state
         if let Some(block) = meta_u64(storage.as_ref(), META_LATEST_BLOCK)? {
@@ -705,6 +725,7 @@ impl Settle {
                 result = Err(e);
                 break;
             }
+            self.engine.set_committed_checkpoint(oldest.checkpoint);
             self.pending.pop_front();
             self.stamp.clear();
             committed = true;
@@ -1087,6 +1108,7 @@ impl Settle {
         if checkpoint {
             self.engine.write_checkpoint(&mut write_batch);
         }
+        self.engine.evict_groups();
         self.append_meta_to_batch(&mut write_batch);
 
         // 4. Update buffer heads with correct cursors (hashes now stored)
@@ -1344,6 +1366,7 @@ impl Settle {
             sequence,
             write_batch,
             joined: 0,
+            checkpoint: self.engine.checkpoints(),
             since: Instant::now(),
         });
         Ok(())
@@ -1394,6 +1417,7 @@ impl Settle {
                 newest.write_batch.delete_journal(sequence, part);
             }
             newest.joined += 1;
+            newest.checkpoint = self.engine.checkpoints();
             return Ok(());
         }
 
@@ -1401,6 +1425,7 @@ impl Settle {
             self.poisoned = Some(format!("{call} commit failed: {e}"));
         })?;
         self.stamp.clear();
+        self.engine.set_committed_checkpoint(self.engine.checkpoints());
         Ok(())
     }
 
@@ -1474,6 +1499,7 @@ mod external_tests;
 
 #[cfg(all(test, feature = "lua"))]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::*;
@@ -1518,5 +1544,41 @@ mod tests {
         let db = open();
         assert_eq!(db.finalized_block(), 49);
         assert_eq!(db.engine.first_unfinal_block(), None);
+    }
+
+    /// Ten new pools a block, final at once, with two batches in flight: no
+    /// reducer and no view holds more than the cap. The groups of the batch
+    /// that waits for its ack stay, the others go.
+    #[test]
+    fn resident_groups_stay_at_the_cap() {
+        let config = Config::new(SCHEMA).max_resident_groups(40);
+        let mut db = Settle::open(config).unwrap();
+        let mut unacked = VecDeque::new();
+
+        for block in 0..100u64 {
+            let rows = (0..10)
+                .map(|i| {
+                    RowMap::from([
+                        ("pool".to_string(), Value::String(format!("{block}-{i}"))),
+                        ("amount".to_string(), Value::UInt64(1)),
+                        ("block_number".to_string(), Value::UInt64(block)),
+                    ])
+                })
+                .collect();
+            let input = IngestInput {
+                data: HashMap::from([("swaps".to_string(), rows)]),
+                rollback_chain: Vec::new(),
+                finalized_head: crate::test_helpers::cursor(block),
+            };
+            unacked.push_back(db.ingest(input).unwrap().unwrap().sequence);
+            assert!(db.engine.most_resident_groups() <= 40, "block {block}");
+
+            if unacked.len() == 2 {
+                db.ack(unacked.pop_front().unwrap()).unwrap();
+            }
+        }
+        // Each eviction goes down to 30 and keeps the 20 groups of the two
+        // batches in flight.
+        assert!(db.engine.most_resident_groups() >= 30);
     }
 }

@@ -417,10 +417,15 @@ fn swap(block: BlockNumber, pool: &str, amount: u64) -> RowMap {
 /// every raw row up to the durable block, so a reopen must replay from the
 /// rows that stay.
 fn reopen(schema: &str, storage: &Arc<MemoryBackend>, interval: u64) -> Settle {
+    reopen_capped(schema, storage, interval, Config::new(schema).max_resident_groups)
+}
+
+fn reopen_capped(schema: &str, storage: &Arc<MemoryBackend>, interval: u64, cap: usize) -> Settle {
     let config = Config::new(schema)
         .storage(storage.clone())
         .backfill_checkpoint_interval(interval)
-        .raw_retention_blocks(0);
+        .raw_retention_blocks(0)
+        .max_resident_groups(cap);
     let mut db = Settle::open(config).unwrap();
     attach_runtimes(&mut db, schema);
     db
@@ -470,6 +475,47 @@ fn reopen_does_not_restore_a_group_without_data() {
             "amount {amount}"
         );
     }
+}
+
+/// A row with a NULL value reaches count(c), so its group has data (DEF-42),
+/// also once its block is final. A fork above that block must leave the row
+/// of the group in the target, and so must a reopen.
+#[test]
+fn count_of_nulls_keeps_its_group_across_a_fork() {
+    const SCHEMA: &str = r#"
+        CREATE TABLE swaps (block_number UInt64, pool String, amount UInt64, ts DateTime);
+        CREATE MATERIALIZED VIEW pool_counts AS
+        SELECT pool, count(amount) AS amounts FROM swaps GROUP BY pool;
+    "#;
+    let null_swap = |block| {
+        let mut row = swap(block, "ETH", 0);
+        row.insert("amount".into(), Value::Null);
+        row
+    };
+    let ops = |batch: &ChangeBatch| -> Vec<ChangeOp> {
+        let records = batch.records_for("pool_counts");
+        records.iter().map(|r| r.operation.clone()).collect()
+    };
+
+    let storage = Arc::new(MemoryBackend::new());
+    {
+        let mut db = reopen(SCHEMA, &storage, 1);
+        let rows = vec![("swaps".into(), 1, vec![null_swap(1)])];
+        let batch = ingest_with_finalized(&mut db, rows, 1).unwrap().unwrap();
+        assert_eq!(ops(&batch), [ChangeOp::Insert]);
+
+        let rows = vec![("swaps".into(), 2, vec![null_swap(2)])];
+        ingest_with_finalized(&mut db, rows, 1).unwrap();
+        let fork = rollback_to(&mut db, 1).unwrap().batch;
+        assert!(fork.as_ref().is_none_or(|batch| ops(batch).is_empty()));
+    }
+
+    let mut db = reopen(SCHEMA, &storage, 1);
+    let rows = vec![("swaps".into(), 2, vec![swap(2, "ETH", 5)])];
+    let batch = ingest_with_finalized(&mut db, rows, 1).unwrap().unwrap();
+    let records = batch.records_for("pool_counts");
+    assert_eq!(ops(&batch), [ChangeOp::Update]);
+    assert_eq!(records[0].get("amounts"), Some(&Value::UInt64(1)));
 }
 
 /// A fork replaces a block of a sliding window while finality stays put, so
@@ -1264,8 +1310,22 @@ fn run(db: &mut Settle, target: &mut Target, op: &Op) -> std::result::Result<(),
 }
 
 fn check_history(schema: &str, interval: u64, forks: bool, seed: u64, steps: usize) {
+    let cap = Config::new(schema).max_resident_groups;
+    check_capped_history(schema, interval, forks, seed, steps, cap);
+}
+
+/// `check_history` where the reopened instance keeps at most `cap` groups
+/// in each reducer and view; the reference keeps all.
+fn check_capped_history(
+    schema: &str,
+    interval: u64,
+    forks: bool,
+    seed: u64,
+    steps: usize,
+    cap: usize,
+) {
     let storage = Arc::new(MemoryBackend::new());
-    let mut reopened = reopen(schema, &storage, interval);
+    let mut reopened = reopen_capped(schema, &storage, interval, cap);
     let mut reference = reopen(schema, &Arc::new(MemoryBackend::new()), interval);
     let mut reopened_target = Target::default();
     let mut reference_target = Target::default();
@@ -1303,7 +1363,7 @@ fn check_history(schema: &str, interval: u64, forks: bool, seed: u64, steps: usi
             }
 
             drop(reopened);
-            reopened = reopen(schema, &storage, interval);
+            reopened = reopen_capped(schema, &storage, interval, cap);
             continue;
         }
 
@@ -1317,7 +1377,8 @@ fn check_history(schema: &str, interval: u64, forks: bool, seed: u64, steps: usi
         assert_eq!(
             actual.is_ok(),
             expected.is_ok(),
-            "seed {seed}, interval {interval}: reopened {actual:?} vs reference {expected:?}\n{}",
+            "seed {seed}, interval {interval}, cap {cap}: reopened {actual:?} vs reference \
+             {expected:?}\n{}",
             log.join("\n")
         );
         if expected.is_ok() {
@@ -1327,7 +1388,7 @@ fn check_history(schema: &str, interval: u64, forks: bool, seed: u64, steps: usi
         let diff = reopened_target.diff(&reference_target);
         assert!(
             diff.is_empty(),
-            "seed {seed}, interval {interval}: outputs differ after\n{}\n\n{}",
+            "seed {seed}, interval {interval}, cap {cap}: outputs differ after\n{}\n\n{}",
             log.join("\n"),
             diff.join("\n")
         );
@@ -1434,6 +1495,40 @@ fn random_short_histories_survive_reopen_sliding() {
     }
 }
 
+const EVERY_SCHEMA: [&str; 6] = [
+    SUM_SCHEMA,
+    REDUCER_SCHEMA,
+    MAP_SCHEMA,
+    FAILING_SCHEMA,
+    CHAIN_SCHEMA,
+    SLIDING_SCHEMA,
+];
+
+/// A cap of 0 evicts after each ingest every group that storage holds, and
+/// a cap of 1 all but one of them, the least recently written first: the
+/// groups load again on their next rows, and the output stays that of the
+/// reference, which evicts none.
+#[test]
+fn random_histories_with_eviction() {
+    for seed in 0..300 {
+        for schema in EVERY_SCHEMA {
+            for cap in [0, 1] {
+                check_capped_history(schema, 1, true, seed, 40, cap);
+                check_capped_history(schema, 3, true, seed, 40, cap);
+            }
+        }
+    }
+}
+
+#[test]
+fn random_short_histories_with_eviction() {
+    for seed in 0..3000 {
+        check_capped_history(SUM_SCHEMA, 1, true, seed, 8, 0);
+        check_capped_history(REDUCER_SCHEMA, 3, true, seed, 8, 0);
+        check_capped_history(CHAIN_SCHEMA, 3, true, seed, 8, 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pipelined acks: the same random histories, with batches that wait for
 // their ack while the next ones are ingested.
@@ -1449,6 +1544,8 @@ struct PipelinedClient {
     interval: u64,
     depth: usize,
     journal: bool,
+    /// `Config::max_resident_groups`.
+    cap: usize,
     storage: Arc<MemoryBackend>,
     db: Settle,
     rng: Rng,
@@ -1470,12 +1567,14 @@ fn open_pipelined(
     interval: u64,
     depth: usize,
     applied: Option<u64>,
+    cap: usize,
 ) -> Settle {
     let mut config = Config::new(schema)
         .storage(storage.clone())
         .backfill_checkpoint_interval(interval)
         .max_pending_batches(depth)
-        .raw_retention_blocks(0);
+        .raw_retention_blocks(0)
+        .max_resident_groups(cap);
     config.applied_sequence = applied;
     let mut db = Settle::open(config).unwrap();
     attach_runtimes(&mut db, schema);
@@ -1493,7 +1592,7 @@ impl PipelinedClient {
 
     fn open(&self) -> Settle {
         let applied = self.journal.then_some(self.applied);
-        open_pipelined(self.schema, &self.storage, self.interval, self.depth, applied)
+        open_pipelined(self.schema, &self.storage, self.interval, self.depth, applied, self.cap)
     }
 
     fn ack(&mut self, sequence: u64) {
@@ -1593,13 +1692,27 @@ fn check_client_history(
     seed: u64,
     steps: usize,
 ) {
+    let cap = Config::new(schema).max_resident_groups;
+    check_capped_client_history(schema, interval, depth, journal, seed, steps, cap);
+}
+
+fn check_capped_client_history(
+    schema: &'static str,
+    interval: u64,
+    depth: usize,
+    journal: bool,
+    seed: u64,
+    steps: usize,
+    cap: usize,
+) {
     let storage = Arc::new(MemoryBackend::new());
     let mut client = PipelinedClient {
         schema,
         interval,
         depth,
         journal,
-        db: open_pipelined(schema, &storage, interval, depth, journal.then_some(0)),
+        cap,
+        db: open_pipelined(schema, &storage, interval, depth, journal.then_some(0), cap),
         storage,
         rng: Rng::new(seed ^ 0x5EED),
         target: Target::default(),
@@ -1638,8 +1751,8 @@ fn check_client_history(
             assert_eq!(
                 actual.is_ok(),
                 expected.is_ok(),
-                "seed {seed}, depth {depth}, interval {interval}, journal {journal}: pipelined \
-                 {actual:?} vs reference {expected:?}\n{}",
+                "seed {seed}, depth {depth}, interval {interval}, journal {journal}, cap {cap}: \
+                 pipelined {actual:?} vs reference {expected:?}\n{}",
                 log.join("\n")
             );
             if expected.is_ok() {
@@ -1651,8 +1764,8 @@ fn check_client_history(
         let diff = client.drained_target().diff(&reference_target);
         assert!(
             diff.is_empty(),
-            "seed {seed}, depth {depth}, interval {interval}, journal {journal}: outputs differ \
-             after\n{}\n\n{}",
+            "seed {seed}, depth {depth}, interval {interval}, journal {journal}, cap {cap}: \
+             outputs differ after\n{}\n\n{}",
             log.join("\n"),
             diff.join("\n")
         );
@@ -1696,6 +1809,21 @@ fn random_pipelined_histories_with_reducer_errors() {
             check_pipelined_history(FAILING_SCHEMA, 1, depth, seed, 40);
             check_pipelined_history(FAILING_SCHEMA, 3, depth, seed, 40);
             check_pipelined_history(CHAIN_SCHEMA, 3, depth, seed, 40);
+        }
+    }
+}
+
+/// Eviction behind unacked batches: a group whose last checkpoint waits for
+/// its ack must stay, else its next row would load the state from before.
+#[test]
+fn random_pipelined_histories_with_eviction() {
+    for seed in 0..300 {
+        for schema in EVERY_SCHEMA {
+            for (depth, journal) in [(2, false), (4, false), (2, true)] {
+                for interval in [1, 3] {
+                    check_capped_client_history(schema, interval, depth, journal, seed, 40, 0);
+                }
+            }
         }
     }
 }
@@ -1899,39 +2027,48 @@ fn assert_open_fails(schema: &str, storage: &Arc<MemoryBackend>, case: &str) {
     );
 }
 
-/// A view whose stored state it cannot read must fail the open. A reopen
-/// that skipped the state would lose finalized aggregates, and replay starts
-/// above them, so it cannot rebuild them.
+/// A sliding window whose stored state it cannot read must fail the open. A
+/// reopen that skipped the state would lose finalized aggregates, and replay
+/// starts above them, so it cannot rebuild them.
 #[test]
-fn unreadable_mv_state_fails_open() {
-    let eth = settle::storage::encode_group_key(&[Value::String("ETH".into())]);
-    let block_one = 1u64.to_be_bytes().to_vec();
-    let views = [
-        (SUM_SCHEMA, "pool_volume", eth),
-        (SLIDING_SCHEMA, "pool_1h", block_one),
-    ];
+fn unreadable_window_fails_open() {
+    let view = "pool_1h";
+    let key = 1u64.to_be_bytes().to_vec();
 
-    for (schema, view, key) in views {
-        let fewer_aggregates: Corruption = |mut r| {
-            r[0] -= 1;
-            r
-        };
-        let corruptions = CORRUPTIONS.iter().copied().chain([("aggregate count", fewer_aggregates)]);
-        for (name, corrupt) in corruptions {
-            // The window record starts with its time, not an aggregate count.
-            if view == "pool_1h" && name == "aggregate count" {
-                continue;
-            }
-            let storage = stored_block_one(schema);
-            let record = storage.get_mv_state(view, &key).unwrap().expect("stored state");
-            overwrite_mv_state(&storage, view, key.clone(), corrupt(record));
-            assert_open_fails(schema, &storage, &format!("{view}, {name}"));
-        }
+    for (name, corrupt) in CORRUPTIONS {
+        let storage = stored_block_one(SLIDING_SCHEMA);
+        let record = storage.get_mv_state(view, &key).unwrap().expect("stored state");
+        overwrite_mv_state(&storage, view, key.clone(), corrupt(record));
+        assert_open_fails(SLIDING_SCHEMA, &storage, &format!("{view}, {name}"));
+    }
 
-        let storage = stored_block_one(schema);
-        let record = storage.get_mv_state(view, &key).unwrap().unwrap();
-        overwrite_mv_state(&storage, view, vec![0xff, 0xff], record);
-        assert_open_fails(schema, &storage, &format!("{view}, unreadable key"));
+    let storage = stored_block_one(SLIDING_SCHEMA);
+    let record = storage.get_mv_state(view, &key).unwrap().unwrap();
+    overwrite_mv_state(&storage, view, vec![0xff, 0xff], record);
+    assert_open_fails(SLIDING_SCHEMA, &storage, &format!("{view}, unreadable key"));
+}
+
+/// Another view loads a group on its first row, as a reducer does, and that
+/// ingest must fail, not start the group with no data.
+#[test]
+fn unreadable_view_group_fails_the_ingest() {
+    let view = "pool_volume";
+    let key = settle::storage::encode_group_key(&[Value::String("ETH".into())]);
+    let fewer_aggregates: Corruption = |mut r| {
+        r[0] -= 1;
+        r
+    };
+
+    let corruptions = CORRUPTIONS.iter().copied().chain([("aggregate count", fewer_aggregates)]);
+    for (name, corrupt) in corruptions {
+        let storage = stored_block_one(SUM_SCHEMA);
+        let record = storage.get_mv_state(view, &key).unwrap().expect("stored state");
+        overwrite_mv_state(&storage, view, key.clone(), corrupt(record));
+
+        let mut db = reopen(SUM_SCHEMA, &storage, 1);
+        let ingested =
+            ingest_with_finalized(&mut db, vec![("swaps".into(), 2, vec![swap(2, "ETH", 10)])], 1);
+        assert!(matches!(ingested, Err(Error::Storage(_))), "{name}: {:?}", ingested.err());
     }
 }
 

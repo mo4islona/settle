@@ -282,6 +282,12 @@ impl StorageBackend for MemoryBackend {
         Ok(())
     }
 
+    fn has_mv_state(&self, view: &str) -> Result<bool> {
+        let inner = self.inner.lock().unwrap();
+        let first = inner.mv_states.range((view.to_string(), Vec::new())..).next();
+        Ok(first.is_some_and(|((v, _), _)| v == view))
+    }
+
     fn list_mv_group_keys(&self, view: &str) -> Result<Vec<Vec<u8>>> {
         let inner = self.inner.lock().unwrap();
         let keys: Vec<Vec<u8>> = inner

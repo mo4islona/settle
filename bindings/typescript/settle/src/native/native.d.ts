@@ -46,6 +46,12 @@ export interface SettleConfig {
    * its callback.
    */
   backfillCheckpointInterval?: number
+  /**
+   * Most groups that each reducer and each view keeps in memory, about
+   * (default 1,000,000). Above it, groups whose state is on disk leave
+   * memory and load again on their next row.
+   */
+  maxResidentGroups?: number
 }
 /** Block cursor: number + hash. */
 export interface SettleCursor {
