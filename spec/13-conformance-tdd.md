@@ -205,7 +205,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | REQ-34 | P | Only PENDING_ACK and WRONG_ACK_SEQUENCE have types (GAP-14). |
 | REQ-35 | P | Builder tests check the generated text and run pipelines. No test compares a builder pipeline with its text. |
 | REQ-40 | P | The throughput bench prints each target. No gate runs it (GAP-37). |
-| REQ-41 | U | known-violated (GAP-6). |
+| REQ-41 | P | CT-2 runs histories with P-RESIDENT-GROUPS at 0 and 1, and a unit test holds each node at the cap. The `resident_memory` bench measures SLI-6 by hand. No gate checks the ceiling. |
 | REQ-42 | P | CT-4 opens a schema with a non-ASCII character at each position, and Lua code that does not compile. A Rust reducer panics in a call. No fuzzer exists (GAP-34). |
 | REQ-43 | P | An instruction case measures one reopen. No time bound is checked. |
 | REQ-44 | P | Purge tests check the margin. No test checks the disk bound. |
@@ -257,7 +257,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | INV-45 | CT-11 | C | Format tests. |
 | INV-46 | CT-8 | P | Corrupt view and reducer state. Raw rows only in unit tests. |
 | INV-47 | CT-1, CT-2 | C | CT-1 compares the finalized cursor after each reopen with the model, with deferral and with gappy chains. |
-| INV-48 | CT-2 | P | Purge tests. No metamorphic run over the margins. |
+| INV-48 | CT-2 | P | Purge tests, and eviction at P-RESIDENT-GROUPS 0 and 1. No metamorphic run over the margins. |
 | INV-49 | CT-3 | U | No power-loss store (GAP-33). |
 | LIV-1 | CT-6 | P | Scale cases double the input, by hand on the host. |
 | LIV-2 | CT-4 | C | A full queue fails at once. |
@@ -295,7 +295,7 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | SLI-3 | CT-6 | P | Measured once. |
 | SLI-4 | CT-6 | P | Manual rollback bench. |
 | SLI-5 | CT-6 | P | One instruction case. |
-| SLI-6 | CT-7 | U | Not measured. |
+| SLI-6 | CT-7 | P | The `resident_memory` bench, by hand. |
 | SLI-7 | CT-6 | C | Instruction counts with a saved baseline and a limit. |
 | SLI-8 | CT-6 | P | Manual, with a cached Postgres baseline. |
 | SLI-9 | CT-6 | P | Manual reorg bench. |
@@ -310,7 +310,6 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 |---|---|---|---|---|
 | GAP-1 | Settle checks no value type at ingest. An aggregate skips each value outside its numeric mode without an error. Lua floats and every number from a JS callback are Float64, so an integer view column drops them. | REQ-27, INV-27, INV-28, FM-4, FM-19, FM-48 | P1 | An external reducer emits a UInt64 state field `n`, and a view sums `n`. Expect the sum of `n`. The code shows that the sum stays empty today, but no test confirms it yet. |
 | GAP-5 | A reducer body has no CPU bound and no memory bound. An endless Lua loop blocks an ingest call forever. | LIV-10, FM-42 | P2 | A Lua body `while true do end`. Expect REDUCER_FAILED within P-REDUCER-STEPS. |
-| GAP-6 | Resident memory has no bound. Reducer groups never leave memory, and an open loads every view group. | REQ-41, PF-1, RS-20 | P1 | Measure the bytes for each group at 1M groups. Then expect a run at P-W-GROUPS below P-MEMORY-CEILING. |
 | GAP-7 | The Lua state table and Lua globals keep values across groups and calls. These values are not rolled back and do not survive a reopen. | INV-36, INV-43 | P2 | Group A sets an undeclared state key. Group B reads it. Expect nil. |
 | GAP-8 | An in-line fork with no common ancestor rolls back to block 0 when `F` is 0. A fork call fails in the same case. | WP-12, FM-22 | P2 | Ingest blocks 0 to 5 with hashes, then a conflict at 3 with no block that matches. Expect NO_COMMON_ANCESTOR. |
 | GAP-9 | The Node and browser bindings keep cursor block numbers as 32-bit numbers and cut larger values. | REQ-33, IB-41, FM-28 | P2 | Ingest block 2^32 + 5 in Node. Expect a cursor at 2^32 + 5. |
@@ -353,11 +352,11 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | ID | Phase | Content | Done when |
 |---|---|---|---|
 | BO-1 | Harness skeleton | HC-4, HC-9 and HC-10. Run CT-1 on the schemas of the current tests. | CT-1 runs in CI, and the matrix shows its first results. |
-| BO-2 | P1 correctness | GAP-1. Measure for GAP-6. | Each closure has its failing test first, and the matrix rows move to C. |
+| BO-2 | P1 correctness | GAP-1. | Each closure has its failing test first, and the matrix rows move to C. |
 | BO-3 | Crash harness | HC-7 and HC-8 (GAP-33). CT-3 at each kill point. | INV-40, INV-41, INV-42 and INV-49 are C. |
 | BO-4 | Robustness | GAP-5, GAP-7, GAP-8, GAP-16 and GAP-17. HC-11 (GAP-34). | FM-1 is C, and CT-9 runs nightly. |
 | BO-5 | Binding parity | HC-17. GAP-9, GAP-12, GAP-13, GAP-14, GAP-15, GAP-23, GAP-24, GAP-28, GAP-29 and GAP-38. | CT-5 compares all bindings in CI. |
-| BO-6 | Performance regime | GAP-6 and GAP-21. HC-15 and the gates of GAP-37. Ratify ADR-9. | Each SLO row has a gate. |
+| BO-6 | Performance regime | GAP-21. HC-15 and the gates of GAP-37. Ratify ADR-9. | Each SLO row has a gate. |
 
 Each phase ends with an update of the matrices and the gap register in the same change.
 

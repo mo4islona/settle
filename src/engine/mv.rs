@@ -13,6 +13,7 @@ use crate::types::{
 };
 
 use super::aggregation::{AggregationFunc, create_agg, restore_agg, to_start_of_interval};
+use super::evict::{Eviction, Victims};
 
 /// Describes one output column of the MV.
 #[derive(Debug)]
@@ -95,6 +96,21 @@ impl SourceRow for RowMap {
 }
 
 const EMIT_ORDER_KEEP: usize = 8192;
+
+/// One group of a view.
+struct Group {
+    /// One aggregate per aggregation column, in `agg_index` order.
+    aggs: Vec<Box<dyn AggregationFunc>>,
+    /// The checkpoint that last wrote the group; 0 if none did since it
+    /// loaded.
+    written: u64,
+}
+
+impl Group {
+    fn new(aggs: Vec<Box<dyn AggregationFunc>>) -> Self {
+        Self { aggs, written: 0 }
+    }
+}
 
 /// The groups that the blocks of an ingest (or a rollback) touched, each with
 /// its aggregation values from before the change. The values of all groups
@@ -191,8 +207,15 @@ pub struct MVEngine {
     time_column: Option<SourceColumn>,
     /// The registry that the `SourceColumn` ids refer to.
     resolved_for: Option<Arc<ColumnRegistry>>,
-    /// group_key -> aggregation state (one AggregationFunc per agg column).
-    groups: FxHashMap<GroupKey, Vec<Box<dyn AggregationFunc>>>,
+    /// The groups in memory. A group that is not here loads its stored
+    /// state, so a group leaves only when storage holds it (`evict`). A
+    /// sliding window keeps all of its groups: it stores blocks, not groups.
+    groups: FxHashMap<GroupKey, Group>,
+    /// Whether a group that is not in memory reads its state from storage.
+    /// False when storage held no group of the view at open or `reload`, and
+    /// no group was evicted since. Always false for a sliding window.
+    reads_storage: bool,
+    eviction: Eviction,
     /// Tracks which blocks have been ingested (for rollback).
     /// block -> set of group keys touched. BTreeMap for O(log N) range queries.
     block_groups: BTreeMap<BlockNumber, FxHashSet<GroupKey>>,
@@ -346,6 +369,8 @@ impl MVEngine {
             time_column,
             resolved_for: None,
             groups: FxHashMap::default(),
+            reads_storage: false,
+            eviction: Eviction::default(),
             block_groups: BTreeMap::new(),
             storage,
             block_times: BlockTimes::default(),
@@ -358,27 +383,34 @@ impl MVEngine {
             ingest_touched: Touched::default(),
             emit_order: Vec::new(),
         };
-        if mv.sliding_window.is_some() {
-            mv.restore_window()?;
-        } else {
-            mv.restore_groups()?;
-        }
+        mv.restore()?;
         Ok(mv)
     }
 
-    /// Load the finalized state of each group.
-    fn restore_groups(&mut self) -> Result<()> {
-        for key in self.storage.list_mv_group_keys(&self.def.name)? {
-            let group_key = storage::decode_group_key(&key)
-                .map_err(|e| self.unreadable(format!("group key: {e}")))?;
-            let aggs = self
-                .storage
-                .get_mv_state(&self.def.name, &key)?
-                .and_then(|bytes| deserialize_mv_group(&bytes, &self.agg_funcs))
-                .ok_or_else(|| self.unreadable(format!("state of group {group_key:?}")))?;
-            self.groups.insert(group_key, aggs);
+    /// Load a sliding window; other views load their groups on demand.
+    fn restore(&mut self) -> Result<()> {
+        if self.sliding_window.is_some() {
+            return self.restore_window();
         }
+        // A failed probe counts as yes: the reads of the groups then report
+        // the error.
+        self.reads_storage = self.storage.has_mv_state(&self.def.name).unwrap_or(true);
         Ok(())
+    }
+
+    /// The stored state of the group `key`, None if storage holds none.
+    fn load_group(&self, key: &GroupKey) -> Result<Option<Group>> {
+        if !self.reads_storage {
+            return Ok(None);
+        }
+
+        let stored_key = storage::encode_group_key(key);
+        let Some(bytes) = self.storage.get_mv_state(&self.def.name, &stored_key)? else {
+            return Ok(None);
+        };
+        let aggs = deserialize_mv_group(&bytes, &self.agg_funcs)
+            .ok_or_else(|| self.unreadable(format!("state of group {key:?}")))?;
+        Ok(Some(Group::new(aggs)))
     }
 
     /// Load the window as of the durable block, which `write_checkpoint`
@@ -409,12 +441,8 @@ impl MVEngine {
         self.removed_groups.clear();
         self.pending_durable.clear();
         self.ingest_touched = Touched::default();
-
-        if self.sliding_window.is_some() {
-            self.restore_window()
-        } else {
-            self.restore_groups()
-        }
+        self.eviction = Eviction::default();
+        self.restore()
     }
 
     fn unreadable(&self, what: String) -> Error {
@@ -432,11 +460,11 @@ impl MVEngine {
             let group_key = storage::decode_group_key(read_slice(record, &mut pos)?).ok()?;
             if !self.groups.contains_key(&group_key) {
                 let aggs = self.create_agg_vec();
-                self.groups.insert(group_key.clone(), aggs);
+                self.groups.insert(group_key.clone(), Group::new(aggs));
             }
 
-            let aggs = self.groups.get_mut(&group_key).unwrap();
-            for agg in aggs {
+            let group = self.groups.get_mut(&group_key).unwrap();
+            for agg in &mut group.aggs {
                 let data = read_slice(record, &mut pos)?;
                 if !data.is_empty() {
                     agg.read_block(block, data)?;
@@ -461,23 +489,25 @@ impl MVEngine {
         self.sliding_window.is_some()
     }
 
-    /// Process a batch of rows from a single block.
-    /// Returns change records for new/updated groups.
+    /// Apply the rows of one block and take their changes.
+    #[cfg(test)]
     pub fn process_block<R: SourceRow>(
         &mut self,
         block: BlockNumber,
         rows: &[R],
     ) -> Vec<ChangeRecord> {
-        self.apply_rows(block, rows);
+        self.apply_rows(block, rows).expect("groups load");
         self.take_changes()
     }
 
     /// Apply the rows of one block of the current ingest; `take_changes`
-    /// emits their changes.
-    pub fn apply_rows<R: SourceRow>(&mut self, block: BlockNumber, rows: &[R]) {
+    /// emits their changes. Err if a group fails to load: the undo of the
+    /// failed ingest then rolls back the rows before it.
+    pub fn apply_rows<R: SourceRow>(&mut self, block: BlockNumber, rows: &[R]) -> Result<()> {
         let mut touched = std::mem::take(&mut self.ingest_touched);
-        self.apply_block(block, rows, &mut touched);
+        let applied = self.apply_block(block, rows, &mut touched);
         self.ingest_touched = touched;
+        applied
     }
 
     /// The changes of the blocks applied since the last call, one per group.
@@ -498,20 +528,26 @@ impl MVEngine {
     /// them. Replay after a deferred tail leaves every replayed block
     /// unfinalized, so reading the values of a group touched in each block
     /// would cost quadratic time in the tail length.
-    pub fn replay_block<R: SourceRow>(&mut self, block: BlockNumber, rows: &[R]) {
+    pub fn replay_block<R: SourceRow>(&mut self, block: BlockNumber, rows: &[R]) -> Result<()> {
         let mut touched = Touched {
             existence_only: true,
             ..Touched::default()
         };
-        self.apply_block(block, rows, &mut touched);
+        let applied = self.apply_block(block, rows, &mut touched);
         self.drop_empty_groups(touched);
+        applied
     }
 
     #[inline]
-    fn apply_block<R: SourceRow>(&mut self, block: BlockNumber, rows: &[R], touched: &mut Touched) {
+    fn apply_block<R: SourceRow>(
+        &mut self,
+        block: BlockNumber,
+        rows: &[R],
+        touched: &mut Touched,
+    ) -> Result<()> {
         // Sliding window replay protection: skip blocks already in restored state
         if self.sliding_window.is_some() && self.block_times.contains_key(&block) {
-            return;
+            return Ok(());
         }
 
         if let Some(registry) = rows.first().and_then(R::registry) {
@@ -542,14 +578,17 @@ impl MVEngine {
         for row in rows {
             let group_key = self.compute_group_key(row);
 
+            let mut exists = self.groups.contains_key(&group_key);
+            if !exists && let Some(group) = self.load_group(&group_key)? {
+                self.groups.insert(group_key.clone(), group);
+                exists = true;
+            }
             // Snapshot prev output before first mutation of this group
             self.snapshot(touched, &group_key);
-
-            // Ensure group exists
-            if !self.groups.contains_key(&group_key) {
-                self.groups.insert(group_key.clone(), self.create_agg_vec());
+            if !exists {
+                self.groups.insert(group_key.clone(), Group::new(self.create_agg_vec()));
             }
-            let aggs = self.groups.get_mut(&group_key).unwrap();
+            let aggs = &mut self.groups.get_mut(&group_key).unwrap().aggs;
 
             // Feed values to each aggregation using pre-computed agg info
             for feed in &self.agg_feeds {
@@ -571,6 +610,7 @@ impl MVEngine {
         if self.sliding_window.is_some() {
             self.expire_old_blocks(block, touched);
         }
+        Ok(())
     }
 
     /// Roll back all blocks after fork_point.
@@ -611,8 +651,8 @@ impl MVEngine {
 
         // Batch-remove blocks from aggregations: one split_off per group key
         for key in touched.groups.keys() {
-            if let Some(aggs) = self.groups.get_mut(key) {
-                for agg in aggs.iter_mut() {
+            if let Some(group) = self.groups.get_mut(key) {
+                for agg in &mut group.aggs {
                     agg.remove_blocks_after(fork_point);
                 }
             }
@@ -645,14 +685,14 @@ impl MVEngine {
                 self.snapshot(touched, &key);
 
                 match self.groups.get_mut(&key) {
-                    Some(aggs) => {
-                        for (from, agg) in data.iter_mut().zip(aggs.iter_mut()) {
+                    Some(group) => {
+                        for (from, agg) in data.iter_mut().zip(&mut group.aggs) {
                             from.move_block(expired.block, agg.as_mut());
                         }
                     }
                     // Expiry emptied the group and removed it.
                     None => {
-                        self.groups.insert(key.clone(), data);
+                        self.groups.insert(key.clone(), Group::new(data));
                     }
                 }
 
@@ -714,7 +754,7 @@ impl MVEngine {
                 continue; // Expired: in `self.expired` or `expired_final`.
             };
             let keys = self.block_groups.get(&b).into_iter().flatten();
-            let groups = keys.filter_map(|key| Some((key, self.groups.get(key)?.as_slice())));
+            let groups = keys.filter_map(|key| Some((key, self.groups.get(key)?.aggs.as_slice())));
             let record = window_record(b, ts, groups);
             self.window_writes.push(WindowWrite::Put(b, record));
         }
@@ -737,8 +777,8 @@ impl MVEngine {
     }
 
     /// Write the stored state of every group in `pending_durable`, and delete
-    /// the groups that emptied.
-    pub fn write_checkpoint(&mut self, batch: &mut StorageWriteBatch) {
+    /// the groups that emptied, as part of checkpoint number `checkpoint`.
+    pub fn write_checkpoint(&mut self, checkpoint: u64, batch: &mut StorageWriteBatch) {
         if self.sliding_window.is_some() {
             for write in self.window_writes.drain(..) {
                 match write {
@@ -756,12 +796,13 @@ impl MVEngine {
         }
 
         for group_key in std::mem::take(&mut self.pending_durable) {
-            let aggs = match self.groups.get(&group_key) {
-                Some(a) => a,
+            let group = match self.groups.get_mut(&group_key) {
+                Some(group) => group,
                 None => continue, // removed meanwhile (handled below)
             };
+            group.written = checkpoint;
             let gk_bytes = storage::encode_group_key(&group_key);
-            batch.put_mv_state(&self.def.name, gk_bytes, serialize_mv_group(aggs));
+            batch.put_mv_state(&self.def.name, gk_bytes, serialize_mv_group(&group.aggs));
         }
 
         // Delete stale groups from storage. Membership-wins reconcile: only
@@ -773,6 +814,41 @@ impl MVEngine {
                 batch.delete_mv_state(&self.def.name, &gk_bytes);
             }
         }
+    }
+
+    /// Once more than `cap` groups are in memory, drop those that storage
+    /// holds, the least recently written first (see `Eviction`). Checkpoint
+    /// `committed` is the last one on disk. A removed group is never one
+    /// that storage holds, so a miss on it cannot read a delete that waits:
+    /// a group with a final value has data for good.
+    pub fn evict(&mut self, cap: usize, committed: u64) {
+        if self.sliding_window.is_some() {
+            return;
+        }
+        let count = self.eviction.due(self.groups.len(), cap, committed);
+        if count == 0 {
+            return;
+        }
+
+        let unfinal: FxHashSet<&GroupKey> = self.block_groups.values().flatten().collect();
+        let pending = &self.pending_durable;
+        let stored = |key: &GroupKey, group: &Group| {
+            group.written <= committed && !unfinal.contains(key) && !pending.contains(key)
+        };
+
+        let candidates = self.groups.iter().filter(|(key, group)| stored(key, group));
+        let written = candidates.map(|(_, group)| group.written).collect();
+        if let Some(mut victims) = Victims::new(written, count) {
+            self.groups
+                .retain(|key, group| !(stored(key, group) && victims.pick(group.written)));
+            self.reads_storage = true;
+        }
+        self.eviction.done(self.groups.len(), cap, committed);
+    }
+
+    #[cfg(test)]
+    pub fn resident_groups(&self) -> usize {
+        self.groups.len()
     }
 
     /// Merge the per-block data of blocks up to `block` into finalized state
@@ -789,8 +865,8 @@ impl MVEngine {
         }
 
         for key in &changed {
-            if let Some(aggs) = self.groups.get_mut(key) {
-                for agg in aggs.iter_mut() {
+            if let Some(group) = self.groups.get_mut(key) {
+                for agg in &mut group.aggs {
                     agg.finalize_up_to(block);
                 }
             }
@@ -817,10 +893,10 @@ impl MVEngine {
                 self.snapshot(touched, &key);
 
                 let mut data = self.create_agg_vec();
-                let Some(aggs) = self.groups.get_mut(&key) else {
+                let Some(group) = self.groups.get_mut(&key) else {
                     continue;
                 };
-                for (agg, into) in aggs.iter_mut().zip(data.iter_mut()) {
+                for (agg, into) in group.aggs.iter_mut().zip(data.iter_mut()) {
                     agg.move_block(block, into.as_mut());
                 }
                 groups.push((key, data));
@@ -879,10 +955,10 @@ impl MVEngine {
             return;
         }
 
-        let at = self.groups.get(group_key).map(|aggs| {
+        let at = self.groups.get(group_key).map(|group| {
             let at = touched.prev.len();
             if !touched.existence_only {
-                touched.prev.extend(aggs.iter().map(|a| a.current_value()));
+                touched.prev.extend(group.aggs.iter().map(|a| a.current_value()));
             }
             at
         });
@@ -911,8 +987,8 @@ impl MVEngine {
             current.clear();
             // False once the group has no data left (all aggs empty) or is gone.
             let has_data = match self.groups.get(&key) {
-                Some(aggs) if aggs.iter().any(|a| a.has_data()) => {
-                    current.extend(aggs.iter().map(|a| a.current_value()));
+                Some(group) if group.aggs.iter().any(|a| a.has_data()) => {
+                    current.extend(group.aggs.iter().map(|a| a.current_value()));
                     true
                 }
                 _ => false,
@@ -975,7 +1051,7 @@ impl MVEngine {
             let has_data = self
                 .groups
                 .get(&key)
-                .is_some_and(|aggs| aggs.iter().any(|a| a.has_data()));
+                .is_some_and(|group| group.aggs.iter().any(|a| a.has_data()));
 
             if !has_data {
                 self.groups.remove(&key);

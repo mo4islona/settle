@@ -1,6 +1,6 @@
 # 15 — Parameters
 
-**As of 2026-10-19.** This is a mutable status document. It holds the value of every `P-*` symbol of the suite. "Observed" is the value or the behavior of the code today. "Target" is the intended value. A ⚠ marks a proposed target that waits for its ADR.
+**As of 2026-10-21.** This is a mutable status document. It holds the value of every `P-*` symbol of the suite. "Observed" is the value or the behavior of the code today. "Target" is the intended value. A ⚠ marks a proposed target that waits for its ADR.
 
 ## Protocol and configuration
 
@@ -10,6 +10,8 @@
 | P-CHECKPOINT-INTERVAL | The blocks between two checkpoints under deferral (WP-40). | 1 by default: no deferral | 1 by default (ADR-2) |
 | P-RAW-RETENTION | The retention margin of raw rows (RS-1, RS-2). | 1,000 blocks | 1,000 blocks (ADR-3) |
 | P-PURGE-STEP | The step of a purge (RS-2). | max(P-RAW-RETENTION / 10, 1) blocks | The same |
+| P-RESIDENT-GROUPS | The groups that a reducer or a view that is not sliding keeps in memory before an eviction (RS-24). | 1,000,000 | ⚠ 1,000,000 (ADR-8) |
+| P-KEY-FILTER | The key filter of the persistent store for each stored group (RS-20, RS-24). | 10 bits, about 1.25 bytes | ⚠ The same (ADR-8) |
 | P-REPLAY-CHUNK | The blocks with rows for each table in one replay read (RS-12, WP-53). | 64 | 64 |
 | P-WAL-BOUND | The largest size of the log of the persistent backend (RS-21). | 256 MiB | 256 MiB (ADR-3) |
 | P-ACK-WARN | The age of the oldest unacked batch for the event of OB-8. | 10 s | 10 s |
@@ -35,7 +37,7 @@
 
 | Parameter | Role | Observed | Target |
 |---|---|---|---|
-| P-MEMORY-CEILING | The ceiling of resident memory (REQ-41, PF-1). | No bound (GAP-6) | ⚠ A formula of the configuration and the group count (ADR-8) |
+| P-MEMORY-CEILING | The ceiling of resident memory (REQ-41, PF-1). | For each reducer and view that is not sliding: P-RESIDENT-GROUPS groups at P-SLO-RSS-PER-GROUP, plus the groups that RS-24 keeps. The key filters add P-KEY-FILTER for each stored group. None in memory mode. | ⚠ The same (ADR-8) |
 | P-REDUCER-STEPS | The step budget of one reducer body call (LIV-10). | No bound (GAP-5) | ⚠ Proposed in ADR-8 |
 | P-REDUCER-MEMORY | The memory budget of one reducer runtime (LIV-10). | No bound (GAP-5) | ⚠ Proposed in ADR-8 |
 | P-DISK-AMP | The factor `A` of the disk bound (RS-21). | Write amplification 1.1 with compaction; 12 to 18 times the live data without it | ⚠ 2, to ratify in ADR-9 |
@@ -57,7 +59,7 @@ The baselines are in [11-performance.md](11-performance.md). The targets with �
 | P-SLO-ACK-SYNC | SLI-3. | About 60 µs on NVMe | ⚠ At most 200 µs (ADR-9) |
 | P-SLO-ROLLBACK | SLI-4, 75 blocks with 10,050 rows. | 2.5 / 2.8 ms | Less than 10 ms |
 | P-SLO-OPEN | SLI-5, the reference tail of SC-5. | 0.6 s | ⚠ At most 2 s (ADR-9) |
-| P-SLO-RSS-PER-GROUP | SLI-6. | Not measured | ⚠ Set after the first measurement (ADR-8) |
+| P-SLO-RSS-PER-GROUP | SLI-6. | 480 bytes for each reducer group, 1,485 for each view group | ⚠ To ratify in ADR-9 |
 | P-SLO-INSTR-LINEAR | SLI-7, the growth when the input doubles. | 2.0 to 2.1 | At most 2.1 |
 | P-SLO-PG-RATIO | SLI-8, pipelined, aggregate workloads. | 0.71 to 0.95 | ⚠ At most 1.0 (ADR-9) |
 | P-SLO-REORG-RATIO | SLI-9, aggregates with no inverse. | 0.08 to 0.14 | ⚠ At most 0.5 (ADR-9) |

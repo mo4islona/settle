@@ -540,7 +540,7 @@ fn sliding_window_expired_block_survives_reopen() {
 
         let mut batch = StorageWriteBatch::new();
         mv.advance_finality(2);
-        mv.write_checkpoint(&mut batch);
+        mv.write_checkpoint(1, &mut batch);
         storage.commit(&batch).unwrap();
     }
 
@@ -569,7 +569,7 @@ fn sliding_checkpoint_does_not_grow_with_the_window() {
             mv.process_block(block, &[trade("ETH", 1.0, block as i64 * 1000)]);
             last = StorageWriteBatch::new();
             mv.advance_finality(block - 5.min(block));
-            mv.write_checkpoint(&mut last);
+            mv.write_checkpoint(1, &mut last);
             storage.commit(&last).unwrap();
         }
 
@@ -737,7 +737,7 @@ fn sliding_window_persistence_and_restore() {
 
         let mut batch = StorageWriteBatch::new();
         mv.advance_finality(2);
-        mv.write_checkpoint(&mut batch);
+        mv.write_checkpoint(1, &mut batch);
         storage.commit(&batch).unwrap();
     }
 
@@ -785,7 +785,7 @@ fn sliding_window_replay_skip() {
         );
         let mut batch = StorageWriteBatch::new();
         mv.advance_finality(1);
-        mv.write_checkpoint(&mut batch);
+        mv.write_checkpoint(1, &mut batch);
         storage.commit(&batch).unwrap();
     }
 
@@ -940,7 +940,7 @@ fn sliding_window_empty_group_cleanup_on_finalize() {
     // Finalize
     let mut batch = StorageWriteBatch::new();
     mv.advance_finality(2);
-    mv.write_checkpoint(&mut batch);
+    mv.write_checkpoint(1, &mut batch);
     storage.commit(&batch).unwrap();
 
     // Restore — group X should not exist
@@ -982,7 +982,7 @@ fn sliding_window_group_expired_on_arrival_is_removed() {
 
     let mut batch = StorageWriteBatch::new();
     mv.advance_finality(2);
-    mv.write_checkpoint(&mut batch);
+    mv.write_checkpoint(1, &mut batch);
     storage.commit(&batch).unwrap();
     let restored = MVEngine::new(
         sliding_sum_mv_def(10),
@@ -1139,7 +1139,7 @@ fn check_random_forks(def: fn(u64) -> MVDef, seed: u64, steps: usize) {
                 log.push(format!("finalize {to}"));
                 let mut batch = StorageWriteBatch::new();
                 mv.advance_finality(to);
-                mv.write_checkpoint(&mut batch);
+                mv.write_checkpoint(1, &mut batch);
                 storage.commit(&batch).unwrap();
                 finalized = to;
                 durable = Some(to);
@@ -1152,7 +1152,7 @@ fn check_random_forks(def: fn(u64) -> MVDef, seed: u64, steps: usize) {
                 mv = random_forks_mv(def, &storage);
                 mv.rollback(durable);
                 for (block, rows) in chain.iter().filter(|(b, _)| *b > durable) {
-                    mv.replay_block(*block, rows);
+                    mv.replay_block(*block, rows).unwrap();
                 }
             }
         }

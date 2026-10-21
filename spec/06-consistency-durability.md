@@ -63,7 +63,7 @@ A change of a body, a default or external code MUST keep the results of the rows
 
 ## Interference
 
-**CN-40 — Maintenance transparency.** Purge, compaction of the store and log rotation never change the state in memory or any batch. They also do not change the committed state that an open reads (INV-48).
+**CN-40 — Maintenance transparency.** Purge, compaction of the store and log rotation never change the state in memory or any batch. Group eviction drops only state that the committed store holds, and the next row of the group loads it again (RS-24). None of them changes a batch or the committed state that an open reads (INV-48).
 
 **CN-41 — Clock independence.** No batch and no state depends on the wall clock (NG-6). Only the performance tree, the age in PENDING_ACK and the log events read it.
 

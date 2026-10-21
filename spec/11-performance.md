@@ -29,7 +29,7 @@ This document states the service level indicators, the objectives, the resource 
 | SLI-3 | SC-2 | P-SLO-ACK-SYNC ⚠ | about 60 µs per ack on NVMe (2026-10-16) |
 | SLI-4 | SC-3, 75 blocks with 10,050 rows | P-SLO-ROLLBACK | 2.5 / 2.8 ms |
 | SLI-5 | SC-5 | P-SLO-OPEN ⚠ | 0.6 s after a long tip run with the log bound (2026-10-17) |
-| SLI-6 | SC-4 | P-SLO-RSS-PER-GROUP ⚠ | not measured (GAP-6) |
+| SLI-6 | SC-4 | P-SLO-RSS-PER-GROUP ⚠ | 480 bytes for each reducer group, 1,485 for each view group. Each is the growth of the peak RSS from 500K to 1M groups (persistent, 2026-10-22). |
 | SLI-7 | Scale cases | P-SLO-INSTR-LINEAR | a growth of 2.0 to 2.1 when the input doubles |
 | SLI-7 | Each case | P-GATE-INSTR-NOISE | for example 311M instructions (15.6K per row) for a backfill sum view |
 | SLI-8 | SC-7, pipelined | P-SLO-PG-RATIO ⚠ | 0.91–0.95 sum for each user, 0.71–0.72 stateful PnL, 1.22 raw rows in serial mode |
@@ -39,7 +39,7 @@ On raw rows with no aggregate, Settle cannot remove work from the target, so SLI
 
 ## Resource bounds
 
-**PF-1 — Memory ceiling.** The host can compute the ceiling P-MEMORY-CEILING of the resident memory (RS-20) from the configuration and the group count. Today no ceiling exists (GAP-6, ADR-8, HZ-3).
+**PF-1 — Memory ceiling.** The host can compute the ceiling P-MEMORY-CEILING of the resident memory (RS-20) from the configuration and the group count. For each reducer and each view that is not sliding, it is P-RESIDENT-GROUPS groups at P-SLO-RSS-PER-GROUP each, plus the groups that RS-24 keeps. The key filters of the store add P-KEY-FILTER for each stored group (RS-20). Above P-RESIDENT-GROUPS groups, each row of a group that is not in memory reads the store, so the throughput falls (HZ-3, ADR-8).
 
 **PF-2 — Backpressure.** The ack queue is the backpressure of Settle (WP-32). P-MAX-UNACKED bounds the number of unacked write sets, but not their size (RP-14). The host bounds their size by the size of its calls (HZ-10).
 
@@ -84,7 +84,7 @@ On raw rows with no aggregate, Settle cannot remove work from the target, so SLI
 |---|---|---|---|
 | HZ-1 | A per-row or per-block step that scans all unfinal blocks, a refold for each moved block, or a replay that reads the tail again. | PF-3, LIV-1 | Scale cases that double the input and assert the growth factor. |
 | HZ-2 | A refold of the sliding window after each expiry. | PF-4 | SC-6 at three widths. |
-| HZ-3 | Resident groups that grow with the cardinality. | PF-1, LIV-5 | SC-4 with a memory probe. |
+| HZ-3 | Resident groups that grow with the cardinality, and reads of the store for the groups above P-RESIDENT-GROUPS. | PF-1, SLI-1, LIV-5 | SC-4 with a memory probe and with a cap below P-W-GROUPS. |
 | HZ-4 | A finality that stalls, so unfinal data, hashes and raw rows grow. | RS-23 | SC-8 with a finality that does not move. |
 | HZ-5 | Rarely written parts of the store that keep old log files. | RS-21, LIV-3 | The log size in SC-8. |
 | HZ-6 | Compaction off: open files and stale data grow. | RS-21 | Keep compaction on (ADR-3). |

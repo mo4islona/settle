@@ -36,18 +36,23 @@ Bands: 1–9 raw rows · 10–19 derived state · 20–29 space and memory.
 
 **RS-20 — Resident memory.** The resident memory of an instance is the sum of these parts:
 
-- the reducer groups and their states;
-- the view groups;
+- the resident reducer groups and their states (RS-24);
+- the resident view groups (RS-24);
 - the unfinal data of RS-11;
-- the write sets of the unacked batches.
+- the write sets of the unacked batches;
+- the key filters of the persistent store, P-KEY-FILTER for each stored group (RS-24).
 
-The intent is a ceiling P-MEMORY-CEILING that the host can compute from the configuration (REQ-41, ADR-8). Today no group leaves memory, and an open loads every stored view group (GAP-6).
+The ceiling P-MEMORY-CEILING is the sum of the bounds of these parts (REQ-41, ADR-8). Each reducer and each view that is not sliding keeps about P-RESIDENT-GROUPS groups, and also the groups that RS-24 keeps in memory. A sliding view keeps the groups of its window. The memory backend holds the store in memory too, so an instance in memory has no ceiling.
 
 **RS-21 — Disk bound.** The disk use of the persistent backend is at most `P-DISK-AMP × live + P-DISK-CONST`. The live data is the raw rows that RS-1 keeps, the final derived state, the window records, the stash and the journal. The bound needs compaction of the store, and a log of at most P-WAL-BOUND (ADR-3, HZ-9).
 
 **RS-22 — Orphan data.** The stored data and layout of an object that the schema removed stay in the store (CN-34). They count against RS-21 with no end (GAP-18).
 
 **RS-23 — Finality stall.** When `F` does not move, the unfinal data, the hashes and the raw rows above `F` grow linearly with `L − F`. This growth is inherent (HZ-4). The host controls it with the finality that it reports.
+
+**RS-24 — Group eviction.** A reducer group or a view group leaves memory only when the committed store holds its state. So the group has no unfinal block, no final change that waits for a checkpoint, and the checkpoint that last wrote it is committed. After each ingest call, a reducer or a view that is not sliding and holds more than P-RESIDENT-GROUPS groups drops the groups that can leave. The groups that a checkpoint wrote longest ago go first, down to three quarters of P-RESIDENT-GROUPS.
+
+A group that is not in memory loads its stored state on its next row. The key filters of the persistent store show that a group is new without a read of the store. An open loads no group of a view that is not sliding. An eviction changes no batch (INV-48).
 
 ## Interactions
 
@@ -56,3 +61,4 @@ The intent is a ceiling P-MEMORY-CEILING that the host can compute from the conf
 - **With deferral:** `D` can lag `F` by up to P-CHECKPOINT-INTERVAL blocks. The purge follows `D`, so the store keeps more raw rows, and the replay tail grows by the interval.
 - **With a reopen:** the open sets the replay tail to the blocks above `D`. Only the blocks of the tail above `F` stay as unfinal data.
 - **With liveness:** LIV-7, LIV-8 and LIV-9 bound how fast the space comes back.
+- **With eviction:** the groups that the blocks above `F`, a deferred checkpoint or an unacked batch changed stay in memory (RS-24). So a finality stall, a long interval or a long ack queue can keep a node above P-RESIDENT-GROUPS.

@@ -230,9 +230,9 @@ No open reads stored data with a layout other than its stored layout. It fails w
 *Check:* CT-11 changes each layout element and expects the refusal.
 
 **INV-46 — Corruption is an error.** [recovery]
-Stored data that does not decode gives STORAGE_FAILED. It never gives a default value or a skipped object. Settle keeps no checksums, so a corrupt value that still decodes is out of scope.
+Stored data that does not decode gives STORAGE_FAILED, at the open or at the first read of it. It never gives a default value or a skipped object. Settle keeps no checksums, so a corrupt value that still decodes is out of scope.
 *Why:* a silent default is silent data loss.
-*Check:* CT-8 corrupts each kind of stored value and opens.
+*Check:* CT-8 corrupts each kind of stored value, opens and reads it.
 
 **INV-47 — Finality survives a reopen.** [recovery]
 After a crash and an open, `F` equals the finality watermark of the last durable commit.
@@ -240,9 +240,9 @@ After a crash and an open, `F` equals the finality watermark of the last durable
 *Check:* CT-1 and CT-2 compare the finalized cursor after each reopen with the one of the last durable commit, with deferral and with gappy chains.
 
 **INV-48 — Maintenance transparency.** [recovery]
-Purge, compaction and log rotation never change the state or a batch (CN-40).
+Purge, compaction, log rotation and group eviction never change the state or a batch (CN-40).
 *Why:* background work is not an input.
-*Check:* CT-2 runs one history with retention margins 0, P-RAW-RETENTION and no purge, and compares the batches.
+*Check:* CT-2 runs one history with retention margins 0, P-RAW-RETENTION and no purge, and compares the batches. It also runs histories with P-RESIDENT-GROUPS at 0 and 1 against a run with no eviction.
 
 **INV-49 — Durability tiers.** [recovery]
 After a crash of each kind, the store keeps each write that CN-10 marks as kept.

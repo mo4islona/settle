@@ -65,6 +65,15 @@ export interface SettleConfig {
    * The web build ignores it.
    */
   backfillCheckpointInterval?: number
+  /**
+   * Most groups that each reducer and each view keeps in memory, about
+   * (default 1,000,000). Above it, the groups whose state is on disk leave
+   * memory, those written longest ago first, and a group loads again on its
+   * next row. Groups with blocks that are not final, or with writes that
+   * wait for `ack()`, stay. A sliding view keeps all of its groups. The web
+   * build, which keeps everything in memory, ignores it.
+   */
+  maxResidentGroups?: number
 }
 
 export interface SettleCursor {

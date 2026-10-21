@@ -484,6 +484,11 @@ impl AggregationFunc for SumAgg {
 pub struct CountAgg {
     finalized: u64,
     blocks: BTreeMap<BlockNumber, u64>,
+    /// Whether a final block reached it: a count of 0 is data too. Not
+    /// stored, so the stored layout stays: a view stores a group only once
+    /// a block of it is final, and each row reaches each aggregate.
+    #[serde(skip)]
+    has_finalized: bool,
     /// Set while the group has `RUNNING_FOLD_MIN_BLOCKS` unfinalized blocks
     /// or more.
     #[serde(skip)]
@@ -499,6 +504,7 @@ impl CountAgg {
         Self {
             finalized: 0,
             blocks: BTreeMap::new(),
+            has_finalized: false,
             running: None,
         }
     }
@@ -554,7 +560,10 @@ impl AggregationFunc for CountAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        drain_up_to(&mut self.blocks, block, |v| self.finalized += v);
+        drain_up_to(&mut self.blocks, block, |v| {
+            self.finalized += v;
+            self.has_finalized = true;
+        });
         if self.blocks.len() < RUNNING_FOLD_MIN_BLOCKS {
             self.running = None;
         }
@@ -569,7 +578,7 @@ impl AggregationFunc for CountAgg {
     }
 
     fn has_data(&self) -> bool {
-        self.finalized > 0 || !self.blocks.is_empty()
+        self.has_finalized || !self.blocks.is_empty()
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -587,6 +596,8 @@ impl AggregationFunc for CountAgg {
 
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut agg: Self = rmp_serde::from_slice(bytes).ok()?;
+        // Only stored groups decode, and each of them had a final block.
+        agg.has_finalized = true;
         agg.refold();
         Some(agg)
     }
@@ -1389,6 +1400,48 @@ mod tests {
 
         agg.remove_block(102);
         assert_eq!(agg.current_value(), Value::UInt64(2));
+    }
+
+    /// A row with a Null value reaches count(c) too (DEF-42), and that stays
+    /// data once its block is final and stored: a group with a final value
+    /// never empties.
+    #[test]
+    fn count_of_nulls_keeps_its_data_at_finality() {
+        let mut agg = CountAgg::new();
+        agg.add_block(100, &[Value::Null]);
+        agg.finalize_up_to(100);
+        agg.add_block(101, &[Value::Float64(1.0)]);
+        agg.remove_blocks_after(100);
+        assert!(agg.has_data());
+
+        let mut stored = Vec::new();
+        agg.write_finalized(&mut stored);
+        let restored = CountAgg::from_bytes(&stored).unwrap();
+        assert!(restored.has_data());
+        assert_eq!(restored.current_value(), Value::UInt64(0));
+    }
+
+    /// A count stores its total and its blocks, as before `has_finalized`,
+    /// so stored counts read both ways.
+    #[test]
+    fn count_keeps_its_stored_layout() {
+        let layout = |count: u64| {
+            let blocks = std::collections::BTreeMap::<BlockNumber, u64>::new();
+            rmp_serde::to_vec(&(count, blocks)).unwrap()
+        };
+
+        let mut agg = CountAgg::new();
+        agg.add_block(100, &[Value::UInt64(1), Value::Null, Value::UInt64(2)]);
+        agg.finalize_up_to(100);
+        let mut stored = Vec::new();
+        agg.write_finalized(&mut stored);
+        assert_eq!(stored, layout(2));
+
+        for count in [0, 5] {
+            let restored = CountAgg::from_bytes(&layout(count)).unwrap();
+            assert!(restored.has_data());
+            assert_eq!(restored.current_value(), Value::UInt64(count));
+        }
     }
 
     // --- Min ---

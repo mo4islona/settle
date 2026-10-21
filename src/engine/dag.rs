@@ -30,7 +30,12 @@ enum PipelineNode {
 /// storage keys, so the branches finalize in parallel on the rayon pool.
 trait FinalizeNode {
     fn advance_finality(&mut self, block: BlockNumber);
-    fn write_checkpoint(&mut self, finalized: BlockNumber, batch: &mut StorageWriteBatch);
+    fn write_checkpoint(
+        &mut self,
+        finalized: BlockNumber,
+        checkpoint: u64,
+        batch: &mut StorageWriteBatch,
+    );
 }
 
 impl FinalizeNode for ReducerEngine {
@@ -38,8 +43,13 @@ impl FinalizeNode for ReducerEngine {
         ReducerEngine::advance_finality(self, block);
     }
 
-    fn write_checkpoint(&mut self, finalized: BlockNumber, batch: &mut StorageWriteBatch) {
-        ReducerEngine::write_checkpoint(self, finalized, batch);
+    fn write_checkpoint(
+        &mut self,
+        finalized: BlockNumber,
+        checkpoint: u64,
+        batch: &mut StorageWriteBatch,
+    ) {
+        ReducerEngine::write_checkpoint(self, finalized, checkpoint, batch);
     }
 }
 
@@ -48,8 +58,13 @@ impl FinalizeNode for MVEngine {
         MVEngine::advance_finality(self, block);
     }
 
-    fn write_checkpoint(&mut self, _finalized: BlockNumber, batch: &mut StorageWriteBatch) {
-        MVEngine::write_checkpoint(self, batch);
+    fn write_checkpoint(
+        &mut self,
+        _finalized: BlockNumber,
+        checkpoint: u64,
+        batch: &mut StorageWriteBatch,
+    ) {
+        MVEngine::write_checkpoint(self, checkpoint, batch);
     }
 }
 
@@ -65,6 +80,9 @@ const REPLAY_READ_BLOCKS: usize = if cfg!(test) { 2 } else { 64 };
 
 /// Default of `Config::raw_retention_blocks`.
 pub const DEFAULT_RAW_RETENTION_BLOCKS: u64 = 1_000;
+
+/// Default of `Config::max_resident_groups`.
+pub const DEFAULT_MAX_RESIDENT_GROUPS: usize = 1_000_000;
 
 /// The raw rows of one table during replay, read a part at a time.
 struct ReplayCursor {
@@ -139,7 +157,7 @@ impl PipelineBranch {
             if !enriched.is_empty() {
                 for (mv_name, mv) in &mut self.mv_entries {
                     let mv_timer = PerfTimer::start(perf);
-                    mv.apply_rows(block, &enriched);
+                    mv.apply_rows(block, &enriched)?;
                     mv_nodes.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
             }
@@ -209,6 +227,12 @@ pub struct SettleEngine {
     block_hashes: BTreeMap<BlockNumber, String>,
     /// Blocks whose hash changed since the last `take_hash_changes`.
     hash_changes: BTreeSet<BlockNumber>,
+    /// The checkpoints written since open; the number of the last one.
+    checkpoints: u64,
+    /// The number of the last checkpoint on disk.
+    committed_checkpoint: u64,
+    /// See `Config::max_resident_groups`.
+    max_resident_groups: usize,
 }
 
 impl SettleEngine {
@@ -370,6 +394,9 @@ impl SettleEngine {
             collect_perf: true,
             block_hashes: BTreeMap::new(),
             hash_changes: BTreeSet::new(),
+            checkpoints: 0,
+            committed_checkpoint: 0,
+            max_resident_groups: DEFAULT_MAX_RESIDENT_GROUPS,
         })
     }
 
@@ -592,7 +619,7 @@ impl SettleEngine {
                     let mv_timer = PerfTimer::start(perf);
                     let mv = self.mvs.get_mut(mv_name).unwrap();
                     if let Some(source_rows) = output_rows.get(mv.source()) {
-                        mv.apply_rows(block, source_rows);
+                        mv.apply_rows(block, source_rows)?;
                     }
                     perf_children.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
@@ -663,7 +690,7 @@ impl SettleEngine {
                             None => self.mvs.get_mut(name).unwrap(),
                         };
                         if let Some(source_rows) = output_rows.get(mv.source()) {
-                            mv.apply_rows(block, source_rows);
+                            mv.apply_rows(block, source_rows)?;
                         }
                         let mv_source = mv.source();
                         // Nest under parent reducer if exists, otherwise add as sibling
@@ -886,7 +913,7 @@ impl SettleEngine {
                         None => self.mvs.get_mut(name).unwrap(),
                     };
                     if let Some(source_rows) = output_rows.get(mv.source()) {
-                        mv.replay_block(block, source_rows);
+                        mv.replay_block(block, source_rows)?;
                     }
                 }
             }
@@ -1147,7 +1174,11 @@ impl SettleEngine {
         }
 
         let finalized = self.finalized_block;
-        self.finalize_nodes(batch, |node, batch| node.write_checkpoint(finalized, batch));
+        self.checkpoints += 1;
+        let checkpoint = self.checkpoints;
+        self.finalize_nodes(batch, |node, batch| {
+            node.write_checkpoint(finalized, checkpoint, batch);
+        });
 
         // On gappy chains finality can run ahead of the data. Without data
         // nothing is durable.
@@ -1192,6 +1223,45 @@ impl SettleEngine {
     /// See `Config::raw_retention_blocks`.
     pub fn set_raw_retention_blocks(&mut self, blocks: u64) {
         self.raw_retention_blocks = blocks;
+    }
+
+    /// See `Config::max_resident_groups`.
+    pub fn set_max_resident_groups(&mut self, groups: usize) {
+        self.max_resident_groups = groups;
+    }
+
+    /// The number of the last checkpoint that `write_checkpoint` wrote, 0
+    /// for none.
+    pub fn checkpoints(&self) -> u64 {
+        self.checkpoints
+    }
+
+    /// Record that the write batch with checkpoint `checkpoint` committed:
+    /// the groups that it and the checkpoints before it wrote may leave
+    /// memory.
+    pub fn set_committed_checkpoint(&mut self, checkpoint: u64) {
+        self.committed_checkpoint = self.committed_checkpoint.max(checkpoint);
+    }
+
+    /// Drop from memory the groups that storage holds, in each reducer and
+    /// MV that holds more than `max_resident_groups`. On this thread: most
+    /// calls evict nothing, and a task per branch would cost more.
+    pub fn evict_groups(&mut self) {
+        let cap = self.max_resident_groups;
+        let committed = self.committed_checkpoint;
+
+        for branch in &mut self.branches {
+            branch.reducer.evict(cap, committed);
+            for (_, mv) in &mut branch.mv_entries {
+                mv.evict(cap, committed);
+            }
+        }
+        for reducer in self.reducers.values_mut() {
+            reducer.evict(cap, committed);
+        }
+        for mv in self.mvs.values_mut() {
+            mv.evict(cap, committed);
+        }
     }
 
     /// Whether the branches process in parallel: 2+ branches, all reducers
@@ -1333,6 +1403,25 @@ impl SettleEngine {
     /// (no sliding-window MV, no reducer registered at run time).
     pub fn defer_allowed(&self) -> bool {
         self.defer_allowed
+    }
+
+    /// The most groups that one reducer or MV holds in memory.
+    #[cfg(test)]
+    pub fn most_resident_groups(&self) -> usize {
+        let reducers = self
+            .branches
+            .iter()
+            .map(|b| &b.reducer)
+            .chain(self.reducers.values());
+        let mvs = self
+            .branches
+            .iter()
+            .flat_map(|b| b.mv_entries.iter().map(|(_, mv)| mv))
+            .chain(self.mvs.values());
+
+        let reducer_groups = reducers.map(ReducerEngine::resident_groups);
+        let mv_groups = mvs.map(MVEngine::resident_groups);
+        reducer_groups.chain(mv_groups).max().unwrap_or(0)
     }
 
     /// The lowest block that a reducer or an MV still holds as unfinal.

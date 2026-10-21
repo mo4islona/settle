@@ -148,6 +148,16 @@ fn upper_bound(prefix: &[u8]) -> Vec<u8> {
 /// alive: the WAL grows to gigabytes, and a reopen replays all of it.
 const MAX_TOTAL_WAL_SIZE: u64 = 256 << 20;
 
+/// The column families of the group states, which a group reads by key.
+const POINT_READ_CFS: [&str; 2] = [CF_REDUCER_FIN, CF_MV];
+
+/// About 1% false positives, at 1.25 bytes of memory per stored group.
+const BLOOM_BITS_PER_KEY: f64 = 10.0;
+
+/// The filter of a memtable, as a part of its size: 1.3 MB for 64 MB, about
+/// 10 bits for each key of 64 bytes.
+const MEMTABLE_BLOOM_RATIO: f64 = 0.02;
+
 /// RocksDB tuning options exposed via Config.
 #[derive(Debug, Default)]
 pub struct RocksDbConfig {
@@ -192,26 +202,28 @@ impl RocksDbBackend {
             }
         });
 
-        let make_opts = || {
+        let make_opts = |name: &str| {
             let mut opts = Options::default();
             opts.set_compression_type(comp_type);
+
+            let mut block_opts = BlockBasedOptions::default();
             match &shared_cache {
-                Some(Some(cache)) => {
-                    let mut block_opts = BlockBasedOptions::default();
-                    block_opts.set_block_cache(cache);
-                    opts.set_block_based_table_factory(&block_opts);
-                }
-                Some(None) => {
-                    let mut block_opts = BlockBasedOptions::default();
-                    block_opts.disable_cache();
-                    opts.set_block_based_table_factory(&block_opts);
-                }
+                Some(Some(cache)) => block_opts.set_block_cache(cache),
+                Some(None) => block_opts.disable_cache(),
                 None => {}
             }
+            // A group that is not in memory reads its state by key, and a new
+            // group finds none: the filter answers that without a block read.
+            if POINT_READ_CFS.contains(&name) {
+                block_opts.set_bloom_filter(BLOOM_BITS_PER_KEY, false);
+                opts.set_memtable_whole_key_filtering(true);
+                opts.set_memtable_prefix_bloom_ratio(MEMTABLE_BLOOM_RATIO);
+            }
+            opts.set_block_based_table_factory(&block_opts);
             opts
         };
 
-        let mut db_opts = make_opts();
+        let mut db_opts = make_opts("default");
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
         db_opts.set_max_total_wal_size(MAX_TOTAL_WAL_SIZE);
@@ -226,7 +238,7 @@ impl RocksDbBackend {
             CF_BLOCK_HASH,
         ]
         .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name, make_opts()))
+            .map(|name| ColumnFamilyDescriptor::new(name, make_opts(name)))
             .collect::<Vec<_>>();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs).map_err(to_err)?;
@@ -565,6 +577,21 @@ impl StorageBackend for RocksDbBackend {
         self.db
             .delete_cf(cf, kv_key(view, group_key))
             .map_err(to_err)
+    }
+
+    fn has_mv_state(&self, view: &str) -> Result<bool> {
+        let cf = self.db.cf_handle(CF_MV).expect("mv CF");
+        let prefix = name_prefix(view);
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_upper_bound(upper_bound(&prefix));
+
+        let mut iter =
+            self.db
+                .iterator_cf_opt(cf, opts, IteratorMode::From(&prefix, Direction::Forward));
+        match iter.next() {
+            Some(item) => item.map(|_| true).map_err(to_err),
+            None => Ok(false),
+        }
     }
 
     fn list_mv_group_keys(&self, view: &str) -> Result<Vec<Vec<u8>>> {
