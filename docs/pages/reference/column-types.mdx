@@ -1,0 +1,150 @@
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Column types [The types of columns and state fields, and their values in each language]
+
+<LanguageSwitch label="Code language" />
+
+Each column of a table and each state field of a reducer has a type. This page gives the name of each type in the schema text, the column function of the builders and the Rust value. It also gives the JavaScript values that go in and come out.
+
+## Types
+
+| Type | Builder function | Rust value | Content |
+|---|---|---|---|
+| `UInt64` | `uint64()` | `Value::UInt64(u64)` | An unsigned 64-bit integer. |
+| `Int64` | `int64()` | `Value::Int64(i64)` | A signed 64-bit integer. |
+| `Float64` | `float64()` | `Value::Float64(f64)` | A 64-bit float (IEEE 754). |
+| `UInt256` | `uint256()` | `Value::Uint256([u8; 32])` | An unsigned 256-bit integer, for example a token amount. In Rust, 32 bytes, the most significant byte first. |
+| `String` | `string()` | `Value::String(String)` | A UTF-8 text. |
+| `DateTime` | `datetime()` | `Value::DateTime(i64)` | A time in milliseconds since 1970-01-01 UTC. |
+| `Boolean` | `boolean()` | `Value::Boolean(bool)` | `true` or `false`. |
+| `Bytes` | `bytes()` | `Value::Bytes(Vec<u8>)` | A sequence of bytes. |
+| `Base58` | `base58()` | `Value::Base58(Vec<u8>)` | A sequence of bytes that the schema marks as base58 data, for example a Solana address. |
+| `JSON` | `json()` | `Value::JSON(serde_json::Value)` | A JSON document. |
+
+Each column also accepts no value: `null` in JavaScript, `Value::Null` in Rust.
+
+The builder functions have the same names in TypeScript and in Rust. Import them from `@settle/stream` or from `settle`.
+
+## Names in the schema text
+
+The names are not case-sensitive. Some types have more than one name, but the names are different in a table and in a state field:
+
+| Type | In `CREATE TABLE` | In `STATE` |
+|---|---|---|
+| `UInt64` | `UInt64` | `UInt64` |
+| `Int64` | `Int64`, `BIGINT` | `Int64` |
+| `Float64` | `Float64`, `DOUBLE` | `Float64` |
+| `UInt256` | `UInt256` | `UInt256` |
+| `String` | `String`, `VARCHAR`, `TEXT` | `String` |
+| `DateTime` | `DateTime`, `TIMESTAMP` | `DateTime` |
+| `Boolean` | `Boolean` | `Boolean` |
+| `Bytes` | `BYTEA`, `VARBINARY`, `BLOB` | `Bytes` |
+| `Base58` | `Base58` | `Base58` |
+| `JSON` | not possible today | `JSON`, `JSONB` |
+
+Today, a table cannot have a `JSON` column, and `Bytes` is not a valid name in `CREATE TABLE`. For this reason, the builder functions `bytes()` and `json()` give a schema error in a table. For a byte column, write the schema text with `BYTEA`. For JSON data, keep it in a `String` column, or in a `JSON` state field of a reducer.
+
+## No conversion
+
+Today, Settle does not change a value to the type of its column. A value keeps its own type. For example, a string in a `UInt64` column stays a string, and `sum` ignores it. Give each column a value of its own type: in Rust, the `Value` variant of the column type.
+
+## Values that go in from JavaScript
+
+Settle reads each JavaScript value of a row in this way:
+
+| JavaScript value | Type in Settle |
+|---|---|
+| An integer `number`, 0 or more, up to 2^53 − 1 | `UInt64` |
+| An integer `number` below 0 | `Int64` |
+| Each other `number`: a fraction, a larger integer, `NaN` or an infinity | `Float64` |
+| A `bigint` from 0 to 2^64 − 1 | `UInt64` |
+| A `bigint` from −2^63 to −1 | `Int64` |
+| A `bigint` from 2^64 to 2^256 − 1 | `UInt256` |
+| Each other `bigint` | `String` with the decimal digits |
+| A `string` | `String` |
+| A `boolean` | `Boolean` |
+| A `Uint8Array`, another typed array or a `DataView` | `Bytes` |
+| `null` or `undefined`, and an absent field | `null` |
+| Each other object or array | `String` with the JSON text |
+
+## Values that come out to JavaScript
+
+| Type in Settle | JavaScript value |
+|---|---|
+| `Float64` | `number` |
+| `UInt64`, `Int64`, `DateTime` up to 2^53 − 1 | `number` |
+| `UInt64`, `Int64`, `DateTime` above 2^53 − 1 | `bigint` |
+| `UInt256` | `string`: `0x` and 64 hexadecimal digits |
+| `String` | `string` |
+| `Boolean` | `boolean` |
+| `Bytes` | `Uint8Array` |
+| `JSON` | The JavaScript value. An integer above 2^53 − 1 comes out as a `bigint`. |
+| `null` | `null` |
+
+The TypeScript type of a `uint256()` column is `bigint`, but the value comes out as a hexadecimal string today. Convert it with `BigInt(value)`.
+
+In Rust, a value comes out as the same `Value` variant that went in.
+
+## Example
+
+This example sends one value of each type and prints what comes out:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-types.ts:builder]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-types.rs:builder]
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+block_number 1 (number)
+u64          1152921504606846976n (bigint)
+i64          -5 (number)
+f64          1.5 (number)
+u256         "0x0000000000000100000000000000000000000000000000000000000000000000" (string)
+text         "hello" (string)
+time         1767225600000 (number)
+flag         true (boolean)
+b58          "abc" (string)
+key          {"block_number":1,"_row_index":0}
+```
+
+```ansi [Rust]
+block_number UInt64(1)
+u64          UInt64(1152921504606846976)
+i64          Int64(-5)
+f64          Float64(1.5)
+u256         Uint256([0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+text         String("hello")
+time         DateTime(1767225600000)
+flag         Boolean(true)
+raw          Bytes([1, 2, 255])
+b58          Base58([1, 2, 3])
+```
+
+:::
+
+In TypeScript, `b58` comes out as the same string, because Settle does not change the input string to bytes.
+
+## Large integers in JavaScript
+
+JavaScript keeps an integer without loss only up to 2^53 − 1 in a `number`. For this reason, a 64-bit integer comes out as a `number` while it is in this range, and as a `bigint` above it. This rule applies also to the state fields of a JavaScript reducer, and to the emits of a reducer that a second reducer reads.
+
+Before you calculate with such a value, change it to one type:
+
+```ts
+const amount = BigInt(row.amount) * 2n
+```
+
+## Values in a reducer
+
+A JavaScript reducer gets a `Bytes` value as a hexadecimal string, an absent row field as `undefined`, and a `null` state field as `null`. Settle reads each `number` that a JavaScript reducer emits or puts into its state as `Float64`, and each object as `JSON`. See [Numeric modes](/reference/aggregates#numeric-modes) for the effect on `sum`.
+
+A Rust closure gets each value as a `Value`. `row.get(column)` gives no value for an absent column and for `Value::Null`. The helpers `as_f64`, `as_u64` and `as_str` change a `Value` to a Rust type.

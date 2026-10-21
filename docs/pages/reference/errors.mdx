@@ -1,0 +1,113 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Errors [What each error means and what to do]
+
+<LanguageSwitch label="Code language" />
+
+A call that fails gives an error and changes nothing, with one exception: a poisoned instance. A failed call never gives a batch.
+
+In TypeScript, two errors have their own classes, and all other errors are `Error` objects. Today, only the message tells these other errors apart. In Rust, each call gives a `settle::error::Error`, an enum with a variant for each kind of failure.
+
+:::code-group
+
+```ts [TypeScript]
+import { SettlePendingAckError, SettleWrongAckSequenceError } from '@settle/stream'
+```
+
+```rust [Rust]
+use settle::error::Error;
+
+match db.ack(sequence) {
+    Err(Error::WrongAckSequence { expected, got }) => { /* a defect in your app */ }
+    other => other?,
+}
+```
+
+:::
+
+## Ack queue full
+
+All places in the ack queue are in use. `ingest` and the fork call give it. The calls that attach or add a reducer give it while any batch waits for its ack.
+
+| TypeScript `SettlePendingAckError` | Rust `Error::PendingAck` | Description |
+|---|---|---|
+| `sequence` | `sequence` | The oldest batch without an ack. |
+| `sinceMs` | `since` | The time since Settle gave this batch. In Rust, a `Duration`. |
+
+Apply the oldest batch, call `ack`, and then do the call again. See [maxPendingBatches](/reference/configuration#maxpendingbatches).
+
+## Wrong ack sequence
+
+`ack` got a sequence above the newest batch that waits for its ack. This is a defect in your app. Nothing changes.
+
+| TypeScript `SettleWrongAckSequenceError` | Rust `Error::WrongAckSequence` | Description |
+|---|---|---|
+| `expected` | `expected` | The newest batch without an ack. |
+| `got` | `got` | The sequence that your app gave. |
+
+## Other errors
+
+| Error | Rust variant | When it occurs | What to do |
+|---|---|---|---|
+| Invalid input | `InvalidOperation` | A block at or below the latest block. A finalized block lower than before. Rows for a table that the schema does not have. A row without `block_number`. An empty list for the fork call. | Correct the input. To replace blocks, use <Api ts="handleFork" rust="handle_fork" />. |
+| Fork below finality | `InvalidOperation` | A new hash for a block at or below the finalized block. | Stop. The source contradicts its own finality. |
+| No common ancestor | `InvalidOperation` | The fork call found no block with the same hash between the finalized block and the latest block. | Call it again with more blocks of the new chain. |
+| Schema error | `Schema` | The schema text is not valid. | Correct the schema. See [Schema language](/reference/schema). |
+| Incompatible storage | `IncompatibleStorage` | The schema changes the layout of stored data, or the data has a different format version. | Give the object a new name, or make a new database. See [Schema changes](/reference/schema#schema-changes). |
+| Target mismatch | `InvalidOperation` | At open, the applied sequence of your database does not agree with the batches that Settle wrote. | Do not try again. Find out why the two stores do not agree. |
+| Invalid operation | `InvalidOperation` | The state does not allow the call. For example, an external reducer has no code, or a reducer gets its code two times. | Correct the order of the calls. |
+| Reducer error | `Reducer` | A reducer body fails, or a reducer emits more than 1,024 columns. A JavaScript reducer throws its own error. A Rust closure panics. | Correct the reducer or the input. |
+| Storage error | `Storage`, `Rollback`, `Serialization`, `Deserialization` | A read or write on disk fails, or stored data does not decode. | If `ack` failed, call `ack` again. Else, open the instance again. |
+| Sync failed | `SyncFailed` | A sync to disk failed. Each later call, also `ack`, fails. | Open the instance again. |
+| Poisoned | `Poisoned` | An earlier failure poisoned the instance. Each call but `ack` fails. | See [A poisoned instance](#a-poisoned-instance). |
+| Invalid configuration | `Storage`, `InvalidOperation` | An unknown compression name. In TypeScript, also a negative `cacheSize` or `appliedSequence`. | Correct the configuration. |
+
+These are examples of messages:
+
+:::code-group
+
+```ansi [TypeScript]
+invalid operation: duplicate ingest: block 5 is at or below latest_block 5 — use handle_fork() for chain reorgs
+invalid operation: finalized_head.number (1) < current finalized_block (2); finality must be monotonic
+unknown table: nope
+row in table 't' missing block_number
+invalid operation: Fork too deep: no common ancestor found in block hashes
+invalid operation: the hash of block 2 differs from the stored one, and the chain holds no common ancestor at or above finalized block 2 — finalized state is irreversible
+invalid operation: external reducer 'r' has no callback: register it before the first ingest
+storage error: invalid RocksDB compression 'gzip' (allowed: none, snappy, zstd, lz4)
+```
+
+```ansi [Rust]
+block not above latest: InvalidOperation — invalid operation: duplicate ingest: block 5 is at or below latest_block 5 — use handle_fork() for chain reorgs
+finality goes back: InvalidOperation — invalid operation: finalized_head.number (1) < current finalized_block (2); finality must be monotonic
+unknown table with rows: InvalidOperation — invalid operation: unknown table: nope
+no common ancestor: InvalidOperation — invalid operation: Fork too deep: no common ancestor found in block hashes
+fork below finality: InvalidOperation — invalid operation: the hash of block 2 differs from the stored one, and the chain holds no common ancestor at or above finalized block 2 — finalized state is irreversible
+schema: Schema — schema error: unknown type 'nope' for column 'c'
+config: Storage — storage error: invalid RocksDB compression 'gzip' (allowed: none, snappy, zstd, lz4)
+closure panics: Reducer — reducer error: the reducer panicked: negative amount
+```
+
+:::
+
+## A poisoned instance
+
+Some failures leave the memory of Settle in a state that no batch describes. Then the instance becomes poisoned, and <Api ts="isPoisoned" rust="is_poisoned()" /> is `true`. Each call but `ack` fails.
+
+Do these steps:
+
+1. Call `ack` for each batch that your database applied, in order.
+2. Stop the use of the instance. In Rust, drop it.
+3. Open the data directory again. Settle continues from the state on disk.
+
+After a sync failure, `ack` also fails. Then do only steps 2 and 3.
+
+## Recovery after a restart
+
+After a crash, a poisoned instance or a sync failure, open the instance again:
+
+- **With an applied sequence:** read the sequence from your database, and give it to open. If open fails with a target mismatch, stop. Then continue the source after the latest block.
+- **Without an applied sequence:** open the data directory. Continue the source after the latest block. Apply each batch so that a second apply of the same batch has no effect.
+
+See [Restarts and crash safety](/guides/restarts).

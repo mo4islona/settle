@@ -1,0 +1,184 @@
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Schema language [The SQL text that declares tables, modules, reducers and views]
+
+<LanguageSwitch label="Code language" />
+
+The schema text declares your pipeline in SQL. It is the same in each language. You give it to [open](/reference/settle#open). The TypeScript and Rust builders make this text for you. You need to write it yourself for Lua reducers, Map fields, a reducer without a group, and `count(column)`.
+
+A schema is a list of statements. A semicolon ends each statement. These are the statements:
+
+- `CREATE TABLE` and `CREATE VIRTUAL TABLE`
+- `CREATE MODULE`
+- `CREATE REDUCER`
+- `CREATE MATERIALIZED VIEW`
+
+Each other statement gives a schema error.
+
+## Example
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-schema.ts:schema]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-schema.rs:schema]
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+insert { pool: 'ETH/USDC', sum_fee: 12, count: 2, max_total: 12 }
+```
+
+```ansi [Rust]
+Insert { pool: ETH/USDC, sum_fee: 12, count: 2, max_total: 12 }
+```
+
+:::
+
+## CREATE TABLE
+
+```sql
+CREATE TABLE name (column Type, ...);
+CREATE VIRTUAL TABLE name (column Type, ...);
+```
+
+Declares a table for the rows that your app sends. A virtual table sends its rows to reducers and views, but the batches do not contain them. See [Tables](/concepts/tables) and [Column types](/reference/column-types).
+
+Settle accepts column options and constraints, for example `NOT NULL` or `PRIMARY KEY`, but it does not use them.
+
+## CREATE MODULE
+
+```sql
+CREATE MODULE name LANGUAGE lua AS $$
+    -- Lua code that returns a value
+$$;
+```
+
+Declares Lua code that more than one reducer can use. Settle runs the code once. The value that the code returns becomes a global variable with the name of the module. A reducer gets the module with `REQUIRE name`. See [Lua reducers](/reference/lua#modules).
+
+## CREATE REDUCER
+
+```sql
+CREATE REDUCER name
+SOURCE source
+[GROUP BY column [, column ...]]
+STATE ( field [, field ...] )
+[REQUIRE module [, module ...]]
+( LANGUAGE lua PROCESS $$ lua code $$ | LANGUAGE EXTERNAL );
+```
+
+Each `field` has one of these forms:
+
+```sql
+field Type DEFAULT literal
+field Map(String, Type)
+```
+
+| Part | Description |
+|---|---|
+| `SOURCE` | The table or reducer that the reducer reads. |
+| `GROUP BY` | The columns of the group key. Without it, the reducer has one group for all rows. |
+| `STATE` | The state fields of each group, with the default value of a new group. A Map field holds entries by a string key and has no `DEFAULT`. |
+| `REQUIRE` | The modules that the Lua code uses. |
+| `LANGUAGE lua` | The body is Lua code. See [Lua reducers](/reference/lua). |
+| `LANGUAGE EXTERNAL` | Your app gives the body: a JavaScript function or a Rust closure. See [Attach reducer code](/reference/settle#attach-reducer-code). |
+
+A default must be valid for the type of its field:
+
+- A `String` or `JSON` default is a text in single quotes. Two single quotes in the text give one quote.
+- A `Boolean` default is `true`, `false`, `1` or `0`.
+- A `UInt256` default is a decimal number or a hexadecimal number that starts with `0x`.
+- A `Bytes` or `Base58` default is `''`.
+
+The emit columns of a reducer are its group columns, then the names that its body emits. A view or a reducer that reads this reducer can use these columns. See [Reducers](/concepts/reducers).
+
+## CREATE MATERIALIZED VIEW
+
+```sql
+CREATE MATERIALIZED VIEW name AS
+SELECT item [, item ...]
+FROM source
+GROUP BY column [, column ...]
+[WINDOW SLIDING INTERVAL n unit BY time_column];
+```
+
+Each `item` has one of these forms:
+
+```sql
+column [AS name]
+function([column]) [AS name]
+toStartOfInterval(column, INTERVAL n unit) [AS name]
+```
+
+| Part | Description |
+|---|---|
+| `function` | `count`, `sum`, `avg`, `min`, `max`, `first` or `last`. See [Aggregate functions](/reference/aggregates). |
+| `toStartOfInterval` | A fixed window: the key is the start of the window, in milliseconds. |
+| `unit` | `SECOND`, `MINUTE`, `HOUR` or `DAY`. The plural form, for example `HOURS`, is valid only in `WINDOW SLIDING`. |
+| `GROUP BY` | Names each key item of the select list one time: a column, or the name of a `toStartOfInterval` item. |
+| `WINDOW SLIDING` | A sliding window over `time_column`. The time column must be `DateTime`, `UInt64` or `Int64`. |
+
+A view reads a table or a reducer. It cannot read another view.
+
+## Rules that open checks
+
+Open fails with a schema error in these conditions:
+
+- The source of a reducer or a view does not exist, or a view reads a view.
+- A reducer reads itself, or two or more reducers read each other in a circle.
+- A module that `REQUIRE` names does not exist, or two modules have the same name.
+- A group column of a reducer is not a column of its table.
+- A column of a view is not a column of its table.
+- Two tables, reducers or views have the same name. Two columns, two state fields or two output columns of one object have the same name.
+- A default is not valid for the type of its field.
+- A table has more than 65,535 columns, or a reducer has more than 65,535 state fields.
+- A view has more than 255 aggregates.
+
+At open, Settle cannot check the columns of a view or a reducer that reads a reducer. The emits set these columns. A column that no emit gives is `null`.
+
+## Refused constructs
+
+A view is a group and a list of aggregates. Open refuses these constructs in a view:
+
+- `WHERE`, `HAVING`, `JOIN`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT` and `WITH`.
+- An option of `CREATE MATERIALIZED VIEW`, for example a column list, `TO`, `OR REPLACE` or `TEMPORARY`.
+- A modifier of a function call, for example `DISTINCT` or `OVER`. An alias of the `FROM` table.
+- A view without an aggregate.
+- A key item that is not in `GROUP BY`, or a `GROUP BY` entry that is not a key item.
+- `sum`, `avg`, `min` or `max` over a column that holds no numbers.
+
+Open also refuses a reducer body with `WHEN ... THEN`. Write the body in Lua.
+
+To filter rows, do it in a Lua or external reducer that emits only the rows that you want. You can also filter the rows in your app before `ingest`.
+
+## Schema changes
+
+Settle stores rows and states by position. Thus a database remembers the layout of each object:
+
+| Object | Layout |
+|---|---|
+| Table | The names and types of the columns, in order. |
+| Reducer | The source, the group columns, and the names and types of the state fields, in order. |
+| View | The source, the key items, each aggregate with its column, the windows, and the sliding window. |
+
+Open refuses a schema that changes a stored layout. You can change these items without a new database:
+
+- The body of a reducer: the Lua code or your external code.
+- The default values of state fields.
+- The output names of a view, after `AS`.
+- The virtual flag of a table.
+- New tables, reducers and views. A new reducer or view does not see the final blocks from before it.
+
+To change a layout, give the object a new name, or make a new database from the source data.
+
+```ansi [Output]
+incompatible storage: table 't' does not match the layout of its stored data, which it would read wrong. Stored: {"columns":[{"name":"block_number","type":"UInt64"},{"name":"k","type":"String"}]}. Schema: {"columns":[{"name":"block_number","type":"UInt64"},{"name":"k","type":"String"},{"name":"n","type":"Float64"}]}. Keep the stored layout, give the table a new name, or rebuild the database from the source data
+```
+
+Open also refuses a database of a different format version.

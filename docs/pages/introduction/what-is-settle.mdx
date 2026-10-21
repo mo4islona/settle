@@ -1,0 +1,53 @@
+# What is Settle? [Live tables from blockchain data that stay correct after a reorg]
+
+Settle is a library for apps that show data from a blockchain. You tell Settle how to calculate a table from blocks, for example the trade volume of each pool. Settle keeps the table up to date when new blocks come. When the chain replaces its last blocks, Settle corrects the table for you.
+
+Settle runs inside your app. It works in Node.js, in a browser and in Rust.
+
+## The problem
+
+A blockchain does not give you the data that your app shows. It gives you blocks with events: a swap, a transfer, a trade. Your app must calculate the totals from these events: a balance, a volume, a price candle.
+
+The last blocks of a chain are not final. The chain can replace them with different blocks. This is a **fork**. Another name for it is a **reorg**. After a fork, each total that used the old blocks is incorrect.
+
+To correct the totals, your code must do these steps:
+
+1. Find the blocks that the chain replaced.
+2. Remove the effect of these blocks from each total.
+3. Apply the new blocks.
+
+This code is not easy to write or to test. Some totals make it harder. For example, you cannot subtract a value from a maximum.
+
+## What Settle does
+
+You declare the data that your app needs:
+
+- **Tables** hold the rows that your app reads from the chain.
+- **Views** calculate totals from the rows: sums, counts, minimums, maximums and price candles.
+- **Reducers** run your code when a view is not sufficient. An example is a profit that depends on the average buy price.
+
+Then your app sends blocks to Settle. For each call, Settle gives back a **batch of changes**: the rows to insert, update or delete in your database. When a fork occurs, Settle gives back the changes that undo the replaced blocks. Your app applies all batches with the same code.
+
+```
+             ┌─────────────────── Settle ───────────────────┐
+  blocks ──► │  tables  ──►  reducers  ──►  views           │ ──► changes ──► your database
+             └──────────────────────────────────────────────┘
+```
+
+## What Settle does not do
+
+- Settle does not connect to a chain. Your app reads the blocks, for example from SQD Portal or from an RPC node. Then it gives the blocks to Settle.
+- Settle does not answer queries. Your database keeps the results, and your app reads them from there.
+
+## Who is Settle for?
+
+Settle is for you when all of these conditions are true:
+
+- Your app shows totals from blockchain data: balances, volumes, prices or statistics.
+- Your app follows the last blocks of the chain, where forks occur.
+- You keep the results in your own database, for example Postgres, ClickHouse or a cache in memory.
+
+## Next steps
+
+- [Why Settle?](/introduction/why-settle) compares Settle with the code that you can write yourself.
+- [Quickstart](/introduction/quickstart) runs a full example in five minutes.

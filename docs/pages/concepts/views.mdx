@@ -1,0 +1,85 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Views [Aggregates for each group of rows]
+
+<LanguageSwitch label="Code language" />
+
+Most totals that an app shows are aggregates: the volume of a pool, the trades of a trader, the price candle of a minute. A view calculates them. It puts the rows into groups by one or more columns, and calculates aggregates for each group. Settle keeps each view correct after each block and after each fork.
+
+## Declare a view
+
+Call <Api ts="createView" rust="create_view" /> on a table or on a reducer:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/quickstart.ts:pipeline]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/quickstart.rs:pipeline]
+```
+
+:::
+
+- <Api ts="groupBy" rust="group_by" /> gives the columns of the group key. Use one column or a list of columns.
+- `select` gives the output columns. <Api ts="agg.key.pool" rust={'agg.key("pool")'} /> is a column of the group key. <Api ts="agg.sum('amount')" rust={'agg.sum("amount")'} /> is an aggregate.
+- Put each <Api ts="groupBy" rust="group_by" /> column in `select` as a key.
+- A view must have at least one aggregate.
+
+## Aggregates
+
+| Function | Result |
+|---|---|
+| `count()` | The number of rows in the group. |
+| `sum(column)` | The sum of the values. |
+| `avg(column)` | The average of the values. |
+| `min(column)` | The smallest value. |
+| `max(column)` | The largest value. |
+| `first(column)` | The first value, in the order of the chain. |
+| `last(column)` | The last value, in the order of the chain. |
+
+Each aggregate stays exact after a fork, also `min`, `max`, `first` and `last`. [Aggregate functions](/reference/aggregates) gives the result type of each function.
+
+## The output of a view
+
+A view has one output row for each group. The key of the row is the group key. The values are all columns of `select`.
+
+| Event | Record in the batch |
+|---|---|
+| The first row of a new group | `insert` |
+| A new row for a group that exists | `update`, with the old values |
+| A fork removes all rows of a group | `delete` |
+| A fork removes some rows of a group | `update` |
+
+A batch has at most one record for each group. When a call changes a group many times, the record shows only the final result.
+
+## Time windows
+
+A view can also put rows into groups by time. Use `interval` to make a group for each minute, hour or day. This gives price candles:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/time-windows.ts:candles]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/time-windows.rs:candles]
+```
+
+:::
+
+A view can also calculate aggregates over a sliding window, for example the volume of the last hour. [Time windows and candles](/guides/time-windows) shows both types of window.
+
+## What a view cannot do
+
+- A view reads one table or one reducer. It cannot join two sources.
+- A view has no `WHERE` clause. To filter rows, use a [reducer](/concepts/reducers), or filter the rows before you send them to Settle.
+- A view cannot read another view.
+
+## Next steps
+
+- [Reducers](/concepts/reducers) runs your code for each row when an aggregate is not sufficient.
+- [Change batches](/concepts/change-batches) explains each field of a record.

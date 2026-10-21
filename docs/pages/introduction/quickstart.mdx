@@ -1,0 +1,174 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Quickstart [Calculate a live table and see Settle correct it after a fork]
+
+<LanguageSwitch label="Code language" />
+
+In this example, your app keeps the trade volume of each pool. You send two blocks to Settle. Then the chain replaces one block, and you see how Settle corrects the volume.
+
+Use the switch above to show the code in TypeScript or in Rust. The choice applies to all pages.
+
+::::steps
+
+### Create a project
+
+:::code-group
+
+```bash [TypeScript]
+mkdir settle-quickstart
+cd settle-quickstart
+npm init -y
+npm pkg set type=module
+npm install @settle/stream
+npm install --save-dev tsx
+```
+
+```bash [Rust]
+cargo new settle-quickstart
+cd settle-quickstart
+cargo add settle --git https://github.com/mo4islona/settle
+```
+
+:::
+
+For TypeScript, you need Node.js 18 or later. Write the code of the next steps into `index.ts`. For Rust, write it into `src/main.rs`.
+
+### Declare a table and a view
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/quickstart.ts:pipeline]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/quickstart.rs:pipeline]
+```
+
+:::
+
+- `swaps` is a **table**. Each row is one swap. Each row must have the number of its block in `block_number`.
+- A virtual table keeps its rows out of the output. Your app needs only the totals, not each swap.
+- `pool_volume` is a **view**. It puts the swaps into groups by pool. For each pool, it calculates the volume and the number of swaps.
+- `build` opens Settle. Without a data directory, Settle keeps all data in memory.
+
+### Apply the changes
+
+Settle gives back the changes in a **batch**. A real app writes each batch to its database. This example only prints it.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/quickstart.ts:apply]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/quickstart.rs:apply]
+```
+
+:::
+
+After your app applies a batch, it calls `ack` with the sequence number of the batch. The ack tells Settle that your database has the batch.
+
+### Send two blocks
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/quickstart.ts:ingest]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/quickstart.rs:ingest]
+```
+
+:::
+
+Each call to `ingest` gives the rows of one or more blocks. It also gives the hash of each block in <Api ts="rollbackChain" rust="rollback_chain" />, and the last final block in <Api ts="finalizedHead" rust="finalized_head" />. Settle uses the hashes to find a fork.
+
+### Replace a block
+
+Now the chain replaces block 2 with a different block 2. The new block has the hash `0x2b`. Block 1 does not change. Tell Settle about the new chain:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/quickstart.ts:fork]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/quickstart.rs:fork]
+```
+
+:::
+
+### Send the new block
+
+The new block 2 has one swap:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/quickstart.ts:new-block]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/quickstart.rs:new-block]
+```
+
+:::
+
+### Run the program
+
+:::code-group
+
+```bash [TypeScript]
+npx tsx index.ts
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/quickstart.rs:main]
+```
+
+:::
+
+In Rust, add the `main` function above, then run `cargo run`. The program prints this output:
+
+:::code-group
+
+```ansi [TypeScript]
+insert { pool: 'ETH/USDC', volume: 350, swaps: 2 }
+insert { pool: 'BTC/USDC', volume: 50, swaps: 1 }
+fork point: 1
+update { pool: 'ETH/USDC', volume: 100, swaps: 1 }
+delete { pool: 'BTC/USDC', volume: 50, swaps: 1 }
+update { pool: 'ETH/USDC', volume: 400, swaps: 2 }
+```
+
+```ansi [Rust]
+insert { pool: ETH/USDC, volume: 350, swaps: 2 }
+insert { pool: BTC/USDC, volume: 50, swaps: 1 }
+fork point: 1
+update { pool: ETH/USDC, volume: 100, swaps: 1 }
+delete { pool: BTC/USDC, volume: 50, swaps: 1 }
+update { pool: ETH/USDC, volume: 400, swaps: 2 }
+```
+
+:::
+
+::::
+
+## What happened
+
+1. The first two blocks gave one row for each pool.
+2. The chain replaced block 2. Settle found the last block that the two chains have in common: block 1. It removed the effect of the old block 2: the ETH/USDC volume went back to 100, and the BTC/USDC row went away.
+3. The new block 2 added 300 to the volume of ETH/USDC.
+
+You did not write code for the fork. The same `apply` function wrote all changes.
+
+## Next steps
+
+- [How Settle works](/concepts/how-settle-works) explains the loop of your app.
+- [Reducers](/concepts/reducers) shows how to keep a state for each group, for example the profit of a trader.
+- [Write changes to Postgres](/guides/postgres) replaces the print with a real database.

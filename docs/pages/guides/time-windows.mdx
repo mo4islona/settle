@@ -1,0 +1,176 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Time windows and candles [Calculate totals for each minute, hour or day, and for the last hour]
+
+<LanguageSwitch label="Code language" />
+
+Many apps show data over time: a price candle for each minute, the volume of each day, or the volume of the last 24 hours. Settle has two types of time windows for this:
+
+- A **fixed window** puts each row into one time bucket, for example 12:00 to 12:01. Each bucket is one row in the output. Use it for candles and for daily totals.
+- A **sliding window** keeps only the rows of the last period, for example the last hour. Each group is one row in the output, and its totals go down when old rows leave the window. Use it for "volume in the last 24 hours".
+
+Both types stay correct after a fork. This includes `min` and `max`, which you cannot correct with a subtraction.
+
+## Add a time column
+
+A time window needs a column with the time of each row. Use the `datetime` type. The value is the number of **milliseconds** since 1970-01-01 UTC.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/time-windows.ts:table]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/time-windows.rs:table]
+```
+
+:::
+
+:::warning
+An EVM block gives its timestamp in seconds. Multiply it by 1000 before you send the row to Settle. If you send seconds, each window is 1000 times too long.
+:::
+
+Settle does not read the clock of your computer. All windows use the time in your rows.
+
+## Make candles with a fixed window
+
+To put rows into time buckets, add `interval(column, duration)` to the groups of the view. Give the bucket a name with <Api ts=".as(name)" rust=".r#as(name)" />, and add it to the select list with `agg.key`:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/time-windows.ts:candles]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/time-windows.rs:candles]
+```
+
+:::
+
+The view has one row for each pool and each minute. The value of `minute` is the start of the bucket, in milliseconds. For four trades in two minutes, Settle gives two rows:
+
+:::code-group
+
+```ansi [TypeScript]
+insert {
+  pool: 'ETH/USDC',
+  minute: 1767268800000,
+  open: 2000,
+  high: 2010,
+  low: 1990,
+  close: 1990,
+  volume: 4
+}
+insert {
+  pool: 'ETH/USDC',
+  minute: 1767268860000,
+  open: 2005,
+  high: 2005,
+  low: 2005,
+  close: 2005,
+  volume: 3
+}
+```
+
+```ansi [Rust]
+insert { pool: ETH/USDC, minute: 1767268800000, open: 2000, high: 2010, low: 1990, close: 1990, volume: 4 }
+insert { pool: ETH/USDC, minute: 1767268860000, open: 2005, high: 2005, low: 2005, close: 2005, volume: 3 }
+```
+
+:::
+
+`first`, `max`, `min`, `last` and `sum` give the open, high, low, close and volume of the candle. For a candle of one hour or one day, change the duration, for example `'1 hour'` or `'1 day'`.
+
+## Candles after a fork
+
+In this example, block 2 has the highest price of the minute. Then the chain replaces blocks 2 and 3:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/candles-fork.ts:fork]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/candles-fork.rs:fork]
+```
+
+:::
+
+Settle gives the candle of block 1 back, and then adds the new block 2. The two programs print the same lines:
+
+```ansi [Output]
+insert { open: 2000, high: 2050, low: 2000, close: 2010 }
+---
+update { open: 2000, high: 2000, low: 2000, close: 2000 }
+update { open: 2000, high: 2000, low: 1995, close: 1995 }
+```
+
+The high goes back from 2050 to 2000. Settle keeps the data of each block that is not final, so it does not need to calculate the old maximum again.
+
+## Keep totals for the last hour with a sliding window
+
+To keep only the rows of the last period, add a sliding window to the view. `interval` is the length of the window, and the time column is the column with the time of the rows:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/time-windows.ts:sliding]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/time-windows.rs:sliding]
+```
+
+:::
+
+After the four trades of the example, the view has one row. Then a block comes with a trade two hours later. The four old trades are now out of the window, and Settle updates the row:
+
+:::code-group
+
+```ansi [TypeScript]
+insert { pool: 'ETH/USDC', volume: 7, trades: 4 }
+---
+update { pool: 'ETH/USDC', volume: 4, trades: 1 }
+```
+
+```ansi [Rust]
+insert { pool: ETH/USDC, volume: 7, trades: 4 }
+---
+update { pool: ETH/USDC, volume: 4, trades: 1 }
+```
+
+:::
+
+### How the window moves
+
+- The time of a block is the latest time in its rows.
+- The end of the window is the latest block time that Settle has.
+- A block stays in the window while its time is not more than `interval` before the end of the window.
+
+So the window moves only when a new block comes with a later time. When no block comes, the totals do not change.
+
+After a fork, Settle puts the rows that the replaced blocks pushed out of the window back into it.
+
+:::info
+A sliding view keeps all of its groups in memory. Make sure that its groups fit in memory. Pools or tokens are usually not a problem, but millions of wallets can be.
+:::
+
+## Durations
+
+A duration is a number and a unit, for example `'5 minutes'` or `'1 day'`. These units are valid:
+
+| Unit | Names |
+|---|---|
+| Second | `second`, `seconds`, `sec`, `s` |
+| Minute | `minute`, `minutes`, `min`, `m` |
+| Hour | `hour`, `hours`, `hr`, `h` |
+| Day | `day`, `days`, `d` |
+
+## Next steps
+
+- [Views](/concepts/views) explains groups and aggregate functions.
+- [Aggregate functions](/reference/aggregates) gives the result type of each function.

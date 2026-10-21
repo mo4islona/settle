@@ -1,0 +1,15 @@
+[package]
+name = "settle-docs-example"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+settle = { path = "../../.." }
+
+# Guides: postgres.rs, rpc-node.rs
+postgres = "0.19"
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }

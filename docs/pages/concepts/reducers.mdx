@@ -1,0 +1,95 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Reducers [Your code for each row, with a state for each group]
+
+<LanguageSwitch label="Code language" />
+
+A view calculates each aggregate from one column. Some values need more: they depend on the rows before them. For example, the profit of a sale depends on the average price of the earlier buys. A reducer does this. It keeps a state for each group and runs your function for each row.
+
+## An example: the profit of a trader
+
+A trader buys and sells. For each sale, the profit is the amount multiplied by the difference between the sale price and the average buy price:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/reducer.ts:pipeline]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/reducer.rs:pipeline]
+```
+
+:::
+
+- The group key `trader` gives each trader a state of their own.
+- <Api ts="initialState" rust="initial_state" /> gives the state of a new group. Here a trader starts with no position and no cost.
+- Settle calls `reduce` for each row, in the order of the chain. `state` holds the current state of the group of the row.
+- `state.update` sets the new state. Give all fields of the state. A field that you do not give becomes empty (null).
+- `state.emit` sends a row to the next step. Here the view `trader_pnl` reads the emitted rows.
+
+Send three trades:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/reducer.ts:ingest]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/reducer.rs:ingest]
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+insert { trader: 'alice', profit: 2000, position: 15, trades: 3 }
+```
+
+```ansi [Rust]
+insert { trader: alice, profit: 2000, position: 15, trades: 3 }
+```
+
+:::
+
+Alice bought 10 at 2,000 and 10 at 2,400, so her average price is 2,200. She sold 5 at 2,600. Her profit is 5 × 400 = 2,000.
+
+## What `emit` does
+
+- Each call of `emit` makes one row. A reducer can emit zero, one or more rows for one input row.
+- To skip a row, return before you call `emit`. This is how you filter rows.
+- The emitted row gets the group key columns from the input row. Here each emitted row has `trader`, but the code does not set it.
+- A reducer is not an output. Its state and its rows are not in the batches. To show them, declare a view that reads the reducer.
+- A reducer can also feed another reducer: call <Api ts="createReducer" rust="create_reducer" /> on the reducer.
+
+## The rules for `reduce`
+
+Settle can run `reduce` again for the same rows, for example after a restart. So `reduce` must give the same result each time for the same state and row:
+
+- Use only `state` and `row`.
+- Do not read or change variables outside the function.
+- Do not read the clock, random numbers or the network.
+
+When a fork occurs, Settle puts back the state of each group as it was at the fork point. Then it runs `reduce` for the rows of the new blocks. You do not write code for this.
+
+## State types
+
+In Rust, the `Value` that you give in `initial_state` sets the type of each field, for example `Value::Float64(0.0)`. In TypeScript, Settle gets the type from the value in `initialState`:
+
+| Value in `initialState` | Type of the field |
+|---|---|
+| A number, for example `0` | `Float64` |
+| A `bigint`, for example `0n` | `UInt64` |
+| A string | `String` |
+| A boolean | `Boolean` |
+| An object or an array | `JSON` |
+
+A state field can also be a map with a string key, for example a balance for each token. Declare a map field in the SQL schema. [Schema language](/reference/schema) explains map fields.
+
+## Next steps
+
+- [Change batches](/concepts/change-batches) explains what your app gets back from each call.
+- [Lua reducers](/reference/lua) shows how to write a reducer in Lua, in the SQL schema.

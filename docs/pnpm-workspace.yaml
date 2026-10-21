@@ -1,0 +1,4 @@
+allowBuilds:
+  esbuild: true
+patchedDependencies:
+  vocs@1.4.1: patches/vocs@1.4.1.patch

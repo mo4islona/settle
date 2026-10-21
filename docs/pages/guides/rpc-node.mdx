@@ -1,0 +1,177 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Use with an RPC node [Read blocks from a JSON-RPC node and find forks yourself]
+
+<LanguageSwitch label="Code language" />
+
+An RPC node gives you one block at a time. It does not tell you when the chain replaces blocks. Your app must find a fork itself. A fork occurs when the parent hash of a new block is not the hash of the last block that your app sent.
+
+This guide shows a full loop with plain JSON-RPC calls: `fetch` in TypeScript, `ureq` in Rust. You can use the same method with another client, for example viem or alloy. The example keeps the number of blocks and the gas of each fee recipient on Ethereum.
+
+:::code-group
+
+```bash [TypeScript]
+npm install @settle/stream
+npm install --save-dev tsx
+```
+
+```bash [Rust]
+cargo add settle --git https://github.com/mo4islona/settle
+cargo add serde_json@1
+cargo add ureq@2 --features json
+```
+
+:::
+
+::::steps
+
+### Read blocks from the node
+
+The block function calls `eth_getBlockByNumber`. It accepts a block number or the tags `latest` and `finalized`:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/rpc-node.ts:rpc]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/rpc-node.rs:rpc]
+```
+
+:::
+
+This example uses the `finalized` tag of the node to get the last final block. Use a node that supports this tag.
+
+### Declare the pipeline
+
+Each block gives one row:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/rpc-node.ts:pipeline]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/rpc-node.rs:pipeline]
+```
+
+:::
+
+The apply function prints the changes and acks them. A real app writes them to its database, as in [Write changes to Postgres](/guides/postgres):
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/rpc-node.ts:apply]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/rpc-node.rs:apply]
+```
+
+:::
+
+### Send each block to Settle
+
+The loop keeps the last block that it sent in `last`. At the start, `last` is <Api ts="db.cursor" rust="db.latest_cursor()" />, the last block that Settle has. For each new block, the loop compares the parent hash with the hash of `last`:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/rpc-node.ts:loop]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/rpc-node.rs:loop]
+```
+
+:::
+
+When the hashes are equal, the new block follows the last block. The loop sends it to Settle with its hash and the last final block.
+
+### Handle a fork
+
+When the hashes are not equal, the chain replaced the last block, or more blocks. The loop gives Settle the blocks of the new chain, from the last block down. Settle finds the last block that the two chains have in common, and undoes the blocks above it:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/rpc-node.ts:reorg]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/rpc-node.rs:reorg]
+```
+
+:::
+
+- <Api ts="resolveForkCursor" rust="resolve_fork_cursor" /> looks for a common block in the chain that you give. It changes nothing.
+- When it finds no common block, the loop reads more blocks, but not below the last final block. A fork cannot replace a final block.
+- <Api ts="handleFork" rust="handle_fork" /> does the rollback. It returns the common block and the changes that undo the blocks above it.
+- The loop then continues after the common block, and reads the blocks of the new chain.
+
+When the chain down to the last final block has no common block, <Api ts="handleFork" rust="handle_fork" /> fails. Then the node and Settle do not agree about a final block. Stop the app and find the cause.
+
+::::
+
+## Example output
+
+This output comes from a test node. It gives blocks 1 to 5. Then it replaces blocks 4 and 5 with two new blocks and adds block 6:
+
+:::code-group
+
+```ansi [TypeScript]
+insert { fee_recipient: '0xaaa', blocks: 1, gas: 1000 }
+insert { fee_recipient: '0xbbb', blocks: 1, gas: 2000 }
+update { fee_recipient: '0xaaa', blocks: 2, gas: 4000 }
+update { fee_recipient: '0xbbb', blocks: 2, gas: 6000 }
+update { fee_recipient: '0xaaa', blocks: 3, gas: 9000 }
+update { fee_recipient: '0xbbb', blocks: 1, gas: 2000 }
+update { fee_recipient: '0xaaa', blocks: 2, gas: 4000 }
+fork point: 3
+insert { fee_recipient: '0xccc', blocks: 1, gas: 4000 }
+update { fee_recipient: '0xccc', blocks: 2, gas: 9000 }
+update { fee_recipient: '0xccc', blocks: 3, gas: 15000 }
+```
+
+```ansi [Rust]
+insert { fee_recipient: 0xaaa, blocks: 1, gas: 1000 }
+insert { fee_recipient: 0xbbb, blocks: 1, gas: 2000 }
+update { fee_recipient: 0xaaa, blocks: 2, gas: 4000 }
+update { fee_recipient: 0xbbb, blocks: 2, gas: 6000 }
+update { fee_recipient: 0xaaa, blocks: 3, gas: 9000 }
+update { fee_recipient: 0xbbb, blocks: 1, gas: 2000 }
+update { fee_recipient: 0xaaa, blocks: 2, gas: 4000 }
+fork point: 3
+insert { fee_recipient: 0xccc, blocks: 1, gas: 4000 }
+update { fee_recipient: 0xccc, blocks: 2, gas: 9000 }
+update { fee_recipient: 0xccc, blocks: 3, gas: 15000 }
+```
+
+:::
+
+The two updates before `fork point: 3` undo blocks 4 and 5. Then the new blocks 4, 5 and 6 add a new fee recipient.
+
+## Run it
+
+:::code-group
+
+```bash [TypeScript]
+RPC_URL=https://ethereum-rpc.publicnode.com npx tsx rpc-node.ts
+```
+
+```bash [Rust]
+RPC_URL=https://ethereum-rpc.publicnode.com cargo run --release --bin rpc-node
+```
+
+:::
+
+On a new database, the loop starts at the last block of the chain. Set `START_BLOCK` to start at a different block. The loop reads each block one by one, so it is slow for a long history. To read a long history, use a source that gives many blocks in one request, for example [SQD Portal](/guides/sqd-portal).
+
+## Next steps
+
+- [Forks and finality](/concepts/forks-and-finality) explains how Settle finds the fork point.
+- [Write changes to Postgres](/guides/postgres) replaces the print with a real database.

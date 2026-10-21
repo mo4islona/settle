@@ -1,0 +1,79 @@
+# Run in a browser [Calculate live tables in a web page with the WebAssembly build]
+
+:::info
+This guide is for TypeScript only. In a browser, Settle runs as a WebAssembly module from the npm package.
+:::
+
+Settle can run inside a web page. Examples are a dashboard that calculates its totals in the page, a demo, or a test without a server. The API is the same as in Node.js, with these differences:
+
+- Import from `@settle/stream/web`.
+- Call `init()` one time before the first call. It loads the WebAssembly module.
+- Open the pipeline with `openCompiled(Settle, p.compile())`. Do not use `p.build()`, because it opens the Node.js module.
+- Settle keeps all data in memory. When the page loads again, Settle starts with an empty database.
+- Reducers in Lua do not work in the browser. Write your reducers in TypeScript.
+
+```bash [Terminal]
+npm install @settle/stream
+```
+
+::::steps
+
+### Load the module and open the pipeline
+
+```ts [app.ts]
+// [!include ~/examples/browser.ts:open]
+```
+
+`p.compile()` makes the schema of the pipeline and collects the code of its reducers. `openCompiled` opens a Settle instance from them and attaches the code of each reducer.
+
+### Send blocks
+
+```ts [app.ts]
+// [!include ~/examples/browser.ts:ingest]
+```
+
+```ansi [Console]
+insert { pool: 'ETH/USDC', swaps: 1, volume: 100 }
+insert { pool: 'BTC/USDC', swaps: 1, volume: 50 }
+```
+
+`ingest`, `ack` and `handleFork` work as in Node.js. The order of the fields in `values` can be different from Node.js. Read the fields by their names.
+
+::::
+
+## Load the WebAssembly file
+
+Without an argument, `init()` loads the file `settle_bg.wasm` from the folder of the Settle module. It uses `new URL('settle_bg.wasm', import.meta.url)`. Vite and webpack 5 find this URL and copy the file into your build.
+
+When your bundler does not copy the file, do these steps:
+
+1. Copy `node_modules/@settle/stream/src/wasm/settle_bg.wasm` to the static files of your site.
+2. Give its URL to `init`, for example `await init('/settle_bg.wasm')`.
+
+## Options that the browser does not accept
+
+In a browser, Settle has no disk. These options make the open fail:
+
+| Option | Why |
+|---|---|
+| `dataDir` | The browser build has no disk storage. |
+| `compression` | It is an option of the disk storage. |
+| `cacheSize` | It is an option of the disk storage. |
+| `maxBufferSize` | The browser build does not have it. |
+
+For example, a data directory gives this error:
+
+```ts [app.ts]
+// [!include ~/examples/browser.ts:options]
+```
+
+```ansi [Console]
+WASM build is memory-only and does not expose buffer tuning — `dataDir`, `compression`, `cacheSize`, and `maxBufferSize` are not supported.
+```
+
+The browser build ignores `appliedSequence`, `backfillCheckpointInterval` and `maxResidentGroups`, because all data is in memory. `maxPendingBatches` works as in Node.js.
+
+## Next steps
+
+- [Change batches](/concepts/change-batches) explains how to show the changes in your page.
+- [Pipeline](/reference/pipeline) describes `compile` and `openCompiled`.

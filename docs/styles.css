@@ -1,0 +1,24 @@
+/*
+ * Code groups render every tab into the HTML (patches/vocs@1.4.1.patch), so
+ * that search engines and crawlers see the code of each language. Show only
+ * the selected tab.
+ */
+[role='tabpanel'][data-state='inactive'] {
+  display: none;
+}
+
+/*
+ * <Api> renders the name of each language. The early script in
+ * vocs.config.tsx sets <html data-language> before the first paint, so the
+ * page shows the right name without a flash. TypeScript is the default.
+ */
+.api-name > [data-lang],
+.api-name > .api-separator {
+  display: none;
+}
+
+html:not([data-language]) .api-name > [data-lang='ts'],
+html[data-language='ts'] .api-name > [data-lang='ts'],
+html[data-language='rust'] .api-name > [data-lang='rust'] {
+  display: inline;
+}

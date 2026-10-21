@@ -1,0 +1,148 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Change batches [What Settle gives back, and how to apply it]
+
+<LanguageSwitch label="Code language" />
+
+Settle does not keep the output for your app to query. Instead, each call gives back the changes to the output: a **change batch**. Your app writes the batch to its database. When your app applies all batches, its database holds the same tables as Settle.
+
+## The shape of a batch
+
+This call adds two swaps to a pool that already has one swap:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/concepts-batches.ts:update]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/concepts-batches.rs:update]
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+sequence: 2
+{
+  pool_volume: [
+    {
+      table: 'pool_volume',
+      operation: 'update',
+      key: { pool: 'ETH/USDC' },
+      values: { pool: 'ETH/USDC', volume: 400, swaps: 3 },
+      prevValues: { pool: 'ETH/USDC', volume: 100, swaps: 1 }
+    }
+  ]
+}
+```
+
+```ansi [Rust]
+sequence: 2
+table: pool_volume
+operation: Update
+key: [("pool", String("ETH/USDC"))]
+values: [("pool", String("ETH/USDC")), ("volume", Float64(400.0)), ("swaps", UInt64(3))]
+prev_values: Some([("pool", String("ETH/USDC")), ("volume", Float64(100.0)), ("swaps", UInt64(1))])
+```
+
+:::
+
+| Field | Description |
+|---|---|
+| `sequence` | The number of the batch. The first batch has the number 1. |
+| `tables` | The records of each output table that changed, by table name. |
+| <Api ts="finalizedHead" rust="finalized_head" /> | The last final block after the call. |
+| <Api ts="latestHead" rust="latest_head" /> | The last block after the call. |
+
+Each record has these fields:
+
+| Field | Description |
+|---|---|
+| `table` | The name of the output table. |
+| `operation` | `insert`, `update` or `delete`. |
+| <Api ts="key" rust="key_values()" /> | The key of the row: the group key of a view, or the block number and the row index of a table row. |
+| <Api ts="values" rust="values()" /> | The new values of the row. For a `delete`, the last values of the row. |
+| <Api ts="prevValues" rust="prev_values()" /> | The old values for an `update` or a view `delete`. An `insert` and a `delete` of a table row have no old values. |
+
+A batch has at most one record for each key. When a call changes a row many times, the record shows only the final result. The records in a batch have no order.
+
+## Apply a batch
+
+Do these steps for each record:
+
+- For `insert` and `update`, write `values` to the row with this `key`. An upsert does both.
+- For `delete`, remove the row with this `key`.
+
+:::code-group
+
+```ts [TypeScript]
+for (const [table, records] of Object.entries(batch.tables)) {
+  for (const record of records) {
+    if (record.operation === 'delete') {
+      await remove(table, record.key)
+    } else {
+      await upsert(table, record.key, record.values)
+    }
+  }
+}
+```
+
+```rust [Rust]
+for (table, records) in &batch.tables {
+    for record in records {
+        match record.operation {
+            ChangeOp::Delete => remove(table, record.key_map())?,
+            ChangeOp::Insert | ChangeOp::Update => {
+                upsert(table, record.key_map(), record.values_map())?
+            }
+        }
+    }
+}
+```
+
+:::
+
+[Write changes to Postgres](/guides/postgres) gives a full example with SQL.
+
+## The rules
+
+Obey these rules, so that your database stays correct:
+
+1. Apply the batches in the order of `sequence`. Do not skip a batch.
+2. Apply each batch in one transaction, so that a crash cannot leave half of a batch.
+3. Call `ack(batch.sequence)` only after your database has the batch.
+
+An ack confirms the batch and all batches before it. Settle writes its own state to disk only for confirmed batches.
+
+## A call without changes
+
+When no output changes, the call gives no batch. For example, a call can only move the final block:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/concepts-batches.ts:heartbeat]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/concepts-batches.rs:heartbeat]
+```
+
+:::
+
+When there is no batch, you have nothing to apply or to confirm.
+
+## Batches that wait for an ack
+
+By default, two batches can wait for an ack at the same time. So your app can send the next blocks to Settle while it writes the batch before. A call that gives no batch while a batch waits also counts as one.
+
+When two wait, the next `ingest` fails with the error <Api ts="SettlePendingAckError" rust="Error::PendingAck" />. Then apply and confirm the oldest batch, and do the call again. The option <Api ts="maxPendingBatches" rust="max_pending_batches" /> changes this number. [Configuration](/reference/configuration) lists all options.
+
+## Next steps
+
+- [Forks and finality](/concepts/forks-and-finality) explains the batches that undo replaced blocks.
+- [Restarts and crash safety](/guides/restarts) explains what Settle keeps after a crash.
