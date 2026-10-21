@@ -1,0 +1,21 @@
+{
+  "name": "settle-docs",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vocs dev",
+    "build": "vocs build && node scripts/postbuild.mjs",
+    "preview": "vocs preview",
+    "lint:ste": "node scripts/ste-lint.mjs pages"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "vocs": "1.4.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "typescript": "^5.9.3"
+  }
+}

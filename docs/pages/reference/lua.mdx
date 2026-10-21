@@ -1,0 +1,128 @@
+# Lua reducers [The body of a reducer in Lua 5.4]
+
+A Lua reducer runs inside Settle, so your app does not need to give code at each start. You write the body in the schema text with `LANGUAGE lua PROCESS $$ ... $$`. Settle runs the body once for each row of the source, in the order of the chain. For the idea of a reducer, read [Reducers](/concepts/reducers).
+
+```sql
+CREATE REDUCER market_stats
+SOURCE orders
+GROUP BY asset_id
+STATE (
+    volume Float64 DEFAULT 0,
+    trades UInt64  DEFAULT 0
+)
+LANGUAGE lua
+PROCESS $$
+    if row.shares == 0 then return end
+
+    local volume = row.usdc / 1000000
+    state.volume = state.volume + volume
+    state.trades = state.trades + 1
+
+    emit({ volume = volume, trades = state.trades })
+$$;
+```
+
+## Globals
+
+| Name | Description |
+|---|---|
+| `row` | The input row. `row.<column>` is the value of a column, or `nil` when the value is `null` or absent. |
+| `state` | The state of the group of the row. Read and write `state.<field>`. A change stays for the next row of the group. |
+| `emit(t)` | Sends the row `t` to the next stage. Call it zero, one or more times. |
+| `json.encode(v)` | Gives the JSON text of a Lua value. |
+| `json.decode(s)` | Gives the Lua value of a JSON text. |
+
+The body sees only the state of its own group and the input row. Use `return` to stop the body early, for example to skip a row.
+
+## emit
+
+Write the emit row as a Lua table:
+
+```lua
+emit({ volume = volume, trades = state.trades })
+emit { volume = volume }
+```
+
+- Each call gives one emit row. An empty table gives no row.
+- When the table does not contain a group column, the column gets the value of the input row.
+- `emit.volume = 5` is not valid: `emit` is a function. It gives a reducer error.
+
+## Numbers
+
+Lua 5.4 keeps integers and floats apart. An integer, for example `3` or `state.trades + 1`, emits as `Int64`. The `/` operator always gives a float, so `row.usdc / 1000000` emits as `Float64`. Use `//` for an integer division.
+
+## JSON fields
+
+A `JSON` state field is a Lua table. Change it in place, and the change stays:
+
+```lua
+state.doc.count = state.doc.count + 1
+```
+
+Today, a Lua table in an emit gives `null`. To send JSON data to the next stage, emit its text:
+
+```lua
+emit({ doc = json.encode(state.doc) })
+```
+
+## Map fields
+
+A Map field, for example `book Map(String, JSON)`, holds entries by a string key. Use its methods with a colon:
+
+| Method | Description |
+|---|---|
+| `state.book:get(key)` | Returns a copy of the entry, or `nil`. A change to the copy stays only after a `set`. |
+| `state.book:set(key, value)` | Writes the entry. A `nil` value deletes it. |
+| `state.book:delete(key)` | Deletes the entry. |
+
+A Map field does not accept an index such as `state.book[key]`. A Map of a type other than `JSON` does not accept a table as a value.
+
+A Map field changes one entry at a time. Thus a fork, a final block or a write to disk costs as much as the changed entries, not as much as the full map.
+
+```lua
+local p = state.book:get(row.token) or { qty = 0 }
+p.qty = p.qty + row.amount
+if p.qty == 0 then state.book:delete(row.token) else state.book:set(row.token, p) end
+```
+
+## Modules
+
+A module holds Lua code that more than one reducer uses. The value that the module code returns becomes a global variable with the name of the module:
+
+```sql
+CREATE MODULE fees LANGUAGE lua AS $$
+    return { rate = 0.003 }
+$$;
+
+CREATE REDUCER pool_fees
+SOURCE trades
+GROUP BY pool
+STATE (total Float64 DEFAULT 0)
+REQUIRE fees
+LANGUAGE lua
+PROCESS $$
+    state.total = state.total + row.amount * fees.rate
+    emit({ total = state.total })
+$$;
+```
+
+## Sandbox
+
+The body runs in a sandbox. These globals are not available: `os`, `io`, `debug`, `loadfile`, `dofile`, `load`, `rawget`, `rawset`, `require` and `package`. The standard libraries `string`, `math` and `table` are available.
+
+## Errors
+
+A Lua error, for example an index of `nil`, stops the call, and `ingest` throws a reducer error. Usually nothing changes. When the same call also removed blocks for a fork, the instance becomes poisoned. See [Errors](/reference/errors).
+
+## Lua or code in your app?
+
+A reducer with `LANGUAGE EXTERNAL` runs code from your app: a JavaScript function or a Rust closure. See [Attach reducer code](/reference/settle#attach-reducer-code).
+
+| | Lua | JavaScript | Rust closure |
+|---|---|---|---|
+| Where the code is | In the schema text. | In your app. Your app attaches it at each start. | In your app. Your app attaches it at each start. |
+| Calls from Settle | One call for each row. | One call for each block, with all groups of the block. | One call for each row. |
+| Browser | Not available. | Available. | — |
+| Numbers | Integers and floats. | Each `number` is a `Float64`. | Each `Value` keeps its type. |
+
+The browser build has no Lua runtime. See [Run in a browser](/guides/browser).

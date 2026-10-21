@@ -1,0 +1,77 @@
+# Use with SQD Portal [Read blocks with the SQD Pipes SDK and send them to Settle]
+
+:::info
+This guide is for TypeScript only, because the Pipes SDK is a TypeScript library.
+:::
+
+[SQD Portal](https://docs.sqd.dev) gives blockchain data in a stream: the blocks, their hashes and the last final block. When the chain replaces blocks, the Portal tells your app the blocks of the new chain. These are the inputs that Settle needs.
+
+The [Pipes SDK](https://github.com/subsquid/pipes-sdk) (`@subsquid/pipes`) reads the stream and decodes the events. A Pipes **target** receives the decoded data. In this guide, you write a small target that sends the data to Settle.
+
+```bash [Terminal]
+npm install @settle/stream @subsquid/pipes
+npm install --save-dev tsx
+```
+
+::::steps
+
+### Write a Settle target
+
+The target has two functions:
+
+- `write` reads the batches of the stream. For each batch, it calls `ingest`, applies the changes and acks them.
+- `resolveFork` receives the blocks of the new chain after a fork. It calls `handleFork`, applies the changes and returns the fork point. The stream continues after this block.
+
+```ts [pipes-target.ts]
+// [!include ~/examples/pipes-target.ts:target]
+```
+
+- At the start, `read` continues after `db.cursor`, the last block that Settle has.
+- `ctx.stream.state.rollbackChain` gives the number and the hash of each block that is not final. Settle uses the hashes to find a fork.
+- `ctx.stream.head.finalized` gives the last final block. Settle needs it, so the target stops when the dataset does not give it.
+- The target applies and acks each batch before it reads the next one. So when a fork comes, your database has all batches before it.
+
+### Declare the pipeline
+
+This example calculates the net USDC flow of each wallet on Ethereum. Each transfer gives two rows: a negative amount for the sender and a positive amount for the receiver.
+
+```ts [index.ts]
+// [!include ~/examples/sqd-portal.ts:pipeline]
+```
+
+### Connect the stream to Settle
+
+`evmPortalStream` reads the USDC transfers from the Portal. `toRows` changes the decoded transfers into the rows of the Settle table. `apply` writes a batch to your database. This example prints a short line for each batch.
+
+```ts [index.ts]
+// [!include ~/examples/sqd-portal.ts:stream]
+```
+
+### Run it
+
+```bash [Terminal]
+npx tsx index.ts
+```
+
+The Pipes SDK prints its own log lines. Between them, you see one line for each batch:
+
+```ansi [Output]
+batch 1: 12 changes, block 21000000
+batch 2: 166 changes, block 21000020
+```
+
+Run the file again. The stream continues after block 21000020, the last block in Settle. This range has no more blocks, so no batch comes.
+
+::::
+
+## Before you use it in production
+
+- **Use a real database.** Replace the `console.log` in `apply` with a transaction, as in [Write changes to Postgres](/guides/postgres). Store `batch.sequence` in the same transaction, and give it to `p.build()` as `appliedSequence`.
+- **Follow the chain.** Remove `to` from the `range`. Then the stream follows the last blocks of the chain, where forks occur.
+- **Apply each batch two times with the same result.** Without `appliedSequence`, a restart can give a batch again that your database has. An upsert of the values is safe.
+- **Keep one process for each data directory.** Settle cannot open a data directory that another instance uses.
+
+## Next steps
+
+- [Forks and finality](/concepts/forks-and-finality) explains the rollback chain and the final block.
+- [Restarts and crash safety](/guides/restarts) explains what Settle keeps after a restart.

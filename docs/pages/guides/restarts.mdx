@@ -1,0 +1,205 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Restarts and crash safety [Keep Settle and your database in step when your app stops]
+
+<LanguageSwitch label="Code language" />
+
+Your app can stop at any time: for a deploy, after a crash or after a power failure. After the restart, Settle and your database must agree on the last block. This page tells you what Settle keeps on disk and what your app must do.
+
+## Keep the state on disk
+
+Give a data directory to `build`. Settle keeps its state in this directory. Without a data directory, Settle keeps all data in memory, and each start begins with an empty database.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/restarts.ts:open]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/restarts.rs:open]
+```
+
+:::
+
+<Api ts="db.cursor" rust="db.latest_cursor()" /> is the last block that Settle has: its number and its hash. On a new database, there is no block. Tell your block source to continue after this block:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/restarts.ts:next-block]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/restarts.rs:next-block]
+```
+
+:::
+
+At the start, Settle also runs the blocks that are not final through the pipeline again. It gives no changes for them. So the start takes more time when many blocks are not final.
+
+## The ack saves a batch
+
+A batch is only in memory until your app acks it. When you call `ack(sequence)`, Settle writes the batch to disk and syncs the disk. After the ack, the batch is safe also from a power failure. An ack is cumulative: `ack(5)` saves each batch up to batch 5.
+
+Always ack a batch **after** your database has it. If you ack first and your app stops, Settle has a state that your database does not have.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/restarts.ts:apply]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/restarts.rs:apply]
+```
+
+:::
+
+Run the example four times. The third run stops before the ack:
+
+:::code-group
+
+```bash [TypeScript]
+npx tsx restarts.ts
+npx tsx restarts.ts
+npx tsx restarts.ts --crash
+npx tsx restarts.ts
+```
+
+```bash [Rust]
+cargo run --release --bin restarts
+cargo run --release --bin restarts
+cargo run --release --bin restarts -- --crash
+cargo run --release --bin restarts
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+continue after: null
+batch 1: insert { pool: 'ETH/USDC', volume: 100, swaps: 1 }
+continue after: { number: 1, hash: '0x1' }
+batch 2: update { pool: 'ETH/USDC', volume: 200, swaps: 2 }
+continue after: { number: 2, hash: '0x2' }
+batch 3: update { pool: 'ETH/USDC', volume: 300, swaps: 3 }
+continue after: { number: 2, hash: '0x2' }
+batch 3: update { pool: 'ETH/USDC', volume: 300, swaps: 3 }
+```
+
+```ansi [Rust]
+continue after: None
+batch 1: insert { pool: ETH/USDC, volume: 100, swaps: 1 }
+continue after: Some(BlockCursor { number: 1, hash: "0x1" })
+batch 2: update { pool: ETH/USDC, volume: 200, swaps: 2 }
+continue after: Some(BlockCursor { number: 2, hash: "0x2" })
+batch 3: update { pool: ETH/USDC, volume: 300, swaps: 3 }
+continue after: Some(BlockCursor { number: 2, hash: "0x2" })
+batch 3: update { pool: ETH/USDC, volume: 300, swaps: 3 }
+```
+
+:::
+
+Settle lost batch 3, but your database has it. The fourth run continues after block 2 and gives batch 3 again. For this reason, your app must apply a batch so that two applies of the same batch give the same result. An upsert of the values does this: write the row of each key, and do not add to the old row.
+
+## Close the gap with the applied sequence
+
+An upsert is not always sufficient. Your app applies batch 3, and then it stops before the ack. Before it sends block 3 again, the chain replaces block 3. Settle does not know that your database has batch 3, so it cannot undo it.
+
+To close this gap, give Settle the sequence number of the last batch in your database:
+
+1. Store the sequence number of the batch in your database, in the same transaction as the data of the batch.
+2. At the start, read this number and give it to Settle as <Api ts="appliedSequence" rust="applied_sequence" />. For a new database, give 0.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/postgres.ts:open]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/postgres.rs:open]
+```
+
+:::
+
+With <Api ts="appliedSequence" rust="applied_sequence" />, Settle writes each batch to a journal on disk before it gives the batch to your app. At the start, Settle uses the journal to get the state after the batch that your database has. Then the two stores agree, also when the ack did not occur. The cost is one more write of each batch. The number of disk syncs stays the same: one for each batch.
+
+In Rust, `BuildOptions` does not have this option. Open the pipeline with `Config` and `Settle::open`, as the example does. This works for a pipeline without reducers.
+
+[Write changes to Postgres](/guides/postgres) shows a full example with a crash.
+
+### When the start fails
+
+With <Api ts="appliedSequence" rust="applied_sequence" />, Settle does not open when the two stores do not agree. These are the cases and their errors:
+
+| Case | Error message |
+|---|---|
+| Your database is behind the last batch that your app acked. | `the target applied batch 1, but batch 2 is acked: the target lost batches that it applied, or does not store their sequence` |
+| Your database has a batch that Settle does not have. | `the target applied batch 5, but the database has no record of batch 4` |
+| The journal has batches, but your app gives no applied sequence. | `the database holds change batches from sequence 3 that were returned and not acked: open it with the applied sequence of the target` |
+
+Do not try again in a loop. Find the cause first: the data in one of the two stores is not correct.
+
+## Wait for the ack: PendingAck
+
+By default, two batches can wait for an ack at the same time. So Settle can process the next blocks while your database applies the batch before. When the limit is full, `ingest` and <Api ts="handleFork" rust="handle_fork" /> fail with <Api ts="SettlePendingAckError" rust="Error::PendingAck" />. Its `sequence` is the oldest batch without an ack.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/pending-ack.ts:pending]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/pending-ack.rs:pending]
+```
+
+:::
+
+```ansi [Output]
+wait for the ack of batch 1
+```
+
+<Api ts="db.unackedBatches" rust="db.unacked_batches()" /> tells you how many places are in use. A call that gives no batch takes a place too while other batches wait, because its writes go to disk with the newest batch.
+
+These rules apply:
+
+- Apply the batches in the order of their sequence numbers.
+- Call <Api ts="handleFork" rust="handle_fork" /> only after your database applied all batches before it.
+- To make each call wait for the ack of the batch before, set <Api ts="maxPendingBatches: 1" rust="max_pending_batches(1)" />.
+
+## When Settle stops after an error
+
+Some failures leave the memory of Settle in a state that no batch describes. An example is a disk failure during a rollback. After such a failure, <Api ts="db.isPoisoned" rust="db.is_poisoned()" /> is true, and each call except `ack` fails. Do these steps:
+
+1. Ack each batch that your database applied. An ack still works.
+2. Close the instance and open the data directory again. Settle opens at the last batch with an ack, or at the applied sequence.
+
+In Rust, drop the `Settle` value to close it. In Node.js, no call closes an instance, and a second open of the same data directory in the same process fails. So stop the process and start it again.
+
+When a disk sync fails, also `ack` fails. Close the instance and open it again in the same way.
+
+## Change the schema between runs
+
+Settle keeps the layout of each table, reducer and view on disk. At the start, it compares the layout with your schema. It does not open when your schema changes a layout:
+
+- The columns of a table, their order or their types.
+- The source, the groups or the state fields of a reducer.
+- The source, the select list or the window of a view.
+
+You can change the code of a reducer, a default value or an output name. You can also add new tables, reducers and views. A new object sees only the blocks that are not final, and the blocks after them.
+
+To change a layout, give the object a new name, or delete the data directory and send all blocks again.
+
+:::warning
+When you change the code of a reducer, the new code must give the same results for the old rows. Settle does not calculate the old rows again, and it does not check this.
+:::
+
+## Next steps
+
+- [Write changes to Postgres](/guides/postgres) uses the applied sequence with a real database.
+- [Configuration](/reference/configuration) lists all options.

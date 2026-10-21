@@ -1,0 +1,45 @@
+# Why Settle? [What you get when you do not write fork logic yourself]
+
+## A fork makes your totals incorrect
+
+Your app shows the trade volume of a pool. Block 101 has a swap of 50 USDC. Your app adds 50 to the volume. Then the chain replaces block 101 with a block that does not have this swap. Now the volume in your database is 50 too high.
+
+Each total that your app keeps has this problem: a balance, a count, a price candle, a profit. Your app must correct all of them after each fork.
+
+## The usual solutions
+
+### Read only final blocks
+
+A block that is final cannot change, so no fork occurs. But your data is late. On Ethereum, a block becomes final after about 13 minutes. Many apps cannot show data that is so old.
+
+### Subtract the old values
+
+On a fork, your app subtracts the values of the replaced blocks from each total. This is fast, and it is correct for a sum and a count. It is not correct for a minimum, a maximum, a first value or a last value. For example, when you remove the highest price from a candle, you do not know the next highest price.
+
+### Store an undo log
+
+For each block, your app stores the old value of each total that the block changed. On a fork, it restores the old values. This is correct for each type of total. But you must write and test this log for each table, and you must delete old entries when blocks become final.
+
+### Calculate again
+
+On a fork, your app deletes the totals and calculates them again from the stored rows. This is correct for each type of total. But it is slow when the history is long.
+
+## What Settle gives you
+
+- **Correct totals after each fork.** After your app applies all batches, your database has the same data as a full calculation over the current chain.
+- **Exact aggregates of all types.** Sum, count, average, minimum, maximum, first and last stay correct after a fork. Time windows also stay correct.
+- **One code path.** A fork gives a batch of changes, as each other call does. Your app applies it with the same code.
+- **Crash safety.** With a data directory, Settle keeps its state on disk. After a restart, it continues from the last batch that your app confirmed.
+- **Your database and your queries.** Settle gives you changes, not a query engine. You keep Postgres, ClickHouse or another store.
+- **The same results in each runtime.** Node.js, the browser and Rust give the same changes for the same calls.
+
+## When Settle is not the correct tool
+
+- Your app reads only final blocks and keeps simple totals. Then an SQL `UPDATE` in your database is sufficient.
+- Your view must join two tables or filter rows with `WHERE`. A Settle view reads one table and has no `WHERE` clause. Filter the rows in a reducer, or in your app before you send them to Settle.
+- You want to query the history in different ways. Settle answers no queries. Keep the raw rows in your database and query them there.
+
+## Next steps
+
+- [Quickstart](/introduction/quickstart) runs a full example in five minutes.
+- [How Settle works](/concepts/how-settle-works) shows the parts of Settle and how they connect.

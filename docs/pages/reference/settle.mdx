@@ -1,0 +1,377 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Settle [The calls of a Settle instance]
+
+<LanguageSwitch label="Code language" />
+
+A `Settle` instance runs your pipeline. Your app sends blocks to it with `ingest`, applies each batch that it gives back, and confirms the batch with `ack`. On a fork, your app calls <Api ts="handleFork" rust="handle_fork" />. The TypeScript class for the browser, from `@settle/stream/web`, has the same calls. See [Run in a browser](/guides/browser).
+
+You can get an instance in two ways:
+
+- [Build](/reference/pipeline#build) opens it from a `Pipeline`.
+- [Open](#open) opens it from a schema text that you write. See [Schema language](/reference/schema).
+
+## Open
+
+:::code-group
+
+```ts [TypeScript]
+Settle.open(config: SettleConfig): Settle
+```
+
+```rust [Rust]
+Settle::open(config: Config) -> Result<Settle>
+```
+
+:::
+
+Reads the schema text, opens the data directory and gets back the state from the last session. The options are in [Configuration](/reference/configuration).
+
+When a reducer has `LANGUAGE EXTERNAL`, attach its code before the first `ingest`:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-settle.ts:open]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-settle.rs:open]
+```
+
+:::
+
+## Ingest
+
+:::code-group
+
+```ts [TypeScript]
+db.ingest(input: IngestInput): Promise<ChangeBatch | null>
+```
+
+```rust [Rust]
+db.ingest(input: IngestInput) -> Result<Option<ChangeBatch>>
+db.ingest_rows(input: IngestRows) -> Result<Option<ChangeBatch>>
+```
+
+:::
+
+Sends the rows of one or more blocks to Settle. Settle runs them through the pipeline and gives back one batch with all the changes, or no batch when no output table changes.
+
+| TypeScript | Rust | Description |
+|---|---|---|
+| `data` | `data` | The rows of each table, by table name. Each row must contain `block_number`. |
+| `rollbackChain` | `rollback_chain` | The number and hash of each block of the call. Settle keeps the hashes and uses them to find a fork. Optional in TypeScript. |
+| `finalizedHead` | `finalized_head` | The last final block of the chain. Settle keeps no undo data for the blocks at or below it. |
+
+These rules apply to each call:
+
+- The lowest block with rows must be above the latest block. Send all rows of one block in one call.
+- The finalized block must not be lower than in an earlier call. It can be higher than the blocks of the call.
+- Each table with rows must be in the schema. An empty list for an unknown table has no effect.
+- Give each value with the type of its column. Today, Settle does not change a value to the type of its column. For example, a string in a `UInt64` column stays a string.
+- Settle accepts a row with a field that the table does not declare. Do not use this, because a later version can refuse it.
+
+When the rollback chain gives a new hash for a block that Settle has, Settle finds the fork point and removes the blocks above it. Then it adds the new rows. The batch contains the corrections and the new changes together. See [Forks and finality](/concepts/forks-and-finality).
+
+A call that gives no batch can still change the state, for example when it moves the finalized block. If a batch waits for its ack, the changes of this call wait with it, and the call takes a place in the ack queue.
+
+In TypeScript, `ingest` gives a promise, but it does all its work before it returns.
+
+### Positional rows in Rust
+
+`ingest_rows` takes the rows in the column order of their table. It skips the lookup of each column by name. Get the columns of a table with `table_registry`. The rows of each table go into a map by block number.
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-settle.rs:rows]
+```
+
+## Ack
+
+:::code-group
+
+```ts [TypeScript]
+db.ack(sequence: number): void
+```
+
+```rust [Rust]
+db.ack(sequence: u64) -> Result<()>
+```
+
+:::
+
+Tells Settle that your database applied each batch up to `sequence`. Then Settle writes the state of these batches to disk. Call it only after your database has the batch.
+
+- An ack confirms all batches up to `sequence`, also the earlier ones.
+- An ack of a batch that is already confirmed has no effect. When no batch waits, an ack has no effect for each sequence.
+- A sequence above the newest batch that waits gives a wrong ack sequence error.
+- In TypeScript, a value that is not a non-negative safe integer throws a `RangeError`.
+- An ack works also on a poisoned instance. See [A poisoned instance](/reference/errors#a-poisoned-instance).
+
+When a disk write fails, `ack` gives an error, and the batch stays without an ack. Call `ack` again with the same sequence.
+
+## Fork
+
+:::code-group
+
+```ts [TypeScript]
+db.handleFork(previousBlocks: SettleCursor[]): { cursor: SettleCursor, batch: ChangeBatch | null }
+```
+
+```rust [Rust]
+db.handle_fork(previous_blocks: Vec<BlockCursor>) -> Result<ForkResult>
+```
+
+:::
+
+Removes the blocks that the chain replaced. The argument holds the number and hash of the recent blocks of the new chain. Settle finds the highest of these blocks that has the same hash in its own chain: the fork point. It removes each block above the fork point.
+
+| Result | Description |
+|---|---|
+| `cursor` | The fork point. Send the blocks after it next. |
+| `batch` | The changes that remove the effect of the old blocks, or no batch when no output table changes. |
+
+Apply all earlier batches to your database before you call this function. The fork batch undoes the state after all of them.
+
+A fork never changes the finalized block. When no block of the argument matches between the finalized block and the latest block, the call gives an error, and nothing changes. Then call it again with more blocks.
+
+## Find the fork point
+
+:::code-group
+
+```ts [TypeScript]
+db.resolveForkCursor(previousBlocks: SettleCursor[]): SettleCursor | null
+```
+
+```rust [Rust]
+db.resolve_fork_cursor(previous_blocks: &[(BlockNumber, &str)]) -> Option<BlockCursor>
+```
+
+:::
+
+Finds the highest block of the argument that has the same hash in Settle, and changes nothing. It gives no value when no block matches. Unlike a fork call, it also looks at blocks below the finalized block.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-settle.ts:resolve]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-settle.rs:resolve]
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+{ number: 11, hash: '0x11a' }
+```
+
+```ansi [Rust]
+Some(BlockCursor { number: 11, hash: "0x11a" })
+```
+
+:::
+
+## Attach reducer code
+
+:::code-group
+
+```ts [TypeScript]
+db.registerReducerCallback(name: string, reduce: (state, row) => void): void
+```
+
+```rust [Rust]
+db.register_reducer_callback(name: &str, runtime: Box<dyn ReducerRuntime>) -> Result<()>
+```
+
+:::
+
+Attaches your code to a reducer that the schema declares with `LANGUAGE EXTERNAL`. Then Settle runs the blocks that are not final through the new code again. The `Pipeline` build calls it for you. In Rust, wrap a closure in `FnReducerRuntime::new`.
+
+The call gives an error in these conditions:
+
+- The schema has no reducer with this name, or the reducer is not `LANGUAGE EXTERNAL`.
+- The reducer already has code. To change the code, open the instance again.
+- A batch waits for its ack.
+
+An `ingest` with an external reducer that has no code gives an error.
+
+## Add a reducer
+
+:::code-group
+
+```ts [TypeScript]
+db.registerReducer(options: ExternalReducerOptions): void
+```
+
+```rust [Rust]
+db.register_reducer(def: ReducerDef) -> Result<()>
+```
+
+:::
+
+Adds a new reducer that the schema does not declare.
+
+| TypeScript | Rust | Description |
+|---|---|---|
+| `name` | `name` | The name of the new reducer. It must not be in use. |
+| `source` | `source` | The table or reducer that it reads. |
+| `groupBy` | `group_by` | The columns of the group key. |
+| `state` | `state` | The state fields. Each field has a name, a type and a default in schema text, for example `'0'` or `"'none'"`. |
+| `reduce` | `body` | In TypeScript, your code. In Rust, the body: `ReducerBody::Lua` with a script, or `ReducerBody::External`. |
+| — | `requires` | The Lua modules of the body. |
+
+In Rust, an external body needs its code too: call `register_reducer_callback` after `register_reducer`.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-settle.ts:register]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-settle.rs:register]
+```
+
+:::
+
+The call gives an error when the name is in use or when a batch waits for its ack. A pipeline with such a reducer writes its state to disk at each call. See [backfillCheckpointInterval](/reference/configuration#backfillcheckpointinterval).
+
+## Status
+
+| TypeScript | Rust | Description |
+|---|---|---|
+| `cursor` | `latest_cursor()`, `latest_block()` | The latest block, or no value before the first block. |
+| — | `finalized_cursor()`, `finalized_block()` | The finalized block. |
+| — | `durable_block()` | The highest block whose reducer and view state is on disk. |
+| `unackedBatches` | `unacked_batches()` | The places in use in the ack queue: each batch without an ack, and each call without a batch that waits with one. |
+| `isAwaitingAck` | `is_awaiting_ack()` | `true` while a batch waits for its ack. |
+| `isPoisoned` | `is_poisoned()` | `true` after a failure that Settle cannot undo. See [A poisoned instance](/reference/errors#a-poisoned-instance). |
+| — | `has_reducer(name)`, `reducer_is_external(name)` | Whether the reducer exists, and whether it is external. |
+| — | `table_registry(table)` | The columns of a table, for `ingest_rows`. |
+| `pendingCount` | `pending_count()` | No effect today. It is always `0`. |
+| `isBackpressured` | `is_backpressured()` | No effect today. It is always `false`. |
+
+TypeScript has no call for the finalized block or the durable block today. No call closes an instance in TypeScript. In Rust, drop the `Settle` value.
+
+:::code-group
+
+```ansi [TypeScript]
+cursor after: { number: 11, hash: '0x11a' }
+```
+
+```ansi [Rust]
+latest_cursor: Some(BlockCursor { number: 11, hash: "0x11a" })
+finalized_cursor: Some(BlockCursor { number: 9, hash: "0x09a" })
+durable_block: 9
+```
+
+:::
+
+## Types
+
+### Change batch
+
+| TypeScript | Rust | Description |
+|---|---|---|
+| `sequence` | `sequence` | The number of the batch: 1, 2, 3 and so on. Give it to `ack`. |
+| `latestHead` | `latest_head` | The latest block after the call. |
+| `finalizedHead` | `finalized_head` | The finalized block after the call. |
+| `tables` | `tables` | The changes of each output table. A table without changes is not in it. |
+| `perf` | `perf` | The time of each step of the call. Use it only for diagnosis. In Rust, `Config::collect_perf(false)` turns it off. |
+
+A batch contains the changes of each table that is not virtual, and of each view. It never contains the rows of a virtual table or of a reducer.
+
+### Change record
+
+| TypeScript | Rust | Description |
+|---|---|---|
+| `table` | `table()` | The name of the table or view. |
+| `operation` | `operation` | `'insert'`, `'update'` or `'delete'`. In Rust, `ChangeOp::Insert`, `Update` or `Delete`. |
+| `key` | `key(column)`, `key_values()` | The key of the row. For a table, `block_number` and `_row_index`. For a view, the key columns. |
+| `values` | `get(column)`, `values()` | All columns of the row. For a view, also the key columns. |
+| `prevValues` | `prev(column)`, `prev_values()` | The values before the change, for an `update` and for a view `delete`. |
+
+A batch has a maximum of one record for each key. Settle gives the records in no fixed order.
+
+For a `delete` of a view row, the values are the values before the delete. For a `delete` of a table row, the values are the deleted row, and there are no previous values.
+
+This is a batch with a table and a view:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-settle.ts:batch]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-settle.rs:batch]
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+sequence: 1
+latestHead: { number: 11, hash: '0x11a' }
+finalizedHead: { number: 9, hash: '0x09a' }
+tables: [ 'swaps', 'pool_volume' ]
+raw record: {
+  table: 'swaps',
+  operation: 'insert',
+  key: { block_number: 10, _row_index: 0 },
+  values: { block_number: 10, pool: 'ETH/USDC', amount: 100 },
+  prevValues: null
+}
+view record: {
+  table: 'pool_volume',
+  operation: 'insert',
+  key: { pool: 'ETH/USDC' },
+  values: { pool: 'ETH/USDC', volume: 150 },
+  prevValues: null
+}
+```
+
+```ansi [Rust]
+sequence: 1
+latest_head: Some(BlockCursor { number: 11, hash: "0x11a" })
+finalized_head: Some(BlockCursor { number: 9, hash: "0x09a" })
+tables: ["pool_volume", "swaps"]
+raw record: swaps Insert key { block_number: 10, _row_index: 0 } values { block_number: 10, pool: ETH/USDC, amount: 100 } prev None
+view record: pool_volume Insert key { pool: ETH/USDC } values { pool: ETH/USDC, volume: 150 } prev None
+```
+
+:::
+
+See [Change batches](/concepts/change-batches) for how to apply them.
+
+### Cursor
+
+:::code-group
+
+```ts [TypeScript]
+interface SettleCursor {
+  number: number
+  hash: string
+}
+```
+
+```rust [Rust]
+pub struct BlockCursor {
+    pub number: u64,
+    pub hash: String,
+}
+```
+
+:::
+
+Today, TypeScript keeps the block number of a cursor only up to 2^32 − 1. A larger number in `rollbackChain`, `finalizedHead` or `handleFork` loses its high bits, and the fork logic then uses the wrong blocks. The rows keep their full block numbers. Rust has no such limit.
+
+## Errors
+
+In TypeScript, `SettlePendingAckError` and `SettleWrongAckSequenceError` have their own classes, and each other failure is an `Error`. In Rust, each call gives a `settle::error::Error`. See [Errors](/reference/errors).

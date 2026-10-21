@@ -1,0 +1,108 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Configuration [The options of open and build]
+
+<LanguageSwitch label="Code language" />
+
+You give these options when you [open](/reference/settle#open) an instance or [build](/reference/pipeline#build) a pipeline. In TypeScript, `Settle.open` takes `SettleConfig`, and `p.build` takes the same options without `schema`. In Rust, `Settle::open` takes `Config`, which has a builder method for each option.
+
+:::code-group
+
+```ts [TypeScript]
+const db = Settle.open({
+  schema,
+  dataDir: './settle-data',
+  appliedSequence: storedSequence,
+})
+```
+
+```rust [Rust]
+use settle::db::{Config, Settle};
+
+let mut db = Settle::open(
+    Config::with_data_dir(schema, "./settle-data")
+        .applied_sequence(stored_sequence),
+)?;
+```
+
+:::
+
+## Options
+
+| TypeScript | Rust | Default | Description |
+|---|---|---|---|
+| `schema` | `Config::new(schema)` | — | The schema text. See [Schema language](/reference/schema). The builder makes it for you. |
+| `dataDir` | `Config::with_data_dir(schema, dir)`, `.data_dir(dir)` | none | The directory for the data on disk. Without it, Settle keeps all data in memory and loses it when the process stops. |
+| `maxPendingBatches` | `.max_pending_batches(n)` | `2` | The number of places in the ack queue. See [maxPendingBatches](#maxpendingbatches). |
+| `appliedSequence` | `.applied_sequence(n)` | none | The sequence of the last batch that your database applied. A value turns on the journal. See [appliedSequence](#appliedsequence). |
+| `backfillCheckpointInterval` | `.backfill_checkpoint_interval(n)` | `1` | In a backfill, Settle writes the state of reducers and views to disk once in this number of blocks. See [backfillCheckpointInterval](#backfillcheckpointinterval). |
+| `maxResidentGroups` | `.max_resident_groups(n)` | `1,000,000` | The approximate maximum number of groups that each reducer and each view keeps in memory. See [maxResidentGroups](#maxresidentgroups). |
+| `compression` | `.compression(name)` | `snappy` | The compression of the data on disk: `none`, `snappy`, `zstd` or `lz4`. Another value gives an error. |
+| `cacheSize` | `.cache_size(bytes)` | the RocksDB default | The size of the block cache, in bytes. `0` turns the cache off. In TypeScript, a negative value gives an error. |
+| `maxBufferSize` | `.max_buffer_size(n)` | `10,000` | No effect today. |
+| — | `.raw_retention_blocks(n)` | `1,000` | The number of blocks below the durable block whose raw rows stay on disk. `u64::MAX` keeps all raw rows. |
+| — | `.ack_warning_threshold(duration)` | `10 s` | The age of the oldest batch without an ack at which Settle writes a message to the log. |
+| — | `.collect_perf(on)` | `true` | When `false`, batches have an empty `perf` list. |
+| — | `.storage(backend)` | none | A storage backend that you make. It has priority over the data directory. |
+
+`compression` and `cacheSize` have an effect only with a data directory. The last four options are only in Rust today.
+
+### dataDir
+
+Settle keeps its data in RocksDB in this directory. One process at a time can use a data directory. After a restart with the same directory, Settle continues after the last batch that your app confirmed with `ack`. See [Restarts and crash safety](/guides/restarts).
+
+A data directory of `':memory:'` keeps all data in memory with the builders and with the Rust `Config`. The TypeScript `Settle.open` does not know this name today: it makes a directory with the name `:memory:`. To keep the data in memory with `Settle.open`, do not give <Api ts="dataDir" rust="data_dir" />.
+
+### maxPendingBatches
+
+Each batch takes one place in the ack queue until your app calls `ack`. A call that gives no batch also takes a place while a batch waits. When all places are in use, `ingest` and the fork call give the error that the ack queue is full.
+
+With the default `2`, Settle can calculate the next blocks while your database applies the batch before. With `1`, each `ingest` must wait for the ack of the batch before. A value below `1` counts as `1`.
+
+### appliedSequence
+
+Give the sequence of the newest batch that your database applied. Before the first batch, give `0`. Your database must keep this number in the same transaction as the data of the batch.
+
+With a value, Settle writes each batch to disk before `ingest` gives it to you. At the next open, Settle goes to the state after the batch with this sequence, also when your app did not call `ack` for it. Without a value, Settle goes back to the last batch with an ack.
+
+Open fails in these conditions:
+
+- Your database is behind the last batch with an ack.
+- Your database applied a batch that Settle did not write.
+- Settle has batches on disk, but you did not give the applied sequence.
+
+See [Write changes to Postgres](/guides/postgres).
+
+### backfillCheckpointInterval
+
+A backfill call is a call whose finalized block is at or above all its blocks. With a value above `1`, Settle writes the state of reducers and views to disk once in this number of blocks. It does not write it at each backfill call. This makes a backfill faster. After a crash, open runs the blocks again since the last write.
+
+The option has no effect in these conditions:
+
+- The call is not a backfill call, for example at the tip of the chain.
+- The pipeline has a sliding window view.
+- The pipeline has a reducer that your app added with <Api ts="registerReducer" rust="register_reducer" />.
+
+After an open that must run blocks again, `ingest` gives an error until each external reducer has its code.
+
+### maxResidentGroups
+
+Above this number, the groups whose state is on disk leave memory. The groups that Settle wrote longest ago go first. A group loads again on its next row. These groups stay in memory:
+
+- A group with a block that is not final.
+- A group with a change that waits for an ack.
+- Each group of a sliding window view.
+
+In Rust, `usize::MAX` keeps all groups in memory.
+
+## In a browser
+
+The browser build keeps all data in memory.
+
+- `dataDir`, `compression`, `cacheSize` and `maxBufferSize` give an error.
+- `appliedSequence`, `backfillCheckpointInterval` and `maxResidentGroups` have no effect.
+
+## The Rust builder
+
+The Rust `BuildOptions` of the `Pipeline` builder has only `data_dir`, `compression`, `cache_size` and `max_buffer_size` today. For the other options, make the schema text with `to_ddl`, and open it with `Config`. See [Build](/reference/pipeline#build).

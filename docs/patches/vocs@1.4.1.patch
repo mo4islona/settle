@@ -1,0 +1,13 @@
+diff --git a/_lib/app/components/mdx/CodeGroup.js b/_lib/app/components/mdx/CodeGroup.js
+index 8b4ac2bf5520497e7796bcd7a6849fc3339e4fea..0fdf3fc426cf6b7a5beedd47f193b9fc3c376129 100644
+--- a/_lib/app/components/mdx/CodeGroup.js
++++ b/_lib/app/components/mdx/CodeGroup.js
+@@ -13,7 +13,7 @@ export function CodeGroup({ children }) {
+     });
+     return (_jsxs(Tabs.Root, { className: styles.root, defaultValue: tabs[0].title, children: [_jsx(Tabs.List, { "aria-label": "Code group", children: tabs.map(({ title }, i) => (_jsx(Tabs.Trigger, { value: title || i.toString(), children: title }, title || i.toString()))) }), tabs.map(({ title, content }, i) => {
+                 const isShiki = content.props?.children?.props?.className?.includes('shiki');
+-                return (_jsx(Tabs.Content, { "data-shiki": isShiki, value: title || i.toString(), children: content }, title || i.toString()));
++                return (_jsx(Tabs.Content, { "data-shiki": isShiki, forceMount: true, value: title || i.toString(), children: content }, title || i.toString()));
+             })] }));
+ }
+ //# sourceMappingURL=CodeGroup.js.map

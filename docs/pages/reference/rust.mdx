@@ -1,0 +1,64 @@
+# Rust crate [Features, two ways to open, closures and positional rows]
+
+The `settle` crate is the core of Settle. The Node.js and browser packages use the same code. Each reference page shows the Rust calls next to the TypeScript calls. This page gives the parts that only Rust has.
+
+```bash [Terminal]
+cargo add settle --git https://github.com/mo4islona/settle
+```
+
+The crate uses the Rust 2024 edition, so it needs Rust 1.85 or later.
+
+## Features
+
+| Feature | Default | Description |
+|---|---|---|
+| `rocksdb` | on | The storage on disk. Without it, Settle keeps all data in memory, and a data directory gives an error. |
+| `lua` | on | The Lua runtime for reducers with `LANGUAGE lua`. |
+| `rayon` | on | Runs independent branches of the pipeline in parallel. |
+| `mimalloc` | on | Uses mimalloc as the global memory allocator. To keep your own allocator, turn it off. |
+| `napi` | off | Builds the Node.js module. |
+| `wasm` | off | Builds the browser module. Use it with `--no-default-features`. |
+
+## Two ways to open
+
+| Way | Use it when |
+|---|---|
+| `Pipeline` and `build` | You declare the pipeline in Rust code, and the defaults of the other options are correct for you. See [Pipeline](/reference/pipeline). |
+| A schema text and `Config` | You need Lua reducers, Map fields, a reducer without a group, or options that `BuildOptions` does not have. See [Schema language](/reference/schema) and [Configuration](/reference/configuration). |
+
+You can also do both: make the schema text with `to_ddl`, open it with `Config`, and attach each closure yourself. See [Build](/reference/pipeline#build).
+
+## Closures
+
+A closure reducer gets a `StateCtx` and the input `Row` for each row. It reads the state with `get`, `get_f64`, `get_u64`, `get_i64`, `get_bool` and `get_str`. It changes the state with `set` or `update`, and sends rows with `emit` or `emit_values`. See [The reducer context](/reference/pipeline#the-reducer-context).
+
+To attach a closure to a reducer of a schema text, wrap it in `FnReducerRuntime`:
+
+```rust
+use settle::reducer_runtime::fn_reducer::FnReducerRuntime;
+
+db.register_reducer_callback("totals", Box::new(FnReducerRuntime::new(|state, row| {
+    // read row and state, then set, update or emit
+})))?;
+```
+
+A closure cannot return an error. If it panics, the call gives `Error::Reducer`, and nothing changes. Settle calls a closure once for each row.
+
+## Values
+
+A row is a `RowMap`: a `HashMap<String, Value>`. Each value is a `Value` variant. See [Column types](/reference/column-types). A change record gives each column as a `&Value`, with `get`, `prev` and `key`.
+
+## Positional rows
+
+`ingest_rows` takes the rows in the column order of their table, so Settle does not look up each column by name. See [Positional rows in Rust](/reference/settle#positional-rows-in-rust).
+
+## Only in Rust
+
+These calls have no TypeScript form today:
+
+- `finalized_cursor`, `finalized_block` and `durable_block`.
+- `ingest_rows` and `table_registry`.
+- `has_reducer`, `reducer_is_external` and `replay_reducer`.
+- The `Config` options `raw_retention_blocks`, `ack_warning_threshold`, `collect_perf` and `storage`.
+
+In the other direction, the Rust `BuildOptions` does not have `max_pending_batches`, `applied_sequence`, `backfill_checkpoint_interval` or `max_resident_groups`.

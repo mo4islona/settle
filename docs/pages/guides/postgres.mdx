@@ -1,0 +1,191 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Write changes to Postgres [Apply each batch in one transaction and survive a crash at any point]
+
+<LanguageSwitch label="Code language" />
+
+Settle calculates your tables, but it does not answer queries. Your app writes the changes to a database, and reads the data from there. This guide uses Postgres. The same method works for each database that has transactions.
+
+The method has three rules:
+
+- Apply each batch in **one transaction**.
+- Store the **sequence number** of the batch in the same transaction.
+- Call `ack` **after** the commit.
+
+Then your database and Settle agree after each crash, also after a crash between the commit and the ack.
+
+You need a Postgres server and a Postgres client library:
+
+:::code-group
+
+```bash [TypeScript]
+npm install @settle/stream pg
+npm install --save-dev tsx @types/pg
+```
+
+```bash [Rust]
+cargo add settle --git https://github.com/mo4islona/settle
+cargo add postgres@0.19
+```
+
+:::
+
+::::steps
+
+### Create the tables
+
+Create a table for each view that you write. Its primary key is the group key of the view. Also create a table with one row for the sequence number of the last batch:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/postgres.ts:tables]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/postgres.rs:tables]
+```
+
+:::
+
+### Open Settle with the applied sequence
+
+Read the sequence number from Postgres. Give it to Settle as <Api ts="appliedSequence" rust="applied_sequence" />:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/postgres.ts:open]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/postgres.rs:open]
+```
+
+:::
+
+With the applied sequence, Settle writes each batch to a journal on disk before it gives the batch to your app. At the start, it compares the journal with the number from Postgres. Then it opens at the state after the last batch that Postgres has.
+
+In Rust, `BuildOptions` does not have this option. Open the pipeline with `Config` and `Settle::open`, as the example does. This works for a pipeline without reducers.
+
+### Apply a batch in one transaction
+
+For each record of the view, delete the row or upsert it. Then store the sequence number and commit. Call `ack` only after the commit:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/postgres.ts:apply]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/postgres.rs:apply]
+```
+
+:::
+
+- An insert and an update both give the full row in the values of the record. An upsert writes them with the same statement.
+- A delete gives the key of the row in the key of the record.
+- The `--crash` flag in this example stops the process after the commit and before the ack. It is only for the test below.
+
+### Send blocks
+
+Continue after the last block that Settle has, and apply each batch:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/postgres.ts:loop]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/postgres.rs:loop]
+```
+
+:::
+
+This example makes three blocks for each run. A real app reads the blocks from its source. See [Use with SQD Portal](/guides/sqd-portal) and [Use with an RPC node](/guides/rpc-node).
+
+::::
+
+## Test a crash
+
+Run the example three times. The second run stops after Postgres commits batch 4, but before the ack:
+
+:::code-group
+
+```bash [TypeScript]
+export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres
+npx tsx postgres.ts
+npx tsx postgres.ts --crash
+npx tsx postgres.ts
+```
+
+```bash [Rust]
+export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres
+cargo run --release --bin postgres
+cargo run --release --bin postgres -- --crash
+cargo run --release --bin postgres
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+continue after: null
+sequence in Postgres: 3
+[
+  { pool: 'BTC/USDC', volume: 200, swaps: 2 },
+  { pool: 'ETH/USDC', volume: 100, swaps: 1 }
+]
+continue after: { number: 3, hash: '0x3' }
+batch 4 is in Postgres, stop before the ack
+continue after: { number: 4, hash: '0x4' }
+sequence in Postgres: 7
+[
+  { pool: 'BTC/USDC', volume: 400, swaps: 4 },
+  { pool: 'ETH/USDC', volume: 300, swaps: 3 }
+]
+```
+
+```ansi [Rust]
+continue after: None
+sequence in Postgres: 3
+{ pool: BTC/USDC, volume: 200, swaps: 2 }
+{ pool: ETH/USDC, volume: 100, swaps: 1 }
+continue after: Some(BlockCursor { number: 3, hash: "0x3" })
+batch 4 is in Postgres, stop before the ack
+continue after: Some(BlockCursor { number: 4, hash: "0x4" })
+sequence in Postgres: 7
+{ pool: BTC/USDC, volume: 400, swaps: 4 }
+{ pool: ETH/USDC, volume: 300, swaps: 3 }
+```
+
+:::
+
+Settle did not get the ack of batch 4. But Postgres has sequence 4, so the third run opens Settle after block 4. Settle does not give batch 4 again, and the totals for blocks 1 to 7 are correct.
+
+## Why store the sequence number
+
+Without the applied sequence, Settle opens at the last batch with an ack. In the test above, it continues after block 3 and gives batch 4 again. The upsert writes the same values again, so the result stays correct.
+
+But the chain can replace block 4 before your app sends it again. Then Settle does not know that Postgres has the changes of block 4, and it cannot undo them. The sequence number in Postgres closes this gap.
+
+[Restarts and crash safety](/guides/restarts) explains the start errors when the two stores do not agree.
+
+## Write the raw rows too
+
+The tables in this guide are virtual: Settle sends only the view rows. To also keep the raw rows in Postgres, make the table not virtual. Then each batch also has records for the table:
+
+- The key of a raw row is `block_number` and `_row_index`, the position of the row in its block.
+- An insert gives the columns of the row in its values.
+- After a fork, a delete removes each row of the replaced blocks.
+
+Use `(block_number, _row_index)` as the primary key of the Postgres table.
+
+## Next steps
+
+- [Change batches](/concepts/change-batches) describes each field of a batch and of a record.
+- [Use with SQD Portal](/guides/sqd-portal) connects this loop to a real block source.

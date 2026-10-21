@@ -1,0 +1,91 @@
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Tables [The input rows of the pipeline]
+
+<LanguageSwitch label="Code language" />
+
+A table holds the rows that your app reads from the chain: swaps, transfers, trades. Each view and each reducer reads one table or one reducer. So each pipeline starts with a table.
+
+## Declare a table
+
+Give the table a name and a type for each column:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/concepts-tables.ts:table]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/concepts-tables.rs:table]
+```
+
+:::
+
+Each row must have the field `block_number`: the number of its block. Settle uses it to undo the rows of a block after a fork. Declare `block_number` as a `uint64` column, as in the example. Then the output rows also show it.
+
+[Column types](/reference/column-types) lists all types: `uint64`, `int64`, `float64`, `uint256`, `string`, `datetime`, `boolean`, `bytes`, `base58` and `json`.
+
+## Send rows
+
+Give the rows of each table in `data`. The keys are the table names:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/concepts-tables.ts:ingest]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/concepts-tables.rs:ingest]
+```
+
+:::
+
+A table is also an output. For each new row, Settle gives an `insert` record in the batch:
+
+:::code-group
+
+```ansi [TypeScript]
+insert { block_number: 7, _row_index: 0 } { block_number: 7, pool: 'ETH/USDC', amount: 100 }
+insert { block_number: 7, _row_index: 1 } { block_number: 7, pool: 'BTC/USDC', amount: 50 }
+```
+
+```ansi [Rust]
+insert { block_number: 7, _row_index: 0 } { block_number: 7, pool: ETH/USDC, amount: 100 }
+insert { block_number: 7, _row_index: 1 } { block_number: 7, pool: BTC/USDC, amount: 50 }
+```
+
+:::
+
+The key of a row is its block number and its position in the block, `_row_index`. After a fork, Settle gives a `delete` record for each row of a replaced block.
+
+## Rules for the rows
+
+- In one call, give the rows of all tables of a block. You cannot add rows to a block in a later call.
+- Each call must give blocks that are higher than the last block that Settle has.
+- Block numbers do not need to be continuous. You do not need to send the blocks that have no rows.
+- Settle reads the rows of a block in the order that you give them. This order is important for `first`, `last` and for reducers.
+
+## Virtual tables
+
+Often your database needs only the totals, not each raw row. Then declare the table as virtual:
+
+:::code-group
+
+```ts [TypeScript]
+const swaps = p.table('swaps', { block_number: uint64(), pool: string(), amount: float64() }, { virtual: true })
+```
+
+```rust [Rust]
+let swaps = p.virtual_table("swaps", [("block_number", uint64()), ("pool", string()), ("amount", float64())]);
+```
+
+:::
+
+A virtual table feeds its views and reducers as a usual table does. But Settle does not put its rows in the batches. This makes the batches smaller, and your app writes less data.
+
+## Next steps
+
+- [Views](/concepts/views) calculates aggregates from the rows of a table.
+- [Reducers](/concepts/reducers) runs your code for each row.

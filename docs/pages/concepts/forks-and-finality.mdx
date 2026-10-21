@@ -1,0 +1,134 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Forks and finality [How Settle finds a fork and undoes the replaced blocks]
+
+<LanguageSwitch label="Code language" />
+
+The last blocks of a chain can change. When two blocks come at the same height, the network keeps one of them and drops the other. Then the chain replaces the blocks after the fork point. Blocks deeper in the chain become **final**: the network cannot replace them.
+
+Settle needs two facts from your app to handle forks: the hash of each block, and the last final block.
+
+## What each call gives
+
+:::code-group
+
+```ts [TypeScript]
+await db.ingest({
+  data: { swaps: rows },
+  rollbackChain: [
+    { number: 101, hash: '0x5f…' },
+    { number: 102, hash: '0x9c…' },
+  ],
+  finalizedHead: { number: 90, hash: '0x1e…' },
+})
+```
+
+```rust [Rust]
+db.ingest(IngestInput {
+    data: [("swaps".to_string(), rows)].into(),
+    rollback_chain: vec![
+        BlockCursor { number: 101, hash: "0x5f…".into() },
+        BlockCursor { number: 102, hash: "0x9c…".into() },
+    ],
+    finalized_head: BlockCursor { number: 90, hash: "0x1e…".into() },
+})?;
+```
+
+:::
+
+- <Api ts="rollbackChain" rust="rollback_chain" /> gives the number and the hash of the blocks in the call. Settle keeps these hashes. Later, it compares them with the hashes of a new chain to find the fork point.
+- <Api ts="finalizedHead" rust="finalized_head" /> gives the last final block of the source. Settle cannot undo a block at or below this block. So it deletes the undo data of these blocks, and its memory stays small.
+
+The final block must not go down: a call with a lower final block than the call before fails.
+
+## Tell Settle about a fork
+
+There are two ways. Use the way that your source supports.
+
+### The source tells you about the fork
+
+SQD Portal tells your app when a fork occurs, and gives the blocks of the new chain. Give these blocks to <Api ts="handleFork" rust="handle_fork" />:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/quickstart.ts:fork]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/quickstart.rs:fork]
+```
+
+:::
+
+<Api ts="handleFork" rust="handle_fork" /> returns two values:
+
+- `cursor` is the fork point: the last block that the old chain and the new chain have in common. Continue to read the source after this block.
+- `batch` holds the changes that undo the blocks after the fork point. Apply it as each other batch. There is no batch when no output changed.
+
+Before you call <Api ts="handleFork" rust="handle_fork" />, apply all batches that Settle gave before. The undo batch changes the state after these batches.
+
+### You send blocks with new hashes
+
+You can also send the new blocks to `ingest` with their new hashes. When a hash differs from the hash that Settle keeps for that block, Settle undoes the old blocks first. Then it applies the new rows. One batch holds both changes:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/concepts-forks.ts:inline]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/concepts-forks.rs:inline]
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+update { pool: 'ETH/USDC', volume: 130 }
+```
+
+```ansi [Rust]
+update { pool: ETH/USDC, volume: 130 }
+```
+
+:::
+
+Before the call, the volume was 400 from three blocks. After the call, it is 100 from block 1 plus 10 and 20 from the new blocks 2 and 3.
+
+The list must include a block below the fork that has the same hash as before, here block 1. Settle uses it as the fork point.
+
+## How Settle finds the fork point
+
+Settle looks at the blocks of the new chain that you give. It takes the highest block that has the same hash as the block that Settle keeps. This block must be at or above the last final block.
+
+When no such block exists, the call fails and changes nothing:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/concepts-forks.ts:no-ancestor]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/concepts-forks.rs:no-ancestor]
+```
+
+:::
+
+```ansi [Output]
+invalid operation: Fork too deep: no common ancestor found in block hashes
+```
+
+This error has two causes:
+
+- The list of blocks is too short. Get more blocks of the new chain from the source, and call again.
+- The fork goes below the last final block. Then the source gave incorrect finality. Settle cannot correct this. Stop and examine the source.
+
+## Next steps
+
+- [Use with SQD Portal](/guides/sqd-portal) connects the fork signal of SQD Portal to Settle.
+- [Use with an RPC node](/guides/rpc-node) finds a fork from the parent hash of each block.

@@ -1,0 +1,19 @@
+{
+  "name": "settle-docs-examples",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@settle/stream": "link:../../bindings/typescript/settle",
+    "@subsquid/pipes": "1.0.0-beta.8",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3"
+  }
+}

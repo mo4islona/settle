@@ -1,0 +1,323 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Pipeline [Declare tables, reducers and views in code]
+
+<LanguageSwitch label="Code language" />
+
+The `Pipeline` builder declares the tables, reducers and views of your app in code. It makes the schema text for you, opens Settle and attaches the code of each reducer. In TypeScript, the types of your rows, states and emits come from these declarations.
+
+:::code-group
+
+```ts [TypeScript]
+import { Pipeline, interval, uint64, string, float64 } from '@settle/stream'
+
+const p = new Pipeline()
+```
+
+```rust [Rust]
+use settle::{Pipeline, BuildOptions, ReducerOptions, ViewOptions, interval, uint64, string, float64};
+
+let mut p = Pipeline::new();
+```
+
+:::
+
+For the ideas behind each part, read [Tables](/concepts/tables), [Reducers](/concepts/reducers) and [Views](/concepts/views).
+
+## Tables
+
+:::code-group
+
+```ts [TypeScript]
+p.table(name: string, columns: Record<string, ColumnType>, options?: { virtual?: boolean }): TableHandle
+```
+
+```rust [Rust]
+p.table(name, columns: [(&str, ColumnType); N]) -> TableHandle
+p.virtual_table(name, columns) -> TableHandle
+```
+
+:::
+
+Declares a table for the rows that your app sends to Settle.
+
+| Parameter | Description |
+|---|---|
+| `name` | The name of the table. The keys of the input data of [ingest](/reference/settle#ingest) use this name. |
+| `columns` | The columns, in order. Each column has a type function, for example `uint64()`. See [Column types](/reference/column-types). |
+| virtual | The rows go to the reducers and views of the table, but the batches do not contain them. In TypeScript, give `{ virtual: true }`. In Rust, use `virtual_table`. |
+
+Each row that your app sends must contain `block_number`. Declare `block_number` as a `uint64()` column, so that the batches show it in the values of each row.
+
+A `TableHandle` has the methods <Api ts="createReducer" rust="create_reducer" /> and <Api ts="createView" rust="create_view" />.
+
+## Reducers
+
+:::code-group
+
+```ts [TypeScript]
+table.createReducer(name: string, options: ReducerOptions): ReducerHandle
+reducer.createReducer(name: string, options: ReducerOptions): ReducerHandle
+```
+
+```rust [Rust]
+table.create_reducer(name, options: ReducerOptions) -> ReducerHandle
+reducer.create_reducer(name, options: ReducerOptions) -> ReducerHandle
+```
+
+:::
+
+Declares a reducer that reads a table, or the emits of another reducer.
+
+| TypeScript | Rust | Description |
+|---|---|---|
+| `groupBy` | `group_by` | The columns of the group key. Each group has its own state. Give at least one column. |
+| `initialState` | `initial_state` | The state of a new group. The type of each value sets the type of its state field. |
+| `reduce` | `reduce` | Your code. Settle calls it once for each row, in the order of the chain. |
+
+The type of each value in the initial state gives the type of the state field:
+
+| TypeScript value | Rust value | State field type |
+|---|---|---|
+| A `number`, also an integer such as `0` | `Value::Float64` | `Float64` |
+| A `bigint`, such as `0n` | `Value::UInt64` | `UInt64` |
+| — | `Value::Int64` | `Int64` |
+| — | `Value::DateTime` | `DateTime` |
+| A `string` | `Value::String` | `String` |
+| A `boolean` | `Value::Boolean` | `Boolean` |
+| An object or an array | `Value::JSON` | `JSON` |
+
+In Rust, a `Value::Null`, `Value::Uint256`, `Value::Bytes` or `Value::Base58` gives a schema error. The Rust builder puts the state fields in the order of their names.
+
+The builder cannot declare a Map field, and it cannot declare a reducer without a group. For these, write the schema text yourself and open it with [open](/reference/settle#open). See [Schema language](/reference/schema#create-reducer).
+
+### The reducer context
+
+The first argument of `reduce` is the context of the group: `ReducerCtx` in TypeScript, `StateCtx` in Rust. The second argument is the input row.
+
+| TypeScript | Rust | Description |
+|---|---|---|
+| `state.<field>` | `state.get(name)`, `get_f64`, `get_u64`, `get_i64`, `get_bool`, `get_str` | Reads a state field: the value before this row, or the value after the last change in this row or block. |
+| `state.update(next)` | `state.update(next)` | Replaces the full state. A field that `next` does not contain becomes `null`. It does not change a Map field. |
+| — | `state.set(name, value)` | Changes one field. |
+| `state.emit(row)` | `state.emit(row)` | Sends one row to the views and reducers that read this reducer. Call it zero, one or more times for each input row. |
+| — | `state.emit_values(values)`, `state.column(name)` | Emits a row by position. `column` gives the position of an emit column. |
+| `state.<mapField>` | `state.map(name)` | A Map field. See [Map fields](#map-fields). |
+
+In TypeScript, change the state only with `update`. A direct assignment, for example `state.volume = 5`, has an effect only until the end of the block. Then Settle forgets it. To change one field, give the other fields too:
+
+```ts
+state.update({ ...state, volume: state.volume + row.amount })
+```
+
+A `bigint` field reads as `number | bigint`. Give it to `update` as a `bigint`, for example `BigInt(state.trades) + 1n`.
+
+TypeScript cannot get the type of the emits from the body of `reduce`. A view or a reducer that reads this reducer then accepts no column name. To use the emit columns, give the state type and the emit type:
+
+```ts
+type Stats = { volume: number }
+type StatsEmit = { volume: number; timestamp: number }
+
+const stats = trades.createReducer<Stats, StatsEmit>('stats', { /* ... */ })
+```
+
+In Rust, a closure cannot return an error. A panic in the closure fails the call with a reducer error.
+
+These rules apply to the emits:
+
+- The emit columns are the group columns, then the names that the emits use, in the order of their first use.
+- When an emit does not contain a group column, the column gets the value of the input row.
+- A reducer can have a maximum of 1,024 emit columns.
+- In TypeScript, Settle reads each `number` that `reduce` emits as `Float64`. When an emit column has the name of an integer state field, `sum`, `min`, `max` and `avg` ignore these values. Emit a `bigint`, or give the emit column a different name. See [Numeric modes](/reference/aggregates#numeric-modes).
+
+In TypeScript, a `UInt64` or `Int64` field reads as a `number` while its value is below 2^53. Above that, it reads as a `bigint`.
+
+### Map fields
+
+A Map field holds entries by a string key. A reducer reads and writes one entry at a time. Declare it in the schema text, for example `book Map(String, Float64)`, and attach the reducer code with <Api ts="registerReducerCallback" rust="register_reducer_callback" />.
+
+| TypeScript `StateMap<V>` | Rust `MapMut` | Description |
+|---|---|---|
+| `get(key)` | `get(key)` | Gives the entry, or no value. In TypeScript, the entry is a copy: a change to it stays only after a `set`. |
+| `set(key, value)` | `set(key, value)` | Writes the entry. A `null` or `undefined` value deletes the entry. In Rust, `Value::Null` deletes it. |
+| `delete(key)` | `remove(key)` | Deletes the entry. Gives `true` when the entry was there. |
+
+A Map field works only while Settle runs the rows of its group. In TypeScript, a call at another time throws an error.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-pipeline.ts:map]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-pipeline.rs:map]
+```
+
+:::
+
+## Views
+
+:::code-group
+
+```ts [TypeScript]
+table.createView(name: string, options: ViewOptions): ViewHandle
+reducer.createView(name: string, options: ViewOptions): ViewHandle
+```
+
+```rust [Rust]
+table.create_view(name, options: ViewOptions) -> ViewHandle
+reducer.create_view(name, options: ViewOptions) -> ViewHandle
+```
+
+:::
+
+Declares a view that aggregates the rows of a table or the emits of a reducer. A view cannot read another view.
+
+| TypeScript | Rust | Description |
+|---|---|---|
+| `groupBy` | `group_by` | The key of the view: column names and `interval` items. Each key value gives one output row. |
+| `select` | `select` | A function that gives the output columns. Each column is a key item or an aggregate. |
+| `slidingWindow` | `sliding_window` | Optional. The view counts only the rows of the last `interval` of `timeColumn` (`time_column`). See [Time windows](/guides/time-windows). |
+
+Put each `groupBy` item into `select` as a key item. If you do not, the build fails with a schema error.
+
+The argument of `select` gives these functions:
+
+| TypeScript | Rust | Result |
+|---|---|---|
+| `agg.key.<column>` | `agg.key(column)` | The value of a key column. |
+| `agg.count()` | `agg.count()` | The number of rows. |
+| `agg.sum(column)` | `agg.sum(column)` | The sum of the values. |
+| `agg.avg(column)` | `agg.avg(column)` | The average of the values. |
+| `agg.min(column)` | `agg.min(column)` | The smallest value. |
+| `agg.max(column)` | `agg.max(column)` | The largest value. |
+| `agg.first(column)` | `agg.first(column)` | The first value that is not `null`, in the order of the chain. |
+| `agg.last(column)` | `agg.last(column)` | The last value that is not `null`, in the order of the chain. |
+
+The name of each output column is its name in `select`. The `key` of each change record also uses these names. See [Aggregate functions](/reference/aggregates) for the result types.
+
+## Time windows
+
+:::code-group
+
+```ts [TypeScript]
+interval(column: string, duration: string): IntervalExpr
+interval('timestamp', '1 minute').as('minute')
+```
+
+```rust [Rust]
+interval(column, duration: &str) -> IntervalExpr
+interval("timestamp", "1 minute").r#as("minute")
+```
+
+:::
+
+Puts the rows into time windows of the same width, for example one candle for each minute. Use it in `groupBy`. The column must hold a time in milliseconds, for example a `datetime()` column.
+
+| Part | Description |
+|---|---|
+| `column` | The time column. |
+| `duration` | A number and a unit, for example `'5 minutes'`. The units are `s`, `sec`, `second`, `seconds`, `m`, `min`, `minute`, `minutes`, `h`, `hr`, `hour`, `hours`, `d`, `day` and `days`. |
+| `as(name)` | Gives a name to the key. Without it, the name is `<column>_interval`. In Rust, write `r#as`. |
+
+The value of the key is the start of the window, in milliseconds. An unknown unit gives an error: in TypeScript at once, in Rust at the build.
+
+## Build
+
+:::code-group
+
+```ts [TypeScript]
+p.build(options?: BuildOptions): Settle
+```
+
+```rust [Rust]
+p.build(options: BuildOptions) -> Result<Settle>
+```
+
+:::
+
+Makes the schema text, opens Settle and attaches each `reduce` function. In TypeScript, `build` works only in Node.js. In a browser, use `compile` and `openCompiled`.
+
+The options are in [Configuration](/reference/configuration). A data directory of `':memory:'` keeps all data in memory.
+
+The Rust `BuildOptions` has only `data_dir`, `compression`, `cache_size` and `max_buffer_size`. For other options, make the schema text with `to_ddl`, open it with `Config`, and attach each closure with `register_reducer_callback`. The TypeScript builder takes all options:
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-pipeline.ts:options]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-pipeline.rs:options]
+```
+
+:::
+
+## The schema text
+
+:::code-group
+
+```ts [TypeScript]
+p.compile(): { schema: string, reducers: CompiledReducer[] }
+```
+
+```rust [Rust]
+p.to_ddl() -> Result<String>
+```
+
+:::
+
+Makes the schema text, but does not open Settle. Use it to look at the schema. In TypeScript, the result also contains the list of reducers, with their `reduce` functions.
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-pipeline.ts:compile]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-pipeline.rs:compile]
+```
+
+:::
+
+:::code-group
+
+```ansi [TypeScript]
+CREATE TABLE trades (block_number UInt64, timestamp DateTime, trader String, amount Float64);
+
+CREATE REDUCER stats SOURCE trades GROUP BY trader STATE (volume Float64 DEFAULT 0, trades UInt64 DEFAULT 0, last_side String DEFAULT 'none', active Boolean DEFAULT false, tags Json DEFAULT '{}') LANGUAGE EXTERNAL;
+
+CREATE MATERIALIZED VIEW trader_volume AS SELECT trader, toStartOfInterval(timestamp, INTERVAL 3600 SECOND) AS hour, last(volume) AS volume FROM stats GROUP BY trader, hour;
+
+CREATE MATERIALIZED VIEW volume_24h AS SELECT trader, sum(amount) AS volume FROM trades GROUP BY trader WINDOW SLIDING INTERVAL 86400 SECOND BY timestamp;
+```
+
+```ansi [Rust]
+CREATE TABLE trades (block_number UInt64, timestamp DateTime, trader String, amount Float64);
+CREATE REDUCER stats SOURCE trades GROUP BY trader STATE (active Boolean DEFAULT false, last_side String DEFAULT 'none', trades UInt64 DEFAULT 0, volume Float64 DEFAULT 0.0) LANGUAGE EXTERNAL;
+CREATE MATERIALIZED VIEW trader_volume AS SELECT trader, toStartOfInterval(timestamp, INTERVAL 3600 SECOND) AS hour, last(volume) AS volume FROM stats GROUP BY trader, hour;
+CREATE MATERIALIZED VIEW volume_24h AS SELECT trader, sum(amount) AS volume FROM trades GROUP BY trader WINDOW SLIDING INTERVAL 86400 SECOND BY timestamp;
+```
+
+:::
+
+## Open in a browser
+
+```ts
+openCompiled(SettleClass, compiled: CompiledPipeline, options?: BuildOptions): Settle
+```
+
+This call is only in TypeScript. It opens the `Settle` class that you give, then attaches each `reduce` function of `compiled`. Use it with the browser class:
+
+```ts
+import { init, openCompiled, Settle } from '@settle/stream/web'
+
+await init()
+const db = openCompiled(Settle, p.compile())
+```
+
+See [Run in a browser](/guides/browser).

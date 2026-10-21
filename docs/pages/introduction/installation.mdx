@@ -1,0 +1,86 @@
+# Installation [Add Settle to a Node.js, browser or Rust project]
+
+## Node.js
+
+:::code-group
+
+```bash [npm]
+npm install @settle/stream
+```
+
+```bash [pnpm]
+pnpm add @settle/stream
+```
+
+```bash [yarn]
+yarn add @settle/stream
+```
+
+```bash [bun]
+bun add @settle/stream
+```
+
+:::
+
+The package includes the TypeScript types. You do not need a different package for them.
+
+The package contains a native module for these platforms:
+
+| System | Processor |
+|---|---|
+| macOS | Apple silicon (arm64) and Intel (x64) |
+| Linux with glibc | x64 and arm64 |
+
+Settle needs Node.js 18 or later. Linux with musl, for example Alpine, and Windows do not have a native module. For these systems, [build Settle from the source](#build-from-the-source).
+
+## Browser
+
+Use the same package. Import it from `@settle/stream/web`, and load the WebAssembly module before the first call:
+
+```ts
+import { init } from '@settle/stream/web'
+
+await init()
+```
+
+In a browser, Settle keeps all data in memory. [Run in a browser](/guides/browser) gives the full setup.
+
+## Rust
+
+Add the crate to `Cargo.toml`:
+
+```toml [Cargo.toml]
+[dependencies]
+settle = { git = "https://github.com/mo4islona/settle" }
+```
+
+The crate has these features. The first four are on by default:
+
+| Feature | What it adds |
+|---|---|
+| `rocksdb` | Storage on disk. Without it, Settle keeps all data in memory. |
+| `lua` | Reducers in Lua, in the SQL schema. |
+| `rayon` | Parallel work on the independent parts of a pipeline. |
+| `mimalloc` | A faster memory allocator for the process. |
+| `napi` | The Node.js module. You need it only to build the Node.js package. |
+| `wasm` | The WebAssembly module. Use it with `--no-default-features`. |
+
+[Rust API](/reference/rust) shows how to use the crate.
+
+## Build from the source
+
+You need Rust (stable), Node.js 18 or later and pnpm. Then run these commands:
+
+```bash [Terminal]
+git clone https://github.com/mo4islona/settle
+cd settle/bindings/typescript/settle
+pnpm install
+pnpm run build
+```
+
+`pnpm run build` builds the native module for your platform and the TypeScript code. To build the browser module too, run `pnpm run build:all`. You need `wasm-pack` for it.
+
+## Next steps
+
+- [Quickstart](/introduction/quickstart) runs a full example in five minutes.
+- [How Settle works](/concepts/how-settle-works) explains the parts of Settle.

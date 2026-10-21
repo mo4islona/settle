@@ -1,0 +1,103 @@
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# Aggregate functions [The functions of a view, their results and their types]
+
+<LanguageSwitch label="Code language" />
+
+A view puts the rows of its source into groups by its key, and calculates aggregates for each group. All aggregates stay exact after a fork, also `min`, `max`, `first` and `last`. For the idea, read [Views](/concepts/views).
+
+## Functions
+
+| SQL | Builder | Input | Result |
+|---|---|---|---|
+| `count()` | `agg.count()` | Each row. | The number of rows, as `UInt64`. |
+| `count(c)` | — | The values of `c` that are not `null`. | The number of these values, as `UInt64`. |
+| `sum(c)` | `agg.sum(c)` | The numbers of `c`. | The sum. The type depends on the numeric mode. |
+| `avg(c)` | `agg.avg(c)` | The numbers of `c`. | The sum divided by the number of values, as `Float64`. In the `UInt256` mode, an integer division that gives a `UInt256`. |
+| `min(c)` | `agg.min(c)` | The numbers of `c`. | The smallest value. |
+| `max(c)` | `agg.max(c)` | The numbers of `c`. | The largest value. |
+| `first(c)` | `agg.first(c)` | The values of `c` that are not `null`. | The first value, in the order of the chain. |
+| `last(c)` | `agg.last(c)` | The values of `c` that are not `null`. | The last value, in the order of the chain. |
+
+`count(c)` is available only in the schema text.
+
+The order of the chain is the order of the blocks first. In a block, it is the order of the rows, then the order of the emits of each row.
+
+A view row is in the output while at least one of its aggregates has a value. When a fork removes all rows of a group, Settle gives a `delete` record for the view row.
+
+## Example
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/ref-aggregates.ts:schema]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/ref-aggregates.rs:schema]
+```
+
+:::
+
+The example sends four transfers. Two of them have no `memo`:
+
+:::code-group
+
+```ansi [TypeScript]
+token      USDC
+rows       4
+memos      2
+total      47
+mean       11.75
+smallest   5
+top_price  1.01
+first_memo rent
+last_memo  tip
+```
+
+```ansi [Rust]
+token      String("USDC")
+rows       UInt64(4)
+memos      UInt64(2)
+total      UInt64(47)
+mean       Float64(11.75)
+smallest   UInt64(5)
+top_price  Float64(1.01)
+first_memo String("rent")
+last_memo  String("tip")
+```
+
+:::
+
+## Output names
+
+In the builder, the name of each output column is its key in `select`. In the schema text, `AS name` gives the name. Without `AS`, the name is `function_column`, for example `sum_amount`. The name of `count()` is `count`.
+
+## Numeric modes
+
+`sum`, `min`, `max` and `avg` calculate in one of three modes. The declared type of the column sets the mode. For a reducer source, the type of the state field or of the group column with the same name sets it.
+
+| Mode | Column types | Calculation | Result type |
+|---|---|---|---|
+| Integer | `UInt64`, `Int64`, `DateTime` | A signed 128-bit integer. At its limits, it stops and does not wrap. | `UInt64` when the result is in its range, else `Int64` when it fits, else `Float64`. |
+| Big integer | `UInt256` | An unsigned 256-bit integer. At its limits, it stops and does not wrap. | `UInt256` |
+| Float | All other types, and each emit column that is not a state field or a group column | A 64-bit float (IEEE 754). | `Float64` |
+
+In each mode, the function uses only the values of that mode. Today, Settle ignores each other value, and it gives no error. These are the usual causes:
+
+- A row gives a fraction, or a string, to an integer column.
+- A JavaScript reducer emits a `number` into a column with the name of an integer state field. Settle reads each `number` from JavaScript as `Float64`. Emit a `bigint`, or give the emit column a different name.
+- A Rust closure emits a `Value::Float64` into such a column. Emit the variant of the state field, for example `Value::UInt64`.
+
+A `Float64` sum depends on the order of the values. Settle adds the values of each block first, then adds the block totals in the order of the chain. Thus the result is the same after each fork and each restart.
+
+## Time windows
+
+A view can put rows into windows of time. The time column holds milliseconds, for example a `DateTime` column.
+
+- A **fixed window** gives one row for each window of a fixed width, for example one candle for each minute. Use `interval()` in the builder, or `toStartOfInterval(column, INTERVAL n unit)` in the schema text. The key is the start of the window, in milliseconds.
+- A **sliding window** gives one row for each group, and counts only the rows of the last width of time. Use the `slidingWindow` option in the builder, or `WINDOW SLIDING INTERVAL n unit BY column` in the schema text.
+
+In a sliding window, the time of a block is the largest time of its rows. The window ends at the largest block time in the chain. A block whose time is at or after the window start stays in the window. The time of day on your computer has no effect.
+
+A price candle is a view with `first`, `max`, `min`, `last` and `sum` over a fixed window. See [Time windows and candles](/guides/time-windows).

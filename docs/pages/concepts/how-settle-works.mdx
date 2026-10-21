@@ -1,0 +1,109 @@
+import { Api } from '../../components/Api'
+import { LanguageSwitch } from '../../components/LanguageSwitch'
+
+# How Settle works [The parts of Settle and the loop of your app]
+
+<LanguageSwitch label="Code language" />
+
+This page shows the full picture. The pages that follow explain each part.
+
+## The parts
+
+Settle has three types of objects. You declare them in a **pipeline**:
+
+```
+              ┌──────────┐
+  rows  ───►  │  table   │ ──────────────────────────┐
+              └────┬─────┘                           ▼
+                   │                           ┌──────────┐
+                   │                           │   view   │ ──► changes
+                   ▼                           └──────────┘
+              ┌──────────┐                           ▲
+              │ reducer  │ ──────────────────────────┘
+              └──────────┘
+```
+
+- A [table](/concepts/tables) holds the rows that your app gives to Settle. Each row belongs to one block.
+- A [view](/concepts/views) puts the rows of a table or of a reducer into groups. For each group, it calculates aggregates such as a sum or a maximum.
+- A [reducer](/concepts/reducers) keeps a state for each group and runs your code for each row. Its code can emit new rows for a view or for another reducer.
+
+A view cannot read another view. A simple pipeline has a table and a view. Add a reducer only when a view cannot calculate the value that you need.
+
+## The loop of your app
+
+Your app reads blocks from a source, for example SQD Portal or an RPC node. Then it does these steps for each part of the chain:
+
+1. Call `ingest` with the rows, the hash of each block and the last final block.
+2. Settle runs the rows through the pipeline.
+3. Settle returns a [batch of changes](/concepts/change-batches), or no batch when no output changed.
+4. Write the batch to your database.
+5. Call `ack` with the sequence number of the batch.
+
+:::code-group
+
+```ts [TypeScript]
+for await (const { rows, hashes, finalized } of source) {
+  const batch = await db.ingest({
+    data: rows,
+    rollbackChain: hashes,
+    finalizedHead: finalized,
+  })
+
+  if (batch) {
+    await writeToDatabase(batch)
+    db.ack(batch.sequence)
+  }
+}
+```
+
+```rust [Rust]
+for (rows, hashes, finalized) in source {
+    let batch = db.ingest(IngestInput {
+        data: rows,
+        rollback_chain: hashes,
+        finalized_head: finalized,
+    })?;
+
+    if let Some(batch) = batch {
+        write_to_database(&batch)?;
+        db.ack(batch.sequence)?;
+    }
+}
+```
+
+:::
+
+When the source tells your app about a fork, your app calls <Api ts="handleFork" rust="handle_fork" />. Settle returns a batch that undoes the replaced blocks. Your app writes this batch with the same code. Then it reads the new blocks from the source. [Forks and finality](/concepts/forks-and-finality) gives the details.
+
+## Who does what
+
+| Task | Who does it |
+|---|---|
+| Read blocks from the chain | Your app |
+| Calculate the views after each block | Settle |
+| Find the fork point and undo the replaced blocks | Settle |
+| Keep the results and answer queries | Your database |
+| Write each batch, then confirm it with `ack` | Your app |
+
+## Where Settle keeps its data
+
+Without a data directory, Settle keeps all data in memory. When the process stops, the data goes away. This is good for tests and for apps in a browser.
+
+With a data directory, Settle keeps its data on disk in RocksDB. When your app calls `ack`, Settle writes the state after that batch to disk. After a restart, Settle continues from the last batch that your app confirmed. [Restarts and crash safety](/guides/restarts) explains this.
+
+:::code-group
+
+```ts [TypeScript]
+const db = p.build({ dataDir: './settle-data' })
+```
+
+```rust [Rust]
+let mut db = p.build(BuildOptions::new().data_dir("./settle-data"))?;
+```
+
+:::
+
+## Next steps
+
+- [Tables](/concepts/tables) shows how to declare the input rows.
+- [Views](/concepts/views) shows how to calculate aggregates.

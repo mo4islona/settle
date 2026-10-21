@@ -1,0 +1,88 @@
+---
+layout: landing
+---
+
+import { HomePage } from 'vocs/components'
+import { LanguageSwitch } from '../components/LanguageSwitch'
+
+<HomePage.Root>
+  <HomePage.Tagline>
+    <h1 style={{ font: 'inherit', margin: 0 }}>Live tables from blockchain data</h1>
+  </HomePage.Tagline>
+  <HomePage.Description>
+    Settle calculates totals from blocks and keeps them correct after a reorg.
+    It runs inside your app: in Node.js, in a browser or in Rust.
+  </HomePage.Description>
+  <HomePage.Buttons>
+    <HomePage.Button href="/introduction/quickstart" variant="accent">Quickstart</HomePage.Button>
+    <HomePage.Button href="/introduction/what-is-settle">What is Settle?</HomePage.Button>
+  </HomePage.Buttons>
+</HomePage.Root>
+
+<div style={{ maxWidth: '44rem', margin: '0 auto', padding: '0 1rem 4rem' }}>
+
+<div style={{ display: 'flex', justifyContent: 'center', marginBottom: '1rem' }}>
+  <LanguageSwitch label="Code language" />
+</div>
+
+### Install
+
+:::code-group
+
+```bash [TypeScript]
+npm install @settle/stream
+```
+
+```bash [Rust]
+cargo add settle --git https://github.com/mo4islona/settle
+```
+
+:::
+
+### 1. Declare a table and a view
+
+:::code-group
+
+```ts [TypeScript]
+// [!include ~/examples/quickstart.ts:pipeline]
+```
+
+```rust [Rust]
+// [!include ~/examples/rust/src/bin/quickstart.rs:pipeline]
+```
+
+:::
+
+### 2. Send blocks and apply the changes
+
+:::code-group
+
+```ansi [TypeScript]
+insert { pool: 'ETH/USDC', volume: 350, swaps: 2 }
+insert { pool: 'BTC/USDC', volume: 50, swaps: 1 }
+```
+
+```ansi [Rust]
+insert { pool: ETH/USDC, volume: 350, swaps: 2 }
+insert { pool: BTC/USDC, volume: 50, swaps: 1 }
+```
+
+:::
+
+### 3. The chain replaces a block: Settle gives the corrections
+
+:::code-group
+
+```ansi [TypeScript]
+update { pool: 'ETH/USDC', volume: 100, swaps: 1 }
+delete { pool: 'BTC/USDC', volume: 50, swaps: 1 }
+```
+
+```ansi [Rust]
+update { pool: ETH/USDC, volume: 100, swaps: 1 }
+delete { pool: BTC/USDC, volume: 50, swaps: 1 }
+```
+
+:::
+
+</div>
