@@ -22,7 +22,7 @@ const ROWS_PER_BLOCK: u64 = 10_000;
 const GROUP_COUNTS: [u64; 2] = [500_000, 1_000_000];
 const CAP: usize = 100_000;
 
-const SHAPES: [(&str, &str); 3] = [
+const SHAPES: [(&str, &str); 4] = [
     (
         "reducer",
         "CREATE TABLE trades (block_number UInt64, trader String, amount UInt64);
@@ -32,6 +32,16 @@ const SHAPES: [(&str, &str); 3] = [
         PROCESS $$
             state.total = state.total + row.amount
             state.trades = state.trades + 1
+        $$;",
+    ),
+    (
+        "map",
+        "CREATE TABLE trades (block_number UInt64, trader String, amount UInt64);
+        CREATE REDUCER positions SOURCE trades GROUP BY trader
+        STATE (book Map(String, UInt64))
+        LANGUAGE lua
+        PROCESS $$
+            state.book:set('total', (state.book:get('total') or 0) + row.amount)
         $$;",
     ),
     (

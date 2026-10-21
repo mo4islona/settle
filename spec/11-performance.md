@@ -29,7 +29,7 @@ This document states the service level indicators, the objectives, the resource 
 | SLI-3 | SC-2 | P-SLO-ACK-SYNC ⚠ | about 60 µs per ack on NVMe (2026-10-16) |
 | SLI-4 | SC-3, 75 blocks with 10,050 rows | P-SLO-ROLLBACK | 2.5 / 2.8 ms |
 | SLI-5 | SC-5 | P-SLO-OPEN ⚠ | 0.6 s after a long tip run with the log bound (2026-10-17) |
-| SLI-6 | SC-4 | P-SLO-RSS-PER-GROUP ⚠ | 480 bytes for each reducer group, 1,485 for each view group. Each is the growth of the peak RSS from 500K to 1M groups (persistent, 2026-10-22). |
+| SLI-6 | SC-4 | P-SLO-RSS-PER-GROUP ⚠ | 358 bytes for each reducer group, 751 with a MAP field, 649 for each view group. Each is the growth of the peak RSS from 500K to 1M groups (persistent, 2026-10-22). |
 | SLI-7 | Scale cases | P-SLO-INSTR-LINEAR | a growth of 2.0 to 2.1 when the input doubles |
 | SLI-7 | Each case | P-GATE-INSTR-NOISE | for example 311M instructions (15.6K per row) for a backfill sum view |
 | SLI-8 | SC-7, pipelined | P-SLO-PG-RATIO ⚠ | 0.91–0.95 sum for each user, 0.71–0.72 stateful PnL, 1.22 raw rows in serial mode |

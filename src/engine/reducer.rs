@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -12,6 +12,7 @@ use crate::schema::ast::{ReducerBody, ReducerDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
 use crate::types::{BlockNumber, ColumnId, ColumnRegistry, Row, Value};
 
+use super::blocks::Blocks;
 use super::evict::{Eviction, Victims};
 
 /// Orchestrates a single reducer: state management, rollback, and output.
@@ -71,11 +72,10 @@ struct Group {
     key: Box<[u8]>,
     /// The current state, in the order of the STATE fields.
     state: Vec<Value>,
-    /// The state before each block that changed it and is not final yet,
-    /// oldest first. A rollback restores the first one above its fork
-    /// point. The state as of finality is the first one above finality,
-    /// else `state`.
-    undo: VecDeque<(BlockNumber, Vec<Value>)>,
+    /// The state before each block that changed it and is not final yet. A
+    /// rollback restores the first one above its fork point. The state as of
+    /// finality is the first one above finality, else `state`.
+    undo: Blocks<Vec<Value>>,
     /// Whether `pending_durable` holds the group.
     pending_durable: bool,
     /// The checkpoint that last wrote the state; 0 if none did since the
@@ -115,7 +115,7 @@ impl Groups {
         self.all.push(Group {
             key: key.into(),
             state,
-            undo: VecDeque::new(),
+            undo: Blocks::new(),
             pending_durable: false,
             written: 0,
             maps,
@@ -150,9 +150,9 @@ impl Groups {
     /// block keeps the state before it, and adds the group to `changed`.
     fn change(&mut self, id: usize, block: BlockNumber, changed: &mut Vec<usize>) -> &mut Group {
         let group = &mut self.all[id];
-        let first = group.undo.back().is_none_or(|(b, _)| *b != block);
+        let first = group.undo.last_block() != Some(block);
         if first {
-            group.undo.push_back((block, group.state.clone()));
+            group.undo.insert(block, group.state.clone());
             changed.push(id);
             if let Some(maps) = &mut group.maps {
                 maps.begin(block);
@@ -529,9 +529,8 @@ impl ReducerEngine {
         let mut affected = 0;
         for id in rolled_back.into_values().flatten() {
             let group = &mut self.groups.all[id];
-            let kept = group.undo.partition_point(|(block, _)| *block <= fork_point);
             // Only the first block of the group restores: it drains the rest.
-            if let Some((_, state)) = group.undo.drain(kept..).next() {
+            if let Some(state) = group.undo.remove_above(fork_point) {
                 group.state = state;
                 affected += 1;
             }
@@ -568,8 +567,7 @@ impl ReducerEngine {
 
         for id in finalized.into_values().flatten() {
             let group = &mut self.groups.all[id];
-            let final_entries = group.undo.partition_point(|(b, _)| *b <= block);
-            group.undo.drain(..final_entries);
+            group.undo.drain_up_to(block, drop);
             if let Some(maps) = &mut group.maps {
                 maps.finalize(block);
             }
@@ -594,8 +592,7 @@ impl ReducerEngine {
             group.pending_durable = false;
             group.written = checkpoint;
 
-            let above = group.undo.partition_point(|(b, _)| *b <= finalized);
-            let state = group.undo.get(above).map_or(&group.state, |(_, state)| state);
+            let state = group.undo.first_above(finalized).unwrap_or(&group.state);
             batch.set_reducer_finalized(&self.def.name, group.key.to_vec(), storage::encode_values(state));
             if let Some(maps) = &mut group.maps {
                 maps.write_checkpoint(finalized, &self.def.name, &group.key, batch);

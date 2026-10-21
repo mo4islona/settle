@@ -26,8 +26,9 @@ This record holds two related proposals. Both give a bound to a resource that a 
 
   | Node | Peak RSS per group | Peak RSS at 1M groups, cap 100K | Time of new keys above the cap | Time of a pass that misses on each row |
   |---|---:|---:|---:|---:|
-  | Reducer | 480 bytes | 256 MB, not 596 MB | +9% | 1.8 times |
-  | View | 1,485 bytes | 368 MB, not 1,627 MB | +32% | 1.8 times |
+  | Reducer | 358 bytes | 243 MB, not 475 MB | +8% | 1.8 times |
+  | Reducer with a MAP field | 751 bytes | 315 MB, not 876 MB | +15% | 2.5 times |
+  | View | 649 bytes | 284 MB, not 781 MB | +23% | 1.6 times |
 
 - A miss of a stored group costs a read of the store, so above the cap the throughput falls. The worst case is a cyclic access to more keys than the cap. A new group costs only a check of the filters. At 5M stored groups, the filters cut the time of a pass of new keys above the cap by 7% to 25%.
 - The filters take P-KEY-FILTER of memory for each stored group. A flush or a compaction that builds them raises the peak memory, by 40 to 60 MB at 5M stored groups.

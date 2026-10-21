@@ -59,7 +59,7 @@ The baselines are in [11-performance.md](11-performance.md). The targets with �
 | P-SLO-ACK-SYNC | SLI-3. | About 60 µs on NVMe | ⚠ At most 200 µs (ADR-9) |
 | P-SLO-ROLLBACK | SLI-4, 75 blocks with 10,050 rows. | 2.5 / 2.8 ms | Less than 10 ms |
 | P-SLO-OPEN | SLI-5, the reference tail of SC-5. | 0.6 s | ⚠ At most 2 s (ADR-9) |
-| P-SLO-RSS-PER-GROUP | SLI-6. | 480 bytes for each reducer group, 1,485 for each view group | ⚠ To ratify in ADR-9 |
+| P-SLO-RSS-PER-GROUP | SLI-6. | 358 bytes for each reducer group, 751 with a MAP field, 649 for each view group | ⚠ To ratify in ADR-9 |
 | P-SLO-INSTR-LINEAR | SLI-7, the growth when the input doubles. | 2.0 to 2.1 | At most 2.1 |
 | P-SLO-PG-RATIO | SLI-8, pipelined, aggregate workloads. | 0.71 to 0.95 | ⚠ At most 1.0 (ADR-9) |
 | P-SLO-REORG-RATIO | SLI-9, aggregates with no inverse. | 0.08 to 0.14 | ⚠ At most 0.5 (ADR-9) |
