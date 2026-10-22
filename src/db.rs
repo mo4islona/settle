@@ -1017,6 +1017,7 @@ impl Settle {
             pending_changes.extend(changes);
         }
 
+        self.engine.begin_ingest(finalized_head.number);
         let result = (|| -> Result<()> {
             for (table, by_block) in tables {
                 for (block, block_rows) in by_block {

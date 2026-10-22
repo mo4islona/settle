@@ -22,7 +22,7 @@ Bands: 1–9 raw rows · 10–19 derived state · 20–29 space and memory.
 
 **RS-10 — Final state.** For each reducer group and each view group, Settle keeps the state at `F` in memory. A checkpoint writes the state at `F` of each group that changed since the last checkpoint.
 
-**RS-11 — Unfinal data.** For each block above `F`, Settle keeps undo data. This is the state of each reducer group before each block that changed it, and the contribution of the block to each view group. The size of this data grows with `L − F` and with the groups that each block changes.
+**RS-11 — Unfinal data.** For each block above `F`, Settle keeps undo data. This is the state of each reducer group before each block that changed it, and the contribution of the block to each view group. The size of this data grows with `L − F` and with the groups that each block changes. RS-17 keeps less for a view during a call.
 
 **RS-12 — Replay.** An open replays the blocks above `D` (DEF-87). It reads at most P-REPLAY-CHUNK blocks with rows per table at a time. So the raw rows of the tail are never in memory all at once. The work of a replay is linear in the tail (LIV-3). After the replay, the replayed blocks at or below `F` are final (ADR-7).
 
@@ -33,6 +33,8 @@ Bands: 1–9 raw rows · 10–19 derived state · 20–29 space and memory.
 **RS-15 — Journal size.** The journal holds the entries of at most P-MAX-UNACKED places. The commit of a batch deletes its entries, and an open deletes all entries (LIV-9).
 
 **RS-16 — External chains.** An open does not replay an external reducer that has no code. If `D < min(F, L)` after the replay, the open waits for code: the reducers and views stay final at `D`, and `F` keeps its stored value. Each attach then replays its chain from `D + 1` (WP-60). The first ingest call after the last attach makes the replayed blocks final, and this ends the wait. With no such gap, an attach replays its chain from `F + 1` (ADR-17).
+
+**RS-17 — Blocks final at their call.** A view keeps no undo data for a block at or below the finalized head of the call that brings it. Each group folds such a block into its final state when the next block of the group arrives, or when the call ends. Until the call ends, the view keeps a copy of each group that these blocks change, as the group was before the call. A failed call puts these copies back (WP-70). A sliding view and a reducer keep the undo data of RS-11 also for these blocks (ADR-20).
 
 ## Space and memory
 

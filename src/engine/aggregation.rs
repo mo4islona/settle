@@ -145,7 +145,7 @@ impl NumAccum {
 ///
 /// Each function tracks per-block contributions separately from finalized state,
 /// enabling surgical rollback to any block boundary.
-pub trait AggregationFunc: Send + Sync {
+pub trait AggregationFunc: Send + Sync + CloneAggregation {
     /// Feed values from a single block into the aggregation.
     fn add_block(&mut self, block: BlockNumber, values: &[Value]);
 
@@ -194,6 +194,23 @@ pub trait AggregationFunc: Send + Sync {
 
     /// Add the data of `block` that `write_block` wrote.
     fn read_block(&mut self, block: BlockNumber, bytes: &[u8]) -> Option<()>;
+}
+
+/// Makes `Box<dyn AggregationFunc>` cloneable.
+pub trait CloneAggregation {
+    fn clone_box(&self) -> Box<dyn AggregationFunc>;
+}
+
+impl<T: AggregationFunc + Clone + 'static> CloneAggregation for T {
+    fn clone_box(&self) -> Box<dyn AggregationFunc> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn AggregationFunc> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }
 
 fn write_entry<V: Serialize>(blocks: &Blocks<V>, block: BlockNumber, out: &mut Vec<u8>) -> bool {
