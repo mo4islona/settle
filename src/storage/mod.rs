@@ -98,6 +98,12 @@ impl StorageWriteBatch {
         });
     }
 
+    /// Leave out the raw rows of the blocks at or below `block`.
+    pub fn drop_raw_rows_through(&mut self, block: BlockNumber) {
+        self.ops
+            .retain(|op| !matches!(op, BatchOp::PutRawRows { block: b, .. } if *b <= block));
+    }
+
     pub fn set_reducer_finalized(&mut self, reducer: &str, group_key: Vec<u8>, state: Vec<u8>) {
         self.ops.push(BatchOp::SetReducerFinalized {
             reducer: reducer.to_string(),

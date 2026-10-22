@@ -89,7 +89,7 @@ Otherwise the call fails with INVALID_INPUT. The current code checks no value ty
 
 ## Commit and ack
 
-**WP-30 — Write set.** Each call has one atomic write set. It holds the raw rows, the rollback deletes, the checkpoint, the watermarks, the hashes, the next sequence and the format stamp. The write set enters the committed state only at its commit.
+**WP-30 — Write set.** Each call has one atomic write set. It holds the raw rows, the rollback deletes, the checkpoint, the watermarks, the hashes, the next sequence and the format stamp. RS-6 leaves some raw rows out. The write set enters the committed state only at its commit.
 
 **WP-31 — Ack.** A call `ack(n)` has one of these effects:
 

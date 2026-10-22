@@ -24,3 +24,4 @@ The files only gain new records. An accepted record changes only when a later re
 | [ADR-16](ADR-16-remove-inert-buffer.md) | Remove the inert buffer setting and gauges | Proposed | — |
 | [ADR-17](ADR-17-external-reducers-defer.md) | External reducers defer their checkpoints | Proposed | — |
 | [ADR-18](ADR-18-interval-counts-to-the-data.md) | The checkpoint interval counts to the latest block | Proposed | — |
+| [ADR-19](ADR-19-checkpoint-leaves-out-covered-rows.md) | A checkpoint leaves out the raw rows that it covers | Proposed | — |

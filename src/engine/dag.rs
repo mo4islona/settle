@@ -1185,8 +1185,22 @@ impl SettleEngine {
         if let Some(latest) = self.latest_block {
             self.durable_block = Some(finalized.min(latest));
         }
+        self.leave_out_checkpointed_raw_rows(batch);
         self.purge_raw_rows(batch);
         self.prune_block_hashes();
+    }
+
+    /// Leave out of `batch` its raw rows at or below the durable block: the
+    /// checkpoint in the same batch holds their state, and nothing reads them
+    /// (see `purge_raw_rows`). `batch` holds the rows of this call only. The
+    /// largest retention margin keeps every raw row.
+    fn leave_out_checkpointed_raw_rows(&self, batch: &mut StorageWriteBatch) {
+        if self.raw_retention_blocks == u64::MAX {
+            return;
+        }
+        if let Some(durable) = self.durable_block {
+            batch.drop_raw_rows_through(durable);
+        }
     }
 
     /// Delete the raw rows that nothing reads any more, in the batch that

@@ -6,7 +6,7 @@ Bands: 1–9 raw rows · 10–19 derived state · 20–29 space and memory.
 
 ## Raw rows
 
-**RS-1 — Retention.** For each raw table, virtual tables included, the store keeps the raw rows of every block above `D − P-RAW-RETENTION`. It always keeps the raw rows of every block above `D` (INV-7).
+**RS-1 — Retention.** For each raw table, virtual tables included, the store keeps the stored raw rows of every block above `D − P-RAW-RETENTION`. It always keeps the raw rows of every block above `D` (INV-7). RS-6 does not store the raw rows of some blocks at or below `D`.
 
 **RS-2 — Purge.** Each checkpoint deletes the stored raw rows of the blocks at or below `D − P-RAW-RETENTION`, in steps of P-PURGE-STEP blocks (WP-43). The deletes are part of the atomic write set of the checkpoint. When P-RAW-RETENTION has its largest value, no purge occurs (ADR-3).
 
@@ -15,6 +15,8 @@ Bands: 1–9 raw rows · 10–19 derived state · 20–29 space and memory.
 **RS-4 — Rollback reach.** A rollback never goes below `F`, and `D ≤ F` (INV-1). So a rollback reads only raw rows above `D`, and RS-1 keeps them.
 
 **RS-5 — No archive.** Settle offers no read of the raw rows. A purged row is gone from Settle (NG-8).
+
+**RS-6 — Rows that a checkpoint covers.** A write set with a checkpoint holds no raw rows of the blocks at or below the `D` that the checkpoint sets. The checkpoint holds their state, and nothing reads them (RS-4, RS-12). When P-RAW-RETENTION has its largest value, the write set keeps them (ADR-19).
 
 ## Derived state
 
