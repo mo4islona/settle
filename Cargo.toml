@@ -132,6 +132,10 @@ harness = false
 name = "resident_memory"
 harness = false
 
+[[bench]]
+name = "scenarios"
+harness = false
+
 [profile.bench]
 debug = true
 
