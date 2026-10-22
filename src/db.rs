@@ -53,13 +53,14 @@ pub struct Config {
     pub max_pending_batches: usize,
     /// Backfill durability checkpoint interval, in blocks. Default `1` =
     /// persist derived reducer/MV state on every finalize. When `> 1` AND the
-    /// ingest is no-lag (finalized head at the batch tip, i.e. historical
-    /// backfill) AND the pipeline is deferral-safe (no sliding-window MV, no
-    /// reducer from `Settle::register_reducer`), derived-state persistence is
-    /// deferred and only flushed every `interval` blocks. Recovery replays raw
-    /// rows from the last durable checkpoint, so a crash mid-interval costs
-    /// extra replay but never loses data. After a reopen with deferred
-    /// blocks, ingest fails until every external reducer has its callback.
+    /// ingest is no-lag (finalized head at or above the batch tip, i.e.
+    /// historical backfill) AND the pipeline is deferral-safe (no
+    /// sliding-window MV, no reducer from `Settle::register_reducer`),
+    /// derived-state persistence is deferred and only flushed every
+    /// `interval` blocks of data. Recovery replays raw rows from the last
+    /// durable checkpoint, so a crash mid-interval costs extra replay but
+    /// never loses data. After a reopen with deferred blocks, ingest fails
+    /// until every external reducer has its callback.
     /// See spec/decisions/ADR-2-finality-and-durable-watermark.md.
     pub backfill_checkpoint_interval: u64,
     /// Build the `ChangeBatch::perf` timing tree on ingest. Default `true`.
@@ -1084,11 +1085,11 @@ impl Settle {
         //    state from disk and the replayed raw rows; on commit, in-memory and
         //    disk agree.
         //
-        //    Backfill deferral: when the ingest is no-lag (finalized head at the
-        //    batch tip — historical backfill), the pipeline is deferral-safe,
-        //    and the checkpoint interval hasn't elapsed, no checkpoint is
-        //    written. The durable watermark (META_DURABLE_BLOCK) then stays
-        //    put and recovery replays raw rows from it. Any lag (tip
+        //    Backfill deferral: when the ingest is no-lag (finalized head at or
+        //    above the batch tip — historical backfill), the pipeline is
+        //    deferral-safe, and the checkpoint interval hasn't elapsed, no
+        //    checkpoint is written. The durable watermark (META_DURABLE_BLOCK)
+        //    then stays put and recovery replays raw rows from it. Any lag (tip
         //    operation), interval elapse, or a deferral-unsafe pipeline writes
         //    one, catching the durable watermark up to finality.
         let target_finalized = finalized_head.number;
@@ -1098,9 +1099,11 @@ impl Settle {
             let no_lag = target_finalized >= latest;
             let defer_active =
                 self.backfill_checkpoint_interval > 1 && self.engine.defer_allowed() && no_lag;
+            // A checkpoint moves the durable block only to min(F, L) (WP-42).
+            let checkpoint_to = target_finalized.min(latest);
             // Until data is durable, recovery has no checkpoint to replay from.
             let reached_interval = durable.is_none_or(|d| {
-                target_finalized.saturating_sub(d) >= self.backfill_checkpoint_interval
+                checkpoint_to.saturating_sub(d) >= self.backfill_checkpoint_interval
             });
             !defer_active || reached_interval
         };

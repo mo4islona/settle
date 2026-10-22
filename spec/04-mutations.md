@@ -119,7 +119,7 @@ Otherwise the call fails with INVALID_INPUT. The current code checks no value ty
 - The pipeline is deferral-safe (DEF-84).
 - The call is a backfill call (DEF-15).
 - `D` is not ⊥.
-- `F − D` is below P-CHECKPOINT-INTERVAL.
+- `min(F, L) − D` is below P-CHECKPOINT-INTERVAL (ADR-18).
 
 **WP-41 — Deferral gate.** Settle computes the deferral-safe property at open and again after each reducer registration (ADR-2, ADR-17).
 

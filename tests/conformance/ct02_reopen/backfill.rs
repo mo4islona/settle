@@ -171,6 +171,33 @@ fn backfill_checkpoint_advances_durable_and_recovers() {
     assert_eq!(total, 26_000.0, "checkpoint + replay-of-tail must yield full MV");
 }
 
+/// A source can report the finalized head of the chain, far above the blocks
+/// of a backfill call. The interval counts to the latest block, which is as
+/// far as a checkpoint moves the durable block: checkpoints come at blocks 1,
+/// 11 and 21, not at each block.
+#[test]
+fn backfill_defers_with_finality_far_above_the_data() {
+    const FINALIZED: u64 = 1_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    {
+        let cfg = Config::with_data_dir(MV_SCHEMA, &path).backfill_checkpoint_interval(10);
+        let mut db = Settle::open(cfg).unwrap();
+        for b in 1..=25u64 {
+            ingest_block(&mut db, "orders", b, FINALIZED, vec![order("A", 1000)]);
+        }
+        assert_eq!(db.durable_block(), 21);
+        assert_eq!(db.finalized_block(), FINALIZED);
+    }
+
+    let cfg = Config::with_data_dir(MV_SCHEMA, &path).backfill_checkpoint_interval(10);
+    let mut db = Settle::open(cfg).unwrap();
+    assert_eq!(db.finalized_block(), FINALIZED);
+    let batch = ingest_block(&mut db, "orders", 26, FINALIZED, vec![order("A", 1000)]).unwrap();
+    let total = mv_value(&batch, "summary", "asset_id", "A", "total").unwrap();
+    assert_eq!(total, 26_000.0, "blocks 22..25 come back through the replay");
+}
+
 /// Gappy chain (review hole #6): finalized head ahead of the latest data block.
 /// The durable watermark must clamp to the latest persisted raw block, so a
 /// later sub-finality data block's contribution survives a crash.
@@ -182,8 +209,8 @@ fn backfill_gappy_chain_clamps_durable_to_latest() {
         let cfg = Config::with_data_dir(MV_SCHEMA, &path).backfill_checkpoint_interval(5);
         let mut db = Settle::open(cfg).unwrap();
         // Data block 3, but finality reported far ahead (block 100) — gappy.
-        // A checkpoint fires (100-0 >= 5) but durable must clamp to latest=3,
-        // never to 100 (no raw rows for 4..100 to replay).
+        // The first data block is a checkpoint, but durable must clamp to
+        // latest=3, never to 100 (no raw rows for 4..100 to replay).
         ingest_block(&mut db, "orders", 3, 100, vec![order("A", 1000)]);
         assert!(
             db.durable_block() <= 3,

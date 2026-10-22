@@ -58,7 +58,7 @@ A group that is not in memory loads its stored state on its next row. The key fi
 
 - **With finality:** finality frees the unfinal data (RS-11, LIV-6) and the hashes below `F` (RS-14).
 - **With forks:** a rollback removes the unfinal data above the fork point and restores the stash entries above it (WP-14). It reads raw rows only above `D` (RS-4).
-- **With deferral:** `D` can lag `F` by up to P-CHECKPOINT-INTERVAL blocks. The purge follows `D`, so the store keeps more raw rows, and the replay tail grows by the interval.
+- **With deferral:** `D` can lag `min(F, L)` by up to P-CHECKPOINT-INTERVAL blocks. The purge follows `D`, so the store keeps more raw rows, and the replay tail grows by the interval.
 - **With a reopen:** the open sets the replay tail to the blocks above `D`. Only the blocks of the tail above `F` stay as unfinal data.
 - **With liveness:** LIV-7, LIV-8 and LIV-9 bound how fast the space comes back.
 - **With eviction:** the groups that the blocks above `F`, a deferred checkpoint or an unacked batch changed stay in memory (RS-24). So a finality stall, a long interval or a long ack queue can keep a node above P-RESIDENT-GROUPS.

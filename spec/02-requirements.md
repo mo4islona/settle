@@ -94,9 +94,9 @@ Without a data directory, Settle keeps all state in memory and loses it when the
 *Trace:* CN-11, IB-23.
 
 **REQ-16 — Backfill deferral.** [SHOULD]
-In a backfill, the finalized head is at the tip of each batch. The operator can then let Settle write a checkpoint every P-CHECKPOINT-INTERVAL blocks in place of every block, with the same output.
+In a backfill, the finalized head is at or above the tip of each batch. The operator can then let Settle write a checkpoint every P-CHECKPOINT-INTERVAL blocks in place of every block, with the same output.
 *Acceptance:* The batches with an interval of N equal the batches with an interval of 1 (CT-2). A crash replays at most the blocks after the last checkpoint.
-*Trace:* ADR-2, ADR-17; WP-40, WP-41, WP-42, INV-44, PF-8.
+*Trace:* ADR-2, ADR-17, ADR-18; WP-40, WP-41, WP-42, INV-44, PF-8.
 
 ## Schema and computation
 

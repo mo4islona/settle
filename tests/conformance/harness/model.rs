@@ -300,8 +300,8 @@ impl<'s> Model<'s> {
     fn checkpoint(&self, st: &mut State) {
         let backfill = st.f >= st.l.unwrap_or(0);
         let defer = self.cfg.interval > 1 && self.schema.deferral_safe() && backfill;
-        let due =
-            st.d.is_none_or(|d| st.f.saturating_sub(d) >= self.cfg.interval);
+        let checkpoint_to = st.f.min(st.l.unwrap_or(0));
+        let due = st.d.is_none_or(|d| checkpoint_to.saturating_sub(d) >= self.cfg.interval);
         if defer && !due {
             return;
         }

@@ -989,13 +989,17 @@ fn checkpoint_persists_mv_group_finalized_during_deferral() {
         // No lag, interval not reached: deferred.
         ingest_with_finalized(&mut db, vec![], 1).unwrap();
         assert_eq!(db.durable_block(), 0);
-        // Interval reached: a checkpoint, clamped to the latest data block.
+        // The interval counts blocks of data, not finality.
         ingest_with_finalized(&mut db, vec![], 2).unwrap();
-        assert_eq!(db.durable_block(), 1);
+        assert_eq!(db.durable_block(), 0);
+        // Interval reached by another pool: the checkpoint writes ETH too.
+        ingest_with_finalized(&mut db, vec![("swaps".into(), 2, vec![make_swap("BTC", 1.0)])], 2)
+            .unwrap();
+        assert_eq!(db.durable_block(), 2);
     }
 
     let mut db = Settle::open(config()).unwrap();
-    let batch = ingest_with_finalized(&mut db, vec![("swaps".into(), 2, vec![make_swap("ETH", 10.0)])], 2)
+    let batch = ingest_with_finalized(&mut db, vec![("swaps".into(), 3, vec![make_swap("ETH", 10.0)])], 3)
         .unwrap()
         .unwrap();
     let eth = record_for(&batch, "pool_volume", "pool", "ETH");
