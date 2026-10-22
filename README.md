@@ -191,18 +191,21 @@ format version (written before format versions existed).
 
 ## Performance
 
-Benchmarked on Apple M-series (`cargo bench`). Independent reducer branches execute in parallel via `rayon`.
+`cargo bench --bench throughput` on an idle AMD EPYC 9455 server, median of six runs (2026-10-22). Independent reducer
+branches execute in parallel via `rayon`. [BENCHMARKS.md](BENCHMARKS.md) has the method, the comparisons with
+Postgres, the map state layouts and the memory per group.
 
-| Benchmark                   | Description                                                          | Memory  | RocksDB |
-|-----------------------------|----------------------------------------------------------------------|---------|---------|
-| Raw table ingestion         | 200K rows, 2K blocks × 100 rows                                      | ~793K/s | ~774K/s |
-| Raw + MV                    | 200K rows, 2K blocks × 100 rows, sum + count MV                      | ~325K/s | ~327K/s |
-| Full pipeline — Lua         | 50K rows, 1K blocks × 50 rows, Lua reducer + MV, 100 groups          | ~171K/s | ~165K/s |
-| Rollback                    | 75 blocks × 134 rows, undo all and emit compensating changes          | ~1.5M/s | ~1.4M/s |
-| Ingest (atomic)             | 100K rows, 20 blocks × 5K rows, Raw + MV + finalize + flush          | ~756K/s | ~692K/s |
-| Polymarket: market_stats    | 200K rows, 400 blocks × 500 rows, Lua reducer + MV, 10K tokens       | ~170K/s | ~170K/s |
-| Polymarket: full pipeline   | 200K rows, 400 blocks × 500 rows, 2 reducers + 2 MVs, parallel       | ~148K/s | ~152K/s |
-| Polymarket: 1M traders      | 500K rows, 500 blocks × 1K rows, 1M unique group keys                | ~125K/s | ~141K/s |
+| Benchmark                   | Description                                                          | Memory   | RocksDB  |
+|-----------------------------|----------------------------------------------------------------------|----------|----------|
+| Raw table ingestion         | 200K rows, 2K blocks × 100 rows                                      | ~2.16M/s | ~753K/s  |
+| Raw + MV                    | 200K rows, 2K blocks × 100 rows, sum + count MV                      | ~1.13M/s | ~597K/s  |
+| Full pipeline — Lua         | 50K rows, 1K blocks × 50 rows, Lua reducer + MV, 100 groups          | ~457K/s  | ~285K/s  |
+| Full pipeline — Rust closure | 50K rows, 1K blocks × 50 rows, external reducer + MV, 100 groups    | ~775K/s  | ~379K/s  |
+| Rollback                    | 75 blocks × 134 rows, undo all and emit compensating changes          | ~3.7M/s  | ~4.2M/s  |
+| Ingest (atomic)             | 100K rows, 20 blocks × 5K rows, Raw + MV + finalize + flush          | ~1.40M/s | ~1.11M/s |
+| Polymarket: market_stats    | 200K rows, 400 blocks × 500 rows, Lua reducer + MV, 10K tokens       | ~287K/s  | ~260K/s  |
+| Polymarket: full pipeline   | 200K rows, 400 blocks × 500 rows, 2 reducers + 2 MVs, parallel       | ~228K/s  | ~221K/s  |
+| Polymarket: 1M traders      | 500K rows, 500 blocks × 1K rows, 1M unique group keys                | ~219K/s  | ~216K/s  |
 
 ## Building
 

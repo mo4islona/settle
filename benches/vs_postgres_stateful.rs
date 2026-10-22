@@ -30,13 +30,8 @@ use common::{
     PgBaseline, PgCase, PgRuntime, BATCH_SIZE, BLOCKS_PER_BATCH, ROWS_PER_BLOCK,
 };
 
-// DISCLAIMER: `CREATE VIRTUAL TABLE` означает что Settle НЕ персистит raw
-// rows в RocksDB — они только проходят через reducer. Это симуляция того
-// как Settle должен работать с auto-purge raw после finalize (которого
-// сейчас в движке нет — engine TODO). В реальной prod-ситуации Settle
-// держал бы raw для unfinalized window (fork support) и дропал после
-// finalize. Сейчас persistent CREATE TABLE дублировал бы raw с PG —
-// нечестный overhead для бенча.
+// VIRTUAL: the trades go to Postgres straight from the input, so a stored
+// table would keep a second copy of them in RocksDB.
 const SETTLE_SCHEMA: &str = r#"
 CREATE VIRTUAL TABLE trades (
     seq          UInt64,
@@ -179,7 +174,12 @@ impl Storage {
     }
 }
 
-fn make_cfg(schema: &str, storage: Storage, depth: usize) -> (Config, Option<tempfile::TempDir>) {
+fn make_cfg(
+    schema: &str,
+    storage: Storage,
+    checkpoint_interval: u64,
+    depth: usize,
+) -> (Config, Option<tempfile::TempDir>) {
     let (cfg, dir) = match storage {
         Storage::Memory => (Config::new(schema), None),
         Storage::Rocks => {
@@ -189,14 +189,18 @@ fn make_cfg(schema: &str, storage: Storage, depth: usize) -> (Config, Option<tem
             (cfg, Some(dir))
         }
     };
-    (cfg.max_pending_batches(depth), dir)
+    let cfg = cfg
+        .backfill_checkpoint_interval(checkpoint_interval)
+        .max_pending_batches(depth);
+    (cfg, dir)
 }
 
 fn open_settle_db(
     storage: Storage,
+    checkpoint_interval: u64,
     depth: usize,
 ) -> anyhow::Result<(Settle, Option<tempfile::TempDir>)> {
-    let (cfg, dir) = make_cfg(SETTLE_SCHEMA, storage, depth);
+    let (cfg, dir) = make_cfg(SETTLE_SCHEMA, storage, checkpoint_interval, depth);
     let mut db = Settle::open(cfg)?;
     db.register_reducer_callback("position", Box::new(position_reducer()))?;
     Ok((db, dir))
@@ -264,8 +268,7 @@ fn pg_smart_step(pg: &PgRuntime, batch_rows: &[RowMap]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Collect EXACT keys touched in this batch (not all keys per user) —
-    // загружаем только то что меняется. Масштабируемый паттерн.
+    // Only the keys that this batch touches, not all keys of each user.
     let mut pos_keys: HashSet<(String, String)> = HashSet::new();
     let mut daily_keys: HashSet<(String, i64)> = HashSet::new();
     let mut user_keys: HashSet<String> = HashSet::new();
@@ -971,12 +974,14 @@ fn main() -> anyhow::Result<()> {
         Some(Group::Queued(4)),
         Some(Group::Fixed(4)),
     ];
-    for pre_fin in [false, true] {
-        let fin_tag = if pre_fin { ",fin" } else { "" };
+    // (tag, pre_fin, checkpoint_interval), as in vs_postgres_simple_agg.
+    let modes: [(&str, bool, u64); 3] =
+        [("", false, 1), (",fin", true, 1), (",backfill", true, 1000)];
+    for (fin_tag, pre_fin, interval) in modes {
         for storage in [Storage::Memory, Storage::Rocks] {
             for consumer in consumers {
                 let depth = consumer.map_or(1, Group::depth);
-                let (mut db, _dir) = open_settle_db(storage, depth)?;
+                let (mut db, _dir) = open_settle_db(storage, interval, depth)?;
                 let pg = PgRuntime::start()?;
                 pg.batch_execute(PG_SCHEMA)?;
                 pg.take_stats();

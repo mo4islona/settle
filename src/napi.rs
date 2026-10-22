@@ -72,11 +72,11 @@ pub struct SettleConfig {
     /// Set, it turns on the journal: open brings the database to the state
     /// after this batch, acked or not. Negative values are rejected.
     pub applied_sequence: Option<i64>,
-    /// In a backfill (finalized head at the tip of each ingest), write the
-    /// derived state to disk once in this many blocks, not at each ingest
-    /// (default 1). A crash replays the blocks since the last write. After
-    /// such a reopen, `ingest()` throws until every external reducer has
-    /// its callback.
+    /// In a backfill (finalized head at or above the tip of each ingest),
+    /// write the derived state to disk once in this many blocks, not at each
+    /// ingest (default 1). A crash replays the blocks since the last write.
+    /// After such a reopen, `ingest()` throws until every external reducer
+    /// has its callback.
     pub backfill_checkpoint_interval: Option<u32>,
     /// Most groups that each reducer and each view keeps in memory, about
     /// (default 1,000,000). Above it, groups whose state is on disk leave

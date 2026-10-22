@@ -3,14 +3,16 @@
 # Benchmarks
 
 All numbers come from release builds with the default features (mimalloc).
-The builds ran on 2026-10-19 on an idle Linux server with an AMD EPYC 9455
-(48 cores). If the conditions of a section are different, the section tells
-you.
+The builds ran on 2026-10-22 (master `72ed7dd`) on an idle Linux server with
+an AMD EPYC 9455 (48 cores). If the conditions of a section are different,
+the section tells you.
 
 | Bench | What it measures | Command |
 |---|---|---|
 | `vs_postgres_raw`, `vs_postgres_simple_agg`, `vs_postgres_stateful`, `vs_postgres_reorg` | The time of a Settle → Postgres indexer and of a Postgres-only indexer. Both indexers make the same Postgres state. | `cargo bench --bench <name>` (Docker is necessary) |
 | `throughput` | Rows per second for typical pipelines, on Memory and on RocksDB | `cargo bench --bench throughput` |
+| `solana_dex` | Swaps per second for a PnL pipeline over a synthetic Solana DEX chain, with three layouts of the state for each wallet | See [Map state](#map-state-solana_dex) |
+| `resident_memory` | Bytes of memory for each group, and the cost of `max_resident_groups` | `cargo bench --bench resident_memory` (Linux) |
 | `instructions` | Instructions and heap allocations for each ingest, under Valgrind. It shows engine changes that are smaller than the wall-clock noise. | See [Instruction counts](#instruction-counts) |
 | `tip_rocks` | Ingest and ack at the chain tip on RocksDB, with and without the journal | `cargo bench --bench tip_rocks` |
 | `profile_*` | One workload each, for a profiler. This file has no numbers for them. | `samply record cargo bench --bench <name>` |
@@ -38,6 +40,10 @@ The conditions:
   after each run.
 - A PG-only time is the median of three runs. `PgBaseline` keeps these times
   in a cache. A Settle time comes from one run.
+- The PG-only times ran on 2026-10-19, the Settle times on 2026-10-22. The
+  Postgres side of the benches did not change between these days. The
+  Postgres time of the pipelined Settle rows also did not change (0.75–0.78s
+  for `simple_agg`, 2.0s for `stateful`).
 
 ### Variant names
 
@@ -60,11 +66,11 @@ RocksDB. A negative difference shows that Settle → PG is faster.
 
 | Workload | Mode | PG only | Settle → PG | Difference |
 |---|---|---:|---:|---:|
-| Sum for each user (`simple_agg`) | backfill (`,backfill`) | 0.850s | 0.773–0.802s | −6% to −9% |
-| | tip | 0.850s | 0.774–0.794s | −7% to −9% |
-| PnL with 3 projections (`stateful`) | backfill (`,fin`) | 2.978s | 2.145s | −28% |
-| | tip | 2.978s | 2.112s | −29% |
-| Raw rows, no aggregates (`raw`), serial | tip | 0.216s | 0.263s | +22% |
+| Sum for each user (`simple_agg`) | backfill (`,backfill`) | 0.850s | 0.783–0.795s | −6% to −8% |
+| | tip | 0.850s | 0.764–0.788s | −7% to −10% |
+| PnL with 3 projections (`stateful`) | backfill (`,backfill`) | 2.978s | 2.166s | −27% |
+| | tip | 2.978s | 2.117s | −29% |
+| Raw rows, no aggregates (`raw`), serial | tip | 0.216s | 0.266s | +23% |
 
 In pipelined mode, the total time is approximately the time that Postgres
 works. Thus Settle → PG is faster only when Settle removes work from Postgres:
@@ -79,7 +85,7 @@ works. Thus Settle → PG is faster only when Settle removes work from Postgres:
   time.
 
 In serial mode, the Settle time adds to the Postgres time. For the sum for
-each user, Settle → PG is then 3% to 27% slower than PG only.
+each user, Settle → PG is then 4% to 28% slower than PG only.
 
 ### Raw passthrough (`vs_postgres_raw`)
 
@@ -89,8 +95,8 @@ table). Then the rows go to Postgres, in serial mode.
 | Variant | Total |
 |---|---:|
 | `postgres_only` (multi-row INSERT) | 0.216s |
-| `settle_only` (no Postgres) | 0.053s |
-| `settle_then_postgres` | 0.263s |
+| `settle_only` (no Postgres) | 0.051s |
+| `settle_then_postgres` | 0.266s |
 
 ### Sum for each user (`vs_postgres_simple_agg`)
 
@@ -104,25 +110,26 @@ There are two PG-only variants:
 - `pg_only_per_row`, 5.56s: one upsert for each row.
 
 The values in parentheses are the difference from `pg_only_batch`. The last
-column shows how long Postgres works in pipelined mode. The Settle rows ran on
-2026-10-20.
+column shows how long Postgres works in pipelined mode.
 
 | Mode | Reducer | Serial | Pipelined | Postgres time, pipelined |
 |---|---|---:|---:|---:|
-| tip | `fn` | 0.935s (+10%) | 0.790s (−7%) | 0.774s |
-| | `lua` | 0.946s (+11%) | 0.794s (−7%) | 0.774s |
-| | `mv` | 0.872s (+3%) | 0.774s (−9%) | 0.756s |
-| `,fin` | `fn` | 1.026s (+21%) | 0.790s (−7%) | 0.763s |
-| | `lua` | 1.081s (+27%) | 0.800s (−6%) | 0.766s |
-| | `mv` | 0.921s (+8%) | 0.801s (−6%) | 0.774s |
-| `,backfill` | `fn` | 0.942s (+11%) | 0.793s (−7%) | 0.769s |
-| | `lua` | 0.969s (+14%) | 0.794s (−7%) | 0.770s |
-| | `mv` | 0.878s (+3%) | 0.773s (−9%) | 0.755s |
+| tip | `fn` | 0.901s (+6%) | 0.764s (−10%) | 0.745s |
+| | `lua` | 0.963s (+13%) | 0.788s (−7%) | 0.767s |
+| | `mv` | 0.883s (+4%) | 0.776s (−9%) | 0.760s |
+| `,fin` | `fn` | 1.054s (+24%) | 0.810s (−5%) | 0.782s |
+| | `lua` | 1.085s (+28%) | 0.806s (−5%) | 0.775s |
+| | `mv` | 0.962s (+13%) | 0.796s (−6%) | 0.771s |
+| `,backfill` | `fn` | 0.926s (+9%) | 0.795s (−6%) | 0.774s |
+| | `lua` | 1.032s (+21%) | 0.791s (−7%) | 0.767s |
+| | `mv` | 0.888s (+4%) | 0.783s (−8%) | 0.764s |
 
 - The checkpoint after each batch (`,fin`) adds the most time to `fn` and
-  `lua`. With `,backfill`, all three write fewer checkpoints. The `fn` row
-  of `,backfill` ran on 2026-10-21. Before that day, an External reducer
-  could not delay its checkpoint, and the row was 1.040s (+22%).
+  `lua`. With `,backfill`, all three write fewer checkpoints. Before
+  2026-10-21, an External reducer could not delay its checkpoint, and the
+  `fn` row of `,backfill` was 1.040s (+22%).
+- Each Settle row comes from one run. Between two runs, a serial total
+  changes by approximately 5%.
 - In each batch, no user occurs more than one time (5,000 rows, 5,000 keys).
   Thus Settle cannot merge rows, and Postgres receives the same number of rows
   from the two sides.
@@ -140,7 +147,9 @@ output to 3 views:
 The PG-only indexer reads back the state of the keys in the batch
 (`WHERE (user, token) IN unnest(...)`, and the same for days). It does the
 moving-average calculation in Rust and writes the result with an upsert.
-Settle reads `trades` as a `VIRTUAL TABLE`.
+Settle reads `trades` as a `VIRTUAL TABLE`. In `,fin` and `,backfill`, the
+finalized head is far above the data, as a source can report it in a
+backfill.
 
 | PG-only variant | Total | Rows written | Rows read |
 |---|---:|---:|---:|
@@ -154,8 +163,9 @@ difference from `pg_only_smart[x4]`.
 
 | Mode | Serial | Pipelined | Pipelined, `,q4` | Pipelined, `,x4` |
 |---|---:|---:|---:|---:|
-| tip | 2.477s (−17%) | 2.112s (−29%) | 1.897s (−11%) | 1.861s (−13%) |
-| `,fin` | 2.903s (−3%) | 2.145s (−28%) | 1.941s (−9%) | 1.937s (−10%) |
+| tip | 2.489s (−16%) | 2.117s (−29%) | 1.893s (−12%) | 1.843s (−14%) |
+| `,fin` | 2.883s (−3%) | 2.142s (−28%) | 1.952s (−9%) | 1.916s (−11%) |
+| `,backfill` | 2.594s (−13%) | 2.166s (−27%) | 1.916s (−11%) | 1.847s (−14%) |
 | Rows written | 330,000 | 330,000 | 285,000–295,000 | 280,000 |
 
 - `,q4`: The Postgres thread takes up to 4 batches that wait already. It
@@ -164,11 +174,16 @@ difference from `pg_only_smart[x4]`.
   more batches.
 - `,x4`: The same as `,q4`, but the Postgres thread waits for 4 batches. Thus
   it commits as frequently as `pg_only_smart[x4]`.
+- In serial mode, Settle works 0.38s at the tip, 0.74s with `,fin` and 0.49s
+  with `,backfill`. In pipelined mode, Postgres works for longer, so the
+  three totals are almost the same.
+- The `,backfill` row comes from a second run on the same day. In that run,
+  the tip and `,fin` totals are at most 3% from the values above.
 - The Postgres time follows the number of rows written. The 100K trades,
   which all variants write, take 0.67s. Each view row adds approximately 6µs.
 - When both sides commit one time in 4 batches, PG only becomes 28% faster,
-  but Settle only 10% to 12% faster. Thus the lead of Settle decreases from
-  28–29% to 9–13%.
+  but Settle only 11% to 13% faster. Thus the lead of Settle decreases from
+  28–29% to 9–14%.
 
 ### Chain tip with reorgs (`vs_postgres_reorg`)
 
@@ -198,11 +213,11 @@ A backfill does not keep this data. Thus the other workloads do not use it.
 | Aggregate | Reorg | Settle | PG, off | PG + `blocks` | PG + `undo` |
 |---|---|---:|---:|---:|---:|
 | min/max/last | never | 0.219s | 1.145s | 1.581s | 6.654s |
-| | every 50 blocks | 0.278s | 2.099s | 2.493s | 7.260s |
-| | every 10 blocks | 0.509s | 5.590s | 6.093s | 11.087s |
-| sum/count | never | 0.206s | 1.078s | 1.583s | 6.485s |
-| | every 50 blocks | 0.251s | 1.364s | 1.848s | 7.131s |
-| | every 10 blocks | 0.460s | 2.073s | 2.769s | 10.393s |
+| | every 50 blocks | 0.269s | 2.099s | 2.493s | 7.260s |
+| | every 10 blocks | 0.490s | 5.590s | 6.093s | 11.087s |
+| sum/count | never | 0.202s | 1.078s | 1.583s | 6.485s |
+| | every 50 blocks | 0.245s | 1.364s | 1.848s | 7.131s |
+| | every 10 blocks | 0.439s | 2.073s | 2.769s | 10.393s |
 
 - Without reorgs, the undo log takes approximately 4× the time of the block
   hashes. It runs a trigger for each changed row and five statements for each
@@ -258,31 +273,117 @@ Settle can do work that these benches do not measure:
    and this takes most of the time. Settle keeps the state in memory.
 5. **Fan-out**: One incremental state supplies data to many consumers.
 
+## Map state (`solana_dex`)
+
+`benches/solana_dex.rs` sends synthetic Solana swaps through three reducers
+and five views. Settle keeps its state in RocksDB. The consumer applies each
+change batch at once, so the numbers are the time of Settle alone, with no
+Postgres. The chain makes approximately 600 swaps per second. Thus 60K swaps/s
+is 100× real time.
+
+- `prices` (one group): the USDC price of each token, from the swaps
+  themselves, through a chain of pools. It keeps the last price of each token
+  in a `Map` field. The other two reducers read their rows from it.
+- `pool_prices` (GROUP BY pool): candles, volume for each DEX, pool stats.
+- `positions`: average-cost PnL for each wallet and token, in one of three
+  layouts (`SDEX_POSITIONS`):
+  - `pair`: GROUP BY trader, token. Each group has scalar state.
+  - `map`: GROUP BY trader. A `Map(String, …)` field keeps the positions of
+    the wallet, with the token as the key.
+  - `json`: GROUP BY trader. A `Json` field keeps the same positions. This
+    was the only method before `Map` fields.
+
+Modes: `backfill` sends 100 slots in each ingest, with finality at the last
+block. `ckpt1000` is the same, but Settle writes its checkpoint only one time
+in 1,000 blocks. `tip` sends one slot in each ingest, with finality 32 blocks
+back.
+
+With 4,000 slots (965K swaps, 182K wallets, 456K wallet-token pairs), in
+swaps per second:
+
+| Runtime | Mode | `pair` | `map` | `map` against `pair` |
+|---|---|---:|---:|---:|
+| Rust closure (`fn`) | backfill | 69.3K | 60.2K | −13% |
+| | backfill, `ckpt1000` | 83.0K | 74.1K | −11% |
+| | tip | 45.2K | 36.5K | −19% |
+| Lua | backfill | 47.9K | 40.3K | −16% |
+| | backfill, `ckpt1000` | 53.9K | 45.8K | −15% |
+| | tip | 33.7K | 28.9K | −14% |
+
+- At the tip, one slot takes 5.4–8.5 ms (p50). The chain makes a slot in
+  400 ms.
+- In a backfill with `fn`, the time is approximately 40% DAG, 34% finality
+  and change batches, 27% RocksDB commit.
+- Peak RSS with `fn`, backfill: `pair` 1,326 MB, `map` 1,530 MB.
+
+The `json` layout becomes slower as the wallets get more tokens: each block
+copies the full map of each wallet that it touches. Thus this table uses
+1,000 slots (245K swaps):
+
+| Runtime | Mode | `json` | `map` | `map` against `json` |
+|---|---|---:|---:|---:|
+| `fn` | backfill | 29.8K | 65.1K | 2.2× |
+| | tip | 10.7K | 37.8K | 3.5× |
+| Lua | backfill | 10.1K | 42.7K | 4.2× |
+| | tip | 4.7K | 28.5K | 6.0× |
+
+- In the backfill, `json` drops from the first quarter of the slots to the
+  last: `fn` 58.4K → 20.6K, Lua 21.7K → 5.8K swaps/s. `map` stays in the
+  range 58–78K (`fn`) and 39–49K (Lua).
+- With 4,000 slots on 2026-10-19, `json` gave 12.7K (`fn`) and 3.1K (Lua)
+  in the backfill. A Lua tip slot then took 290 ms (p50).
+
+The Node bench (`bindings/typescript/settle/bench/solana-dex.mjs`) ran on
+2026-10-20, before the changes of PR #58 and PR #60. With 4,000 slots and
+`map`, an External JS reducer gave 43.1K (backfill) and 28.6K (tip) swaps/s,
+and Lua through the binding 37.7K and 25.4K.
+
+## Resident memory (`resident_memory`)
+
+Each case puts N new groups into one node on RocksDB (blocks of 10K keys,
+final at once), and then sends the same keys again. Bytes for each group
+come from the growth of the peak RSS from 500K to 1M groups. With a cap,
+`max_resident_groups` is 100,000. Run on 2026-10-22.
+
+| Shape | Bytes for each group | Peak RSS at 1M groups | Peak RSS, cap 100K | First pass, cap 100K | Second pass, cap 100K |
+|---|---:|---:|---:|---:|---:|
+| Lua reducer, 2 scalar fields | 353 | 474 MB | 244 MB | +8% | ×1.8 |
+| Lua reducer, a `Map` field with 1 key | 747 | 874 MB | 317 MB | +13% | ×2.5 |
+| View (`sum`, `count`) | 638 | 774 MB | 282 MB | +22% | ×1.7 |
+| Lua reducer → view (`last`, `count`) | 1,026 | 1,093 MB | 366 MB | +20% | ×1.8 |
+
+- The last two columns compare the time with the time without a cap. In the
+  first pass, all keys are new. In the second pass, almost each key is not
+  in memory, so Settle reads it from RocksDB.
+- The default cap is 1,000,000 groups for each reducer and each view.
+
 ## Throughput
 
 Command: `cargo bench --bench throughput`. The values are rows per second,
-the median of three runs. The ± value is half the range of the three runs.
+the median of six runs (two sets of three, 20 minutes apart). The ± value is
+half the range of the six runs.
 
 | Pipeline | Rows | Memory | RocksDB | Target |
 |---|---:|---:|---:|---|
-| Raw ingestion | 200K | 2,070K ±3% | 741K ±2% | >100K |
-| Raw + MV | 200K | 1,051K ±3% | 569K ±1% | >50K |
-| Ingest + persist (Raw + MV) | 100K | 1,347K ±2% | 1,102K ±3% | >20K |
-| Full pipeline — Lua | 50K | 473K ±2% | 285K ±2% | >30K |
-| Full pipeline — Rust closure | 50K | 768K ±2% | 376K ±2% | >30K |
-| Reducer only — Lua | 200K | 788K ±3% | — | >100K |
-| Reducer only — Rust closure | 200K | 2,161K ±3% | — | >100K |
-| 100K unique group keys (Lua) | 100K | 429K ±2% | 394K ±3% | — |
-| Polymarket: market_stats only | 200K | 290K ±1% | 263K ±1% | >160K |
-| Polymarket: insider_classifier only | 200K | 472K ±2% | 429K ±0% | >300K |
-| Polymarket: full pipeline | 200K | 216K ±5% | 198K ±17% | >150K |
-| Polymarket: 1M traders | 500K | 192K ±12% | 189K ±2% | >75K |
+| Raw ingestion | 200K | 2,163K ±3% | 753K ±4% | >100K |
+| Raw + MV | 200K | 1,133K ±2% | 597K ±4% | >50K |
+| Ingest + persist (Raw + MV) | 100K | 1,395K ±3% | 1,112K ±4% | >20K |
+| Full pipeline — Lua | 50K | 457K ±2% | 285K ±4% | >30K |
+| Full pipeline — Rust closure | 50K | 775K ±1% | 379K ±5% | >30K |
+| Reducer only — Lua | 200K | 751K ±3% | — | >100K |
+| Reducer only — Rust closure | 200K | 1,957K ±2% | — | >100K |
+| 100K unique group keys (Lua) | 100K | 459K ±2% | 424K ±4% | — |
+| Polymarket: market_stats only | 200K | 287K ±1% | 260K ±1% | >160K |
+| Polymarket: insider_classifier only | 200K | 484K ±2% | 438K ±3% | >300K |
+| Polymarket: full pipeline | 200K | 228K ±12% | 221K ±9% | >150K |
+| Polymarket: 1M traders | 500K | 219K ±11% | 216K ±8% | >75K |
 
-A rollback of 75 blocks (10,050 rows) takes 2.4 ms on Memory and 2.5 ms on
+A rollback of 75 blocks (10,050 rows) takes 2.7 ms on Memory and 2.4 ms on
 RocksDB. The target is less than 10 ms.
 
-The row with 100K unique group keys and the rollback time ran on 2026-10-20.
-Before, these benches used an event-rules reducer.
+The Polymarket insider reducer keeps the positions of a trader in a `Json`
+field, not in a `Map` field: it iterates over all positions with `pairs()`,
+and a `Map` field has no iteration.
 
 ## Instruction counts
 
@@ -359,23 +460,32 @@ by name, as a Rust caller does.
 
 | Case | Instructions | Per row | Bytes | Blocks | Blocks per row |
 |---|---:|---:|---:|---:|---:|
-| `backfill mv_sum` | 311M | 15.6K | 65.5 MB | 229K | 11.5 |
-| `backfill mv_sum_stored` | 372M | 18.6K | 100.1 MB | 290K | 14.5 |
-| `backfill mv_minmax` | 175M | 8.8K | 24.5 MB | 85K | 4.2 |
-| `backfill lua` | 638M | 31.9K | 89.0 MB | 563K | 28.1 |
-| `backfill polymarket` | 1,639M | 81.9K | 168.8 MB | 930K | 46.5 |
-| `tip mv_sum` | 149M | 14.9K | 28.6 MB | 128K | 12.8 |
-| `tip mv_sum_stored` | 176M | 17.6K | 41.6 MB | 160K | 16.0 |
-| `tip mv_minmax` | 166M | 16.6K | 33.0 MB | 128K | 12.8 |
-| `tip lua` | 320M | 32.0K | 40.4 MB | 296K | 29.6 |
-| `tip polymarket` | 811M | 81.1K | 78.6 MB | 483K | 48.3 |
-| `napi_backfill mv_sum` | 314M | 15.7K | 72.1 MB | 269K | 13.5 |
-| `napi_backfill lua` | 642M | 32.1K | 95.7 MB | 603K | 30.2 |
-| `napi_backfill polymarket` | 1,644M | 82.2K | 183.3 MB | 990K | 49.5 |
-| `napi_tip mv_sum` | 156M | 15.6K | 33.3 MB | 157K | 15.7 |
-| `napi_tip polymarket` | 817M | 81.7K | 88.0 MB | 522K | 52.2 |
+| `backfill mv_sum` | 302M | 15.1K | 67.1 MB | 229K | 11.5 |
+| `backfill mv_sum_stored` | 358M | 17.9K | 101.7 MB | 290K | 14.5 |
+| `backfill mv_minmax` | 181M | 9.0K | 32.2 MB | 97K | 4.8 |
+| `backfill lua` | 637M | 31.9K | 92.3 MB | 563K | 28.1 |
+| `backfill polymarket` | 1,669M | 83.5K | 203.3 MB | 1,142K | 57.1 |
+| `tip mv_sum` | 146M | 14.6K | 29.2 MB | 129K | 12.9 |
+| `tip mv_sum_stored` | 171M | 17.1K | 42.2 MB | 161K | 16.1 |
+| `tip mv_minmax` | 164M | 16.4K | 33.6 MB | 129K | 12.9 |
+| `tip lua` | 319M | 31.9K | 41.7 MB | 297K | 29.7 |
+| `tip polymarket` | 829M | 82.9K | 95.3 MB | 589K | 58.9 |
+| `napi_backfill mv_sum` | 308M | 15.4K | 73.7 MB | 269K | 13.5 |
+| `napi_backfill lua` | 644M | 32.2K | 99.0 MB | 603K | 30.2 |
+| `napi_backfill polymarket` | 1,673M | 83.7K | 217.8 MB | 1,202K | 60.1 |
+| `napi_tip mv_sum` | 153M | 15.3K | 33.9 MB | 158K | 15.8 |
+| `napi_tip polymarket` | 835M | 83.5K | 104.7 MB | 629K | 62.9 |
 
-The `lua` rows ran on 2026-10-20.
+Changes since the counts of 2026-10-19 (each step measured in one session):
+
+- `polymarket`: +23% allocated blocks and +3.5% instructions from PR #47.
+  Since that PR, a Lua reducer with STATE fields gets a new row table for
+  each row, because the state can keep the row. The wall-clock time of the
+  Polymarket `throughput` cases did not change.
+- `mv_minmax` backfill: +4.5% instructions and +14% blocks from PR #60. A
+  group that gets rows in more than one block of an ingest moves its blocks
+  from the inline slot into a map at each ingest.
+- MV cases: −1% to −3% instructions.
 
 ### Scale
 
@@ -390,10 +500,10 @@ linear engine, the count doubles when N doubles.
 
 | Case | 2K blocks | 4K | 8K | When N doubles |
 |---|---:|---:|---:|---:|
-| `sum` | 33M | 68M | 139M | ×2.0–2.1 |
+| `sum` | 33M | 68M | 140M | ×2.0–2.1 |
 | `minmax` | 35M | 72M | 148M | ×2.0–2.1 |
-| `sliding_last` | 44M | 93M | 193M | ×2.1 |
-| `sliding_jump` | 44M | 92M | 188M | ×2.0–2.1 |
+| `sliding_last` | 44M | 94M | 193M | ×2.1 |
+| `sliding_jump` | 43M | 89M | 182M | ×2.0–2.1 |
 
 ### Checkpoint and reopen
 
@@ -404,16 +514,18 @@ window. Thus the count increases with the window size.
 
 | Case | Instructions | Bytes | Blocks |
 |---|---:|---:|---:|
-| `checkpoint window_1k` (tip) | 27M | 2.3 MB | 17K |
-| `checkpoint window_2k` (tip) | 45M | 2.3 MB | 17K |
-| `checkpoint window_4k` (tip) | 80M | 2.3 MB | 17K |
-| `checkpoint backfill_window_1k` | 24M | 1.8 MB | 14K |
-| `checkpoint backfill_window_4k` | 60M | 1.8 MB | 14K |
-| `reopen mv_sum_stored` | 216M | 42.1 MB | 250K |
+| `checkpoint window_1k` (tip) | 27M | 2.4 MB | 18K |
+| `checkpoint window_2k` (tip) | 44M | 2.5 MB | 18K |
+| `checkpoint window_4k` (tip) | 77M | 2.5 MB | 18K |
+| `checkpoint backfill_window_1k` | 24M | 1.6 MB | 13K |
+| `checkpoint backfill_window_4k` | 60M | 1.6 MB | 13K |
+| `reopen mv_sum_stored` | 260M | 47.1 MB | 260K |
 
 In `reopen mv_sum_stored`, the derived state of the database is durable only
 up to its first ingest. Thus `Settle::open` replays 700 blocks (35K rows), and
-the case counts this replay.
+the case counts this replay. Since 2026-10-19, this count increased by 21%.
+The PRs between #48 and #58 added 10%. PR #60 added 10%: a view loads its
+groups on demand, with one read for each group.
 
 ## History
 
@@ -443,4 +555,9 @@ only in the same row.
 | 2026-10-18 | Reducer state and emits by position | `backfill event_rules` −11.7%, `backfill polymarket` −14.3% instructions |
 | 2026-10-18 | Binary bridge for the TS binding | External JS reducer through napi: 3.31 → 0.89 µs for each row at 100 groups, 9.22 → 4.20 at 100K groups. This is now approximately the time of EventRules. |
 | 2026-10-18 | Reducer groups in a slab. Finality on the thread that processed the node. | At 100K groups, µs for each row: EventRules 3.27 → 2.10, Rust closure 3.67 → 2.08, External JS through napi 4.15 → 2.45 |
+| 2026-10-18 | No state read for a new group when the database has no reducer state | RocksDB, 100K groups: +6% to +8% |
+| 2026-10-19 | A Lua reducer converts the state of a group one time for each block, not for each row | Solana DEX, JSON layout, Lua backfill: 1,526 → 3,103 swaps/s |
+| 2026-10-20 | `Map` state fields | Solana DEX, 1,000 slots: `map` is 2.2× (`fn` backfill) to 6.0× (Lua tip) faster than `json`. With 4,000 slots, `map` is 11% to 19% slower than `pair`. |
 | 2026-10-21 | External reducers delay their checkpoint in a backfill too (ADR-17) | Solana DEX bench, 4,000 slots: Rust closures +13% and JS +14% at 1,000 blocks; +23% and +17% with 10 slots in each call at 100 blocks. `simple_agg` serial `fn,backfill` 1.040s → 0.942s |
+| 2026-10-22 | Groups leave memory above `max_resident_groups`. One unfinal block stays inline in each group. | Solana DEX: peak RSS 3,030 → 1,320 MB, swaps/s +5% to +6%. `throughput` reducer only (Rust closure) −5%, rollback on Memory 2.3 → 2.7 ms. |
+| 2026-10-22 | The checkpoint interval counts blocks of data, not blocks of finality (ADR-18) | `stateful` serial `,backfill`, finalized head far above the data: Settle time 0.836s → 0.486s, total 2.985s → 2.594s |

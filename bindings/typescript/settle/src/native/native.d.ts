@@ -39,11 +39,11 @@ export interface SettleConfig {
    */
   appliedSequence?: number
   /**
-   * In a backfill (finalized head at the tip of each ingest), write the
-   * derived state to disk once in this many blocks, not at each ingest
-   * (default 1). A crash replays the blocks since the last write. After
-   * such a reopen, `ingest()` throws until every external reducer has
-   * its callback.
+   * In a backfill (finalized head at or above the tip of each ingest),
+   * write the derived state to disk once in this many blocks, not at each
+   * ingest (default 1). A crash replays the blocks since the last write.
+   * After such a reopen, `ingest()` throws until every external reducer
+   * has its callback.
    */
   backfillCheckpointInterval?: number
   /**
