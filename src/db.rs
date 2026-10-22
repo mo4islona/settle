@@ -68,8 +68,9 @@ pub struct Config {
     /// How many blocks below the durable block keep their raw rows on disk.
     /// Default 1,000. A reopen replays only the raw rows above the durable
     /// block, and a rollback only those above finality, so older rows are
-    /// deleted, in steps of a tenth of this margin. `u64::MAX` keeps every
-    /// raw row.
+    /// deleted, in steps of a tenth of this margin. A call does not store the
+    /// rows of the blocks that its own checkpoint makes durable, such as the
+    /// blocks of a backfill. `u64::MAX` keeps every raw row.
     pub raw_retention_blocks: u64,
     /// Most groups that each reducer and each view keeps in memory, about.
     /// Default 1,000,000. Above it, the groups whose state is on disk leave
@@ -1016,6 +1017,7 @@ impl Settle {
             pending_changes.extend(changes);
         }
 
+        self.engine.begin_ingest(finalized_head.number);
         let result = (|| -> Result<()> {
             for (table, by_block) in tables {
                 for (block, block_rows) in by_block {

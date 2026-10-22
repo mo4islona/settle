@@ -98,17 +98,41 @@ impl SourceRow for RowMap {
 const EMIT_ORDER_KEEP: usize = 8192;
 
 /// One group of a view.
+#[derive(Clone)]
 struct Group {
     /// One aggregate per aggregation column, in `agg_index` order.
     aggs: Vec<Box<dyn AggregationFunc>>,
     /// The checkpoint that last wrote the group; 0 if none did since it
     /// loaded.
     written: u64,
+    /// The last block of the current call that fed the group and is final
+    /// at the call. Its contribution waits for the end of the block; None
+    /// outside such a call.
+    final_block: Option<BlockNumber>,
 }
 
 impl Group {
     fn new(aggs: Vec<Box<dyn AggregationFunc>>) -> Self {
-        Self { aggs, written: 0 }
+        Self {
+            aggs,
+            written: 0,
+            final_block: None,
+        }
+    }
+
+    /// Before the rows of `block`, a block final at its call: fold the
+    /// contributions below it into the finalized state, since no row and
+    /// no rollback can change them now.
+    fn enter_final_block(&mut self, block: BlockNumber) {
+        if self.final_block == Some(block) {
+            return;
+        }
+        if let Some(below) = block.checked_sub(1) {
+            for agg in &mut self.aggs {
+                agg.finalize_up_to(below);
+            }
+        }
+        self.final_block = Some(block);
     }
 }
 
@@ -218,7 +242,12 @@ pub struct MVEngine {
     eviction: Eviction,
     /// Tracks which blocks have been ingested (for rollback).
     /// block -> set of group keys touched. BTreeMap for O(log N) range queries.
+    /// A block final at its call is not here: no rollback reaches it.
     block_groups: BTreeMap<BlockNumber, FxHashSet<GroupKey>>,
+    /// The groups that blocks final at the current call fed, each with its
+    /// state from before the call (None if it had none). `discard_changes`
+    /// puts these states back, since the blocks keep no undo data.
+    final_groups: Vec<(GroupKey, Option<Group>)>,
     /// Storage backend for persisting finalized MV state.
     storage: Arc<dyn StorageBackend>,
     /// Sliding window configuration (None for tumbling/non-windowed MVs).
@@ -372,6 +401,7 @@ impl MVEngine {
             reads_storage: false,
             eviction: Eviction::default(),
             block_groups: BTreeMap::new(),
+            final_groups: Vec::new(),
             storage,
             block_times: BlockTimes::default(),
             current_watermark: 0,
@@ -433,6 +463,7 @@ impl MVEngine {
     pub fn reload(&mut self) -> Result<()> {
         self.groups.clear();
         self.block_groups.clear();
+        self.final_groups.clear();
         self.block_times = BlockTimes::default();
         self.current_watermark = 0;
         self.expired.clear();
@@ -496,16 +527,26 @@ impl MVEngine {
         block: BlockNumber,
         rows: &[R],
     ) -> Vec<ChangeRecord> {
-        self.apply_rows(block, rows).expect("groups load");
+        self.apply_rows(block, rows, false).expect("groups load");
         self.take_changes()
     }
 
     /// Apply the rows of one block of the current ingest; `take_changes`
-    /// emits their changes. Err if a group fails to load: the undo of the
-    /// failed ingest then rolls back the rows before it.
-    pub fn apply_rows<R: SourceRow>(&mut self, block: BlockNumber, rows: &[R]) -> Result<()> {
+    /// emits their changes. `is_final`: the block is at or below the
+    /// finality of the ingest, so it needs no rollback data. Err if a group
+    /// fails to load: the undo of the failed ingest then rolls back the
+    /// rows before it.
+    pub fn apply_rows<R: SourceRow>(
+        &mut self,
+        block: BlockNumber,
+        rows: &[R],
+        is_final: bool,
+    ) -> Result<()> {
+        // A window keeps its blocks apart until they expire, final or not.
+        let is_final = is_final && self.sliding_window.is_none();
+
         let mut touched = std::mem::take(&mut self.ingest_touched);
-        let applied = self.apply_block(block, rows, &mut touched);
+        let applied = self.apply_block(block, rows, is_final, &mut touched);
         self.ingest_touched = touched;
         applied
     }
@@ -519,9 +560,17 @@ impl MVEngine {
         self.emit_changes(touched)
     }
 
-    /// Forget the changes of a failed ingest, which its undo rolls back.
+    /// Forget the changes of a failed ingest, which its undo rolls back,
+    /// and put back the groups that its final blocks changed.
     pub fn discard_changes(&mut self) {
         self.ingest_touched = Touched::default();
+
+        for (key, before) in self.final_groups.drain(..) {
+            match before {
+                Some(group) => self.groups.insert(key, group),
+                None => self.groups.remove(&key),
+            };
+        }
     }
 
     /// `process_block` with no change records, for replay, which discards
@@ -533,7 +582,7 @@ impl MVEngine {
             existence_only: true,
             ..Touched::default()
         };
-        let applied = self.apply_block(block, rows, &mut touched);
+        let applied = self.apply_block(block, rows, false, &mut touched);
         self.drop_empty_groups(touched);
         applied
     }
@@ -543,6 +592,7 @@ impl MVEngine {
         &mut self,
         block: BlockNumber,
         rows: &[R],
+        is_final: bool,
         touched: &mut Touched,
     ) -> Result<()> {
         // Sliding window replay protection: skip blocks already in restored state
@@ -588,7 +638,15 @@ impl MVEngine {
             if !exists {
                 self.groups.insert(group_key.clone(), Group::new(self.create_agg_vec()));
             }
-            let aggs = &mut self.groups.get_mut(&group_key).unwrap().aggs;
+            let group = self.groups.get_mut(&group_key).unwrap();
+
+            if is_final {
+                if group.final_block.is_none() {
+                    let before = exists.then(|| group.clone());
+                    self.final_groups.push((group_key.clone(), before));
+                }
+                group.enter_final_block(block);
+            }
 
             // Feed values to each aggregation using pre-computed agg info
             for feed in &self.agg_feeds {
@@ -596,14 +654,16 @@ impl MVEngine {
                     Some(col) => row.column(col),
                     None => &Value::UInt64(1),
                 };
-                aggs[feed.agg_index].add_block(block, std::slice::from_ref(value));
+                group.aggs[feed.agg_index].add_block(block, std::slice::from_ref(value));
             }
 
             // Track block -> group key mapping for rollback
-            self.block_groups
-                .entry(block)
-                .or_default()
-                .insert(group_key);
+            if !is_final {
+                self.block_groups
+                    .entry(block)
+                    .or_default()
+                    .insert(group_key);
+            }
         }
 
         // Expire old blocks for sliding windows
@@ -617,7 +677,7 @@ impl MVEngine {
     /// Returns compensating change records.
     pub fn rollback(&mut self, fork_point: BlockNumber) -> Vec<ChangeRecord> {
         debug_assert!(
-            self.ingest_touched.groups.is_empty(),
+            self.ingest_touched.groups.is_empty() && self.final_groups.is_empty(),
             "rollback with the changes of an ingest not taken"
         );
 
@@ -725,6 +785,22 @@ impl MVEngine {
         } else {
             let changed = self.finalize_blocks_up_to(block);
             self.pending_durable.extend(changed);
+            self.close_final_blocks(block);
+        }
+    }
+
+    /// Fold the last final block of each group in `final_groups` into its
+    /// finalized state, and queue the group for the checkpoint.
+    fn close_final_blocks(&mut self, block: BlockNumber) {
+        for (key, _) in self.final_groups.drain(..) {
+            if let Some(group) = self.groups.get_mut(&key) {
+                debug_assert!(group.final_block.is_none_or(|b| b <= block));
+                for agg in &mut group.aggs {
+                    agg.finalize_up_to(block);
+                }
+                group.final_block = None;
+            }
+            self.pending_durable.insert(key);
         }
     }
 

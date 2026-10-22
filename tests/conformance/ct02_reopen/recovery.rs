@@ -696,6 +696,41 @@ fn max_raw_retention_keeps_every_raw_row() {
     assert_eq!(stored_raw_blocks(&storage), (0..50).collect::<Vec<_>>());
 }
 
+/// A call stores no raw rows of the blocks that its own checkpoint makes
+/// durable, whatever the margin: nothing reads them. The rows above the
+/// durable block stay, and a reopen rebuilds the state from them.
+#[test]
+fn a_checkpoint_leaves_out_the_raw_rows_that_it_makes_durable() {
+    let storage = Arc::new(MemoryBackend::new());
+    let open = || Settle::open(Config::new(SUM_SCHEMA).storage(storage.clone())).unwrap();
+
+    let mut db = open();
+    for block in 1..=50 {
+        ingest_eth(&mut db, block, block);
+    }
+    assert_eq!(db.durable_block(), 50);
+    assert_eq!(stored_raw_blocks(&storage), Vec::<BlockNumber>::new());
+
+    for block in 51..=55 {
+        ingest_eth(&mut db, block, 50);
+    }
+    // One call: its checkpoint makes 56..=58 durable, not 59..=60.
+    let data = (56..=60)
+        .map(|block| ("swaps".to_string(), block, vec![swap(block, "ETH", 1)]))
+        .collect();
+    ingest_with_finalized(&mut db, data, 58).unwrap();
+    assert_eq!(db.durable_block(), 58);
+    assert_eq!(
+        stored_raw_blocks(&storage),
+        vec![51, 52, 53, 54, 55, 59, 60]
+    );
+
+    drop(db);
+    let mut db = open();
+    let batch = ingest_eth(&mut db, 61, 58).unwrap();
+    assert_eq!(total(&batch, "pool_volume", "ETH"), Value::UInt64(61));
+}
+
 /// Backfill deferral from the first block: block 0 must survive a reopen
 /// before the first checkpoint.
 #[test]

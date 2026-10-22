@@ -146,6 +146,7 @@ impl PipelineBranch {
     fn process_block(
         &mut self,
         block: BlockNumber,
+        is_final: bool,
         output_rows: &HashMap<String, Vec<Row>>,
         perf: bool,
     ) -> Result<Option<PerfNode>> {
@@ -157,7 +158,7 @@ impl PipelineBranch {
             if !enriched.is_empty() {
                 for (mv_name, mv) in &mut self.mv_entries {
                     let mv_timer = PerfTimer::start(perf);
-                    mv.apply_rows(block, &enriched)?;
+                    mv.apply_rows(block, &enriched, is_final)?;
                     mv_nodes.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
             }
@@ -216,6 +217,13 @@ pub struct SettleEngine {
     /// reducer, and each callback replays its chain from here. The next
     /// `advance_finality` ends it. See `restore_finality`.
     nodes_final_at: Option<BlockNumber>,
+    /// The finality that the current ingest advances to, from
+    /// `begin_ingest` to its finality advance or undo. Its blocks at or
+    /// below it are final as they arrive (`MVEngine::apply_rows`).
+    ingest_finality: Option<BlockNumber>,
+    /// Whether the current ingest processed a block at or below
+    /// `ingest_finality`.
+    processed_final_block: bool,
     /// True once finality advanced at least once (or state was restored from
     /// disk). Lets `advance_finality(N)` skip work when N has not moved:
     /// heartbeat ingests with a stale `finalized_head` are common at the tip.
@@ -390,6 +398,8 @@ impl SettleEngine {
             raw_purged_through: None,
             defer_allowed,
             nodes_final_at: None,
+            ingest_finality: None,
+            processed_final_block: false,
             has_finalized: false,
             collect_perf: true,
             block_hashes: BTreeMap::new(),
@@ -530,6 +540,14 @@ impl SettleEngine {
         Ok((changes, perf_node))
     }
 
+    /// Start an ingest that advances finality to `finalized`: its blocks at
+    /// or below it need no rollback data. Its finality advance or its undo
+    /// ends it.
+    pub fn begin_ingest(&mut self, finalized: BlockNumber) {
+        self.ingest_finality = Some(finalized);
+        self.processed_final_block = false;
+    }
+
     /// Process a batch, deferring raw row storage writes to the given WriteBatch.
     /// `rows` are in the column order of the table (`table_registry`).
     /// Returns the raw-table changes only: the MV changes of all the blocks of
@@ -586,6 +604,8 @@ impl SettleEngine {
         }
 
         let mut all_changes = Vec::new();
+        let is_final = self.ingest_finality.is_some_and(|f| block <= f);
+        self.processed_final_block |= is_final;
 
         // Phase 1: Raw table ingest
         let raw_timer = PerfTimer::start(perf);
@@ -619,7 +639,7 @@ impl SettleEngine {
                     let mv_timer = PerfTimer::start(perf);
                     let mv = self.mvs.get_mut(mv_name).unwrap();
                     if let Some(source_rows) = output_rows.get(mv.source()) {
-                        mv.apply_rows(block, source_rows)?;
+                        mv.apply_rows(block, source_rows, is_final)?;
                     }
                     perf_children.extend(mv_timer.stop(PerfNodeKind::MV, mv_name, vec![]));
                 }
@@ -635,8 +655,8 @@ impl SettleEngine {
                 if self.branches.len() == 2 {
                     let (first, second) = self.branches.split_at_mut(1);
                     let (result_0, result_1) = rayon::join(
-                        || first[0].process_block(block, &output_rows, perf),
-                        || second[0].process_block(block, &output_rows, perf),
+                        || first[0].process_block(block, is_final, &output_rows, perf),
+                        || second[0].process_block(block, is_final, &output_rows, perf),
                     );
                     take(result_0)?;
                     take(result_1)?;
@@ -644,7 +664,7 @@ impl SettleEngine {
                     let results: Vec<_> = self
                         .branches
                         .par_iter_mut()
-                        .map(|branch| branch.process_block(block, &output_rows, perf))
+                        .map(|branch| branch.process_block(block, is_final, &output_rows, perf))
                         .collect();
                     for result in results {
                         take(result)?;
@@ -690,7 +710,7 @@ impl SettleEngine {
                             None => self.mvs.get_mut(name).unwrap(),
                         };
                         if let Some(source_rows) = output_rows.get(mv.source()) {
-                            mv.apply_rows(block, source_rows)?;
+                            mv.apply_rows(block, source_rows, is_final)?;
                         }
                         let mv_source = mv.source();
                         // Nest under parent reducer if exists, otherwise add as sibling
@@ -1010,6 +1030,8 @@ impl SettleEngine {
         block: Option<BlockNumber>,
         pending: &PendingWrites,
     ) -> Result<()> {
+        self.ingest_finality = None;
+        self.processed_final_block = false;
         self.discard_changes();
 
         // A rollback keeps its target block, so it cannot undo block 0. With
@@ -1096,10 +1118,15 @@ impl SettleEngine {
     /// stops at `block` from now on. Nothing reaches disk before
     /// `write_checkpoint`.
     pub fn advance_finality(&mut self, block: BlockNumber) {
+        debug_assert!(self.ingest_finality.is_none_or(|f| f <= block));
+        self.ingest_finality = None;
+        let processed_final_block = std::mem::take(&mut self.processed_final_block);
+
         // With the durable state at this finality, every block up to it is
         // merged: new data lands above the latest block, which is at or above
         // the durable one.
-        let merged = self.has_finalized
+        let merged = !processed_final_block
+            && self.has_finalized
             && block == self.finalized_block
             && self.durable_block.is_some_and(|d| d >= block);
         if merged {
@@ -1185,8 +1212,22 @@ impl SettleEngine {
         if let Some(latest) = self.latest_block {
             self.durable_block = Some(finalized.min(latest));
         }
+        self.leave_out_checkpointed_raw_rows(batch);
         self.purge_raw_rows(batch);
         self.prune_block_hashes();
+    }
+
+    /// Leave out of `batch` its raw rows at or below the durable block: the
+    /// checkpoint in the same batch holds their state, and nothing reads them
+    /// (see `purge_raw_rows`). `batch` holds the rows of this call only. The
+    /// largest retention margin keeps every raw row.
+    fn leave_out_checkpointed_raw_rows(&self, batch: &mut StorageWriteBatch) {
+        if self.raw_retention_blocks == u64::MAX {
+            return;
+        }
+        if let Some(durable) = self.durable_block {
+            batch.drop_raw_rows_through(durable);
+        }
     }
 
     /// Delete the raw rows that nothing reads any more, in the batch that

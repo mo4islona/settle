@@ -6,7 +6,7 @@ use settle::error::Error;
 use settle::schema::ast::MAX_MV_AGGREGATES;
 use settle::storage::memory::MemoryBackend;
 use settle::test_helpers::cursor;
-use settle::types::{BlockCursor, Value};
+use settle::types::{BlockCursor, ChangeBatch, Value};
 
 use crate::support::*;
 
@@ -272,32 +272,56 @@ fn mv_at_aggregate_limit_survives_reopen() {
     assert_eq!(eth.get(&last), Some(&Value::Float64(20.0)));
 }
 
+/// A table whose reducer fails the call on a row with code 13. Its name
+/// sorts last, so the blocks of the other tables are processed first.
+#[cfg(feature = "lua")]
+const ALARM_SCHEMA: &str = r#"
+    CREATE TABLE zz_alarms (block_number UInt64, code UInt64);
+
+    CREATE REDUCER alarm
+    SOURCE zz_alarms
+    GROUP BY code
+    STATE (seen UInt64 DEFAULT 0)
+    LANGUAGE lua
+    PROCESS $$
+        if row.code == 13 then error("unlucky code") end
+        state.seen = state.seen + 1
+    $$;
+"#;
+
+#[cfg(feature = "lua")]
+fn failing_alarm() -> Vec<HashMap<String, Value>> {
+    vec![HashMap::from([("code".to_string(), Value::UInt64(13))])]
+}
+
 /// On a gappy chain finality can be ahead of the latest data block. A failed
 /// ingest must still undo the blocks it processed: the undo is not a chain
 /// rollback, so the finality bound does not apply.
+#[cfg(feature = "lua")]
 #[test]
 fn failed_ingest_is_undone_when_finality_is_ahead_of_latest() {
-    let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
+    let schema = format!("{DEX_SCHEMA}{ALARM_SCHEMA}");
+    let mut db = Settle::open(Config::new(schema)).unwrap();
     let buy = |amount: f64| vec![make_trade("alice", "buy", amount, 1.0)];
 
     ingest_with_finalized(&mut db, vec![("trades".into(), 3, buy(10.0))], 100).unwrap();
     assert_eq!(db.latest_block(), 3);
     assert_eq!(db.finalized_block(), 100);
 
-    // "trades" sorts before "zz_unknown": blocks 4 and 5 are processed, then
-    // the unknown table fails the ingest.
+    // Blocks 4 and 5 of "trades" are processed, then the alarm fails the
+    // ingest.
     let err = ingest_with_finalized(
         &mut db,
         vec![
             ("trades".into(), 4, buy(5.0)),
             ("trades".into(), 5, buy(5.0)),
-            ("zz_unknown".into(), 5, buy(1.0)),
+            ("zz_alarms".into(), 5, failing_alarm()),
         ],
         100,
     )
     .unwrap_err();
     assert!(
-        matches!(err, Error::InvalidOperation(_)),
+        err.to_string().contains("unlucky code"),
         "expected the ingest error itself, not a failed recovery: {err}"
     );
     assert_eq!(db.latest_block(), 3, "the failed ingest is undone");
@@ -325,6 +349,82 @@ fn failed_ingest_is_undone_when_finality_is_ahead_of_latest() {
         .unwrap();
     assert_eq!(alice.get("trade_count"), Some(&Value::UInt64(3)));
     assert_eq!(alice.get("current_position"), Some(&Value::Float64(20.0)));
+}
+
+/// A view keeps no rollback data for a block that is final at its call, so a
+/// failed call puts back the groups that such blocks changed. A retry, or a
+/// fork of the unfinal blocks before the failed call, then gives the records
+/// of a run without the failure.
+#[cfg(feature = "lua")]
+#[test]
+fn failed_call_puts_back_the_view_groups_of_its_final_blocks() {
+    let schema = r#"
+        CREATE TABLE ticks (block_number UInt64, pool String, price Float64);
+        CREATE MATERIALIZED VIEW stats AS
+        SELECT pool, sum(price) AS total, count() AS n, min(price) AS low,
+               max(price) AS high, avg(price) AS mean, first(price) AS open,
+               last(price) AS close
+        FROM ticks GROUP BY pool;
+    "#;
+    let schema = format!("{schema}{ALARM_SCHEMA}");
+    let tick = |pool: &str, price: f64| {
+        HashMap::from([
+            ("pool".to_string(), Value::String(pool.into())),
+            ("price".to_string(), Value::Float64(price)),
+        ])
+    };
+    // Pool "a" has blocks 2 and 3 unfinal when the failed call makes them
+    // final; pool "b" is new in it. The sums of DEF-42 depend on the order.
+    let first = vec![
+        ("ticks".to_string(), 1, vec![tick("a", 1e16)]),
+        ("ticks".to_string(), 2, vec![tick("a", -1e16), tick("a", 1.0)]),
+        ("ticks".to_string(), 3, vec![tick("a", 5.0)]),
+    ];
+    let second = vec![
+        ("ticks".to_string(), 4, vec![tick("a", 2.0), tick("b", 7.0)]),
+        ("ticks".to_string(), 5, vec![tick("a", 3.0), tick("b", 0.5)]),
+    ];
+    // The view takes blocks 4 and 5, then the alarm fails the call.
+    let mut failing = second.clone();
+    failing.push(("zz_alarms".to_string(), 5, failing_alarm()));
+
+    let image = |batch: Option<ChangeBatch>| {
+        let mut records: Vec<String> = batch
+            .expect("a batch")
+            .all_records()
+            .map(|r| {
+                let mut values: Vec<_> = r.values_map().into_iter().collect();
+                values.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut prev: Option<Vec<_>> = r.prev_map().map(|p| p.into_iter().collect());
+                if let Some(prev) = &mut prev {
+                    prev.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+                format!("{:?} {:?} {values:?} {prev:?}", r.operation, r.key("pool"))
+            })
+            .collect();
+        records.sort();
+        records
+    };
+
+    for retry in [true, false] {
+        let run = |fail: bool| {
+            let mut db = Settle::open(Config::new(schema.as_str())).unwrap();
+            ingest_with_finalized(&mut db, first.clone(), 1).unwrap();
+            if fail {
+                let err = ingest_with_finalized(&mut db, failing.clone(), 10).unwrap_err();
+                assert!(err.to_string().contains("unlucky code"), "{err}");
+                assert_eq!(db.finalized_block(), 1, "the failed call keeps finality");
+            }
+            if retry {
+                ingest_with_finalized(&mut db, second.clone(), 10).unwrap()
+            } else {
+                rollback_to(&mut db, 1).unwrap().batch
+            }
+        };
+
+        let case = if retry { "retry" } else { "fork" };
+        assert_eq!(image(run(true)), image(run(false)), "{case}");
+    }
 }
 
 /// Block 0 is a block like any other: ingested twice, it is a duplicate.

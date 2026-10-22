@@ -221,12 +221,12 @@ These checks need no domain knowledge, so CT-1, CT-2 and CT-5 run them on every 
 | INV-4 | CT-1 | C | A validator on every batch. |
 | INV-5 | CT-1, CT-2 | C | The differential compares stored and memory hashes at each reopen. |
 | INV-6 | CT-1 | P | known-violated for a group whose values are all NaN (GAP-48), so CT-1 sends no NaN. CT-1 compares the presence of each group with the model, also for groups that a rollback or a window empties. |
-| INV-7 | CT-2, CT-7 | P | Tests of the purge margin. |
+| INV-7 | CT-2, CT-7 | P | Tests of the purge margin and of the rows that a checkpoint covers (RS-6). |
 | INV-8 | CT-1, CT-4 | C | Tests of the emit limit and of columns that shrink. |
 | INV-9 | CT-1 | P | CT-1 compares the derived state with the model for raw and virtual tables, Lua reducers with Map state, and the Int and Float modes. Chained and external reducers and the BigInt mode are not in CT-1. |
 | INV-10 | CT-1, CT-2 | C | CT-1 checks `F` after every call, also after a reopen. |
 | INV-11 | CT-1, CT-2 | C | CT-1 sends forks below finality, also after a reopen. |
-| INV-12 | CT-4, CT-8 | P | A failed attach replay poisons the instance (WP-71); a CT-2 test checks it after a reopen, with and without deferral. |
+| INV-12 | CT-4, CT-8 | P | A failed attach replay poisons the instance (WP-71); a CT-2 test checks it after a reopen, with and without deferral. A CT-4 test undoes a call whose blocks are final at the call (RS-17). |
 | INV-13 | CT-1 | C | CT-1 reads each status twice after every call. |
 | INV-14 | CT-4 | P | Dedup tests, also for block 0. No test for a second table of an accepted block. |
 | INV-15 | CT-8, CT-3 | P | CT-8 is C, with a store that records each commit. CT-3 is U: no kill points (HC-7). |
