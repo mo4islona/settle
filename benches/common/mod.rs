@@ -131,6 +131,7 @@ fn pg_tag() -> String {
 pub struct PgRuntime {
     pub rt: tokio::runtime::Runtime,
     pub client: Client,
+    conn_str: String,
     // Option so Drop can take it out and drop it inside a runtime
     // context (testcontainers' ContainerAsync::drop is async).
     container: Option<ContainerAsync<PgImage>>,
@@ -153,12 +154,8 @@ impl Drop for PgRuntime {
 
 impl PgRuntime {
     pub fn start() -> anyhow::Result<Self> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
-
-        let (container, client) = rt.block_on(async {
+        let rt = Self::runtime()?;
+        let (container, conn_str) = rt.block_on(async {
             let container = PgImage::default()
                 .with_tag(pg_tag())
                 // The benches run a chain about 100x faster than real time. With
@@ -173,19 +170,45 @@ impl PgRuntime {
             let conn_str = format!(
                 "host={host} port={port} user=postgres password=postgres dbname=postgres"
             );
+            Ok::<_, anyhow::Error>((container, conn_str))
+        })?;
+        let mut pg = Self::connect_on(rt, conn_str)?;
+        pg.container = Some(container);
+        Ok(pg)
+    }
+
+    /// A connection to a Postgres that another process started.
+    pub fn connect(conn_str: &str) -> anyhow::Result<Self> {
+        Self::connect_on(Self::runtime()?, conn_str.to_string())
+    }
+
+    pub fn conn_str(&self) -> &str {
+        &self.conn_str
+    }
+
+    fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+        Ok(tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?)
+    }
+
+    fn connect_on(rt: tokio::runtime::Runtime, conn_str: String) -> anyhow::Result<Self> {
+        let client = rt.block_on(async {
             let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
                     eprintln!("postgres connection error: {e}");
                 }
             });
-            Ok::<_, anyhow::Error>((container, client))
+            Ok::<_, anyhow::Error>(client)
         })?;
 
         Ok(Self {
             rt,
             client,
-            container: Some(container),
+            conn_str,
+            container: None,
             write_statements: AtomicU64::new(0),
             read_statements: AtomicU64::new(0),
             rows_written: AtomicU64::new(0),
