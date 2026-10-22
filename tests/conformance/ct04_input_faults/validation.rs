@@ -272,32 +272,56 @@ fn mv_at_aggregate_limit_survives_reopen() {
     assert_eq!(eth.get(&last), Some(&Value::Float64(20.0)));
 }
 
+/// A table whose reducer fails the call on a row with code 13. Its name
+/// sorts last, so the blocks of the other tables are processed first.
+#[cfg(feature = "lua")]
+const ALARM_SCHEMA: &str = r#"
+    CREATE TABLE zz_alarms (block_number UInt64, code UInt64);
+
+    CREATE REDUCER alarm
+    SOURCE zz_alarms
+    GROUP BY code
+    STATE (seen UInt64 DEFAULT 0)
+    LANGUAGE lua
+    PROCESS $$
+        if row.code == 13 then error("unlucky code") end
+        state.seen = state.seen + 1
+    $$;
+"#;
+
+#[cfg(feature = "lua")]
+fn failing_alarm() -> Vec<HashMap<String, Value>> {
+    vec![HashMap::from([("code".to_string(), Value::UInt64(13))])]
+}
+
 /// On a gappy chain finality can be ahead of the latest data block. A failed
 /// ingest must still undo the blocks it processed: the undo is not a chain
 /// rollback, so the finality bound does not apply.
+#[cfg(feature = "lua")]
 #[test]
 fn failed_ingest_is_undone_when_finality_is_ahead_of_latest() {
-    let mut db = Settle::open(Config::new(DEX_SCHEMA)).unwrap();
+    let schema = format!("{DEX_SCHEMA}{ALARM_SCHEMA}");
+    let mut db = Settle::open(Config::new(schema)).unwrap();
     let buy = |amount: f64| vec![make_trade("alice", "buy", amount, 1.0)];
 
     ingest_with_finalized(&mut db, vec![("trades".into(), 3, buy(10.0))], 100).unwrap();
     assert_eq!(db.latest_block(), 3);
     assert_eq!(db.finalized_block(), 100);
 
-    // "trades" sorts before "zz_unknown": blocks 4 and 5 are processed, then
-    // the unknown table fails the ingest.
+    // Blocks 4 and 5 of "trades" are processed, then the alarm fails the
+    // ingest.
     let err = ingest_with_finalized(
         &mut db,
         vec![
             ("trades".into(), 4, buy(5.0)),
             ("trades".into(), 5, buy(5.0)),
-            ("zz_unknown".into(), 5, buy(1.0)),
+            ("zz_alarms".into(), 5, failing_alarm()),
         ],
         100,
     )
     .unwrap_err();
     assert!(
-        matches!(err, Error::InvalidOperation(_)),
+        err.to_string().contains("unlucky code"),
         "expected the ingest error itself, not a failed recovery: {err}"
     );
     assert_eq!(db.latest_block(), 3, "the failed ingest is undone");
